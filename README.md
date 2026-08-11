@@ -78,6 +78,35 @@ pnpm install                  # instala Pi 0.84.1 y pi-chrome 0.15.46
 ADMIN_TOKEN=mi-token .venv/bin/python -m go_backend.server serve --port 8787
 ```
 
+## App de escritorio (Electron + TypeScript)
+
+El repositorio incluye una interfaz de escritorio separada del backend y del
+harness. Permite elegir conectores, buscar por herramienta, crear varios bots,
+personalizar su color/forma/nombre y guardar qué conectores utilizará cada bot.
+Después de crear un bot, una conversación guiada pregunta para qué se usará,
+dónde vive el trabajo y qué sistema de proyectos debe considerar; con esas
+respuestas recomienda y asigna conectores al perfil.
+
+```bash
+pnpm install
+pnpm desktop
+```
+
+La app guarda únicamente preferencias y perfiles de bots en
+`desktop-state.json`, dentro del directorio `userData` de Electron. El renderer
+no tiene acceso a Node.js: toda persistencia pasa por un `preload` aislado y una
+lista cerrada de operaciones IPC.
+
+El catálogo reutiliza las superficies que ya existen en `outcome-desktop`
+(trabajo, ventas, desarrollo y diseño) y `ecom-research-agent` (Shopify,
+Tiendanube y WooCommerce). En esta etapa, elegir una herramienta significa
+asignarla al perfil del bot; **no se muestra como autenticada** hasta que exista
+un flujo OAuth/API específico para ese proveedor. La selección por sí sola no
+permite que una persona inicie sesión: para eso todavía se necesita registrar
+una app OAuth por proveedor, implementar callbacks y guardar tokens cifrados y
+aislados por usuario. Esta capa no modifica ni reconfigura
+`go_backend/pi_harness.py`.
+
 Cargar keys de Go al pool:
 
 ```bash

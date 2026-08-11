@@ -1,6 +1,7 @@
 # Entorno y dependencias
 .venv/
 node_modules/
+desktop/dist/
 __pycache__/
 *.pyc
 

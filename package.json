@@ -1,9 +1,25 @@
 {
   "name": "wrapper-backend-pi-runtime",
   "private": true,
+  "version": "0.1.0",
   "description": "Pi harness runtime used by wrapper-backend",
+  "main": "desktop/dist/main.cjs",
+  "scripts": {
+    "build:desktop": "node desktop/build.mjs",
+    "desktop": "pnpm build:desktop && electron .",
+    "smoke:desktop": "pnpm build:desktop && electron . --smoke-test",
+    "typecheck:desktop": "tsc -p desktop/tsconfig.json --noEmit",
+    "test:desktop": "pnpm typecheck:desktop && pnpm build:desktop && node --test tests/test_desktop.mjs"
+  },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.1",
-    "pi-chrome": "0.15.46"
+    "pi-chrome": "0.15.46",
+    "simple-icons": "^15.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "electron": "^37.4.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
   }
 }
