@@ -208,6 +208,8 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
   assert.match(oauth, /agent-genia-connectors-account\.bin/);
   assert.match(oauth, /accountClient/);
   assert.match(oauth, /connectorClient/);
+  assert.match(oauth, /sameAccountService/);
+  assert.match(main, /WRAPPER_SERVICE_URL\?\.trim\(\) \|\| outcomeServiceUrl/);
   assert.match(oauth, /owner_account_id/);
   assert.match(oauth, /managed_connection_id/);
   assert.match(oauth, /\/v1\/connectors\/start/);

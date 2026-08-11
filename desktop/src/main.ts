@@ -194,10 +194,12 @@ function createWindow(): void {
 
 if (hasSingleInstanceLock) app.whenReady().then(() => {
   const userDataPath = app.getPath("userData");
+  const outcomeServiceUrl = process.env.OUTCOME_SERVICE_URL?.trim() || "https://outcome-service.onrender.com";
+  const accountServiceUrl = process.env.WRAPPER_SERVICE_URL?.trim() || outcomeServiceUrl;
   stateStore = new DesktopStateStore(path.join(userDataPath, "desktop-state.json"));
   oauthController = new DesktopOAuthController({
-    accountBaseUrl: process.env.WRAPPER_SERVICE_URL ?? "http://127.0.0.1:8787",
-    connectorBaseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
+    accountBaseUrl: accountServiceUrl,
+    connectorBaseUrl: outcomeServiceUrl,
     safeStorage,
     userDataPath,
     shell,
