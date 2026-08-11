@@ -76,6 +76,16 @@ let mainWindow: BrowserWindow | null = null;
 let stateStore: DesktopStateStore;
 let oauthController: DesktopOAuthController;
 const smokeTest = process.argv.includes("--smoke-test");
+const hasSingleInstanceLock = smokeTest || app.requestSingleInstanceLock();
+
+if (!hasSingleInstanceLock) app.quit();
+
+app.on("second-instance", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
 
 function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.bootstrap, () => stateStore.snapshot());
@@ -182,11 +192,12 @@ function createWindow(): void {
   void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
 }
 
-app.whenReady().then(() => {
+if (hasSingleInstanceLock) app.whenReady().then(() => {
   const userDataPath = app.getPath("userData");
   stateStore = new DesktopStateStore(path.join(userDataPath, "desktop-state.json"));
   oauthController = new DesktopOAuthController({
-    baseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
+    accountBaseUrl: process.env.WRAPPER_SERVICE_URL ?? "http://127.0.0.1:8787",
+    connectorBaseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
     safeStorage,
     userDataPath,
     shell,

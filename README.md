@@ -100,10 +100,36 @@ sesiones de proveedores para que otra persona del equipo no las herede. El
 renderer no tiene acceso a Node.js, tokens ni red: toda autenticación pasa por
 un `preload` aislado y una lista cerrada de operaciones IPC.
 
-El catálogo reutiliza las superficies que ya existen en `outcome-desktop`
-(trabajo, ventas, desarrollo y diseño) y `ecom-research-agent` (Shopify,
-Tiendanube y WooCommerce). Electron ofrece conexión real y aislada por usuario
-para 31 proveedores mediante el gateway administrado de Composio: Google
+### Login con Google
+
+El login principal vive ahora en este repositorio. `wrapper-backend` inicia un
+Authorization Code flow con PKCE, valida el `state`, consulta la identidad
+verificada de Google y crea siempre una cuenta `free`. Google se identifica por
+su `sub` estable; nunca se enlaza automáticamente por email con un usuario del
+signup antiguo porque esos correos no fueron verificados.
+
+El backend no persiste tokens de Google. Emite tokens opacos propios, guarda
+solo sus hashes en SQLite, liga cada refresh token al `device_id`, lo rota al
+usarlo y revoca el access token al cerrar sesión. Electron cifra access,
+refresh e identidad con `safeStorage`/Keychain.
+
+Para producción:
+
+1. Crea en Google Cloud un cliente OAuth 2.0 de tipo **Web application**.
+2. Registra exactamente
+   `https://api.tu-dominio.com/v1/account-auth/google/callback` como redirect URI.
+3. Define `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` y
+   `GOOGLE_OAUTH_REDIRECT_URI` únicamente en el entorno privado del backend.
+4. En un host como Render configura `HOST=0.0.0.0` y conserva SQLite y
+   `secret.key` en un disco persistente.
+5. Compila Electron con `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`.
+
+La sesión principal y la sesión del broker de conectores se guardan en archivos
+cifrados distintos. Así, un token de Google/Agent Genia no se puede presentar
+accidentalmente ante Composio, Slack, Notion u otro proveedor.
+
+El catálogo de Agent Genia ofrece conexión real y aislada por usuario para 31
+proveedores mediante el gateway administrado de Composio: Google
 Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
 Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
@@ -283,10 +309,16 @@ de modo que el agente puede observar la página y decidir su siguiente acción.
 
 ## Endpoints
 
-Públicos (Bearer = api key del usuario del wrapper):
+Públicos (los endpoints de cuenta no requieren Bearer; los endpoints del modelo
+aceptan API key o access token de una sesión Google):
 
 | Método | Ruta | Descripción |
 |---|---|---|
+| POST | `/v1/account-auth/start` | Inicia Google OAuth para un `device_id` UUID |
+| GET | `/v1/account-auth/status/<attempt_id>` | Entrega la sesión al dispositivo que inició el flujo |
+| GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
+| POST | `/v1/account-auth/refresh` | Rota access y refresh token ligados al dispositivo |
+| POST | `/v1/account-auth/logout` | Revoca la sesión actual |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
 | POST | `/v1/byok` | El usuario registra su propia key de Go `{apiKey}` |
 | GET | `/v1/models` | Catálogo de modelos (proxy a Go) |

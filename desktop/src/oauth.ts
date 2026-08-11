@@ -81,19 +81,23 @@ const PROVIDER_LABELS: Readonly<Record<OAuthProviderId, string>> = Object.freeze
 
 export class DesktopOAuthController {
   private readonly accountStore: EncryptedJsonStore<AccountSession>;
+  private readonly connectorAccountStore: EncryptedJsonStore<AccountSession>;
   private readonly deviceStore: DeviceIdentityStore;
-  private readonly client: OutcomeOAuthClient;
+  private readonly accountClient: OutcomeOAuthClient;
+  private readonly connectorClient: OutcomeOAuthClient;
   private readonly providerSessions: Map<OAuthProviderId, ManagedProviderSession>;
   private readonly managedConnectorSessions: Map<string, ManagedConnectorAccount>;
 
   constructor({
-    baseUrl,
+    accountBaseUrl,
+    connectorBaseUrl,
     safeStorage,
     userDataPath,
     shell,
     appVersion
   }: {
-    baseUrl: string;
+    accountBaseUrl: string;
+    connectorBaseUrl: string;
     safeStorage: SafeStorage;
     userDataPath: string;
     shell: Shell;
@@ -104,10 +108,22 @@ export class DesktopOAuthController {
       safeStorage,
       validate: isAccountSession
     });
+    this.connectorAccountStore = new EncryptedJsonStore({
+      filePath: path.join(userDataPath, "secrets", "agent-genia-connectors-account.bin"),
+      safeStorage,
+      validate: isAccountSession
+    });
     this.deviceStore = new DeviceIdentityStore({ safeStorage, userDataPath });
-    this.client = new OutcomeOAuthClient({
-      baseUrl,
+    this.accountClient = new OutcomeOAuthClient({
+      baseUrl: accountBaseUrl,
       accountStore: this.accountStore,
+      deviceStore: this.deviceStore,
+      appVersion,
+      openExternal: (url) => shell.openExternal(url)
+    });
+    this.connectorClient = new OutcomeOAuthClient({
+      baseUrl: connectorBaseUrl,
+      accountStore: this.connectorAccountStore,
       deviceStore: this.deviceStore,
       appVersion,
       openExternal: (url) => shell.openExternal(url)
@@ -118,8 +134,8 @@ export class DesktopOAuthController {
         new ManagedProviderSession({
           provider,
           displayName: PROVIDER_LABELS[provider],
-          client: this.client,
-          accountStore: this.accountStore,
+          client: this.connectorClient,
+          accountStore: this.connectorAccountStore,
           safeStorage,
           userDataPath,
           shell
@@ -134,8 +150,8 @@ export class DesktopOAuthController {
           new ManagedConnectorAccount({
             connectorId,
             displayName: definition.name,
-            client: this.client,
-            accountStore: this.accountStore,
+            client: this.connectorClient,
+            accountStore: this.connectorAccountStore,
             safeStorage,
             userDataPath,
             shell
@@ -185,7 +201,7 @@ export class DesktopOAuthController {
   }
 
   async signIn(signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
-    await this.client.signIn(shellSafeSignal(signal));
+    await this.accountClient.signIn(shellSafeSignal(signal));
     return this.snapshot();
   }
 
@@ -194,11 +210,14 @@ export class DesktopOAuthController {
       ...[...this.providerSessions.values()].map((session) => session.disconnect()),
       ...[...this.managedConnectorSessions.values()].map((session) => session.clearLocal())
     ]);
-    await this.client.signOut();
+    await Promise.all([this.accountClient.signOut(), this.connectorClient.signOut()]);
     return this.snapshot();
   }
 
   async connect(connectorId: string, signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
+    if (!await this.accountStore.get()) {
+      await this.accountClient.signIn(shellSafeSignal(signal));
+    }
     const managed = this.managedConnectorSessions.get(connectorId);
     if (managed) {
       await managed.connect(shellSafeSignal(signal));
@@ -420,6 +439,13 @@ class OutcomeOAuthClient {
   }
 
   async signOut(): Promise<void> {
+    const stored = await this.options.accountStore.get();
+    if (stored) {
+      await this.publicJson("/v1/account-auth/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${stored.token}` }
+      }).catch(() => {});
+    }
     this.session = null;
     await this.options.accountStore.clear();
   }
@@ -482,6 +508,7 @@ class OutcomeOAuthClient {
     const next: AccountSession = {
       ...stored,
       token: stringValue(refreshed.token),
+      refreshToken: stringValue(refreshed.refresh_token) || stored.refreshToken,
       expiresAt: numberValue(refreshed.expires_at)
     };
     await this.options.accountStore.set(next);
