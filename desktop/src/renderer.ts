@@ -1,15 +1,33 @@
 import {
+  siAsana,
+  siBox,
+  siCalendly,
   siCanva,
+  siClickup,
+  siDatabricks,
+  siDropbox,
   siFigma,
   siGithub,
   siGoogle,
+  siGreenhouse,
   siHubspot,
+  siIntercom,
   siJira,
+  siLinear,
+  siLoom,
+  siMailchimp,
+  siMixpanel,
   siNotion,
+  siQuickbooks,
   siSalesforce,
   siShopify,
   siSlack,
+  siSnowflake,
+  siStripe,
+  siTrello,
+  siVercel,
   siWoocommerce,
+  siZendesk,
   siZoom,
   type SimpleIcon
 } from "simple-icons";
@@ -33,6 +51,7 @@ import {
   normalizeConnectorIds,
   updateBotProfile
 } from "./contracts";
+import { CONNECTOR_LOGO_DATA_URLS } from "./connector-logo-data";
 
 declare global {
   interface Window {
@@ -62,8 +81,26 @@ const iconCatalog: Record<string, SimpleIcon> = {
   figma: siFigma,
   hubspot: siHubspot,
   canva: siCanva,
+  linear: siLinear,
+  asana: siAsana,
+  clickup: siClickup,
+  trello: siTrello,
+  intercom: siIntercom,
+  zendesk: siZendesk,
+  box: siBox,
+  dropbox: siDropbox,
+  calendly: siCalendly,
+  loom: siLoom,
+  stripe: siStripe,
+  quickbooks: siQuickbooks,
+  greenhouse: siGreenhouse,
+  vercel: siVercel,
+  mixpanel: siMixpanel,
+  snowflake: siSnowflake,
+  databricks: siDatabricks,
+  mailchimp: siMailchimp,
   shopify: siShopify,
-  woocommerce: siWoocommerce
+  woocommerce: siWoocommerce,
 };
 
 let state = initialAppState();
@@ -976,6 +1013,10 @@ function closeBotSettings(): void {
 }
 
 function renderConnectorIcon(iconId: string, name: string, compact = false): string {
+  const logoDataUrl = CONNECTOR_LOGO_DATA_URLS[iconId];
+  if (logoDataUrl) {
+    return `<span class="connector-icon${compact ? " compact" : ""}" aria-hidden="true"><img src="${logoDataUrl}" alt="" /></span>`;
+  }
   const icon = iconCatalog[iconId];
   if (!icon) {
     const initials = name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2);

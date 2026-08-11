@@ -24,6 +24,23 @@ test("ships the complete connector catalog from work and commerce apps", () => {
   assert.equal(contracts.HOSTED_CONNECTOR_IDS.length, 36);
 });
 
+test("renders a bundled brand logo for every plugin", async () => {
+  const [renderer, bundledLogos] = await Promise.all([
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/connector-logo-data.ts", import.meta.url), "utf8")
+  ]);
+  const simpleIconIds = new Set(
+    [...renderer.matchAll(/^  ([a-z0-9]+): si[A-Za-z0-9]+,$/gm)].map((match) => match[1])
+  );
+  const bundledIconIds = new Set(
+    [...bundledLogos.matchAll(/^  "([a-z0-9]+)": "data:image\//gm)].map((match) => match[1])
+  );
+  const missing = [...new Set(contracts.CONNECTOR_CATALOG.map((item) => item.icon))]
+    .filter((iconId) => !simpleIconIds.has(iconId) && !bundledIconIds.has(iconId));
+  assert.deepEqual(missing, []);
+  assert.match(renderer, /CONNECTOR_LOGO_DATA_URLS\[iconId\]/);
+});
+
 test("keeps Electron, the Python broker, and the Pi extension connector ids aligned", async () => {
   const [backend, extension] = await Promise.all([
     readFile(new URL("../go_backend/connectors.py", import.meta.url), "utf8"),
@@ -187,4 +204,12 @@ test("desktop layer does not import or rewrite the Pi harness", async () => {
     readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
   ]);
   for (const source of files) assert.doesNotMatch(source, /pi_harness|go_backend/);
+});
+
+test("keeps one normal Electron main process so renderer and IPC handlers cannot drift", async () => {
+  const main = await readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8");
+  assert.match(main, /smokeTest \|\| app\.requestSingleInstanceLock\(\)/);
+  assert.match(main, /app\.on\("second-instance"/);
+  assert.match(main, /mainWindow\.focus\(\)/);
+  assert.match(main, /if \(hasSingleInstanceLock\) app\.whenReady\(\)/);
 });

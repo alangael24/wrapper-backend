@@ -97,8 +97,10 @@ button { color: inherit; }
 .connector-auth:disabled { cursor: wait; opacity: .7; }
 .connector-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 10px; background: white; box-shadow: 0 0 0 1px #e9e9ea; }
 .connector-icon svg { width: 23px; height: 23px; }
+.connector-icon img { width: 25px; height: 25px; object-fit: contain; }
 .connector-icon.compact { display: inline-grid; width: 25px; height: 25px; border-radius: 7px; box-shadow: none; }
 .connector-icon.compact svg { width: 15px; height: 15px; }
+.connector-icon.compact img { width: 17px; height: 17px; }
 .connector-icon-custom { background: #222; color: white; font-size: 10px; font-weight: 800; }
 .empty-search { display: grid; justify-items: center; gap: 6px; padding: 60px 20px; color: var(--muted); }
 .empty-search strong { color: #333; }

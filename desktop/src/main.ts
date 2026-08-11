@@ -76,6 +76,16 @@ let mainWindow: BrowserWindow | null = null;
 let stateStore: DesktopStateStore;
 let oauthController: DesktopOAuthController;
 const smokeTest = process.argv.includes("--smoke-test");
+const hasSingleInstanceLock = smokeTest || app.requestSingleInstanceLock();
+
+if (!hasSingleInstanceLock) app.quit();
+
+app.on("second-instance", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
 
 function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.bootstrap, () => stateStore.snapshot());
@@ -182,7 +192,7 @@ function createWindow(): void {
   void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
 }
 
-app.whenReady().then(() => {
+if (hasSingleInstanceLock) app.whenReady().then(() => {
   const userDataPath = app.getPath("userData");
   stateStore = new DesktopStateStore(path.join(userDataPath, "desktop-state.json"));
   oauthController = new DesktopOAuthController({
