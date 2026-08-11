@@ -102,27 +102,33 @@ un `preload` aislado y una lista cerrada de operaciones IPC.
 
 ### Login con Google
 
-El login principal vive ahora en este repositorio. `wrapper-backend` inicia un
-Authorization Code flow con PKCE, valida el `state`, consulta la identidad
-verificada de Google y crea siempre una cuenta `free`. Google se identifica por
-su `sub` estable; nunca se enlaza automáticamente por email con un usuario del
-signup antiguo porque esos correos no fueron verificados.
+Electron usa el login Google público que ya ofrece `OUTCOME_SERVICE_URL`. No
+requiere desplegar otro servicio: si `WRAPPER_SERVICE_URL` está vacío, la cuenta
+y los conectores comparten ese broker y una sola sesión cifrada. La
+implementación equivalente incluida en `wrapper-backend` queda disponible para
+una futura separación del modelo y se activa únicamente al definir su URL.
+
+El flujo usa Authorization Code con PKCE, valida el `state` y consulta la
+identidad verificada de Google. Google se identifica por su `sub` estable; una
+instancia propia del wrapper nunca enlaza automáticamente por email con un
+usuario del signup antiguo porque esos correos no fueron verificados.
 
 El backend no persiste tokens de Google. Emite tokens opacos propios, guarda
 solo sus hashes en SQLite, liga cada refresh token al `device_id`, lo rota al
 usarlo y revoca el access token al cerrar sesión. Electron cifra access,
 refresh e identidad con `safeStorage`/Keychain.
 
-Para producción:
+Para reemplazar el broker actual por una instancia propia:
 
 1. Crea en Google Cloud un cliente OAuth 2.0 de tipo **Web application**.
 2. Registra exactamente
    `https://api.tu-dominio.com/v1/account-auth/google/callback` como redirect URI.
 3. Define `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` y
    `GOOGLE_OAUTH_REDIRECT_URI` únicamente en el entorno privado del backend.
-4. En un host como Render configura `HOST=0.0.0.0` y conserva SQLite y
+4. Si eliges desplegar una instancia separada, configura `HOST=0.0.0.0` y conserva SQLite y
    `secret.key` en un disco persistente.
-5. Compila Electron con `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`.
+5. Define `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`; si la omites se
+   conserva automáticamente el login actual de `OUTCOME_SERVICE_URL`.
 
 La sesión principal y la sesión del broker de conectores se guardan en archivos
 cifrados distintos. Así, un token de Google/Agent Genia no se puede presentar

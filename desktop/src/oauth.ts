@@ -108,11 +108,14 @@ export class DesktopOAuthController {
       safeStorage,
       validate: isAccountSession
     });
-    this.connectorAccountStore = new EncryptedJsonStore({
-      filePath: path.join(userDataPath, "secrets", "agent-genia-connectors-account.bin"),
-      safeStorage,
-      validate: isAccountSession
-    });
+    const sameAccountService = normalizedServiceUrl(accountBaseUrl) === normalizedServiceUrl(connectorBaseUrl);
+    this.connectorAccountStore = sameAccountService
+      ? this.accountStore
+      : new EncryptedJsonStore({
+        filePath: path.join(userDataPath, "secrets", "agent-genia-connectors-account.bin"),
+        safeStorage,
+        validate: isAccountSession
+      });
     this.deviceStore = new DeviceIdentityStore({ safeStorage, userDataPath });
     this.accountClient = new OutcomeOAuthClient({
       baseUrl: accountBaseUrl,
@@ -656,6 +659,10 @@ function safeAuthorizationUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" || url.username || url.password) throw new Error("El servicio devolvió una URL OAuth insegura.");
   return url.toString();
+}
+
+function normalizedServiceUrl(value: string): string {
+  return new URL(value).toString().replace(/\/$/, "");
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
