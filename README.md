@@ -3,10 +3,11 @@
 Backend para tu wrapper: **cada usuario nuevo recibe automáticamente una
 suscripción de OpenCode Go asignada** (una key por usuario). El backend
 proxya las requests de LLM al upstream de Go con la key de ese usuario,
-registra uso y vigila los límites de la suscripción.
+registra uso y vigila los límites de la suscripción. También puede ejecutar
+tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 
-Cero dependencias fuera del stdlib excepto `cryptography` (para cifrar las
-keys en reposo). Python 3.12.
+El backend base solo requiere Python y `cryptography`; Pi es una dependencia
+opcional de Node.js y viene desactivado por defecto.
 
 ## Tiers de usuario
 
@@ -46,11 +47,13 @@ funciona con un **pool de suscripciones**:
 ## Requisitos
 
 - Python 3.12 (`python3.12` o el que tengas; si no, instálalo).
-- `cryptography` (solo para cifrado AES; sin él usa el Keychain de macOS):
+- `cryptography` (solo para cifrado AES; sin él usa el Keychain de macOS).
+- Node.js y `pnpm` para habilitar el harness de Pi.
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install cryptography
+pnpm install                  # instala Pi 0.84.1, fijado en package.json
 ```
 
 ## Arranque rápido
@@ -84,6 +87,24 @@ curl -X POST http://127.0.0.1:8787/v1/signup \
 curl http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $API_KEY"
 ```
 
+Para ejecutar una tarea con Pi, configura `PI_ENABLED=1`, reinicia el backend
+y usa la api key del usuario:
+
+```bash
+curl http://127.0.0.1:8787/v1/agent/status \
+  -H "Authorization: Bearer $API_KEY"
+
+curl -X POST http://127.0.0.1:8787/v1/agent/run \
+  -H "Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Investiga tres proveedores y compara precio, MOQ y riesgos"}'
+```
+
+El recorrido es `cliente → agent/run → Pi RPC → chat/completions → OpenCode Go`.
+Por eso las llamadas que hace Pi usan la suscripción asignada al
+usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
+propios bajo `PI_RUNS_DIR`.
+
 ## Endpoints
 
 Públicos (Bearer = api key del usuario del wrapper):
@@ -98,6 +119,8 @@ Públicos (Bearer = api key del usuario del wrapper):
 | POST | `/v1/messages` | Proxy estilo Anthropic |
 | GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
 | GET | `/v1/me` | Usuario, tier y suscripción asignada |
+| GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false}` y espera el resultado |
 
 Admin (Bearer = `ADMIN_TOKEN`):
 
@@ -131,6 +154,19 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
 | `ENFORCE_LIMITS` | `1` | Rechazar al superar límites de Go |
+| `PI_ENABLED` | `0` | Habilitar el endpoint de tareas de Pi |
+| `PI_BIN` | `./node_modules/.bin/pi` | Ejecutable de Pi |
+| `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
+| `PI_BACKEND_URL` | `http://127.0.0.1:$PORT` | URL que Pi usa para volver al wrapper |
+| `PI_RUNS_DIR` | `data/pi-runs` | Workspaces y logs por ejecución |
+| `PI_MODEL` | `deepseek-v4-flash` | Modelo configurado en Pi |
+| `PI_THINKING` | `high` | Nivel de razonamiento de Pi |
+| `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
+| `PI_MAX_CONCURRENT` | `2` | Procesos Pi simultáneos |
+| `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
+| `PI_CHROME_EXTENSION` | vacío | Ruta a una extensión Chrome compatible con Pi |
+| `PI_CHROME_AUTO_AUTHORIZE` | `0` | Permitir autorización automática de Chrome |
+| `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración de la autorización de Chrome |
 
 ## Seguridad
 
@@ -140,6 +176,11 @@ Admin (Bearer = `ADMIN_TOKEN`):
   solo se muestran una vez en el signup.
 - Los secretos viven en `data/secret.key` (0600); si usas `WRAPPER_SECRET`
   en producción, bórralo y apóyalo en tu gestor de secretos.
+- Pi puede ejecutar comandos y manipular archivos con los permisos del proceso
+  del backend. El endpoint viene desactivado; en producción debe correr en un
+  contenedor o sandbox por tarea, sin montar secretos ni el código del servidor.
+- El subproceso de Pi recibe un entorno limpio: no hereda `ADMIN_TOKEN`,
+  `WRAPPER_SECRET` ni las demás API keys del servidor.
 
 ## Tests
 
@@ -150,4 +191,5 @@ Admin (Bearer = `ADMIN_TOKEN`):
 Corren contra un upstream mock (sin llamadas reales a OpenCode Go) y cubren:
 signup/asignación, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
-cifrado en reposo.
+cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
+falso, sin consumir saldo real.

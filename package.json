@@ -1,0 +1,8 @@
+{
+  "name": "wrapper-backend-pi-runtime",
+  "private": true,
+  "description": "Pi harness runtime used by wrapper-backend",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1"
+  }
+}

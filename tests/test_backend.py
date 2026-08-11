@@ -6,6 +6,7 @@ No se hace ninguna llamada real a OpenCode Go.
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import sys
 import tempfile
@@ -53,7 +54,15 @@ class MockUpstream(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
         if self.path == "/v1/chat/completions":
             if payload.get("stream"):
-                self._send(200, b'data: {"choices":[{"delta":{"content":"hola"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15},"model":"deepseek-v4-flash"}\n\ndata: [DONE]\n\n', ctype="text/event-stream")
+                self._send(
+                    200,
+                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"hola"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n'
+                    b'data: [DONE]\n\n',
+                    ctype="text/event-stream",
+                )
             else:
                 resp = {
                     "id": "cmpl-test", "model": "deepseek-v4-flash",
@@ -96,6 +105,7 @@ class WrapperServer:
         os.environ["SECRET_FILE"] = os.path.join(tmp, "secret.key")
         os.environ["ADMIN_TOKEN"] = "test-admin"
         os.environ["ENFORCE_LIMITS"] = "1"
+        os.environ["PI_ENABLED"] = "0"
         os.environ.pop("WRAPPER_SECRET", None)
         self.cfg = Config()
         self.cfg.go_base_url = upstream_base + "/v1"
@@ -105,6 +115,14 @@ class WrapperServer:
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.admin_headers = {"Authorization": "Bearer test-admin"}
+
+    def enable_fake_pi(self):
+        fake_pi = Path(__file__).resolve().parent / "fake_pi.py"
+        self.backend.pi.enabled = True
+        self.backend.pi.binary = str(fake_pi)
+        self.backend.pi.backend_url = self.base
+        self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
+        self.backend.pi.timeout_seconds = 5
 
     def stop(self):
         self.httpd.shutdown()
@@ -252,7 +270,32 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         text = body.decode()
         self.assertIn("data:", text)
+        self.assertIn("\n\ndata:", text)
         self.assertIn("[DONE]", text)
+
+    def test_chunked_request_body(self):
+        signup = self.new_user()
+        host, port = self.ws.httpd.server_address
+        connection = http.client.HTTPConnection(host, port, timeout=5)
+        payload = json.dumps({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "chunked"}],
+        }).encode()
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=iter((payload[:20], payload[20:])),
+            headers={
+                "Authorization": f"Bearer {signup['api_key']}",
+                "Content-Type": "application/json",
+            },
+            encode_chunked=True,
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "hola")
 
     def test_usage_limit_429(self):
         ws = self.ws
@@ -431,6 +474,45 @@ class TestBackend(unittest.TestCase):
         status, users = ws.req("GET", "/admin/users", headers=ws.admin_headers)
         self.assertEqual(status, 200)
         self.assertTrue(any(u["id"] == user["id"] and u["tier"] == "free" for u in users["users"]))
+
+    # ---------- Pi harness ----------
+    def test_pi_disabled_by_default(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(info["enabled"])
+        self.assertNotIn("binary", info)
+        status, body = self.ws.req(
+            "POST", "/v1/agent/run", {"prompt": "haz una tarea"}, headers=headers
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "pi_disabled")
+
+    def test_pi_rpc_uses_wrapper_key_and_assigned_go_key(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        status, result = self.ws.req(
+            "POST", "/v1/agent/run", {"prompt": "prueba end to end"}, headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
+        self.assertEqual(result["usage"]["input_tokens"], 11)
+        self.assertEqual(result["usage"]["cached_read_tokens"], 3)
+
+        upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
+        self.assertEqual(len(upstream_calls), 1)
+        self.assertEqual(upstream_calls[0][2]["Authorization"], "Bearer sk-go-0000")
+
+        status, usage = self.ws.req("GET", "/v1/usage", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(usage["windows"]["5h"]["requests"], 1)
+        status, all_usage = self.ws.req("GET", "/admin/usage", headers=self.ws.admin_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
+        self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
 
 
 if __name__ == "__main__":

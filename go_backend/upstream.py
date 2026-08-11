@@ -148,10 +148,12 @@ def proxy_request(
         usage = Usage()
         try:
             for raw in resp:
-                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                # Preservar el framing SSE exacto, incluidas las lineas vacias
+                # que separan eventos. Clientes como Pi las necesitan.
+                if on_chunk:
+                    on_chunk(raw)
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line:
-                    if on_chunk:
-                        on_chunk((line + "\n").encode())
                     m, u = parse_usage_from_sse_line(line, model)
                     if u.any():
                         usage = u

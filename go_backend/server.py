@@ -7,6 +7,8 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/chat/completions
   POST /v1/responses
   POST /v1/messages
+  GET  /v1/agent/status    Estado del harness de Pi
+  POST /v1/agent/run       Ejecutar una tarea con Pi
   GET  /v1/usage           Uso por ventanas con limites ajustados al tier
   GET  /v1/me
 
@@ -41,12 +43,15 @@ from urllib.parse import urlparse
 from . import __version__
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .go_prices import estimate_cost_usd
+from .pi_harness import PiHarness, PiHarnessBusy, PiHarnessError
 from .tiers import DEFAULT_TIER, SIGNUP_TIERS, effective_limits, is_valid, requires_subscription, tier_label
 from .store import Store, new_id
 from .upstream import DEFAULT_UA, proxy_request
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "secret.key"
+DEFAULT_PI_RUNS = Path(__file__).resolve().parent.parent / "data" / "pi-runs"
+DEFAULT_PI_BIN = Path(__file__).resolve().parent.parent / "node_modules" / ".bin" / "pi"
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
 
@@ -65,6 +70,14 @@ def masked(key: str) -> str:
     return key[:4] + "..." + key[-4:]
 
 
+class RequestBodyError(ValueError):
+    pass
+
+
+class RequestBodyTooLarge(RequestBodyError):
+    pass
+
+
 class Config:
     def __init__(self):
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
@@ -74,6 +87,21 @@ class Config:
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
         self.admin_token = os.environ.get("ADMIN_TOKEN") or None
+        self.pi_enabled = os.environ.get("PI_ENABLED", "0") == "1"
+        self.pi_bin = os.environ.get("PI_BIN", str(DEFAULT_PI_BIN))
+        self.pi_backend_url = os.environ.get(
+            "PI_BACKEND_URL", f"http://127.0.0.1:{self.port}"
+        ).rstrip("/")
+        self.pi_runs_dir = Path(os.environ.get("PI_RUNS_DIR", str(DEFAULT_PI_RUNS)))
+        self.pi_model = os.environ.get("PI_MODEL", "deepseek-v4-flash")
+        self.pi_thinking = os.environ.get("PI_THINKING", "high")
+        self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
+        self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "2"))
+        self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
+        self.pi_node_bin_dir = os.environ.get("PI_NODE_BIN_DIR") or None
+        self.pi_chrome_extension = os.environ.get("PI_CHROME_EXTENSION") or None
+        self.pi_chrome_auto_authorize = os.environ.get("PI_CHROME_AUTO_AUTHORIZE", "0") == "1"
+        self.pi_chrome_authorize_minutes = int(os.environ.get("PI_CHROME_AUTHORIZE_MINUTES", "30"))
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
@@ -95,6 +123,21 @@ class Backend:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
+        self.pi = PiHarness(
+            enabled=cfg.pi_enabled,
+            binary=cfg.pi_bin,
+            backend_url=cfg.pi_backend_url,
+            runs_dir=cfg.pi_runs_dir,
+            model=cfg.pi_model,
+            thinking=cfg.pi_thinking,
+            timeout_seconds=cfg.pi_timeout_seconds,
+            max_concurrent=cfg.pi_max_concurrent,
+            max_prompt_chars=cfg.pi_max_prompt_chars,
+            node_bin_dir=cfg.pi_node_bin_dir,
+            chrome_extension=cfg.pi_chrome_extension,
+            chrome_auto_authorize=cfg.pi_chrome_auto_authorize,
+            chrome_authorize_minutes=cfg.pi_chrome_authorize_minutes,
+        )
 
     # ---------- auth helpers ----------
     def bearer(self, handler: BaseHTTPRequestHandler) -> str | None:
@@ -311,13 +354,109 @@ class Backend:
             cost, status,
         )
 
+    # ---------- Pi agent harness ----------
+    def handle_agent_status(self, handler: BaseHTTPRequestHandler) -> None:
+        if not self.require_user(handler):
+            return
+        status = self.pi.status()
+        status.pop("binary", None)  # no exponer rutas internas del servidor
+        json_response(handler, 200, status)
+
+    def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        tier = user.get("tier") or DEFAULT_TIER
+        if not requires_subscription(tier):
+            error_response(
+                handler, 402,
+                f"El tier '{tier}' no incluye ejecuciones de Pi",
+                "tier_requires_upgrade",
+            )
+            return
+        sub = self.store.get_subscription(user["subscription_id"]) if user["subscription_id"] else None
+        if not sub or sub["status"] != "assigned":
+            error_response(handler, 402, "El usuario no tiene una suscripcion de Go asignada", "no_subscription")
+            return
+
+        body = self.read_json(handler) or {}
+        prompt = body.get("prompt")
+        browser = body.get("browser", False)
+        if not isinstance(prompt, str) or not prompt.strip():
+            error_response(handler, 400, "Envia un prompt de texto no vacio", "bad_prompt")
+            return
+        if not isinstance(browser, bool):
+            error_response(handler, 400, "browser debe ser true o false", "bad_browser")
+            return
+
+        pi_status = self.pi.status()
+        if not pi_status["enabled"]:
+            error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
+            return
+        if not pi_status["available"]:
+            error_response(handler, 503, "Pi no esta instalado o PI_BIN es invalido", "pi_unavailable")
+            return
+        if browser and not (
+            pi_status["browser_available"] and pi_status["browser_auto_authorize"]
+        ):
+            error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
+            return
+
+        api_key = self.bearer(handler)
+        assert api_key is not None
+        try:
+            result = self.pi.run(user_api_key=api_key, prompt=prompt, browser=browser)
+        except PiHarnessBusy as e:
+            error_response(handler, 429, str(e), "pi_busy")
+            return
+        except PiHarnessError as e:
+            error_response(handler, 502, str(e), "pi_error")
+            return
+        json_response(handler, 200, result.as_dict())
+
     # ---------- body helpers ----------
     def read_body(self, handler: BaseHTTPRequestHandler) -> bytes:
+        transfer_encoding = handler.headers.get("transfer-encoding", "").lower()
+        if "chunked" in (part.strip() for part in transfer_encoding.split(",")):
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                size_line = handler.rfile.readline(8193)
+                if not size_line or len(size_line) > 8192:
+                    handler.close_connection = True
+                    raise RequestBodyError("Framing chunked invalido")
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError as e:
+                    handler.close_connection = True
+                    raise RequestBodyError("Tamano de chunk invalido") from e
+                if size == 0:
+                    # Consumir trailers hasta la linea vacia final.
+                    while True:
+                        trailer = handler.rfile.readline(8193)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                        if len(trailer) > 8192:
+                            handler.close_connection = True
+                            raise RequestBodyError("Trailer chunked invalido")
+                    break
+                total += size
+                if total > MAX_BODY:
+                    handler.close_connection = True
+                    raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
+                chunk = handler.rfile.read(size)
+                ending = handler.rfile.read(2)
+                if len(chunk) != size or ending != b"\r\n":
+                    handler.close_connection = True
+                    raise RequestBodyError("Chunk incompleto")
+                chunks.append(chunk)
+            return b"".join(chunks)
         length = handler.headers.get("content-length")
         if length and length.isdigit():
             n = int(length)
             if n > MAX_BODY:
-                return b""
+                handler.close_connection = True
+                raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
             return handler.rfile.read(n)
         return b""
 
@@ -472,6 +611,10 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_usage(self)
             elif self.command == "GET" and path == "/v1/me":
                 backend.handle_me(self)
+            elif self.command == "GET" and path == "/v1/agent/status":
+                backend.handle_agent_status(self)
+            elif self.command == "POST" and path == "/v1/agent/run":
+                backend.handle_agent_run(self)
             elif self.command == "POST" and path == "/admin/subscriptions":
                 backend.handle_admin_add_subscriptions(self)
             elif self.command == "GET" and path == "/admin/subscriptions":
@@ -490,6 +633,10 @@ class Handler(BaseHTTPRequestHandler):
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
+        except RequestBodyTooLarge as e:
+            error_response(self, 413, str(e), "body_too_large")
+        except RequestBodyError as e:
+            error_response(self, 400, str(e), "bad_body")
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:
                 error_response(self, 500, f"Error interno: {e}", "internal_error")
@@ -513,6 +660,7 @@ def serve(cfg: Config) -> None:
     print(f"[server] wrapper backend v{__version__} escuchando en http://127.0.0.1:{cfg.port}")
     print(f"[server] upstream Go: {cfg.go_base_url}")
     print(f"[server] enforce_limits={cfg.enforce_limits} db={cfg.db_path}")
+    print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -524,7 +672,8 @@ def cli() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("init-db", help="Crear la base de datos")
-    sub.add_parser("serve", help="Arrancar el servidor HTTP")
+    serve_cmd = sub.add_parser("serve", help="Arrancar el servidor HTTP")
+    serve_cmd.add_argument("--port", type=int, default=None)
     sub.add_parser("users", help="Listar usuarios")
     sub.add_parser("subs", help="Listar suscripciones del pool")
     sub.add_parser("usage", help="Ver eventos de uso")
@@ -536,6 +685,10 @@ def cli() -> None:
 
     args = parser.parse_args()
     cfg = Config()
+    if args.cmd == "serve" and args.port is not None:
+        cfg.port = args.port
+        if "PI_BACKEND_URL" not in os.environ:
+            cfg.pi_backend_url = f"http://127.0.0.1:{cfg.port}"
     backend = Backend(cfg)
     if args.cmd == "init-db":
         print(f"[ok] base de datos en {cfg.db_path}")
