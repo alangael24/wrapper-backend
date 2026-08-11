@@ -92,21 +92,34 @@ pnpm install
 pnpm desktop
 ```
 
-La app guarda únicamente preferencias y perfiles de bots en
-`desktop-state.json`, dentro del directorio `userData` de Electron. El renderer
-no tiene acceso a Node.js: toda persistencia pasa por un `preload` aislado y una
-lista cerrada de operaciones IPC.
+La app guarda preferencias y perfiles de bots en `desktop-state.json`, dentro
+del directorio `userData` de Electron. Las sesiones de cuenta y de proveedores
+se guardan aparte, cifradas con `safeStorage`/Keychain, con permisos `0600` y
+ligadas al ID de la cuenta que inició sesión. Cerrar sesión borra también las
+sesiones de proveedores para que otra persona del equipo no las herede. El
+renderer no tiene acceso a Node.js, tokens ni red: toda autenticación pasa por
+un `preload` aislado y una lista cerrada de operaciones IPC.
 
 El catálogo reutiliza las superficies que ya existen en `outcome-desktop`
 (trabajo, ventas, desarrollo y diseño) y `ecom-research-agent` (Shopify,
-Tiendanube y WooCommerce). En esta etapa, elegir una herramienta significa
-asignarla al perfil del bot; **no se muestra como autenticada** hasta que exista
-un flujo OAuth/API específico para ese proveedor. La selección por sí sola no
-permite que una persona inicie sesión: para eso todavía se necesita registrar
-una app OAuth por proveedor, implementar callbacks y guardar tokens cifrados y
-aislados por usuario. El runtime de Pi ya incluye el broker y la carga dinámica
-descritos abajo; un proveedor solo aparece conectado cuando el backend tiene
-registrado su adaptador autenticado para ese usuario.
+Tiendanube y WooCommerce). Electron ya ofrece conexión OAuth real, aislada por
+usuario, para los proveedores cuyas apps están configuradas en el servicio:
+Google Workspace, Microsoft 365, HubSpot y Salesforce. La primera conexión abre
+el inicio de sesión de Agent Genia y luego el consentimiento oficial del
+proveedor; la app hace polling del callback y nunca expone client secrets al
+renderer.
+
+Los demás elementos del catálogo se muestran como `Próximamente`: seleccionarlos
+solo los asigna al bot y no inventa una autenticación. Para habilitarlos hay que
+registrar su propia app OAuth y añadirla a la lista cerrada de proveedores. El
+servicio se configura con `OUTCOME_SERVICE_URL` y debe usar HTTPS fuera de
+loopback.
+
+La sesión OAuth de Electron y el adaptador del broker de Pi son límites de
+confianza distintos. Conectar una cuenta en la interfaz prueba y conserva el
+consentimiento real del usuario; para que una ejecución HTTP de Pi use esa
+cuenta, el backend todavía necesita un adaptador del proveedor registrado para
+ese mismo usuario. Pi nunca recibe refresh tokens ni client secrets.
 
 Cargar keys de Go al pool:
 

@@ -24,6 +24,7 @@ import {
   type BotPatch,
   type BotProfile,
   type BotSetupAnswer,
+  type ConnectorConnectionSnapshot,
   type DesktopApi,
   applyBotSetupAnswer,
   createBotProfile,
@@ -68,6 +69,9 @@ let transientError = "";
 let settingsOpen = false;
 let avatarEditorOpen = false;
 let avatarEditorTab: "bot" | "generate" | "upload" = "bot";
+let connections: ConnectorConnectionSnapshot = emptyConnectionSnapshot();
+let authBusyConnectorId = "";
+let accountAuthBusy = false;
 const settingsSaveTimers = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
@@ -76,7 +80,10 @@ void initialize();
 
 async function initialize(): Promise<void> {
   try {
-    state = await desktopApi.bootstrap();
+    [state, connections] = await Promise.all([
+      desktopApi.bootstrap(),
+      desktopApi.connectionSnapshot()
+    ]);
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
     const preview = new URLSearchParams(window.location.search).get("preview");
@@ -124,8 +131,9 @@ function renderConnectors(): void {
       <header class="connector-heading">
         <span class="eyebrow">CONECTA TU FLUJO</span>
         <h1>¿Qué usas todos los días?</h1>
-        <p>Elige las herramientas que podrá usar cada bot. Puedes cambiar esta selección después.</p>
+        <p>Elige las herramientas y autoriza tu propia cuenta. Las sesiones quedan cifradas en este dispositivo y nunca se comparten con otros usuarios.</p>
       </header>
+      ${renderAccountBanner()}
       <label class="connector-search">
         <span aria-hidden="true">⌕</span>
         <input id="connector-search" type="search" placeholder="Buscar herramientas" value="${escapeAttribute(connectorQuery)}" autocomplete="off" />
@@ -141,12 +149,16 @@ function renderConnectors(): void {
               <div class="connector-grid">
                 ${items.map((connector) => {
                   const selected = selectedConnectorIds.has(connector.id);
+                  const connection = connectorConnection(connector.id);
                   return `
-                    <button class="connector-card${selected ? " selected" : ""}" type="button" data-connector-id="${connector.id}" aria-pressed="${selected}">
-                      ${renderConnectorIcon(connector.icon, connector.name)}
-                      <span class="connector-card-copy"><strong>${connector.name}</strong><small>${connector.description}</small></span>
-                      <span class="connector-check" aria-hidden="true">${selected ? "✓" : "+"}</span>
-                    </button>`;
+                    <article class="connector-card${selected ? " selected" : ""}${connection.connected ? " connected" : ""}">
+                      <button class="connector-card-main" type="button" data-connector-id="${connector.id}" aria-pressed="${selected}">
+                        ${renderConnectorIcon(connector.icon, connector.name)}
+                        <span class="connector-card-copy"><strong>${connector.name}</strong><small>${connector.description}</small></span>
+                        <span class="connector-check" aria-hidden="true">${selected ? "✓" : "+"}</span>
+                      </button>
+                      ${renderConnectorAuthAction(connector.id)}
+                    </article>`;
                 }).join("")}
               </div>
             </div>`;
@@ -176,8 +188,124 @@ function renderConnectors(): void {
       renderConnectors();
     });
   }
+  bindConnectionActions();
+  bindAccountActions();
   document.querySelector("#connectors-next")?.addEventListener("click", () => void leaveConnectors("bot-builder"));
   document.querySelector("#connectors-back")?.addEventListener("click", () => void leaveConnectors(state.bots.length ? "bot-detail" : "bot-builder"));
+}
+
+function renderAccountBanner(): string {
+  if (connections.account.connected) {
+    return `
+      <section class="account-banner connected">
+        <span class="account-avatar">${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span>
+        <span><strong>Sesión personal activa</strong><small>${escapeHtml(connections.account.email)}</small></span>
+        <button type="button" data-sign-out>Salir</button>
+      </section>`;
+  }
+  return `
+    <section class="account-banner">
+      <span class="account-avatar">A</span>
+      <span><strong>Conecta tus propias cuentas</strong><small>Inicia sesión una vez y después autoriza cada proveedor.</small></span>
+      <button type="button" data-sign-in ${accountAuthBusy ? "disabled" : ""}>${accountAuthBusy ? "Abriendo…" : "Iniciar sesión"}</button>
+    </section>`;
+}
+
+function connectorConnection(connectorId: string) {
+  return connections.connectors.find((item) => item.connectorId === connectorId) ?? {
+    connectorId,
+    provider: null,
+    available: false,
+    connected: false,
+    account: "",
+    reason: "OAuth no configurado."
+  };
+}
+
+function renderConnectorAuthAction(connectorId: string): string {
+  const connection = connectorConnection(connectorId);
+  if (!connection.available) {
+    return `<span class="connector-auth unavailable" title="${escapeAttribute(connection.reason)}">Próximamente</span>`;
+  }
+  if (connection.connected) {
+    return `<button class="connector-auth connected" type="button" data-disconnect-connector="${connectorId}" title="Desconectar ${escapeAttribute(connection.account)}">✓ Conectado</button>`;
+  }
+  const busy = authBusyConnectorId === connectorId;
+  return `<button class="connector-auth" type="button" data-connect-connector="${connectorId}" ${busy ? "disabled" : ""}>${busy ? "Esperando…" : "Conectar"}</button>`;
+}
+
+function bindConnectionActions(): void {
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-connect-connector]")) {
+    button.addEventListener("click", () => void connectConnector(button.dataset.connectConnector ?? ""));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-disconnect-connector]")) {
+    button.addEventListener("click", () => void disconnectConnector(button.dataset.disconnectConnector ?? ""));
+  }
+}
+
+function bindAccountActions(): void {
+  document.querySelector("[data-sign-in]")?.addEventListener("click", () => void signInAccount());
+  document.querySelector("[data-sign-out]")?.addEventListener("click", () => void signOutAccount());
+}
+
+async function signInAccount(): Promise<void> {
+  accountAuthBusy = true;
+  transientError = "";
+  render();
+  try {
+    connections = await desktopApi.signIn();
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    accountAuthBusy = false;
+  }
+  render();
+}
+
+async function signOutAccount(): Promise<void> {
+  transientError = "";
+  accountAuthBusy = true;
+  render();
+  try {
+    connections = await desktopApi.signOut();
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    accountAuthBusy = false;
+  }
+  render();
+}
+
+async function connectConnector(connectorId: string): Promise<void> {
+  if (!connectorId || authBusyConnectorId) return;
+  authBusyConnectorId = connectorId;
+  transientError = "";
+  render();
+  try {
+    connections = await desktopApi.connectConnector(connectorId);
+    selectedConnectorIds.add(connectorId);
+    state = await desktopApi.saveConnectors([...selectedConnectorIds], state.onboardingCompleted);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    authBusyConnectorId = "";
+  }
+  render();
+}
+
+async function disconnectConnector(connectorId: string): Promise<void> {
+  if (!connectorId || authBusyConnectorId) return;
+  authBusyConnectorId = connectorId;
+  transientError = "";
+  render();
+  try {
+    connections = await desktopApi.disconnectConnector(connectorId);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    authBusyConnectorId = "";
+  }
+  render();
 }
 
 async function leaveConnectors(nextView: View): Promise<void> {
@@ -391,34 +519,34 @@ function renderAnsweredQuestion(title: string, answer: string): string {
 }
 
 function renderConnectionRecommendations(bot: BotProfile): string {
-  const connections = connectionCards(bot);
+  const cards = connectionCards(bot);
   return `
-    <div class="assistant-bubble">Voy a preparar estas herramientas. Cada persona deberá autorizar su propia cuenta cuando el OAuth del proveedor esté configurado.</div>
+    <div class="assistant-bubble">Voy a preparar estas herramientas. Autoriza tus cuentas y las guardaré cifradas solamente para tu usuario.</div>
     <section class="setup-question-card connection-setup-card">
       <h2>Conectores recomendados</h2>
-      <p>Seleccionar una herramienta no concede acceso a ninguna cuenta.</p>
+      <p>Cada botón abre el inicio de sesión oficial del proveedor.</p>
       <div class="setup-connection-list">
-        ${connections.length ? connections.map((connection) => `
+        ${cards.length ? cards.map((connection) => `
           <article class="setup-connection-row">
             ${renderConnectorIcon(connection.icon, connection.name)}
             <span><strong>${connection.name}</strong><small>${connection.description}</small></span>
-            <span class="pending-auth">OAuth pendiente</span>
+            ${renderConnectorAuthAction(connection.connectorId)}
           </article>`).join("") : '<div class="no-recommendations">No seleccionaste conectores. Puedes agregarlos después.</div>'}
       </div>
-      <div class="oauth-truth-note"><strong>Aún no inicia sesión</strong><span>Hace falta implementar el callback OAuth y guardar tokens separados por usuario para que estos accesos funcionen.</span></div>
+      <div class="oauth-truth-note"><strong>${connections.account.connected ? "Sesión personal activa" : "Primero inicia sesión"}</strong><span>${connections.account.connected ? escapeHtml(connections.account.email) : "Al conectar una herramienta abriremos el acceso de Agent Genia y después el del proveedor."}</span></div>
       <button id="finish-bot-setup" class="primary-action compact" type="button">Continuar con el bot</button>
     </section>`;
 }
 
-function connectionCards(bot: BotProfile): Array<{ name: string; icon: string; description: string }> {
-  const cards: Array<{ name: string; icon: string; description: string }> = [];
+function connectionCards(bot: BotProfile): Array<{ connectorId: string; name: string; icon: string; description: string }> {
+  const cards: Array<{ connectorId: string; name: string; icon: string; description: string }> = [];
   for (const connector of CONNECTOR_CATALOG.filter((item) => bot.connectorIds.includes(item.id))) {
     if (connector.id === "google-workspace") {
       cards.push(
-        { name: "Gmail", icon: "google", description: "Correo, búsqueda y borradores" },
-        { name: "Google Calendar", icon: "google", description: "Agenda, reuniones y eventos" }
+        { connectorId: connector.id, name: "Gmail", icon: "google", description: "Correo, búsqueda y borradores" },
+        { connectorId: connector.id, name: "Google Calendar", icon: "google", description: "Agenda, reuniones y eventos" }
       );
-    } else cards.push({ name: connector.name, icon: connector.icon, description: connector.description });
+    } else cards.push({ connectorId: connector.id, name: connector.name, icon: connector.icon, description: connector.description });
   }
   return cards;
 }
@@ -428,6 +556,7 @@ function setupLabel(group: keyof typeof BOT_SETUP_OPTIONS, value: string, custom
 }
 
 function bindBotSetup(bot: BotProfile): void {
+  bindConnectionActions();
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-setup-answer]")) {
     button.addEventListener("click", () => void answerCurrentSetup(bot, button.dataset.setupAnswer ?? ""));
   }
@@ -472,9 +601,9 @@ function renderReadyBot(bot: BotProfile): void {
         <div class="detail-avatar">${renderBotAvatar(bot, "hero")}</div>
         <span class="ready-pill">BOT LISTO</span>
         <h1>${escapeHtml(bot.name)}</h1>
-        <p>El perfil del bot quedó configurado. Los conectores aparecen como seleccionados; las cuentas siguen pendientes hasta implementar OAuth por usuario.</p>
-        <div class="selected-tools">
-          ${connectors.length ? connectors.map((connector) => `<span>${renderConnectorIcon(connector.icon, connector.name, true)}${connector.name}</span>`).join("") : "<em>Sin conectores seleccionados</em>"}
+        <p>${connections.account.connected ? `Sesión activa como ${escapeHtml(connections.account.email)}. Cada conector usa únicamente la cuenta que tú autorizaste.` : "Inicia sesión al conectar una herramienta; cada proveedor abrirá su autorización oficial."}</p>
+        <div class="selected-tools detailed">
+          ${connectors.length ? connectors.map((connector) => `<article>${renderConnectorIcon(connector.icon, connector.name, true)}<strong>${connector.name}</strong>${renderConnectorAuthAction(connector.id)}</article>`).join("") : "<em>Sin conectores seleccionados</em>"}
         </div>
         <div class="detail-actions">
           <button id="new-bot-from-detail" class="primary-action compact" type="button">Crear otro bot</button>
@@ -484,6 +613,7 @@ function renderReadyBot(bot: BotProfile): void {
     </section>
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
+  bindConnectionActions();
   document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
   document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
   document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
@@ -515,7 +645,7 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
           ${state.bots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderBotAvatar(bot, "small")}<span><strong>${escapeHtml(bot.name)}</strong><small>${bot.setup.step === "complete" ? `${bot.connectorIds.length} conectores` : "Configurando perfil…"}</small></span></button>`).join("")}
         </nav>
         ${state.bots.length ? "" : '<div class="sidebar-empty">Todavía no hay bots</div>'}
-        <div class="sidebar-user"><span>A</span><strong>Alan</strong></div>
+        <div class="sidebar-user"><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong></div>
       </aside>
       <div class="desktop-content">${content}</div>
       ${settingsBot ? renderBotSettings(settingsBot) : ""}
@@ -781,10 +911,59 @@ function escapeAttribute(value: string): string {
   return escapeHtml(value).replace(/`/g, "&#096;");
 }
 
+function emptyConnectionSnapshot(): ConnectorConnectionSnapshot {
+  const providers: Record<string, "google" | "microsoft" | "hubspot" | "salesforce" | undefined> = {
+    "google-workspace": "google",
+    "microsoft-365": "microsoft",
+    hubspot: "hubspot",
+    salesforce: "salesforce"
+  };
+  return {
+    account: { connected: false, required: true, email: "", name: "" },
+    connectors: CONNECTOR_CATALOG.map((connector) => ({
+      connectorId: connector.id,
+      provider: providers[connector.id] ?? null,
+      available: Boolean(providers[connector.id]),
+      connected: false,
+      account: "",
+      reason: providers[connector.id] ? "Listo para autorizar." : "OAuth no configurado."
+    }))
+  };
+}
+
 function createPreviewApi(): DesktopApi {
   let previewState = initialAppState();
+  let previewConnections = emptyConnectionSnapshot();
   return {
     async bootstrap() { return structuredClone(previewState); },
+    async connectionSnapshot() { return structuredClone(previewConnections); },
+    async signIn() {
+      previewConnections = { ...previewConnections, account: { connected: true, required: true, email: "demo@example.com", name: "Demo" } };
+      return structuredClone(previewConnections);
+    },
+    async signOut() {
+      previewConnections = emptyConnectionSnapshot();
+      return structuredClone(previewConnections);
+    },
+    async connectConnector(connectorId) {
+      previewConnections = {
+        ...previewConnections,
+        account: { connected: true, required: true, email: "demo@example.com", name: "Demo" },
+        connectors: previewConnections.connectors.map((item) => item.connectorId === connectorId
+          ? { ...item, connected: item.available, account: item.available ? "demo@example.com" : "" }
+          : item)
+      };
+      return structuredClone(previewConnections);
+    },
+    async disconnectConnector(connectorId) {
+      previewConnections = {
+        ...previewConnections,
+        connectors: previewConnections.connectors.map((item) => item.connectorId === connectorId
+          ? { ...item, connected: false, account: "" }
+          : item)
+      };
+      return structuredClone(previewConnections);
+    },
     async saveConnectors(connectorIds, onboardingCompleted) {
       previewState = {
         ...previewState,

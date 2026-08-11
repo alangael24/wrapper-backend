@@ -80,6 +80,28 @@ export type ConnectorDefinition = (typeof CONNECTOR_CATALOG)[number];
 export type BotColor = (typeof BOT_COLORS)[number];
 export type BotShape = (typeof BOT_SHAPES)[number];
 export type BotSetupStep = "purpose" | "workspace" | "project" | "connections" | "complete";
+export type OAuthProviderId = "google" | "microsoft" | "hubspot" | "salesforce" | "pipedrive" | "zoho";
+
+export interface AccountConnectionStatus {
+  connected: boolean;
+  required: boolean;
+  email: string;
+  name: string;
+}
+
+export interface ConnectorConnectionStatus {
+  connectorId: string;
+  provider: OAuthProviderId | null;
+  available: boolean;
+  connected: boolean;
+  account: string;
+  reason: string;
+}
+
+export interface ConnectorConnectionSnapshot {
+  account: AccountConnectionStatus;
+  connectors: ConnectorConnectionStatus[];
+}
 
 export interface BotSetupState {
   step: BotSetupStep;
@@ -135,6 +157,11 @@ export interface BotPatch {
 
 export interface DesktopApi {
   bootstrap(): Promise<AppState>;
+  connectionSnapshot(): Promise<ConnectorConnectionSnapshot>;
+  signIn(): Promise<ConnectorConnectionSnapshot>;
+  signOut(): Promise<ConnectorConnectionSnapshot>;
+  connectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
+  disconnectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;

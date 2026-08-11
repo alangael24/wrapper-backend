@@ -130,6 +130,23 @@ test("keeps Electron renderer isolated from Node and external network", async ()
   assert.match(html, /connect-src 'none'/);
 });
 
+test("stores real OAuth sessions outside the renderer and binds them to one signed-in account", async () => {
+  const [oauth, main, preload, renderer] = await Promise.all([
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(oauth, /safeStorage\.encryptString/);
+  assert.match(oauth, /owner_account_id/);
+  assert.match(oauth, /https:\/\/outcome-service\.onrender\.com|baseUrl/);
+  assert.match(main, /DesktopOAuthController/);
+  assert.match(preload, /connectConnector/);
+  assert.doesNotMatch(preload, /access_token|refresh_token|client_secret/);
+  assert.match(renderer, /Próximamente/);
+  assert.match(renderer, /data-connect-connector/);
+});
+
 test("desktop layer does not import or rewrite the Pi harness", async () => {
   const files = await Promise.all([
     readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),

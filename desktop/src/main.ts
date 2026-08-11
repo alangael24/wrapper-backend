@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
 import {
   type AppState,
   type BotDraft,
@@ -14,9 +14,15 @@ import {
   normalizeConnectorIds,
   updateBotProfile
 } from "./contracts";
+import { DesktopOAuthController } from "./oauth";
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
+  connectionSnapshot: "desktop:connection-snapshot",
+  signIn: "desktop:sign-in",
+  signOut: "desktop:sign-out",
+  connectConnector: "desktop:connect-connector",
+  disconnectConnector: "desktop:disconnect-connector",
   saveConnectors: "desktop:save-connectors",
   createBot: "desktop:create-bot",
   updateBot: "desktop:update-bot",
@@ -68,10 +74,22 @@ app.setName("Agent Genia");
 
 let mainWindow: BrowserWindow | null = null;
 let stateStore: DesktopStateStore;
+let oauthController: DesktopOAuthController;
 const smokeTest = process.argv.includes("--smoke-test");
 
 function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.bootstrap, () => stateStore.snapshot());
+  ipcMain.handle(CHANNELS.connectionSnapshot, () => oauthController.snapshot());
+  ipcMain.handle(CHANNELS.signIn, () => oauthController.signIn());
+  ipcMain.handle(CHANNELS.signOut, () => oauthController.signOut());
+  ipcMain.handle(CHANNELS.connectConnector, (_event, connectorId: unknown) => {
+    if (typeof connectorId !== "string") throw new Error("Conector inválido.");
+    return oauthController.connect(connectorId);
+  });
+  ipcMain.handle(CHANNELS.disconnectConnector, (_event, connectorId: unknown) => {
+    if (typeof connectorId !== "string") throw new Error("Conector inválido.");
+    return oauthController.disconnect(connectorId);
+  });
   ipcMain.handle(CHANNELS.saveConnectors, (_event, connectorIds: unknown, onboardingCompleted?: unknown) => {
     const normalized = normalizeConnectorIds(connectorIds);
     return stateStore.update((state) => ({
@@ -165,7 +183,15 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
-  stateStore = new DesktopStateStore(path.join(app.getPath("userData"), "desktop-state.json"));
+  const userDataPath = app.getPath("userData");
+  stateStore = new DesktopStateStore(path.join(userDataPath, "desktop-state.json"));
+  oauthController = new DesktopOAuthController({
+    baseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
+    safeStorage,
+    userDataPath,
+    shell,
+    appVersion: app.getVersion()
+  });
   registerDesktopIpc();
   createWindow();
   app.on("activate", () => {

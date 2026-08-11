@@ -3,6 +3,11 @@ import type { BotDraft, BotPatch, BotSetupAnswer, DesktopApi } from "./contracts
 
 const api: DesktopApi = Object.freeze({
   bootstrap: () => ipcRenderer.invoke("desktop:bootstrap"),
+  connectionSnapshot: () => ipcRenderer.invoke("desktop:connection-snapshot"),
+  signIn: () => ipcRenderer.invoke("desktop:sign-in"),
+  signOut: () => ipcRenderer.invoke("desktop:sign-out"),
+  connectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:connect-connector", connectorId),
+  disconnectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:disconnect-connector", connectorId),
   saveConnectors: (connectorIds: string[], onboardingCompleted?: boolean) => (
     ipcRenderer.invoke("desktop:save-connectors", connectorIds, onboardingCompleted)
   ),
