@@ -41,6 +41,10 @@ test("normalizes connector selection and persisted bot state", () => {
   assert.equal(state.bots[0].name, "Mi bot");
   assert.deepEqual(state.bots[0].connectorIds, ["github"]);
   assert.equal(state.bots[0].setup.step, "purpose");
+  assert.equal(state.bots[0].title, "");
+  assert.equal(state.bots[0].description, "");
+  assert.equal(state.bots[0].avatarDataUrl, "");
+  assert.equal(state.bots[0].notificationsEnabled, true);
   assert.equal(state.activeBotId, "bot-1");
 });
 
@@ -76,6 +80,41 @@ test("creates bots with bounded validated fields", () => {
   assert.equal(bot.shape, contracts.BOT_SHAPES[0]);
   assert.deepEqual(bot.connectorIds, ["slack"]);
   assert.throws(() => contracts.createBotProfile({ name: "", color: "", shape: "" }, [], "bot-3"));
+});
+
+test("updates persisted bot personalization without touching its setup", () => {
+  const original = contracts.createBotProfile({
+    name: "Nuevo bot",
+    color: "#2f91f5",
+    shape: "circle"
+  }, ["slack"], "bot-settings", new Date("2026-08-11T01:02:03.000Z"));
+  const updated = contracts.updateBotProfile(original, {
+    name: "  Operaciones  ",
+    title: "Asistente de operaciones",
+    description: "Da seguimiento a pendientes y decisiones.",
+    color: "#8654ed",
+    shape: "hexagon",
+    avatarDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    notificationsEnabled: false
+  });
+  assert.equal(updated.name, "Operaciones");
+  assert.equal(updated.title, "Asistente de operaciones");
+  assert.equal(updated.description, "Da seguimiento a pendientes y decisiones.");
+  assert.equal(updated.color, "#8654ed");
+  assert.equal(updated.shape, "hexagon");
+  assert.match(updated.avatarDataUrl, /^data:image\/png;base64,/);
+  assert.equal(updated.notificationsEnabled, false);
+  assert.deepEqual(updated.setup, original.setup);
+  assert.deepEqual(updated.connectorIds, ["slack"]);
+  assert.throws(() => contracts.updateBotProfile(original, { name: "" }));
+  assert.throws(() => contracts.updateBotProfile(original, { avatarDataUrl: "data:image/svg+xml;base64,PHN2Zz4=" }));
+});
+
+test("opens personalization from the bot avatar instead of after bot creation", async () => {
+  const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
+  assert.match(renderer, /class="bot-avatar-trigger"[^>]*data-open-settings/);
+  assert.match(renderer, /activeView = "bot-detail";\s+settingsOpen = false;/);
+  assert.match(renderer, /function closeBotSettings\(\): void/);
 });
 
 test("keeps Electron renderer isolated from Node and external network", async () => {

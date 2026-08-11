@@ -21,13 +21,15 @@ import {
   CONNECTOR_CATALOG,
   type AppState,
   type BotDraft,
+  type BotPatch,
   type BotProfile,
   type BotSetupAnswer,
   type DesktopApi,
   applyBotSetupAnswer,
   createBotProfile,
   initialAppState,
-  normalizeConnectorIds
+  normalizeConnectorIds,
+  updateBotProfile
 } from "./contracts";
 
 declare global {
@@ -63,6 +65,10 @@ let connectorQuery = "";
 let selectedConnectorIds = new Set<string>();
 let botDraft: BotDraft = { name: "", color: BOT_COLORS[6], shape: BOT_SHAPES[0] };
 let transientError = "";
+let settingsOpen = false;
+let avatarEditorOpen = false;
+let avatarEditorTab: "bot" | "generate" | "upload" = "bot";
+const settingsSaveTimers = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
 
@@ -78,7 +84,7 @@ async function initialize(): Promise<void> {
       selectedConnectorIds = new Set(["google-workspace", "slack", "notion", "shopify"]);
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds] };
       activeView = "bot-builder";
-    } else if (!window.wrapperDesktop && ["setup", "connections"].includes(preview ?? "")) {
+    } else if (!window.wrapperDesktop && ["setup", "connections", "settings", "settings-avatar"].includes(preview ?? "")) {
       selectedConnectorIds = new Set(["google-workspace", "slack"]);
       let bot = createBotProfile({ name: "Juan", color: "#2f91f5", shape: "drop" }, [...selectedConnectorIds], "preview-bot");
       if (preview === "connections") {
@@ -88,6 +94,8 @@ async function initialize(): Promise<void> {
       }
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds], bots: [bot], activeBotId: bot.id };
       activeView = "bot-detail";
+      settingsOpen = preview === "settings" || preview === "settings-avatar";
+      avatarEditorOpen = preview === "settings-avatar";
     }
   } catch (error) {
     transientError = errorMessage(error);
@@ -262,6 +270,8 @@ async function createBot(): Promise<void> {
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     botDraft = { name: "", color: BOT_COLORS[6], shape: BOT_SHAPES[0] };
     activeView = "bot-detail";
+    settingsOpen = false;
+    avatarEditorOpen = false;
   } catch (error) {
     transientError = errorMessage(error);
   }
@@ -286,9 +296,9 @@ function renderBotOnboarding(bot: BotProfile): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-chat-view">
       <header class="workspace-topbar">
-        <span>${renderMascot(bot.shape, bot.color, "tiny")}</span>
+        <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <button id="edit-connectors" class="topbar-link" type="button">Administrar conectores</button>
+        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Conectores</button></div>
       </header>
       <div id="bot-setup-thread" class="bot-setup-thread">
         <div class="thread-date">Hoy · ${new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(new Date())}</div>
@@ -298,10 +308,10 @@ function renderBotOnboarding(bot: BotProfile): void {
         ${renderError()}
       </div>
     </section>
-  `, bot.id);
+  `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
   bindBotSetup(bot);
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { activeView = "connectors"; render(); });
+  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
   requestAnimationFrame(() => {
     const thread = document.querySelector<HTMLElement>("#bot-setup-thread");
     if (thread) thread.scrollTop = thread.scrollHeight;
@@ -454,12 +464,12 @@ function renderReadyBot(bot: BotProfile): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-detail-view">
       <header class="workspace-topbar">
-        <span>${renderMascot(bot.shape, bot.color, "tiny")}</span>
+        <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <button id="edit-connectors" class="topbar-link" type="button">Administrar conectores</button>
+        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Conectores</button></div>
       </header>
       <div class="bot-detail-content">
-        <div class="detail-avatar">${renderMascot(bot.shape, bot.color, "hero")}</div>
+        <div class="detail-avatar">${renderBotAvatar(bot, "hero")}</div>
         <span class="ready-pill">BOT LISTO</span>
         <h1>${escapeHtml(bot.name)}</h1>
         <p>El perfil del bot quedó configurado. Los conectores aparecen como seleccionados; las cuentas siguen pendientes hasta implementar OAuth por usuario.</p>
@@ -472,10 +482,10 @@ function renderReadyBot(bot: BotProfile): void {
         </div>
       </div>
     </section>
-  `, bot.id);
+  `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { activeView = "connectors"; render(); });
-  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => { activeView = "bot-builder"; render(); });
+  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
+  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
   document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
 }
 
@@ -485,15 +495,16 @@ async function deleteActiveBot(bot: BotProfile): Promise<void> {
   try {
     state = await desktopApi.deleteBot(bot.id);
     activeView = state.bots.length ? "bot-detail" : "bot-builder";
+    closeBotSettings();
   } catch (error) {
     transientError = errorMessage(error);
   }
   render();
 }
 
-function renderDesktopShell(content: string, activeId: string): string {
+function renderDesktopShell(content: string, activeId: string, settingsBot?: BotProfile): string {
   return `
-    <main class="desktop-shell">
+    <main class="desktop-shell${settingsBot ? " has-settings" : ""}">
       <aside class="desktop-sidebar">
         <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
         <div class="sidebar-brand">${renderMascot("circle", "#2f91f5", "tiny")}<strong>Agent Genia</strong></div>
@@ -501,31 +512,213 @@ function renderDesktopShell(content: string, activeId: string): string {
           <button class="sidebar-row${activeId === "new" ? " selected" : ""}" type="button" data-new-bot>${renderMascot("circle", "#2f91f5", "small")}<span><strong>Crear un bot</strong><small>Personaliza un nuevo agente</small></span></button>
           <button class="sidebar-row connector-row" type="button" data-open-connectors><span class="sidebar-connector-icon">⌘</span><span><strong>Conectores</strong><small>${selectedConnectorIds.size} herramientas elegidas</small></span></button>
           ${state.bots.length ? '<div class="sidebar-label">TUS BOTS</div>' : ""}
-          ${state.bots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderMascot(bot.shape, bot.color, "small")}<span><strong>${escapeHtml(bot.name)}</strong><small>${bot.setup.step === "complete" ? `${bot.connectorIds.length} conectores` : "Configurando perfil…"}</small></span></button>`).join("")}
+          ${state.bots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderBotAvatar(bot, "small")}<span><strong>${escapeHtml(bot.name)}</strong><small>${bot.setup.step === "complete" ? `${bot.connectorIds.length} conectores` : "Configurando perfil…"}</small></span></button>`).join("")}
         </nav>
         ${state.bots.length ? "" : '<div class="sidebar-empty">Todavía no hay bots</div>'}
         <div class="sidebar-user"><span>A</span><strong>Alan</strong></div>
       </aside>
       <div class="desktop-content">${content}</div>
+      ${settingsBot ? renderBotSettings(settingsBot) : ""}
     </main>`;
 }
 
+function renderBotSettings(bot: BotProfile): string {
+  return `
+    <aside class="bot-settings-panel" aria-label="Configuración de ${escapeAttribute(bot.name)}">
+      <header class="settings-header">
+        <button type="button" data-close-settings aria-label="Volver">‹</button>
+        <strong>Configuración</strong>
+        <button type="button" data-close-settings aria-label="Cerrar">×</button>
+      </header>
+      <div class="settings-scroll">
+        <button class="settings-avatar-button" type="button" data-toggle-avatar-editor aria-expanded="${avatarEditorOpen}">${renderBotAvatar(bot, "large")}<span>Editar avatar</span></button>
+        <form id="bot-settings-form" class="bot-settings-form">
+          <label><span>Nombre</span><input name="name" maxlength="60" value="${escapeAttribute(bot.name)}" /></label>
+          <label><span>Título</span><input name="title" maxlength="100" placeholder="Describe qué hace tu agente" value="${escapeAttribute(bot.title)}" /></label>
+          <label><span>Descripción</span><textarea name="description" maxlength="600" rows="5" placeholder="Para qué sirve este agente">${escapeHtml(bot.description)}</textarea></label>
+          <label class="notification-setting">
+            <span><strong>Notificaciones</strong><small>Recibe una alerta cuando este agente termine o necesite información</small></span>
+            <input name="notificationsEnabled" type="checkbox" role="switch" ${bot.notificationsEnabled ? "checked" : ""} />
+          </label>
+        </form>
+      </div>
+      ${avatarEditorOpen ? renderAvatarEditor(bot) : ""}
+    </aside>`;
+}
+
+function renderAvatarEditor(bot: BotProfile): string {
+  return `
+    <section class="avatar-editor-popover">
+      <nav class="avatar-editor-tabs" aria-label="Tipo de avatar">
+        ${(["bot", "generate", "upload"] as const).map((tab) => `<button type="button" data-avatar-tab="${tab}" class="${avatarEditorTab === tab ? "selected" : ""}">${tab === "bot" ? "Bot" : tab === "generate" ? "Generar" : "Subir"}</button>`).join("")}
+      </nav>
+      ${avatarEditorTab === "bot" ? `
+        <div class="settings-shape-grid">
+          ${BOT_SHAPES.map((shape) => `<button type="button" data-settings-shape="${shape}" class="${!bot.avatarDataUrl && bot.shape === shape ? "selected" : ""}">${renderMascot(shape, bot.color, "medium")}</button>`).join("")}
+        </div>
+        <div class="settings-color-grid">
+          ${BOT_COLORS.map((color) => `<button type="button" data-settings-color="${color}" class="settings-color-choice ${mascotColorClass(color)}${!bot.avatarDataUrl && bot.color === color ? " selected" : ""}" aria-label="Usar color ${color}"></button>`).join("")}
+        </div>` : avatarEditorTab === "generate" ? `
+        <form id="generate-avatar-form" class="avatar-tool-panel">
+          <strong>Generar una variante</strong>
+          <p>Describe el carácter visual del bot y crearemos una combinación local de forma y color.</p>
+          <input name="avatarPrompt" maxlength="160" placeholder="Ej. tranquilo, confiable y creativo" />
+          <button type="submit">Generar</button>
+        </form>` : `
+        <div class="avatar-tool-panel">
+          <strong>Subir una imagen</strong>
+          <p>PNG, JPEG o WebP. Máximo 1 MB; se guarda solamente en este dispositivo.</p>
+          <label class="upload-avatar-button">Elegir imagen<input id="avatar-upload" type="file" accept="image/png,image/jpeg,image/webp" /></label>
+          ${bot.avatarDataUrl ? '<button id="remove-uploaded-avatar" class="remove-avatar-button" type="button">Volver al bot</button>' : ""}
+        </div>`}
+    </section>`;
+}
+
+function bindBotSettings(): void {
+  if (!settingsOpen) return;
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-close-settings]")) {
+    button.addEventListener("click", () => {
+      settingsOpen = false;
+      avatarEditorOpen = false;
+      render();
+    });
+  }
+  document.querySelector("[data-toggle-avatar-editor]")?.addEventListener("click", () => {
+    avatarEditorOpen = !avatarEditorOpen;
+    avatarEditorTab = "bot";
+    render();
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-avatar-tab]")) {
+    button.addEventListener("click", () => {
+      avatarEditorTab = button.dataset.avatarTab as typeof avatarEditorTab;
+      render();
+    });
+  }
+  const form = document.querySelector<HTMLFormElement>("#bot-settings-form");
+  const activeBot = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (!form || !activeBot) return;
+  for (const field of form.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input[name='name'], input[name='title'], textarea[name='description']")) {
+    field.addEventListener("input", () => {
+      const patch: BotPatch = { [field.name]: field.value };
+      if (field.name === "name" && !field.value.trim()) return;
+      applyLocalBotPatch(activeBot.id, patch);
+      scheduleBotSettingsSave(activeBot.id);
+    });
+    field.addEventListener("blur", () => {
+      if (field.name === "name" && !field.value.trim()) render();
+    });
+  }
+  const notification = form.elements.namedItem("notificationsEnabled") as HTMLInputElement | null;
+  notification?.addEventListener("change", () => {
+    applyLocalBotPatch(activeBot.id, { notificationsEnabled: notification.checked });
+    scheduleBotSettingsSave(activeBot.id, 0);
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-settings-shape]")) {
+    button.addEventListener("click", () => void saveAvatarPatch(activeBot.id, { shape: button.dataset.settingsShape, avatarDataUrl: "" }));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-settings-color]")) {
+    button.addEventListener("click", () => void saveAvatarPatch(activeBot.id, { color: button.dataset.settingsColor, avatarDataUrl: "" }));
+  }
+  document.querySelector("#generate-avatar-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const promptInput = (event.currentTarget as HTMLFormElement).elements.namedItem("avatarPrompt") as HTMLInputElement | null;
+    const prompt = promptInput?.value.trim() ?? "";
+    if (!prompt) return promptInput?.focus();
+    const hash = [...prompt].reduce((total, character) => ((total * 31) + character.codePointAt(0)!) >>> 0, 17);
+    void saveAvatarPatch(activeBot.id, {
+      color: BOT_COLORS[hash % BOT_COLORS.length],
+      shape: BOT_SHAPES[Math.floor(hash / BOT_COLORS.length) % BOT_SHAPES.length],
+      avatarDataUrl: ""
+    });
+  });
+  document.querySelector<HTMLInputElement>("#avatar-upload")?.addEventListener("change", (event) => void uploadAvatar(activeBot.id, event.currentTarget as HTMLInputElement));
+  document.querySelector("#remove-uploaded-avatar")?.addEventListener("click", () => void saveAvatarPatch(activeBot.id, { avatarDataUrl: "" }));
+}
+
+function applyLocalBotPatch(botId: string, patch: BotPatch): void {
+  state = { ...state, bots: state.bots.map((bot) => bot.id === botId ? updateBotProfile(bot, patch) : bot) };
+}
+
+function scheduleBotSettingsSave(botId: string, delay = 450): void {
+  const previous = settingsSaveTimers.get(botId);
+  if (previous !== undefined) window.clearTimeout(previous);
+  const timer = window.setTimeout(() => void persistBotSettings(botId), delay);
+  settingsSaveTimers.set(botId, timer);
+}
+
+async function persistBotSettings(botId: string): Promise<void> {
+  settingsSaveTimers.delete(botId);
+  const bot = state.bots.find((item) => item.id === botId);
+  if (!bot) return;
+  try {
+    state = await desktopApi.updateBot(botId, {
+      name: bot.name,
+      title: bot.title,
+      description: bot.description,
+      notificationsEnabled: bot.notificationsEnabled
+    });
+  } catch (error) {
+    transientError = errorMessage(error);
+    render();
+  }
+}
+
+async function saveAvatarPatch(botId: string, patch: BotPatch): Promise<void> {
+  transientError = "";
+  try {
+    applyLocalBotPatch(botId, patch);
+    state = await desktopApi.updateBot(botId, patch);
+  } catch (error) {
+    transientError = errorMessage(error);
+  }
+  render();
+}
+
+async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<void> {
+  const file = input.files?.[0];
+  if (!file) return;
+  if (!/^image\/(?:png|jpeg|webp)$/.test(file.type) || file.size > 1_000_000) {
+    transientError = "Elige una imagen PNG, JPEG o WebP de máximo 1 MB.";
+    render();
+    return;
+  }
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result ?? "")), { once: true });
+    reader.addEventListener("error", () => reject(reader.error), { once: true });
+    reader.readAsDataURL(file);
+  });
+  await saveAvatarPatch(botId, { avatarDataUrl: dataUrl });
+}
+
 function bindSidebar(): void {
-  document.querySelector("[data-new-bot]")?.addEventListener("click", () => { activeView = "bot-builder"; render(); });
-  document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { activeView = "connectors"; render(); });
+  document.querySelector("[data-new-bot]")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
+  document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-bot]")) {
     button.addEventListener("click", () => void selectBot(button.dataset.selectBot ?? ""));
   }
+  document.querySelector("[data-open-settings]")?.addEventListener("click", () => {
+    settingsOpen = true;
+    avatarEditorOpen = false;
+    render();
+  });
+  bindBotSettings();
 }
 
 async function selectBot(botId: string): Promise<void> {
   try {
     state = await desktopApi.setActiveBot(botId);
     activeView = "bot-detail";
+    closeBotSettings();
   } catch (error) {
     transientError = errorMessage(error);
   }
   render();
+}
+
+function closeBotSettings(): void {
+  settingsOpen = false;
+  avatarEditorOpen = false;
 }
 
 function renderConnectorIcon(iconId: string, name: string, compact = false): string {
@@ -542,6 +735,11 @@ function renderMascot(shape: string, color: string, size: "micro" | "tiny" | "sm
   const safeShape = BOT_SHAPES.includes(shape as (typeof BOT_SHAPES)[number]) ? shape : "circle";
   const safeColor = BOT_COLORS.includes(color as (typeof BOT_COLORS)[number]) || /^#[0-9a-f]{6}$/i.test(color) ? color : "#2f91f5";
   return `<span class="mascot mascot-${safeShape} mascot-${size} ${mascotColorClass(safeColor)}" aria-hidden="true"><i></i><i></i></span>`;
+}
+
+function renderBotAvatar(bot: BotProfile, size: "micro" | "tiny" | "small" | "medium" | "large" | "hero"): string {
+  if (!bot.avatarDataUrl) return renderMascot(bot.shape, bot.color, size);
+  return `<span class="uploaded-avatar uploaded-avatar-${size}" aria-hidden="true"><img src="${escapeAttribute(bot.avatarDataUrl)}" alt="" /></span>`;
 }
 
 function mascotColorClass(color: string): string {
@@ -598,6 +796,11 @@ function createPreviewApi(): DesktopApi {
     async createBot(draft) {
       const bot = createBotProfile(draft, previewState.selectedConnectorIds, crypto.randomUUID());
       previewState = { ...previewState, bots: [...previewState.bots, bot], activeBotId: bot.id, onboardingCompleted: true };
+      return structuredClone(previewState);
+    },
+    async updateBot(botId, patch) {
+      const bots = previewState.bots.map((bot) => bot.id === botId ? updateBotProfile(bot, patch) : bot);
+      previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },
     async answerBotSetup(botId, answer) {

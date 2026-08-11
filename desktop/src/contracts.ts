@@ -47,7 +47,7 @@ export const BOT_TEMPLATES = Object.freeze([
     id: "chief-of-staff",
     name: "Jefe de operaciones",
     description: "Organiza prioridades, seguimientos y decisiones pendientes",
-    color: "#ff3d58",
+    color: "#ff2f43",
     shape: "square"
   })
 ]);
@@ -98,8 +98,12 @@ export interface BotSetupAnswer {
 export interface BotProfile {
   id: string;
   name: string;
+  title: string;
+  description: string;
   color: BotColor;
   shape: BotShape;
+  avatarDataUrl: string;
+  notificationsEnabled: boolean;
   connectorIds: string[];
   setup: BotSetupState;
   createdAt: string;
@@ -119,10 +123,21 @@ export interface BotDraft {
   shape: string;
 }
 
+export interface BotPatch {
+  name?: string;
+  title?: string;
+  description?: string;
+  color?: string;
+  shape?: string;
+  avatarDataUrl?: string;
+  notificationsEnabled?: boolean;
+}
+
 export interface DesktopApi {
   bootstrap(): Promise<AppState>;
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
+  updateBot(botId: string, patch: BotPatch): Promise<AppState>;
   answerBotSetup(botId: string, answer: BotSetupAnswer): Promise<AppState>;
   setActiveBot(botId: string | null): Promise<AppState>;
   deleteBot(botId: string): Promise<AppState>;
@@ -172,11 +187,37 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
   return {
     id,
     name,
+    title: "",
+    description: "",
     color,
     shape,
+    avatarDataUrl: "",
+    notificationsEnabled: true,
     connectorIds: normalizeConnectorIds(connectorIds),
     setup: initialBotSetup(),
     createdAt: now.toISOString()
+  };
+}
+
+export function updateBotProfile(bot: BotProfile, patch: BotPatch): BotProfile {
+  const name = patch.name === undefined ? bot.name : cleanBotName(patch.name);
+  if (!name) throw new Error("El bot necesita un nombre.");
+  const color = patch.color === undefined
+    ? bot.color
+    : BOT_COLORS.includes(patch.color as BotColor) ? patch.color as BotColor : bot.color;
+  const shape = patch.shape === undefined
+    ? bot.shape
+    : BOT_SHAPES.includes(patch.shape as BotShape) ? patch.shape as BotShape : bot.shape;
+  const avatarDataUrl = patch.avatarDataUrl === undefined ? bot.avatarDataUrl : normalizeAvatarDataUrl(patch.avatarDataUrl);
+  return {
+    ...bot,
+    name,
+    title: patch.title === undefined ? bot.title : cleanProfileText(patch.title, 100),
+    description: patch.description === undefined ? bot.description : cleanProfileText(patch.description, 600),
+    color,
+    shape,
+    avatarDataUrl,
+    notificationsEnabled: patch.notificationsEnabled === undefined ? bot.notificationsEnabled : patch.notificationsEnabled === true
   };
 }
 
@@ -236,7 +277,14 @@ function normalizeBot(value: unknown): BotProfile | null {
       color: typeof value.color === "string" ? value.color : "",
       shape: typeof value.shape === "string" ? value.shape : ""
     }, normalizeConnectorIds(value.connectorIds), value.id.slice(0, 100), createdAt);
-    return { ...bot, setup: normalizeBotSetup(value.setup) };
+    return {
+      ...bot,
+      title: cleanProfileText(value.title, 100),
+      description: cleanProfileText(value.description, 600),
+      avatarDataUrl: safeAvatarDataUrl(value.avatarDataUrl),
+      notificationsEnabled: value.notificationsEnabled !== false,
+      setup: normalizeBotSetup(value.setup)
+    };
   } catch {
     return null;
   }
@@ -276,6 +324,24 @@ function cleanAnswer(value: unknown): string {
 function cleanBotName(value: unknown): string {
   if (typeof value !== "string") return "";
   return value.replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
+function cleanProfileText(value: unknown, limit: number): string {
+  return typeof value === "string" ? value.replace(/\r\n?/g, "\n").trim().slice(0, limit) : "";
+}
+
+function normalizeAvatarDataUrl(value: unknown): string {
+  if (value === "" || value === undefined || value === null) return "";
+  if (typeof value !== "string" || value.length > 1_500_000) throw new Error("La imagen del avatar es demasiado grande.");
+  if (!/^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/i.test(value)) {
+    throw new Error("El avatar debe ser PNG, JPEG o WebP.");
+  }
+  return value;
+}
+
+function safeAvatarDataUrl(value: unknown): string {
+  try { return normalizeAvatarDataUrl(value); }
+  catch { return ""; }
 }
 
 function uniqueStrings(value: unknown): string[] {

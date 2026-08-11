@@ -5,18 +5,21 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import {
   type AppState,
   type BotDraft,
+  type BotPatch,
   type BotSetupAnswer,
   applyBotSetupAnswer,
   createBotProfile,
   initialAppState,
   normalizeAppState,
-  normalizeConnectorIds
+  normalizeConnectorIds,
+  updateBotProfile
 } from "./contracts";
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
   saveConnectors: "desktop:save-connectors",
   createBot: "desktop:create-bot",
+  updateBot: "desktop:update-bot",
   answerBotSetup: "desktop:answer-bot-setup",
   setActiveBot: "desktop:set-active-bot",
   deleteBot: "desktop:delete-bot"
@@ -82,6 +85,14 @@ function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.createBot, (_event, draft: BotDraft) => stateStore.update((state) => {
     const bot = createBotProfile(draft, state.selectedConnectorIds, randomUUID());
     return { ...state, bots: [...state.bots, bot], activeBotId: bot.id, onboardingCompleted: true };
+  }));
+  ipcMain.handle(CHANNELS.updateBot, (_event, botId: unknown, patch: BotPatch) => stateStore.update((state) => {
+    if (typeof botId !== "string") throw new Error("Bot inválido.");
+    const index = state.bots.findIndex((bot) => bot.id === botId);
+    if (index < 0) throw new Error("No encontramos ese bot.");
+    const bots = [...state.bots];
+    bots[index] = updateBotProfile(bots[index], patch ?? {});
+    return { ...state, bots, activeBotId: botId };
   }));
   ipcMain.handle(CHANNELS.answerBotSetup, (_event, botId: unknown, answer: BotSetupAnswer) => stateStore.update((state) => {
     if (typeof botId !== "string") throw new Error("Bot inválido.");
