@@ -55,7 +55,8 @@ export const CONNECTOR_CATALOG = Object.freeze([
 export const MANAGED_CONNECTOR_IDS = Object.freeze([
   "google-workspace", "slack", "notion", "linkedin", "zoom", "github", "jira", "linear",
   "asana", "clickup", "figma", "canva", "trello", "monday-com", "intercom", "zendesk",
-  "box", "dropbox", "calendly", "stripe", "quickbooks", "greenhouse", "mailchimp", "shopify"
+  "box", "dropbox", "calendly", "stripe", "quickbooks", "greenhouse", "mailchimp", "shopify",
+  "apollo", "ashby", "vercel", "hex", "amplitude", "mixpanel", "databricks"
 ]);
 
 export const BOT_COLORS = Object.freeze([

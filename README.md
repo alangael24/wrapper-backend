@@ -103,11 +103,12 @@ un `preload` aislado y una lista cerrada de operaciones IPC.
 El catálogo reutiliza las superficies que ya existen en `outcome-desktop`
 (trabajo, ventas, desarrollo y diseño) y `ecom-research-agent` (Shopify,
 Tiendanube y WooCommerce). Electron ofrece conexión real y aislada por usuario
-para 24 proveedores mediante el gateway administrado de Composio: Google
+para 31 proveedores mediante el gateway administrado de Composio: Google
 Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
 Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
-Stripe, QuickBooks, Greenhouse, Mailchimp y Shopify. Microsoft 365, HubSpot y
-Salesforce conservan sus adaptadores OAuth directos. La primera conexión abre el
+Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
+Amplitude, Mixpanel y Databricks. Microsoft 365, HubSpot y Salesforce conservan
+sus adaptadores OAuth directos. La primera conexión abre el
 inicio de sesión de Agent Genia y después el consentimiento oficial del
 proveedor; los tokens administrados permanecen en el servicio, nunca en el
 renderer ni en Pi.
