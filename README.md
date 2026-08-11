@@ -102,24 +102,36 @@ un `preload` aislado y una lista cerrada de operaciones IPC.
 
 El catálogo reutiliza las superficies que ya existen en `outcome-desktop`
 (trabajo, ventas, desarrollo y diseño) y `ecom-research-agent` (Shopify,
-Tiendanube y WooCommerce). Electron ya ofrece conexión OAuth real, aislada por
-usuario, para los proveedores cuyas apps están configuradas en el servicio:
-Google Workspace, Microsoft 365, HubSpot y Salesforce. La primera conexión abre
-el inicio de sesión de Agent Genia y luego el consentimiento oficial del
-proveedor; la app hace polling del callback y nunca expone client secrets al
-renderer.
+Tiendanube y WooCommerce). Electron ofrece conexión real y aislada por usuario
+para 24 proveedores mediante el gateway administrado de Composio: Google
+Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
+Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
+Stripe, QuickBooks, Greenhouse, Mailchimp y Shopify. Microsoft 365, HubSpot y
+Salesforce conservan sus adaptadores OAuth directos. La primera conexión abre el
+inicio de sesión de Agent Genia y después el consentimiento oficial del
+proveedor; los tokens administrados permanecen en el servicio, nunca en el
+renderer ni en Pi.
 
-Los demás elementos del catálogo se muestran como `Próximamente`: seleccionarlos
-solo los asigna al bot y no inventa una autenticación. Para habilitarlos hay que
-registrar su propia app OAuth y añadirla a la lista cerrada de proveedores. El
-servicio se configura con `OUTCOME_SERVICE_URL` y debe usar HTTPS fuera de
-loopback.
+Los proveedores que exigen credenciales propias o no tienen un toolkit
+compatible se muestran como `Próximamente`: seleccionarlos solo los asigna al
+bot y no inventa una autenticación. El servicio se configura con
+`OUTCOME_SERVICE_URL`, debe usar HTTPS fuera de loopback y guarda su
+`COMPOSIO_API_KEY` exclusivamente en el entorno privado de producción.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con
 búsqueda y las pestañas `Marketplace` y `Yours`. `Yours` se deriva de los IDs
 instalados en `selectedConnectorIds`; desde ahí el usuario puede conectar,
 desconectar o remover cada plugin sin volver al onboarding.
+
+El marketplace incluye 49 proveedores distribuidos entre Trabajo, Ventas,
+Soporte, Desarrollo, Diseño, Finanzas, RR. HH., Datos, Marketing y Comercio.
+Además de las herramientas iniciales, incluye Trello, monday.com, Intercom,
+Zendesk, Box, Dropbox, DocuSign, Calendly, Loom, Outreach, Salesloft, Apollo,
+Clay, ZoomInfo, Nooks, Stripe, QuickBooks, NetSuite, Ramp, Workday, Rippling,
+Ashby, Greenhouse, Vercel, Tableau, Hex, Amplitude, Mixpanel, Snowflake,
+Databricks y Mailchimp. Que aparezcan en el catálogo no implica autenticación:
+sin app OAuth y adaptador registrados se muestran como `Próximamente`.
 
 La sesión OAuth de Electron y el adaptador del broker de Pi son límites de
 confianza distintos. Conectar una cuenta en la interfaz prueba y conserva el

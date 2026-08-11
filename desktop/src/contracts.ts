@@ -14,9 +14,48 @@ export const CONNECTOR_CATALOG = Object.freeze([
   connector("figma", "Figma", "figma", "Diseño", "Archivos, comentarios y entregables de diseño", "outcome"),
   connector("hubspot", "HubSpot", "hubspot", "Ventas", "Contactos, empresas y oportunidades", "outcome"),
   connector("canva", "Canva", "canva", "Diseño", "Diseños, plantillas y contenido de marca", "outcome"),
+  connector("trello", "Trello", "trello", "Trabajo", "Tableros, listas, tarjetas y responsables", "outcome"),
+  connector("monday-com", "monday.com", "monday", "Trabajo", "Tableros, proyectos y automatizaciones de trabajo", "outcome"),
+  connector("intercom", "Intercom", "intercom", "Soporte", "Conversaciones, usuarios y atención al cliente", "outcome"),
+  connector("zendesk", "Zendesk", "zendesk", "Soporte", "Tickets, usuarios y operaciones de soporte", "outcome"),
+  connector("box", "Box", "box", "Trabajo", "Archivos, carpetas y colaboración empresarial", "outcome"),
+  connector("dropbox", "Dropbox", "dropbox", "Trabajo", "Archivos, carpetas y contenido compartido", "outcome"),
+  connector("docusign", "DocuSign", "docusign", "Trabajo", "Sobres, firmas y seguimiento de documentos", "outcome"),
+  connector("calendly", "Calendly", "calendly", "Trabajo", "Tipos de evento, disponibilidad y reuniones", "outcome"),
+  connector("loom", "Loom", "loom", "Trabajo", "Videos, transcripciones y espacios de equipo", "outcome"),
+  connector("outreach", "Outreach", "outreach", "Ventas", "Prospectos, secuencias y actividades comerciales", "outcome"),
+  connector("salesloft", "Salesloft", "salesloft", "Ventas", "Cadencias, personas y actividades de ventas", "outcome"),
+  connector("apollo", "Apollo", "apollo", "Ventas", "Personas, empresas y enriquecimiento comercial", "outcome"),
+  connector("clay", "Clay", "clay", "Ventas", "Tablas, enriquecimiento y flujos de prospección", "outcome"),
+  connector("zoominfo", "ZoomInfo", "zoominfo", "Ventas", "Contactos, empresas e inteligencia comercial", "outcome"),
+  connector("nooks", "Nooks", "nooks", "Ventas", "Marcador, sesiones y productividad de ventas", "outcome"),
+  connector("stripe", "Stripe", "stripe", "Finanzas", "Clientes, pagos, facturas y suscripciones", "outcome"),
+  connector("quickbooks", "QuickBooks", "quickbooks", "Finanzas", "Contabilidad, facturas, gastos y clientes", "outcome"),
+  connector("netsuite", "NetSuite", "netsuite", "Finanzas", "ERP, finanzas, clientes y operaciones", "outcome"),
+  connector("ramp", "Ramp", "ramp", "Finanzas", "Tarjetas, gastos, reembolsos y proveedores", "outcome"),
+  connector("workday", "Workday", "workday", "RR. HH.", "Personas, puestos y operaciones de recursos humanos", "outcome"),
+  connector("rippling", "Rippling", "rippling", "RR. HH.", "Empleados, nómina, dispositivos y aplicaciones", "outcome"),
+  connector("ashby", "Ashby", "ashby", "RR. HH.", "Candidatos, vacantes y procesos de contratación", "outcome"),
+  connector("greenhouse", "Greenhouse", "greenhouse", "RR. HH.", "Candidatos, entrevistas y vacantes", "outcome"),
+  connector("vercel", "Vercel", "vercel", "Desarrollo", "Proyectos, deployments, dominios y logs", "outcome"),
+  connector("tableau", "Tableau", "tableau", "Datos", "Fuentes, workbooks y visualizaciones", "outcome"),
+  connector("hex", "Hex", "hex", "Datos", "Proyectos, notebooks y análisis colaborativo", "outcome"),
+  connector("amplitude", "Amplitude", "amplitude", "Datos", "Analítica de producto, eventos y cohortes", "outcome"),
+  connector("mixpanel", "Mixpanel", "mixpanel", "Datos", "Eventos, funnels, retención y perfiles", "outcome"),
+  connector("snowflake", "Snowflake", "snowflake", "Datos", "Warehouses, bases de datos y consultas", "outcome"),
+  connector("databricks", "Databricks", "databricks", "Datos", "Lakehouse, notebooks, jobs y consultas", "outcome"),
+  connector("mailchimp", "Mailchimp", "mailchimp", "Marketing", "Audiencias, campañas y automatizaciones", "outcome"),
   connector("shopify", "Shopify", "shopify", "Comercio", "Catálogo, tienda y herramientas publicadas", "ecom"),
   connector("tiendanube", "Tiendanube", "tiendanube", "Comercio", "Catálogo y contexto de la tienda", "ecom"),
   connector("woocommerce", "WooCommerce", "woocommerce", "Comercio", "Productos y contexto de WordPress Commerce", "ecom")
+]);
+
+// Verified against Composio's managed-auth catalog. These connectors can use
+// hosted per-user authorization without embedding provider secrets in Electron.
+export const MANAGED_CONNECTOR_IDS = Object.freeze([
+  "google-workspace", "slack", "notion", "linkedin", "zoom", "github", "jira", "linear",
+  "asana", "clickup", "figma", "canva", "trello", "monday-com", "intercom", "zendesk",
+  "box", "dropbox", "calendly", "stripe", "quickbooks", "greenhouse", "mailchimp", "shopify"
 ]);
 
 export const BOT_COLORS = Object.freeze([
@@ -80,7 +119,7 @@ export type ConnectorDefinition = (typeof CONNECTOR_CATALOG)[number];
 export type BotColor = (typeof BOT_COLORS)[number];
 export type BotShape = (typeof BOT_SHAPES)[number];
 export type BotSetupStep = "purpose" | "workspace" | "project" | "connections" | "complete";
-export type OAuthProviderId = "google" | "microsoft" | "hubspot" | "salesforce" | "pipedrive" | "zoho";
+export type OAuthProviderId = "google" | "microsoft" | "hubspot" | "salesforce" | "pipedrive" | "zoho" | "composio";
 
 export interface AccountConnectionStatus {
   connected: boolean;

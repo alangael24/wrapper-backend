@@ -19,6 +19,7 @@ import {
   BOT_SHAPES,
   BOT_TEMPLATES,
   CONNECTOR_CATALOG,
+  MANAGED_CONNECTOR_IDS,
   type AppState,
   type BotDraft,
   type BotPatch,
@@ -40,6 +41,11 @@ declare global {
 }
 
 type View = "connectors" | "plugins" | "bot-builder" | "bot-detail";
+
+const CONNECTOR_CATEGORIES = Object.freeze([
+  "Trabajo", "Ventas", "Soporte", "Desarrollo", "Diseño",
+  "Finanzas", "RR. HH.", "Datos", "Marketing", "Comercio"
+]);
 
 const appRootElement = document.querySelector<HTMLDivElement>("#app");
 if (!appRootElement) throw new Error("No se encontró la raíz de la aplicación.");
@@ -129,7 +135,7 @@ function renderConnectors(): void {
     !normalizedQuery
     || `${connector.name} ${connector.category} ${connector.description}`.toLocaleLowerCase("es").includes(normalizedQuery)
   ));
-  const groups = ["Trabajo", "Ventas", "Desarrollo", "Diseño", "Comercio"];
+  const groups = CONNECTOR_CATEGORIES;
 
   appRoot.innerHTML = `
     <main class="connector-screen">
@@ -324,7 +330,7 @@ function renderPluginMarketplace(): void {
     || `${connector.name} ${connector.category} ${connector.description}`.toLocaleLowerCase("es").includes(normalizedQuery)
   ));
   const groups = pluginTab === "marketplace"
-    ? ["Trabajo", "Ventas", "Desarrollo", "Diseño", "Comercio"]
+    ? CONNECTOR_CATEGORIES
     : ["Tus plugins"];
 
   appRoot.innerHTML = `
@@ -1036,15 +1042,16 @@ function emptyConnectionSnapshot(): ConnectorConnectionSnapshot {
     hubspot: "hubspot",
     salesforce: "salesforce"
   };
+  const managed = new Set<string>(MANAGED_CONNECTOR_IDS);
   return {
     account: { connected: false, required: true, email: "", name: "" },
     connectors: CONNECTOR_CATALOG.map((connector) => ({
       connectorId: connector.id,
-      provider: providers[connector.id] ?? null,
-      available: Boolean(providers[connector.id]),
+      provider: managed.has(connector.id) ? "composio" : providers[connector.id] ?? null,
+      available: managed.has(connector.id) || Boolean(providers[connector.id]),
       connected: false,
       account: "",
-      reason: providers[connector.id] ? "Listo para autorizar." : "OAuth no configurado."
+      reason: managed.has(connector.id) || providers[connector.id] ? "Listo para autorizar." : "OAuth no configurado."
     }))
   };
 }

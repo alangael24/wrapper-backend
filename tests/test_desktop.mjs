@@ -8,12 +8,30 @@ const contracts = require("../desktop/dist/contracts.cjs");
 
 test("ships the complete connector catalog from work and commerce apps", () => {
   const ids = contracts.CONNECTOR_CATALOG.map((item) => item.id);
-  assert.equal(ids.length, 18);
+  assert.equal(ids.length, 49);
   for (const id of [
     "google-workspace", "slack", "notion", "salesforce", "microsoft-365",
     "linkedin", "zoom", "github", "jira", "figma", "hubspot", "canva",
-    "linear", "asana", "clickup", "shopify", "tiendanube", "woocommerce"
+    "linear", "asana", "clickup", "shopify", "tiendanube", "woocommerce",
+    "trello", "monday-com", "intercom", "zendesk", "box", "dropbox",
+    "docusign", "calendly", "loom", "outreach", "salesloft", "apollo",
+    "clay", "zoominfo", "nooks", "stripe", "quickbooks", "netsuite",
+    "ramp", "workday", "rippling", "ashby", "greenhouse", "vercel",
+    "tableau", "hex", "amplitude", "mixpanel", "snowflake", "databricks",
+    "mailchimp"
   ]) assert.ok(ids.includes(id), `missing connector ${id}`);
+});
+
+test("keeps Electron, the Python broker, and the Pi extension connector ids aligned", async () => {
+  const [backend, extension] = await Promise.all([
+    readFile(new URL("../go_backend/connectors.py", import.meta.url), "utf8"),
+    readFile(new URL("../extensions/connectors/index.ts", import.meta.url), "utf8")
+  ]);
+  const desktopIds = contracts.CONNECTOR_CATALOG.map((item) => item.id).sort();
+  const backendIds = [...backend.matchAll(/_connector\(\s*\n?\s*"([a-z0-9-]+)"/g)].map((match) => match[1]).sort();
+  const extensionIds = [...extension.matchAll(/provider\("([a-z0-9-]+)"/g)].map((match) => match[1]).sort();
+  assert.deepEqual(backendIds, desktopIds);
+  assert.deepEqual(extensionIds, desktopIds);
 });
 
 test("normalizes connector selection and persisted bot state", () => {
@@ -149,6 +167,9 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
   ]);
   assert.match(oauth, /safeStorage\.encryptString/);
   assert.match(oauth, /owner_account_id/);
+  assert.match(oauth, /managed_connection_id/);
+  assert.match(oauth, /\/v1\/connectors\/start/);
+  assert.match(oauth, /COMPOSIO_CONNECTOR_IDS/);
   assert.match(oauth, /https:\/\/outcome-service\.onrender\.com|baseUrl/);
   assert.match(main, /DesktopOAuthController/);
   assert.match(preload, /connectConnector/);

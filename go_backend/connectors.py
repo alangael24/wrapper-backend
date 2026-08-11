@@ -123,6 +123,161 @@ CONNECTOR_CATALOG: dict[str, dict[str, Any]] = {
             ("search_designs", "get_design", "create_design"),
         ),
         _connector(
+            "trello", "Trello", "Tableros, listas, tarjetas y responsables.",
+            ("trello", "board", "list", "card", "task"),
+            ("list_boards", "get_board", "list_cards", "create_card", "update_card"),
+        ),
+        _connector(
+            "monday-com", "monday.com", "Tableros, proyectos y automatizaciones de trabajo.",
+            ("monday", "board", "item", "project", "work management"),
+            ("list_boards", "get_board", "list_items", "create_item", "update_item"),
+        ),
+        _connector(
+            "intercom", "Intercom", "Conversaciones, usuarios y atencion al cliente.",
+            ("intercom", "support", "conversation", "contact", "customer"),
+            ("search_contacts", "list_conversations", "get_conversation", "reply_conversation"),
+        ),
+        _connector(
+            "zendesk", "Zendesk", "Tickets, usuarios y operaciones de soporte.",
+            ("zendesk", "support", "ticket", "user", "customer"),
+            ("search_tickets", "get_ticket", "create_ticket", "update_ticket"),
+        ),
+        _connector(
+            "box", "Box", "Archivos, carpetas y colaboracion empresarial.",
+            ("box", "file", "folder", "document", "storage"),
+            ("search_files", "get_file", "list_folder", "upload_file"),
+        ),
+        _connector(
+            "dropbox", "Dropbox", "Archivos, carpetas y contenido compartido.",
+            ("dropbox", "file", "folder", "document", "storage"),
+            ("search_files", "get_file", "list_folder", "upload_file"),
+        ),
+        _connector(
+            "docusign", "DocuSign", "Sobres, firmas y seguimiento de documentos.",
+            ("docusign", "signature", "envelope", "document", "contract"),
+            ("list_envelopes", "get_envelope", "create_envelope", "send_envelope"),
+        ),
+        _connector(
+            "calendly", "Calendly", "Tipos de evento, disponibilidad y reuniones.",
+            ("calendly", "calendar", "meeting", "event", "availability"),
+            ("list_event_types", "list_scheduled_events", "get_event", "cancel_event"),
+        ),
+        _connector(
+            "loom", "Loom", "Videos, transcripciones y espacios de equipo.",
+            ("loom", "video", "recording", "transcript", "workspace"),
+            ("search_videos", "get_video", "list_transcripts"),
+        ),
+        _connector(
+            "outreach", "Outreach", "Prospectos, secuencias y actividades comerciales.",
+            ("outreach", "sales", "prospect", "sequence", "activity"),
+            ("search_prospects", "get_prospect", "list_sequences", "create_task", "update_prospect"),
+        ),
+        _connector(
+            "salesloft", "Salesloft", "Cadencias, personas y actividades de ventas.",
+            ("salesloft", "sales", "person", "cadence", "activity"),
+            ("search_people", "get_person", "list_cadences", "create_activity", "update_person"),
+        ),
+        _connector(
+            "apollo", "Apollo", "Personas, empresas y enriquecimiento comercial.",
+            ("apollo", "sales", "person", "company", "enrichment"),
+            ("search_people", "search_organizations", "enrich_person", "enrich_organization"),
+        ),
+        _connector(
+            "clay", "Clay", "Tablas, enriquecimiento y flujos de prospeccion.",
+            ("clay", "sales", "table", "enrichment", "prospecting"),
+            ("list_tables", "get_table", "list_records", "update_record"),
+        ),
+        _connector(
+            "zoominfo", "ZoomInfo", "Contactos, empresas e inteligencia comercial.",
+            ("zoominfo", "sales", "contact", "company", "intelligence"),
+            ("search_contacts", "search_companies", "get_contact", "get_company"),
+        ),
+        _connector(
+            "nooks", "Nooks", "Marcador, sesiones y productividad de ventas.",
+            ("nooks", "sales", "dialer", "call", "session"),
+            ("list_sessions", "get_session", "list_calls", "get_call"),
+        ),
+        _connector(
+            "stripe", "Stripe", "Clientes, pagos, facturas y suscripciones.",
+            ("stripe", "payment", "customer", "invoice", "subscription"),
+            ("search_customers", "get_customer", "list_payments", "list_invoices", "list_subscriptions"),
+        ),
+        _connector(
+            "quickbooks", "QuickBooks", "Contabilidad, facturas, gastos y clientes.",
+            ("quickbooks", "accounting", "invoice", "expense", "customer"),
+            ("search_customers", "get_customer", "list_invoices", "create_invoice", "list_expenses"),
+        ),
+        _connector(
+            "netsuite", "NetSuite", "ERP, finanzas, clientes y operaciones.",
+            ("netsuite", "erp", "finance", "customer", "record"),
+            ("search_records", "get_record", "create_record", "update_record"),
+        ),
+        _connector(
+            "ramp", "Ramp", "Tarjetas, gastos, reembolsos y proveedores.",
+            ("ramp", "finance", "card", "expense", "reimbursement"),
+            ("list_cards", "list_transactions", "list_reimbursements", "get_transaction"),
+        ),
+        _connector(
+            "workday", "Workday", "Personas, puestos y operaciones de recursos humanos.",
+            ("workday", "hr", "worker", "position", "time off"),
+            ("search_workers", "get_worker", "list_positions", "list_time_off"),
+        ),
+        _connector(
+            "rippling", "Rippling", "Empleados, nomina, dispositivos y aplicaciones.",
+            ("rippling", "hr", "employee", "payroll", "device"),
+            ("list_employees", "get_employee", "list_payroll_runs", "list_devices"),
+        ),
+        _connector(
+            "ashby", "Ashby", "Candidatos, vacantes y procesos de contratacion.",
+            ("ashby", "recruiting", "candidate", "job", "interview"),
+            ("list_jobs", "search_candidates", "get_candidate", "list_interviews"),
+        ),
+        _connector(
+            "greenhouse", "Greenhouse", "Candidatos, entrevistas y vacantes.",
+            ("greenhouse", "recruiting", "candidate", "job", "application"),
+            ("list_jobs", "search_candidates", "get_candidate", "list_applications"),
+        ),
+        _connector(
+            "vercel", "Vercel", "Proyectos, deployments, dominios y logs.",
+            ("vercel", "deployment", "project", "domain", "log"),
+            ("list_projects", "get_project", "list_deployments", "get_deployment", "list_domains"),
+        ),
+        _connector(
+            "tableau", "Tableau", "Fuentes, workbooks y visualizaciones.",
+            ("tableau", "analytics", "workbook", "dashboard", "view"),
+            ("search_workbooks", "get_workbook", "list_views", "query_view"),
+        ),
+        _connector(
+            "hex", "Hex", "Proyectos, notebooks y analisis colaborativo.",
+            ("hex", "analytics", "project", "notebook", "query"),
+            ("list_projects", "get_project", "run_project", "get_run"),
+        ),
+        _connector(
+            "amplitude", "Amplitude", "Analitica de producto, eventos y cohortes.",
+            ("amplitude", "analytics", "event", "funnel", "cohort"),
+            ("query_events", "query_funnel", "query_retention", "list_cohorts"),
+        ),
+        _connector(
+            "mixpanel", "Mixpanel", "Eventos, funnels, retencion y perfiles.",
+            ("mixpanel", "analytics", "event", "funnel", "retention"),
+            ("query_events", "query_funnel", "query_retention", "list_profiles"),
+        ),
+        _connector(
+            "snowflake", "Snowflake", "Warehouses, bases de datos y consultas.",
+            ("snowflake", "data warehouse", "database", "table", "sql"),
+            ("list_databases", "list_schemas", "list_tables", "describe_table", "run_query"),
+        ),
+        _connector(
+            "databricks", "Databricks", "Lakehouse, notebooks, jobs y consultas.",
+            ("databricks", "lakehouse", "notebook", "job", "sql"),
+            ("list_catalogs", "list_schemas", "list_tables", "run_query", "list_jobs"),
+        ),
+        _connector(
+            "mailchimp", "Mailchimp", "Audiencias, campanas y automatizaciones.",
+            ("mailchimp", "marketing", "audience", "campaign", "automation"),
+            ("list_audiences", "search_members", "get_campaign", "create_campaign", "list_automations"),
+        ),
+        _connector(
             "shopify", "Shopify", "Catalogo y contexto de la tienda.",
             ("shopify", "commerce", "store", "product", "order", "customer"),
             ("search_products", "get_product", "list_orders", "get_order", "list_customers"),

@@ -8,7 +8,7 @@ import type {
   ConnectorConnectionStatus,
   OAuthProviderId
 } from "./contracts";
-import { CONNECTOR_CATALOG } from "./contracts";
+import { CONNECTOR_CATALOG, MANAGED_CONNECTOR_IDS } from "./contracts";
 
 const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
@@ -45,6 +45,14 @@ interface ProviderSession extends ProviderSessionPayload {
   owner_account_id: string;
 }
 
+interface ManagedConnectorSession {
+  managed_connection_id: string;
+  connector_id: string;
+  account_label?: string;
+  saved_at: number;
+  owner_account_id: string;
+}
+
 interface JsonRequestOptions {
   method?: "GET" | "POST";
   headers?: Record<string, string>;
@@ -53,11 +61,12 @@ interface JsonRequestOptions {
 }
 
 export const CONNECTOR_PROVIDER: Readonly<Record<string, OAuthProviderId | undefined>> = Object.freeze({
-  "google-workspace": "google",
   "microsoft-365": "microsoft",
   hubspot: "hubspot",
   salesforce: "salesforce"
 });
+
+export const COMPOSIO_CONNECTOR_IDS: ReadonlySet<string> = new Set(MANAGED_CONNECTOR_IDS);
 
 const PROVIDER_LABELS: Readonly<Record<OAuthProviderId, string>> = Object.freeze({
   google: "Google Workspace",
@@ -65,7 +74,8 @@ const PROVIDER_LABELS: Readonly<Record<OAuthProviderId, string>> = Object.freeze
   hubspot: "HubSpot",
   salesforce: "Salesforce",
   pipedrive: "Pipedrive",
-  zoho: "Zoho CRM"
+  zoho: "Zoho CRM",
+  composio: "Composio"
 });
 
 export class DesktopOAuthController {
@@ -73,6 +83,7 @@ export class DesktopOAuthController {
   private readonly deviceStore: DeviceIdentityStore;
   private readonly client: OutcomeOAuthClient;
   private readonly providerSessions: Map<OAuthProviderId, ManagedProviderSession>;
+  private readonly managedConnectorSessions: Map<string, ManagedConnectorAccount>;
 
   constructor({
     baseUrl,
@@ -114,12 +125,41 @@ export class DesktopOAuthController {
         })
       ])
     );
+    this.managedConnectorSessions = new Map(
+      [...COMPOSIO_CONNECTOR_IDS].map((connectorId) => {
+        const definition = CONNECTOR_CATALOG.find((item) => item.id === connectorId)!;
+        return [
+          connectorId,
+          new ManagedConnectorAccount({
+            connectorId,
+            displayName: definition.name,
+            client: this.client,
+            accountStore: this.accountStore,
+            safeStorage,
+            userDataPath,
+            shell
+          })
+        ];
+      })
+    );
   }
 
   async snapshot(): Promise<ConnectorConnectionSnapshot> {
     const account = await this.accountStatus();
     const connectors = await Promise.all(CONNECTOR_CATALOG.map(async (connector): Promise<ConnectorConnectionStatus> => {
       const provider = CONNECTOR_PROVIDER[connector.id];
+      const managed = this.managedConnectorSessions.get(connector.id);
+      if (managed) {
+        const status = await managed.status();
+        return {
+          connectorId: connector.id,
+          provider: "composio",
+          available: true,
+          connected: status.connected,
+          account: status.account,
+          reason: status.connected ? "" : account.connected ? "Listo para conectar tu cuenta real." : "Inicia sesión para conectar tu cuenta."
+        };
+      }
       if (!provider) {
         return {
           connectorId: connector.id,
@@ -149,12 +189,20 @@ export class DesktopOAuthController {
   }
 
   async signOut(): Promise<ConnectorConnectionSnapshot> {
-    await Promise.all([...this.providerSessions.values()].map((session) => session.disconnect()));
+    await Promise.all([
+      ...[...this.providerSessions.values()].map((session) => session.disconnect()),
+      ...[...this.managedConnectorSessions.values()].map((session) => session.clearLocal())
+    ]);
     await this.client.signOut();
     return this.snapshot();
   }
 
   async connect(connectorId: string, signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
+    const managed = this.managedConnectorSessions.get(connectorId);
+    if (managed) {
+      await managed.connect(shellSafeSignal(signal));
+      return this.snapshot();
+    }
     const provider = CONNECTOR_PROVIDER[connectorId];
     if (!provider) throw new Error("Este conector todavía no tiene una app OAuth pública configurada.");
     await this.providerSessions.get(provider)!.connect(shellSafeSignal(signal));
@@ -162,6 +210,11 @@ export class DesktopOAuthController {
   }
 
   async disconnect(connectorId: string): Promise<ConnectorConnectionSnapshot> {
+    const managed = this.managedConnectorSessions.get(connectorId);
+    if (managed) {
+      await managed.disconnect();
+      return this.snapshot();
+    }
     const provider = CONNECTOR_PROVIDER[connectorId];
     if (!provider) throw new Error("Este conector no admite desconexión OAuth.");
     await this.providerSessions.get(provider)!.disconnect();
@@ -173,6 +226,75 @@ export class DesktopOAuthController {
     return stored
       ? { connected: true, required: true, email: stored.account.email, name: stored.account.name ?? "" }
       : { connected: false, required: true, email: "", name: "" };
+  }
+}
+
+class ManagedConnectorAccount {
+  private readonly store: EncryptedJsonStore<ManagedConnectorSession>;
+  private connectPromise: Promise<void> | null = null;
+
+  constructor(private readonly options: {
+    connectorId: string;
+    displayName: string;
+    client: OutcomeOAuthClient;
+    accountStore: EncryptedJsonStore<AccountSession>;
+    safeStorage: SafeStorage;
+    userDataPath: string;
+    shell: Shell;
+  }) {
+    this.store = new EncryptedJsonStore({
+      filePath: path.join(options.userDataPath, "secrets", `connector-managed-${options.connectorId}.bin`),
+      safeStorage: options.safeStorage,
+      validate: isManagedConnectorSession
+    });
+  }
+
+  async status(): Promise<{ connected: boolean; account: string }> {
+    const [stored, account] = await Promise.all([this.store.get(), this.options.accountStore.get()]);
+    const connected = Boolean(stored?.managed_connection_id && account?.account.id && stored.owner_account_id === account.account.id);
+    return { connected, account: connected ? stored?.account_label || account?.account.email || "" : "" };
+  }
+
+  async connect(signal?: AbortSignal): Promise<void> {
+    if (!this.connectPromise) this.connectPromise = this.connectOnce(signal).finally(() => { this.connectPromise = null; });
+    await withSignal(this.connectPromise, signal);
+  }
+
+  async disconnect(): Promise<void> {
+    const account = await this.options.accountStore.get();
+    if (account) await this.options.client.disconnectConnector(this.options.connectorId);
+    await this.store.clear();
+  }
+
+  clearLocal(): Promise<void> {
+    return this.store.clear();
+  }
+
+  private async connectOnce(signal?: AbortSignal): Promise<void> {
+    let account = await this.options.accountStore.get();
+    if (!account) {
+      await this.options.client.signIn(signal);
+      account = await this.options.accountStore.get();
+    }
+    if (!account) throw new Error("No se pudo verificar tu cuenta de Agent Genia.");
+    const provider = await this.options.client.connector(this.options.connectorId, signal);
+    if (provider.available !== true) throw new Error(stringValue(provider.reason) || `${this.options.displayName} todavía no está configurado.`);
+    const started = await this.options.client.startConnector(this.options.connectorId, signal);
+    await this.options.shell.openExternal(safeAuthorizationUrl(stringValue(started.authorize_url)));
+    for (let attempt = 0; attempt < CONNECTOR_AUTH_ATTEMPTS; attempt += 1) {
+      const status = await this.options.client.connectorStatus(stringValue(started.attempt_id), signal);
+      if (status.status === "complete" && isManagedConnectorPayload(status.session)) {
+        await this.store.set({
+          ...status.session,
+          saved_at: Date.now(),
+          owner_account_id: account.account.id
+        });
+        return;
+      }
+      if (status.status === "error") throw new Error(stringValue(status.message) || `${this.options.displayName} rechazó la conexión.`);
+      await delay(OAUTH_POLL_MS, signal);
+    }
+    throw new Error(`La conexión con ${this.options.displayName} expiró.`);
   }
 }
 
@@ -311,6 +433,22 @@ class OutcomeOAuthClient {
 
   providerStatus(attemptId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.authorizedJson(`/v1/oauth/status/${encodeURIComponent(attemptId)}`, { signal });
+  }
+
+  connector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson(`/v1/connectors/${encodeURIComponent(connectorId)}`, { signal });
+  }
+
+  startConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/connectors/start", { method: "POST", body: { connector_id: connectorId }, signal });
+  }
+
+  connectorStatus(attemptId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson(`/v1/connectors/status/${encodeURIComponent(attemptId)}`, { signal });
+  }
+
+  disconnectConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/connectors/disconnect", { method: "POST", body: { connector_id: connectorId }, signal });
   }
 
   private async authorizedJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
@@ -455,6 +593,23 @@ function isProviderSession(value: unknown): value is ProviderSession {
 
 function isProviderSessionPayload(value: unknown): value is ProviderSessionPayload {
   return isRecord(value) && typeof value.access_token === "string" && value.access_token.length > 10;
+}
+
+function isManagedConnectorPayload(value: unknown): value is Pick<ManagedConnectorSession, "managed_connection_id" | "connector_id" | "account_label"> {
+  return isRecord(value)
+    && typeof value.managed_connection_id === "string"
+    && value.managed_connection_id.length > 5
+    && typeof value.connector_id === "string"
+    && COMPOSIO_CONNECTOR_IDS.has(value.connector_id);
+}
+
+function isManagedConnectorSession(value: unknown): value is ManagedConnectorSession {
+  if (!isManagedConnectorPayload(value)) return false;
+  const persisted = value as typeof value & Record<string, unknown>;
+  return typeof persisted.saved_at === "number"
+    && Number.isFinite(persisted.saved_at)
+    && typeof persisted.owner_account_id === "string"
+    && persisted.owner_account_id.startsWith("acct_");
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
