@@ -196,7 +196,8 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   const userDataPath = app.getPath("userData");
   stateStore = new DesktopStateStore(path.join(userDataPath, "desktop-state.json"));
   oauthController = new DesktopOAuthController({
-    baseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
+    accountBaseUrl: process.env.WRAPPER_SERVICE_URL ?? "http://127.0.0.1:8787",
+    connectorBaseUrl: process.env.OUTCOME_SERVICE_URL ?? "https://outcome-service.onrender.com",
     safeStorage,
     userDataPath,
     shell,

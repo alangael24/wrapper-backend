@@ -14,7 +14,9 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -144,6 +146,9 @@ class WrapperServer:
         os.environ["VISION_TARGET_MODELS"] = "deepseek-v4"
         os.environ["PI_ENABLED"] = "0"
         os.environ.pop("WRAPPER_SECRET", None)
+        os.environ.pop("GOOGLE_OAUTH_CLIENT_ID", None)
+        os.environ.pop("GOOGLE_OAUTH_CLIENT_SECRET", None)
+        os.environ.pop("GOOGLE_OAUTH_REDIRECT_URI", None)
         self.cfg = Config()
         self.cfg.go_base_url = upstream_base + "/v1"
         self.backend = Backend(self.cfg)
@@ -308,7 +313,152 @@ class TestBackend(unittest.TestCase):
                 payloads.append(payload)
         return payloads
 
+    def configure_fake_google(self, *, email="alan@example.com", verified=True):
+        auth = self.ws.backend.google_auth
+        auth.client_id = "google-client-id.apps.googleusercontent.com"
+        auth.client_secret = "test-secret-not-for-production"
+        auth.redirect_uri = self.ws.base + "/v1/account-auth/google/callback"
+        auth._exchange_code = lambda **_: {"access_token": "google-access-token-for-tests"}
+        auth._fetch_userinfo = lambda _token: {
+            "sub": "google-subject-123",
+            "email": email,
+            "email_verified": verified,
+            "name": "Alan Example",
+            "picture": "https://images.example/avatar.png",
+        }
+        return auth
+
     # ---------- pool / signup ----------
+    def test_google_account_auth_flow_issues_rotates_and_revokes_session(self):
+        self.configure_fake_google()
+        device_id = str(uuid.uuid4())
+        status, started = self.ws.req(
+            "POST",
+            "/v1/account-auth/start",
+            {"device_id": device_id, "app_version": "0.1.0"},
+        )
+        self.assertEqual(status, 201)
+        authorize = urllib.parse.urlparse(started["authorize_url"])
+        params = urllib.parse.parse_qs(authorize.query)
+        self.assertEqual(authorize.hostname, "accounts.google.com")
+        self.assertEqual(params["scope"], ["openid email profile"])
+        self.assertEqual(params["code_challenge_method"], ["S256"])
+
+        callback_path = "/v1/account-auth/google/callback?" + urllib.parse.urlencode({
+            "state": params["state"][0],
+            "code": "one-use-code",
+        })
+        status, html = self.ws.req("GET", callback_path, raw=True)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Regresa a Agent Genia", html)
+        status, replayed = self.ws.req("GET", callback_path)
+        self.assertEqual(status, 400)
+        self.assertEqual(replayed["error"]["type"], "invalid_state")
+
+        status, completed = self.ws.req(
+            "GET",
+            f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(completed["status"], "complete")
+        self.assertTrue(completed["token"].startswith("aga_"))
+        self.assertTrue(completed["refresh_token"].startswith("agr_"))
+        self.assertTrue(completed["account"]["id"].startswith("acct_"))
+
+        status, me = self.ws.req(
+            "GET", "/v1/me", headers={"Authorization": f"Bearer {completed['token']}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(me["email"], "alan@example.com")
+        self.assertEqual(me["tier"], "free")
+
+        status, _ = self.ws.req(
+            "POST",
+            "/v1/account-auth/refresh",
+            {"device_id": str(uuid.uuid4())},
+            headers={"Authorization": f"Bearer {completed['refresh_token']}"},
+        )
+        self.assertEqual(status, 401)
+
+        status, refreshed = self.ws.req(
+            "POST",
+            "/v1/account-auth/refresh",
+            {"device_id": device_id},
+            headers={"Authorization": f"Bearer {completed['refresh_token']}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotEqual(refreshed["token"], completed["token"])
+        self.assertNotEqual(refreshed["refresh_token"], completed["refresh_token"])
+
+        status, _ = self.ws.req(
+            "POST",
+            "/v1/account-auth/refresh",
+            {"device_id": device_id},
+            headers={"Authorization": f"Bearer {completed['refresh_token']}"},
+        )
+        self.assertEqual(status, 401)
+
+        status, body = self.ws.req(
+            "POST",
+            "/v1/account-auth/logout",
+            headers={"Authorization": f"Bearer {refreshed['token']}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["revoked"])
+        status, _ = self.ws.req(
+            "GET", "/v1/me", headers={"Authorization": f"Bearer {refreshed['token']}"}
+        )
+        self.assertEqual(status, 401)
+
+    def test_google_login_does_not_link_unverified_signup_email(self):
+        status, signup = self.ws.req("POST", "/v1/signup", {"email": "alan@example.com"})
+        self.assertEqual(status, 201)
+        self.configure_fake_google(email="alan@example.com")
+        device_id = str(uuid.uuid4())
+        _, started = self.ws.req(
+            "POST", "/v1/account-auth/start", {"device_id": device_id, "app_version": "test"}
+        )
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(started["authorize_url"]).query)
+        self.ws.req(
+            "GET",
+            "/v1/account-auth/google/callback?" + urllib.parse.urlencode({
+                "state": params["state"][0], "code": "ok"
+            }),
+            raw=True,
+        )
+        _, completed = self.ws.req(
+            "GET", f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}"
+        )
+        google_user = self.ws.backend.store.get_user_by_access_token(completed["token"])
+        self.assertNotEqual(google_user["id"], signup["user_id"])
+        self.assertEqual(len(self.ws.backend.store.list_users()), 2)
+
+    def test_google_auth_rejects_unverified_email_and_missing_configuration(self):
+        device_id = str(uuid.uuid4())
+        status, body = self.ws.req(
+            "POST", "/v1/account-auth/start", {"device_id": device_id, "app_version": "test"}
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "google_not_configured")
+
+        self.configure_fake_google(verified=False)
+        _, started = self.ws.req(
+            "POST", "/v1/account-auth/start", {"device_id": device_id, "app_version": "test"}
+        )
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(started["authorize_url"]).query)
+        self.ws.req(
+            "GET",
+            "/v1/account-auth/google/callback?" + urllib.parse.urlencode({
+                "state": params["state"][0], "code": "ok"
+            }),
+            raw=True,
+        )
+        _, result = self.ws.req(
+            "GET", f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}"
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("verificada", result["message"])
+
     def test_public_signup_always_free_and_never_consumes_pool(self):
         ws = self.ws
         created = self.add_pool_keys(2, prefix="sk-go-x")

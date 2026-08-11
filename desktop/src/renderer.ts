@@ -107,9 +107,10 @@ let state = initialAppState();
 let activeView: View = "connectors";
 let connectorQuery = "";
 let pluginQuery = "";
+let sidebarQuery = "";
 let pluginTab: "marketplace" | "yours" = "marketplace";
 let selectedConnectorIds = new Set<string>();
-let botDraft: BotDraft = { name: "", color: BOT_COLORS[6], shape: BOT_SHAPES[0] };
+let botDraft: BotDraft = { name: "", color: "#08be70", shape: "drop" };
 let transientError = "";
 let settingsOpen = false;
 let avatarEditorOpen = false;
@@ -485,7 +486,7 @@ function renderBotBuilder(): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-builder-view">
       <header class="workspace-topbar">
-        <span>${renderMascot("circle", "#2f91f5", "tiny")}</span>
+        <span>${renderMascot(botDraft.shape, botDraft.color, "tiny")}</span>
         <strong>Nuevo bot</strong>
         <button id="open-connectors" class="topbar-link" type="button">${selectedConnectorIds.size} plugins instalados</button>
       </header>
@@ -557,10 +558,34 @@ async function createBot(): Promise<void> {
   try {
     state = await desktopApi.createBot(botDraft);
     selectedConnectorIds = new Set(state.selectedConnectorIds);
-    botDraft = { name: "", color: BOT_COLORS[6], shape: BOT_SHAPES[0] };
+    botDraft = { name: "", color: "#08be70", shape: "drop" };
     activeView = "bot-detail";
     settingsOpen = false;
     avatarEditorOpen = false;
+  } catch (error) {
+    transientError = errorMessage(error);
+  }
+  render();
+}
+
+async function createDefaultBot(): Promise<void> {
+  if (!state.bots.length) {
+    closeBotSettings();
+    activeView = "bot-builder";
+    render();
+    return;
+  }
+  setBusy(true);
+  transientError = "";
+  try {
+    state = await desktopApi.createBot({
+      name: "Nuevo bot",
+      color: BOT_COLORS[6],
+      shape: BOT_SHAPES[0]
+    });
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
+    activeView = "bot-detail";
+    closeBotSettings();
   } catch (error) {
     transientError = errorMessage(error);
   }
@@ -596,6 +621,7 @@ function renderBotOnboarding(bot: BotProfile): void {
         ${renderCurrentSetupStep(bot)}
         ${renderError()}
       </div>
+      ${renderMessageComposer(bot.name)}
     </section>
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
@@ -718,6 +744,7 @@ function setupLabel(group: keyof typeof BOT_SETUP_OPTIONS, value: string, custom
 
 function bindBotSetup(bot: BotProfile): void {
   bindConnectionActions();
+  document.querySelector(".message-composer")?.addEventListener("submit", (event) => event.preventDefault());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-setup-answer]")) {
     button.addEventListener("click", () => void answerCurrentSetup(bot, button.dataset.setupAnswer ?? ""));
   }
@@ -776,7 +803,7 @@ function renderReadyBot(bot: BotProfile): void {
   bindSidebar();
   bindConnectionActions();
   document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
-  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
+  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => void createDefaultBot());
   document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
 }
 
@@ -794,23 +821,55 @@ async function deleteActiveBot(bot: BotProfile): Promise<void> {
 }
 
 function renderDesktopShell(content: string, activeId: string, settingsBot?: BotProfile): string {
+  const normalizedSidebarQuery = sidebarQuery.trim().toLocaleLowerCase("es");
+  const visibleBots = state.bots.filter((bot) => (
+    !normalizedSidebarQuery
+    || `${bot.name} ${bot.title} ${bot.description}`.toLocaleLowerCase("es").includes(normalizedSidebarQuery)
+  ));
   return `
     <main class="desktop-shell${settingsBot ? " has-settings" : ""}">
       <aside class="desktop-sidebar">
-        <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
-        <div class="sidebar-brand">${renderMascot("circle", "#2f91f5", "tiny")}<strong>Agent Genia</strong></div>
+        <div class="sidebar-window-bar">
+          <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+          <button class="sidebar-new-button" type="button" data-new-bot aria-label="Crear un bot">＋</button>
+        </div>
+        <label class="sidebar-search"><span aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m15.5 15.5 5 5"></path></svg></span><input id="sidebar-search" type="search" placeholder="Buscar" value="${escapeAttribute(sidebarQuery)}" autocomplete="off" /></label>
         <nav class="sidebar-nav" aria-label="Navegación de bots">
-          <button class="sidebar-row${activeId === "new" ? " selected" : ""}" type="button" data-new-bot>${renderMascot("circle", "#2f91f5", "small")}<span><strong>Crear un bot</strong><small>Personaliza un nuevo agente</small></span></button>
-          <button class="sidebar-row connector-row" type="button" data-open-connectors><span class="sidebar-connector-icon">⌘</span><span><strong>Plugins</strong><small>${selectedConnectorIds.size} instalados</small></span></button>
-          ${state.bots.length ? '<div class="sidebar-label">TUS BOTS</div>' : ""}
-          ${state.bots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderBotAvatar(bot, "small")}<span><strong>${escapeHtml(bot.name)}</strong><small>${bot.setup.step === "complete" ? `${bot.connectorIds.length} conectores` : "Configurando perfil…"}</small></span></button>`).join("")}
+          ${visibleBots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderBotAvatar(bot, "small")}<span><span class="sidebar-row-title"><strong>${escapeHtml(bot.name)}</strong><time>${formatBotTime(bot.createdAt)}</time></span><small>${escapeHtml(botSidebarPreview(bot))}</small></span></button>`).join("")}
         </nav>
-        ${state.bots.length ? "" : '<div class="sidebar-empty">Todavía no hay bots</div>'}
-        <div class="sidebar-user"><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong></div>
+        ${normalizedSidebarQuery && !visibleBots.length ? '<div class="sidebar-empty">No encontramos ese bot</div>' : ""}
+        <div class="sidebar-footer">
+          <button class="sidebar-footer-row" type="button" data-open-connectors><span class="sidebar-connector-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3v5M16 3v5M5 8h14v2a7 7 0 0 1-7 7 7 7 0 0 1-7-7V8Zm7 9v4"></path></svg></span><strong>Plugins</strong><small>${selectedConnectorIds.size ? `${selectedConnectorIds.size} instalados` : ""}</small></button>
+          <div class="sidebar-user"><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong></div>
+        </div>
       </aside>
       <div class="desktop-content">${content}</div>
       ${settingsBot ? renderBotSettings(settingsBot) : ""}
     </main>`;
+}
+
+function botSidebarPreview(bot: BotProfile): string {
+  if (bot.title) return bot.title;
+  if (bot.setup.step === "purpose") return "¿Con qué debería ayudarte más?";
+  if (bot.setup.step === "workspace") return "¿Dónde vive tu trabajo?";
+  if (bot.setup.step === "project") return "Elige tu herramienta de proyectos";
+  if (bot.setup.step === "connections") return "Conecta tus herramientas";
+  return bot.connectorIds.length ? `${bot.connectorIds.length} plugins conectados` : "Listo para trabajar";
+}
+
+function formatBotTime(createdAt: string): string {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(date);
+}
+
+function renderMessageComposer(botName: string): string {
+  return `
+    <form class="message-composer" aria-label="Mensaje para ${escapeAttribute(botName)}">
+      <button type="button" aria-label="Agregar">＋</button>
+      <input type="text" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" />
+      <button class="composer-mic" type="button" aria-label="Mensaje de voz"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="8" height="12" rx="4"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg></button>
+    </form>`;
 }
 
 function renderBotSettings(bot: BotProfile): string {
@@ -983,11 +1042,18 @@ async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<voi
 }
 
 function bindSidebar(): void {
-  document.querySelector("[data-new-bot]")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
+  document.querySelector("[data-new-bot]")?.addEventListener("click", () => void createDefaultBot());
   document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-bot]")) {
     button.addEventListener("click", () => void selectBot(button.dataset.selectBot ?? ""));
   }
+  document.querySelector<HTMLInputElement>("#sidebar-search")?.addEventListener("input", (event) => {
+    sidebarQuery = (event.currentTarget as HTMLInputElement).value;
+    render();
+    const input = document.querySelector<HTMLInputElement>("#sidebar-search");
+    input?.focus();
+    input?.setSelectionRange(sidebarQuery.length, sidebarQuery.length);
+  });
   document.querySelector("[data-open-settings]")?.addEventListener("click", () => {
     settingsOpen = true;
     avatarEditorOpen = false;

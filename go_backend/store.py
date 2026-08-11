@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -48,6 +49,32 @@ CREATE TABLE IF NOT EXISTS usage_events (
   status               INTEGER,
   created_at           REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS account_identities (
+  id             TEXT PRIMARY KEY,
+  user_id        TEXT NOT NULL,
+  provider       TEXT NOT NULL,
+  subject        TEXT NOT NULL,
+  email          TEXT NOT NULL,
+  email_verified INTEGER NOT NULL DEFAULT 0,
+  name           TEXT,
+  picture        TEXT,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE(provider, subject)
+);
+CREATE TABLE IF NOT EXISTS account_sessions (
+  id                 TEXT PRIMARY KEY,
+  account_id         TEXT NOT NULL,
+  device_id          TEXT NOT NULL,
+  access_token_hash  TEXT UNIQUE NOT NULL,
+  refresh_token_hash TEXT UNIQUE NOT NULL,
+  access_expires_at  REAL NOT NULL,
+  refresh_expires_at REAL NOT NULL,
+  revoked_at         REAL,
+  created_at         REAL NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES account_identities(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -58,6 +85,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_subscription
 CREATE INDEX IF NOT EXISTS idx_subs_status ON go_subscriptions(status);
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_sub_time ON usage_events(subscription_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_account_identity_user ON account_identities(user_id);
+CREATE INDEX IF NOT EXISTS idx_account_session_account ON account_sessions(account_id);
+CREATE INDEX IF NOT EXISTS idx_account_session_refresh ON account_sessions(refresh_token_hash);
 """
 
 
@@ -71,6 +101,10 @@ class NoSubscriptionAvailable(RuntimeError):
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
+
+
+def _hash_account_token(kind: str, token: str) -> str:
+    return hashlib.sha256(f"account-{kind}|{token}".encode()).hexdigest()
 
 
 class Store:
@@ -173,6 +207,172 @@ class Store:
     def get_user_by_id(self, user_id: str) -> dict | None:
         row = self._one("SELECT * FROM users WHERE id=?", (user_id,))
         return dict(row) if row else None
+
+    def get_or_create_google_account(
+        self,
+        *,
+        subject: str,
+        email: str,
+        name: str | None,
+        picture: str | None,
+    ) -> dict:
+        """Crea una identidad Google free o actualiza sus metadatos verificados.
+
+        No enlaza por email con usuarios de `/v1/signup`: esas direcciones nunca
+        fueron verificadas y hacerlo permitiría apropiarse de una cuenta ajena.
+        La identidad estable es exclusivamente el `sub` emitido por Google.
+        """
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM account_identities WHERE provider='google' AND subject=?",
+                    (subject,),
+                ).fetchone()
+                if existing is None:
+                    user_id = new_id("usr")
+                    account_id = new_id("acct")
+                    internal_api_key = secrets.token_urlsafe(48)
+                    self._conn.execute(
+                        "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier, created_at) "
+                        "VALUES(?,?,?,?,NULL,'free',?)",
+                        (user_id, name, email, hash_wrapper_key(internal_api_key), now),
+                    )
+                    self._conn.execute(
+                        "INSERT INTO account_identities("
+                        "id,user_id,provider,subject,email,email_verified,name,picture,created_at,updated_at"
+                        ") VALUES(?,?,?,?,?,1,?,?,?,?)",
+                        (account_id, user_id, "google", subject, email, name, picture, now, now),
+                    )
+                else:
+                    account_id = existing["id"]
+                    user_id = existing["user_id"]
+                    self._conn.execute(
+                        "UPDATE account_identities SET email=?, email_verified=1, name=?, picture=?, updated_at=? "
+                        "WHERE id=?",
+                        (email, name, picture, now, account_id),
+                    )
+                    self._conn.execute(
+                        "UPDATE users SET name=?, email=? WHERE id=?",
+                        (name, email, user_id),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        account = self.get_account_identity(account_id)
+        if account is None:  # pragma: no cover - defensa ante corrupción externa
+            raise RuntimeError("No se pudo leer la identidad Google recién guardada")
+        return account
+
+    def get_account_identity(self, account_id: str) -> dict | None:
+        row = self._one(
+            "SELECT a.*, u.tier, u.subscription_id FROM account_identities a "
+            "JOIN users u ON u.id=a.user_id WHERE a.id=?",
+            (account_id,),
+        )
+        return dict(row) if row else None
+
+    def create_account_session(
+        self,
+        *,
+        account_id: str,
+        device_id: str,
+        access_token: str,
+        refresh_token: str,
+        access_expires_at: float,
+        refresh_expires_at: float,
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO account_sessions("
+                "id,account_id,device_id,access_token_hash,refresh_token_hash,"
+                "access_expires_at,refresh_expires_at,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    new_id("ses"),
+                    account_id,
+                    device_id,
+                    _hash_account_token("access", access_token),
+                    _hash_account_token("refresh", refresh_token),
+                    access_expires_at,
+                    refresh_expires_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    def get_user_by_access_token(self, access_token: str) -> dict | None:
+        row = self._one(
+            "SELECT u.* FROM account_sessions s "
+            "JOIN account_identities a ON a.id=s.account_id "
+            "JOIN users u ON u.id=a.user_id "
+            "WHERE s.access_token_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>?",
+            (_hash_account_token("access", access_token), _now()),
+        )
+        return dict(row) if row else None
+
+    def rotate_account_session(
+        self,
+        *,
+        refresh_token: str,
+        device_id: str,
+        new_access_token: str,
+        new_refresh_token: str,
+        access_expires_at: float,
+        refresh_expires_at: float,
+    ) -> dict | None:
+        """Rota refresh+access atómicamente y rechaza reuso o cambio de dispositivo."""
+        now = _now()
+        refresh_hash = _hash_account_token("refresh", refresh_token)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                session = self._conn.execute(
+                    "SELECT * FROM account_sessions WHERE refresh_token_hash=? "
+                    "AND device_id=? AND revoked_at IS NULL AND refresh_expires_at>?",
+                    (refresh_hash, device_id, now),
+                ).fetchone()
+                if session is None:
+                    self._conn.rollback()
+                    return None
+                self._conn.execute(
+                    "UPDATE account_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+                    (now, session["id"]),
+                )
+                self._conn.execute(
+                    "INSERT INTO account_sessions("
+                    "id,account_id,device_id,access_token_hash,refresh_token_hash,"
+                    "access_expires_at,refresh_expires_at,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        new_id("ses"),
+                        session["account_id"],
+                        device_id,
+                        _hash_account_token("access", new_access_token),
+                        _hash_account_token("refresh", new_refresh_token),
+                        access_expires_at,
+                        refresh_expires_at,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_account_identity(session["account_id"])
+
+    def revoke_account_session(self, access_token: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE account_sessions SET revoked_at=? "
+                "WHERE access_token_hash=? AND revoked_at IS NULL",
+                (_now(), _hash_account_token("access", access_token)),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def list_users(self) -> list[dict]:
         return [dict(r) for r in self._q("SELECT * FROM users ORDER BY created_at")]

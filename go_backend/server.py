@@ -1,6 +1,11 @@
 """Servidor HTTP del wrapper backend.
 
 Endpoints publicos (Bearer = api key del usuario del wrapper):
+  POST /v1/account-auth/start    Iniciar login con Google
+  GET  /v1/account-auth/status  Consultar login desde Electron
+  GET  /v1/account-auth/google/callback
+  POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
+  POST /v1/account-auth/logout   Revocar la sesión actual
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
   POST /v1/byok            El usuario registra su propia key de Go
   GET  /v1/models          Catalogo de modelos (proxy a Go)
@@ -39,12 +44,13 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .connectors import ConnectorBroker, ConnectorBrokerError
 from .go_prices import estimate_cost_usd
+from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
     PiHarness,
@@ -129,6 +135,12 @@ class Config:
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
         self.admin_token = (os.environ.get("ADMIN_TOKEN") or "").strip() or None
+        self.google_oauth_client_id = (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
+        self.google_oauth_client_secret = (os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
+        self.google_oauth_redirect_uri = (os.environ.get("GOOGLE_OAUTH_REDIRECT_URI") or "").strip() or None
+        self.account_access_ttl_seconds = int(os.environ.get("ACCOUNT_ACCESS_TTL_SECONDS", "900"))
+        self.account_refresh_ttl_seconds = int(os.environ.get("ACCOUNT_REFRESH_TTL_SECONDS", str(30 * 86400)))
+        self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
         self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
         self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
         self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
@@ -195,6 +207,26 @@ def error_response(handler: BaseHTTPRequestHandler, status: int, message: str, c
     json_response(handler, status, {"error": {"message": message, "type": code or "error"}})
 
 
+def empty_redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
+    handler.send_response(303)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Referrer-Policy", "no-referrer")
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
+
+
+def html_response(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Referrer-Policy", "no-referrer")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -202,6 +234,15 @@ class Backend:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
+        self.google_auth = GoogleAccountAuth(
+            store=self.store,
+            client_id=cfg.google_oauth_client_id,
+            client_secret=cfg.google_oauth_client_secret,
+            redirect_uri=cfg.google_oauth_redirect_uri,
+            access_ttl_seconds=cfg.account_access_ttl_seconds,
+            refresh_ttl_seconds=cfg.account_refresh_ttl_seconds,
+            attempt_ttl_seconds=cfg.account_auth_attempt_ttl_seconds,
+        )
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
@@ -252,9 +293,9 @@ class Backend:
         if not key:
             error_response(handler, 401, "Falta Authorization: Bearer <api_key>", "unauthorized")
             return None
-        user = self.store.get_user_by_api_key(key)
+        user = self.store.get_user_by_api_key(key) or self.google_auth.authenticate(key)
         if not user:
-            error_response(handler, 401, "API key del wrapper invalida", "unauthorized")
+            error_response(handler, 401, "Sesión o API key del wrapper inválida", "unauthorized")
             return None
         return user
 
@@ -267,6 +308,48 @@ class Backend:
         return True
 
     # ---------- signup ----------
+    def handle_account_auth_start(self, handler: BaseHTTPRequestHandler) -> None:
+        body = self.read_json(handler) or {}
+        result = self.google_auth.start(
+            device_id=body.get("device_id") if isinstance(body.get("device_id"), str) else "",
+            app_version=body.get("app_version") if isinstance(body.get("app_version"), str) else "",
+            remote_key=handler.client_address[0],
+        )
+        json_response(handler, 201, result)
+
+    def handle_account_auth_status(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str, query: dict[str, list[str]]
+    ) -> None:
+        device_id = (query.get("device_id") or [""])[0]
+        json_response(
+            handler,
+            200,
+            self.google_auth.status(attempt_id=attempt_id, device_id=device_id),
+        )
+
+    def handle_account_auth_callback(
+        self, handler: BaseHTTPRequestHandler, query: dict[str, list[str]]
+    ) -> None:
+        self.google_auth.callback(query)
+        empty_redirect(handler, "/v1/account-auth/complete")
+
+    def handle_account_auth_refresh(self, handler: BaseHTTPRequestHandler) -> None:
+        refresh_token = self.bearer(handler) or ""
+        body = self.read_json(handler) or {}
+        result = self.google_auth.refresh(
+            refresh_token=refresh_token,
+            device_id=body.get("device_id") if isinstance(body.get("device_id"), str) else "",
+            remote_key=handler.client_address[0],
+        )
+        json_response(handler, 200, result)
+
+    def handle_account_auth_logout(self, handler: BaseHTTPRequestHandler) -> None:
+        access_token = self.bearer(handler) or ""
+        if not access_token or not self.google_auth.logout(access_token):
+            error_response(handler, 401, "La sesión ya no es válida", "unauthorized")
+            return
+        json_response(handler, 200, {"revoked": True})
+
     def handle_signup(self, handler: BaseHTTPRequestHandler) -> None:
         body = self.read_json(handler) or {}
         name = body.get("name")
@@ -789,7 +872,20 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         backend = self.backend
         try:
-            if self.command == "POST" and path == "/v1/signup":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if self.command == "POST" and path == "/v1/account-auth/start":
+                backend.handle_account_auth_start(self)
+            elif self.command == "GET" and path.startswith("/v1/account-auth/status/"):
+                backend.handle_account_auth_status(self, path.rsplit("/", 1)[-1], query)
+            elif self.command == "GET" and path == "/v1/account-auth/google/callback":
+                backend.handle_account_auth_callback(self, query)
+            elif self.command == "GET" and path == "/v1/account-auth/complete":
+                html_response(self, 200, completion_html())
+            elif self.command == "POST" and path == "/v1/account-auth/refresh":
+                backend.handle_account_auth_refresh(self)
+            elif self.command == "POST" and path == "/v1/account-auth/logout":
+                backend.handle_account_auth_logout(self)
+            elif self.command == "POST" and path == "/v1/signup":
                 backend.handle_signup(self)
             elif self.command == "POST" and path == "/v1/byok":
                 backend.handle_byok(self)
@@ -822,7 +918,11 @@ class Handler(BaseHTTPRequestHandler):
             elif self.command == "GET" and path == "/admin/usage":
                 backend.handle_admin_usage(self)
             elif path == "/healthz":
-                json_response(self, 200, {"ok": True, "version": __version__})
+                json_response(self, 200, {
+                    "ok": True,
+                    "version": __version__,
+                    "google_auth_configured": backend.google_auth.configured,
+                })
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
         except (BrokenPipeError, ConnectionResetError):
@@ -831,6 +931,8 @@ class Handler(BaseHTTPRequestHandler):
             error_response(self, 413, str(e), "body_too_large")
         except RequestBodyError as e:
             error_response(self, 400, str(e), "bad_body")
+        except GoogleAuthError as e:
+            error_response(self, e.status, str(e), e.code)
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:
                 error_response(self, 500, f"Error interno: {e}", "internal_error")

@@ -154,6 +154,25 @@ test("opens personalization from the bot avatar instead of after bot creation", 
   assert.match(renderer, /function closeBotSettings\(\): void/);
 });
 
+test("matches the conversation shell with bot search, plus-only creation, and composer", async () => {
+  const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
+  assert.match(renderer, /class="sidebar-search"/);
+  assert.match(renderer, /class="sidebar-new-button"/);
+  assert.doesNotMatch(renderer, /class="sidebar-draft/);
+  assert.match(renderer, /function botSidebarPreview/);
+  assert.match(renderer, /function renderMessageComposer/);
+  assert.match(renderer, /\$\{renderMessageComposer\(bot\.name\)\}/);
+});
+
+test("keeps the first-bot builder but creates later bots immediately with defaults", async () => {
+  const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
+  assert.match(renderer, /async function createDefaultBot\(\): Promise<void>/);
+  assert.match(renderer, /if \(!state\.bots\.length\)[\s\S]{0,180}activeView = "bot-builder"/);
+  assert.match(renderer, /name: "Nuevo bot",\s+color: BOT_COLORS\[6\],\s+shape: BOT_SHAPES\[0\]/);
+  assert.match(renderer, /\[data-new-bot\][\s\S]{0,150}createDefaultBot\(\)/);
+  assert.match(renderer, /#new-bot-from-detail[\s\S]{0,120}createDefaultBot\(\)/);
+});
+
 test("opens a post-onboarding plugin marketplace and derives Yours from installed connectors", async () => {
   const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
   assert.match(renderer, /type View = "connectors" \| "plugins"/);
@@ -185,12 +204,18 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
     readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
   ]);
   assert.match(oauth, /safeStorage\.encryptString/);
+  assert.match(oauth, /agent-genia-account\.bin/);
+  assert.match(oauth, /agent-genia-connectors-account\.bin/);
+  assert.match(oauth, /accountClient/);
+  assert.match(oauth, /connectorClient/);
   assert.match(oauth, /owner_account_id/);
   assert.match(oauth, /managed_connection_id/);
   assert.match(oauth, /\/v1\/connectors\/start/);
   assert.match(oauth, /COMPOSIO_CONNECTOR_IDS/);
   assert.match(oauth, /https:\/\/outcome-service\.onrender\.com|baseUrl/);
   assert.match(main, /DesktopOAuthController/);
+  assert.match(main, /WRAPPER_SERVICE_URL/);
+  assert.match(main, /OUTCOME_SERVICE_URL/);
   assert.match(preload, /connectConnector/);
   assert.doesNotMatch(preload, /access_token|refresh_token|client_secret/);
   assert.match(renderer, /Próximamente/);
