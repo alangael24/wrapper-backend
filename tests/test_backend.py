@@ -27,6 +27,7 @@ from go_backend.server import (  # noqa: E402
     UnsafeConfigurationError,
     serve,
 )
+from go_backend.connectors import ConnectorBroker, ConnectorBrokerError  # noqa: E402
 from go_backend.store import NoSubscriptionAvailable, Store  # noqa: E402
 
 
@@ -157,6 +158,7 @@ class WrapperServer:
         self.backend.pi.enabled = True
         self.backend.pi.binary = str(fake_pi)
         self.backend.pi.backend_url = self.base
+        self.backend.pi.connector_broker_url = self.base
         self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
         self.backend.pi.timeout_seconds = 5
         if browser:
@@ -229,6 +231,19 @@ class WrapperServer:
             if include_headers:
                 return e.code, parsed, dict(e.headers)
             return e.code, parsed
+
+
+class FakeGitHubAdapter:
+    def __init__(self, connected_user_id: str):
+        self.connected_user_id = connected_user_id
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def is_connected(self, user_id: str) -> bool:
+        return user_id == self.connected_user_id
+
+    def execute(self, user_id: str, operation: str, arguments: dict):
+        self.calls.append((user_id, operation, arguments))
+        return {"items": [{"name": "wrapper-backend", "private": True}]}
 
 
 class TestBackend(unittest.TestCase):
@@ -913,6 +928,9 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(info["enabled"])
         self.assertTrue(info["image_input"])
+        self.assertTrue(info["connectors_available"])
+        self.assertEqual(info["connector_tool_loading"], "dynamic")
+        self.assertEqual(info["connector_auth_scope"], "ephemeral_run")
         self.assertTrue(info["vision"]["enabled"])
         self.assertEqual(info["vision"]["primary_model"], "gpt-5.6-luna")
         self.assertNotIn("binary", info)
@@ -947,6 +965,132 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
 
+    def test_connector_broker_scopes_catalog_and_execution_to_run_grant(self):
+        signup = self.new_user()
+        user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
+        adapter = FakeGitHubAdapter(user["id"])
+        self.ws.backend.connectors.register_adapter("github", adapter)
+        token = self.ws.backend.connectors.issue(
+            user_id=user["id"], connector_ids=("github", "google-workspace")
+        )
+        internal_headers = {"X-Connector-Run-Token": token}
+
+        status, catalog = self.ws.req(
+            "GET", "/v1/internal/connectors/catalog", headers=internal_headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["id"] for item in catalog["connectors"]],
+            ["github", "google-workspace"],
+        )
+        github = next(item for item in catalog["connectors"] if item["id"] == "github")
+        google = next(
+            item for item in catalog["connectors"] if item["id"] == "google-workspace"
+        )
+        self.assertTrue(github["connected"])
+        self.assertFalse(google["connected"])
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/internal/connectors/execute",
+            {
+                "connector_id": "github",
+                "operation": "search_repositories",
+                "arguments": {"query": "wrapper"},
+            },
+            headers=internal_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["result"]["items"][0]["name"], "wrapper-backend")
+        self.assertEqual(adapter.calls, [(user["id"], "search_repositories", {"query": "wrapper"})])
+
+        status, body = self.ws.req(
+            "POST",
+            "/v1/internal/connectors/execute",
+            {"connector_id": "slack", "operation": "list_channels", "arguments": {}},
+            headers=internal_headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["type"], "connector_forbidden")
+
+        self.ws.backend.connectors.revoke(token)
+        status, body = self.ws.req(
+            "GET", "/v1/internal/connectors/catalog", headers=internal_headers
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "connector_token_invalid")
+
+    def test_connector_grant_expires_without_server_restart(self):
+        clock = [100.0]
+        broker = ConnectorBroker(default_ttl_seconds=5, now=lambda: clock[0])
+        token = broker.issue(user_id="user-a", connector_ids=("github",))
+        self.assertEqual(broker.catalog(token)[0]["id"], "github")
+        clock[0] = 106.0
+        with self.assertRaises(ConnectorBrokerError) as error:
+            broker.catalog(token)
+        self.assertEqual(error.exception.status, 401)
+        self.assertEqual(error.exception.code, "connector_token_invalid")
+
+    def test_pi_connectors_are_passed_to_child_and_revoked_after_run(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        captured_tokens: list[str] = []
+        original_issue = self.ws.backend.connectors.issue
+
+        def issue_and_capture(**kwargs):
+            token = original_issue(**kwargs)
+            captured_tokens.append(token)
+            return token
+
+        self.ws.backend.connectors.issue = issue_and_capture
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "consulta mis repositorios y calendario",
+                "connector_ids": ["github", "google-workspace", "github"],
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["connector_ids"], ["github", "google-workspace"])
+        run_dir = self.ws.backend.pi.runs_dir / result["run_id"]
+        catalog = json.loads((run_dir / "config" / "connector-catalog.json").read_text())
+        self.assertEqual(
+            [item["id"] for item in catalog["connectors"]],
+            ["github", "google-workspace"],
+        )
+        self.assertEqual(len(captured_tokens), 1)
+        status, body = self.ws.req(
+            "GET",
+            "/v1/internal/connectors/catalog",
+            headers={"X-Connector-Run-Token": captured_tokens[0]},
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "connector_token_invalid")
+
+        command = self.ws.backend.pi._command(browser=False)
+        extension_paths = [
+            command[index + 1]
+            for index, value in enumerate(command[:-1])
+            if value == "--extension"
+        ]
+        self.assertEqual(extension_paths, [str(Path("extensions/connectors/index.ts").resolve())])
+
+    def test_agent_rejects_unknown_connector_before_starting_pi(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        status, body = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {"prompt": "haz algo", "connector_ids": ["unknown-provider"]},
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "bad_connector")
+
     def test_pi_chrome_uses_a_fresh_profile_and_bridge_for_each_run(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
@@ -969,8 +1113,14 @@ class TestBackend(unittest.TestCase):
             )
         )
         command = self.ws.backend.pi._command(browser=True)
-        self.assertIn("--extension", command)
-        self.assertTrue(command[command.index("--extension") + 1].endswith("index.ts"))
+        extension_paths = [
+            command[index + 1]
+            for index, value in enumerate(command[:-1])
+            if value == "--extension"
+        ]
+        self.assertEqual(len(extension_paths), 2)
+        self.assertEqual(extension_paths[0], str(Path("extensions/connectors/index.ts").resolve()))
+        self.assertEqual(extension_paths[1], str(Path(self.ws.backend.pi.chrome_extension).resolve()))
 
         results = []
         for prompt in ("revisa la pagina", "abre otra sesion"):

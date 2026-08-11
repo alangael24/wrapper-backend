@@ -81,6 +81,8 @@ class PiHarness:
         max_prompt_chars: int,
         supports_images: bool = False,
         node_bin_dir: str | None = None,
+        connector_extension: str | None = None,
+        connector_broker_url: str | None = None,
         chrome_extension: str | None = None,
         chrome_auto_authorize: bool = False,
         chrome_authorize_minutes: int = 30,
@@ -98,6 +100,8 @@ class PiHarness:
         self.max_prompt_chars = max_prompt_chars
         self.supports_images = supports_images
         self.node_bin_dir = node_bin_dir
+        self.connector_extension = connector_extension
+        self.connector_broker_url = (connector_broker_url or backend_url).rstrip("/")
         self.chrome_extension = chrome_extension
         self.chrome_auto_authorize = chrome_auto_authorize
         self.chrome_authorize_minutes = chrome_authorize_minutes
@@ -117,6 +121,12 @@ class PiHarness:
         if not self.chrome_extension:
             return None
         path = Path(self.chrome_extension).expanduser()
+        return str(path.resolve()) if path.is_file() else None
+
+    def _resolved_connector_extension(self) -> str | None:
+        if not self.connector_extension:
+            return None
+        path = Path(self.connector_extension).expanduser()
         return str(path.resolve()) if path.is_file() else None
 
     def _resolved_chrome_companion(self) -> Path | None:
@@ -190,9 +200,19 @@ class PiHarness:
             "browser_auto_authorize": self.chrome_auto_authorize,
             "browser_isolation": self.chrome_isolation,
             "browser_profile_scope": "ephemeral_run",
+            "connectors_available": bool(self._resolved_connector_extension()),
+            "connector_tool_loading": "dynamic",
+            "connector_auth_scope": "ephemeral_run",
         }
 
-    def run(self, *, user_api_key: str, prompt: str, browser: bool = False) -> PiRunResult:
+    def run(
+        self,
+        *,
+        user_api_key: str,
+        prompt: str,
+        browser: bool = False,
+        connector_run_token: str | None = None,
+    ) -> PiRunResult:
         if not self.enabled:
             raise PiHarnessError("El harness de Pi esta desactivado (PI_ENABLED=0)")
         if not self._resolved_binary():
@@ -208,10 +228,17 @@ class PiHarness:
                 "Chrome requiere aislamiento per_run, Chrome for Testing/Chromium, "
                 "pi-chrome instalado y PI_CHROME_AUTO_AUTHORIZE=1"
             )
+        if connector_run_token and not self._resolved_connector_extension():
+            raise PiHarnessError("La extension de conectores no esta instalada")
         if not self._slots.acquire(blocking=False):
             raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
         try:
-            return self._run(user_api_key=user_api_key, prompt=prompt, browser=browser)
+            return self._run(
+                user_api_key=user_api_key,
+                prompt=prompt,
+                browser=browser,
+                connector_run_token=connector_run_token,
+            )
         finally:
             self._slots.release()
 
@@ -268,6 +295,7 @@ class PiHarness:
         config_dir: Path,
         user_api_key: str,
         chrome_bridge_port: int | None = None,
+        connector_run_token: str | None = None,
     ) -> dict[str, str]:
         # No heredar ADMIN_TOKEN, WRAPPER_SECRET ni otras API keys del servidor.
         runtime_path = os.environ.get("PATH", "/usr/bin:/bin")
@@ -288,6 +316,9 @@ class PiHarness:
         if chrome_bridge_port is not None:
             env["PI_CHROME_BRIDGE_HOST"] = "127.0.0.1"
             env["PI_CHROME_BRIDGE_PORT"] = str(chrome_bridge_port)
+        if connector_run_token is not None:
+            env["PI_CONNECTOR_BROKER_URL"] = self.connector_broker_url
+            env["PI_CONNECTOR_RUN_TOKEN"] = connector_run_token
         return env
 
     def _reserve_bridge_port(self) -> int:
@@ -409,12 +440,22 @@ class PiHarness:
             "--no-approve",
             "--offline",
         ]
+        connector_extension = self._resolved_connector_extension()
+        if connector_extension:
+            command.extend(["--extension", connector_extension])
         chrome_extension = self._resolved_chrome_extension()
         if browser and chrome_extension:
             command.extend(["--extension", chrome_extension])
         return command
 
-    def _run(self, *, user_api_key: str, prompt: str, browser: bool) -> PiRunResult:
+    def _run(
+        self,
+        *,
+        user_api_key: str,
+        prompt: str,
+        browser: bool,
+        connector_run_token: str | None,
+    ) -> PiRunResult:
         run_id = uuid.uuid4().hex
         run_dir = self.runs_dir / run_id
         config_dir = run_dir / "config"
@@ -461,6 +502,7 @@ class PiHarness:
                         config_dir,
                         user_api_key,
                         chrome_bridge_port=bridge_port,
+                        connector_run_token=connector_run_token,
                     ),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,

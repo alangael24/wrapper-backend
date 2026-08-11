@@ -8,13 +8,16 @@
     "build:desktop": "node desktop/build.mjs",
     "desktop": "pnpm build:desktop && electron .",
     "smoke:desktop": "pnpm build:desktop && electron . --smoke-test",
+    "test:connectors": "pnpm typecheck:connectors && node --test tests/test_connector_extension.mjs",
+    "typecheck:connectors": "tsc -p extensions/connectors/tsconfig.json",
     "typecheck:desktop": "tsc -p desktop/tsconfig.json --noEmit",
     "test:desktop": "pnpm typecheck:desktop && pnpm build:desktop && node --test tests/test_desktop.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.1",
     "pi-chrome": "0.15.46",
-    "simple-icons": "^15.15.0"
+    "simple-icons": "^15.15.0",
+    "typebox": "1.3.7"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

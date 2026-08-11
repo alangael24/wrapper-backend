@@ -104,8 +104,9 @@ asignarla al perfil del bot; **no se muestra como autenticada** hasta que exista
 un flujo OAuth/API específico para ese proveedor. La selección por sí sola no
 permite que una persona inicie sesión: para eso todavía se necesita registrar
 una app OAuth por proveedor, implementar callbacks y guardar tokens cifrados y
-aislados por usuario. Esta capa no modifica ni reconfigura
-`go_backend/pi_harness.py`.
+aislados por usuario. El runtime de Pi ya incluye el broker y la carga dinámica
+descritos abajo; un proveedor solo aparece conectado cuando el backend tiene
+registrado su adaptador autenticado para ese usuario.
 
 Cargar keys de Go al pool:
 
@@ -145,13 +146,46 @@ curl http://127.0.0.1:8787/v1/agent/status \
 curl -X POST http://127.0.0.1:8787/v1/agent/run \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Investiga tres proveedores y compara precio, MOQ y riesgos"}'
+  -d '{"prompt":"Revisa mis issues urgentes", "connector_ids":["github","linear"]}'
 ```
 
 El recorrido es `cliente → agent/run → Pi RPC → chat/completions → OpenCode Go`.
 Por eso las llamadas que hace Pi usan la suscripción asignada al
 usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
 propios bajo `PI_RUNS_DIR`.
+
+## Conectores nativos de Pi
+
+Pi carga `extensions/connectors/index.ts` como una extensión first-party. Para
+conservar el prompt cache y no mandar 18 esquemas de herramientas en cada turno,
+al inicio solo está activa `connector_search`. Cuando el modelo busca una
+capacidad, la extensión consulta el catálogo permitido para esa ejecución y
+activa aditivamente únicamente la herramienta correspondiente, por ejemplo
+`connector_github`.
+
+El aislamiento es por ejecución:
+
+1. El cliente envía `connector_ids` en `/v1/agent/run`; ids desconocidos se
+   rechazan antes de arrancar Pi.
+2. El backend crea un token aleatorio ligado al usuario y a esa lista cerrada.
+3. El proceso de Pi recibe solo la URL loopback del broker y ese token; no recibe
+   secretos OAuth, `ADMIN_TOKEN` ni la clave maestra del servidor.
+4. Los endpoints internos aceptan únicamente tráfico loopback y limitan cada
+   operación al grant. El token se revoca al terminar o fallar la tarea y además
+   tiene una expiración máxima de una hora.
+5. El adaptador del proveedor conserva y refresca sus credenciales dentro del
+   backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
+   con `connector_not_configured` o `connector_not_connected`.
+
+La extensión y el broker no inventan una sesión OAuth: son la ruta segura entre
+Pi y los adaptadores reales. Registrar las apps OAuth, callbacks y almacenamiento
+cifrado sigue siendo obligatorio por proveedor. La selección visual de un bot
+solamente determina el `connector_ids` que debe enviarse al ejecutar ese bot.
+
+```bash
+pnpm test:connectors
+python3 -m unittest tests.test_backend -v
+```
 
 ## Visión para DeepSeek
 
@@ -227,7 +261,7 @@ Públicos (Bearer = api key del usuario del wrapper):
 | GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
 | GET | `/v1/me` | Usuario, tier y suscripción asignada |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false}` y espera el resultado |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, connector_ids?: string[]}` y espera el resultado |
 
 Admin (Bearer = `ADMIN_TOKEN`):
 
@@ -282,6 +316,8 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `2` | Procesos Pi simultáneos |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
+| `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con `connector_search` y herramientas diferidas |
+| `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |
 | `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Extensión Pi de pi-chrome |
 | `PI_CHROME_BIN` | autodetectado | Ejecutable de Chrome for Testing/Chromium; no es una ruta de perfil |
 | `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
@@ -328,5 +364,6 @@ signup siempre-free, activación admin, carrera de asignación, rechazo del toke
 inseguro, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
 cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
-falso, el puente Luna/MiMo y el aislamiento de proceso, perfil y bridge de
-pi-chrome, sin consumir saldo real.
+falso, el puente Luna/MiMo, los grants efímeros del broker, la carga dinámica de
+herramientas y el aislamiento de proceso, perfil y bridge de pi-chrome, sin
+consumir saldo real.

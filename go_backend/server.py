@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -42,6 +43,7 @@ from urllib.parse import urlparse
 
 from . import __version__
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
+from .connectors import ConnectorBroker, ConnectorBrokerError
 from .go_prices import estimate_cost_usd
 from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
@@ -65,6 +67,9 @@ DEFAULT_PI_CHROME_EXTENSION = (
     / "extensions"
     / "chrome-profile-bridge"
     / "index.ts"
+)
+DEFAULT_PI_CONNECTOR_EXTENSION = (
+    Path(__file__).resolve().parent.parent / "extensions" / "connectors" / "index.ts"
 )
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
@@ -153,6 +158,18 @@ class Config:
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "2"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
         self.pi_node_bin_dir = os.environ.get("PI_NODE_BIN_DIR") or None
+        if "PI_CONNECTOR_EXTENSION" in os.environ:
+            self.pi_connector_extension = os.environ.get("PI_CONNECTOR_EXTENSION") or None
+        else:
+            self.pi_connector_extension = str(DEFAULT_PI_CONNECTOR_EXTENSION)
+        default_connector_ttl = (
+            min(3600, self.pi_timeout_seconds + 60)
+            if self.pi_timeout_seconds > 0
+            else 3600
+        )
+        self.pi_connector_token_ttl_seconds = int(
+            os.environ.get("PI_CONNECTOR_TOKEN_TTL_SECONDS", str(default_connector_ttl))
+        )
         if "PI_CHROME_EXTENSION" in os.environ:
             self.pi_chrome_extension = os.environ.get("PI_CHROME_EXTENSION") or None
         else:
@@ -185,6 +202,9 @@ class Backend:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
+        self.connectors = ConnectorBroker(
+            default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
+        )
         self.vision = VisionRouter(
             enabled=cfg.vision_enabled,
             base_url=cfg.go_base_url,
@@ -211,6 +231,8 @@ class Backend:
             max_prompt_chars=cfg.pi_max_prompt_chars,
             supports_images=self.vision.supports_model(cfg.pi_model),
             node_bin_dir=cfg.pi_node_bin_dir,
+            connector_extension=cfg.pi_connector_extension,
+            connector_broker_url=cfg.pi_backend_url,
             chrome_extension=cfg.pi_chrome_extension,
             chrome_auto_authorize=cfg.pi_chrome_auto_authorize,
             chrome_authorize_minutes=cfg.pi_chrome_authorize_minutes,
@@ -475,11 +497,17 @@ class Backend:
         body = self.read_json(handler) or {}
         prompt = body.get("prompt")
         browser = body.get("browser", False)
+        connector_ids_value = body.get("connector_ids", [])
         if not isinstance(prompt, str) or not prompt.strip():
             error_response(handler, 400, "Envia un prompt de texto no vacio", "bad_prompt")
             return
         if not isinstance(browser, bool):
             error_response(handler, 400, "browser debe ser true o false", "bad_browser")
+            return
+        try:
+            connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
+        except ConnectorBrokerError as e:
+            error_response(handler, e.status, str(e), e.code)
             return
 
         pi_status = self.pi.status()
@@ -494,18 +522,86 @@ class Backend:
         ):
             error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
             return
+        if connector_ids and not pi_status["connectors_available"]:
+            error_response(
+                handler,
+                409,
+                "La extension TypeScript de conectores no esta instalada",
+                "pi_connectors_unavailable",
+            )
+            return
 
         api_key = self.bearer(handler)
         assert api_key is not None
+        connector_run_token = (
+            self.connectors.issue(user_id=user["id"], connector_ids=connector_ids)
+            if connector_ids
+            else None
+        )
         try:
-            result = self.pi.run(user_api_key=api_key, prompt=prompt, browser=browser)
+            result = self.pi.run(
+                user_api_key=api_key,
+                prompt=prompt,
+                browser=browser,
+                connector_run_token=connector_run_token,
+            )
         except PiHarnessBusy as e:
             error_response(handler, 429, str(e), "pi_busy")
             return
         except PiHarnessError as e:
             error_response(handler, 502, str(e), "pi_error")
             return
-        json_response(handler, 200, result.as_dict())
+        finally:
+            self.connectors.revoke(connector_run_token)
+        payload = result.as_dict()
+        payload["connector_ids"] = list(connector_ids)
+        json_response(handler, 200, payload)
+
+    # ---------- broker interno de conectores ----------
+    @staticmethod
+    def _is_loopback_request(handler: BaseHTTPRequestHandler) -> bool:
+        try:
+            return ipaddress.ip_address(handler.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _connector_token(self, handler: BaseHTTPRequestHandler) -> str | None:
+        if not self._is_loopback_request(handler):
+            error_response(handler, 403, "El broker solo acepta trafico loopback", "connector_loopback_only")
+            return None
+        token = (handler.headers.get("X-Connector-Run-Token") or "").strip()
+        if not token:
+            error_response(handler, 401, "Falta el token interno de ejecucion", "connector_token_required")
+            return None
+        return token
+
+    def handle_connector_catalog(self, handler: BaseHTTPRequestHandler) -> None:
+        token = self._connector_token(handler)
+        if not token:
+            return
+        try:
+            connectors = self.connectors.catalog(token)
+        except ConnectorBrokerError as e:
+            error_response(handler, e.status, str(e), e.code)
+            return
+        json_response(handler, 200, {"connectors": connectors})
+
+    def handle_connector_execute(self, handler: BaseHTTPRequestHandler) -> None:
+        token = self._connector_token(handler)
+        if not token:
+            return
+        body = self.read_json(handler) or {}
+        try:
+            result = self.connectors.execute(
+                token=token,
+                connector_id=body.get("connector_id"),
+                operation=body.get("operation"),
+                arguments=body.get("arguments", {}),
+            )
+        except ConnectorBrokerError as e:
+            error_response(handler, e.status, str(e), e.code)
+            return
+        json_response(handler, 200, result)
 
     # ---------- body helpers ----------
     def read_body(self, handler: BaseHTTPRequestHandler) -> bytes:
@@ -709,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_status(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
+            elif self.command == "GET" and path == "/v1/internal/connectors/catalog":
+                backend.handle_connector_catalog(self)
+            elif self.command == "POST" and path == "/v1/internal/connectors/execute":
+                backend.handle_connector_execute(self)
             elif self.command == "POST" and path == "/admin/subscriptions":
                 backend.handle_admin_add_subscriptions(self)
             elif self.command == "GET" and path == "/admin/subscriptions":
