@@ -1,7 +1,7 @@
 """Servidor HTTP del wrapper backend.
 
 Endpoints publicos (Bearer = api key del usuario del wrapper):
-  POST /v1/signup          Crear usuario (tier: free|basic|pro) + asignar sub Go si aplica
+  POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
   POST /v1/byok            El usuario registra su propia key de Go
   GET  /v1/models          Catalogo de modelos (proxy a Go)
   POST /v1/chat/completions
@@ -44,8 +44,8 @@ from . import __version__
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .go_prices import estimate_cost_usd
 from .pi_harness import PiHarness, PiHarnessBusy, PiHarnessError
-from .tiers import DEFAULT_TIER, SIGNUP_TIERS, effective_limits, is_valid, requires_subscription, tier_label
-from .store import Store, new_id
+from .tiers import DEFAULT_TIER, effective_limits, is_valid, requires_subscription, tier_label
+from .store import NoSubscriptionAvailable, Store, new_id
 from .upstream import DEFAULT_UA, proxy_request
 from .vision import VisionError, VisionRouter
 
@@ -63,6 +63,7 @@ DEFAULT_PI_CHROME_EXTENSION = (
 )
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
+UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 
 # Rutas expuestas por el wrapper -> rutas relativas al upstream de Go
 UPSTREAM_PATHS = {
@@ -87,6 +88,19 @@ class RequestBodyTooLarge(RequestBodyError):
     pass
 
 
+class UnsafeConfigurationError(RuntimeError):
+    pass
+
+
+def validate_admin_token(admin_token: str | None) -> None:
+    """Impide arrancar con secretos publicados en ejemplos o documentación."""
+    if admin_token and admin_token.strip().lower() in UNSAFE_ADMIN_TOKENS:
+        raise UnsafeConfigurationError(
+            "ADMIN_TOKEN usa el valor inseguro de ejemplo 'cambia-este-token'. "
+            "Genera un secreto aleatorio antes de arrancar."
+        )
+
+
 class Config:
     def __init__(self):
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
@@ -95,7 +109,7 @@ class Config:
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
-        self.admin_token = os.environ.get("ADMIN_TOKEN") or None
+        self.admin_token = (os.environ.get("ADMIN_TOKEN") or "").strip() or None
         self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
         self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
         self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
@@ -214,24 +228,11 @@ class Backend:
         body = self.read_json(handler) or {}
         name = body.get("name")
         email = body.get("email")
-        tier = str(body.get("tier") or DEFAULT_TIER).lower()
-        if not is_valid(tier):
-            error_response(handler, 400, f"Tier invalido: {tier}. Opciones: {', '.join(SIGNUP_TIERS)}", "bad_tier")
-            return
-        sub = None
-        if requires_subscription(tier):
-            sub = self.store.next_available()
-            if sub is None:
-                error_response(
-                    handler, 409,
-                    "No hay suscripciones de OpenCode Go disponibles. El operador debe "
-                    "agregar keys al pool (POST /admin/subscriptions o `add-key`).",
-                    "no_subscriptions_available",
-                )
-                return
+        # El cliente nunca decide su tier. Los upgrades pagados solo pueden
+        # ocurrir mediante un webhook de pago verificado o el endpoint admin.
+        tier = DEFAULT_TIER
         api_key = secrets.token_hex(32)
-        user = self.store.create_user(api_key, name, email,
-                                      subscription_id=sub["id"] if sub else None, tier=tier)
+        user = self.store.create_user(api_key, name, email, tier=tier)
         json_response(handler, 201, {
             "api_key": api_key,
             "user_id": user["id"],
@@ -239,10 +240,13 @@ class Backend:
             "tier": tier,
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
-            "subscription_id": sub["id"] if sub else None,
-            "subscription_status": "assigned" if sub else "none",
+            "subscription_id": None,
+            "subscription_status": "none",
             "available_left": self.store.available_count(),
-            "note": "Guarda el api_key; no se puede volver a mostrar.",
+            "note": (
+                "Guarda el api_key; no se puede volver a mostrar. La cuenta inicia en free; "
+                "basic/pro se activan exclusivamente después de verificar el pago."
+            ),
         })
 
     def handle_byok(self, handler: BaseHTTPRequestHandler) -> None:
@@ -588,9 +592,7 @@ class Backend:
         if not user:
             error_response(handler, 404, "Usuario no encontrado", "not_found")
             return
-        if user["subscription_id"]:
-            self.store.revoke_subscription(user["subscription_id"])
-            self.store.update_user_subscription(user_id, None)
+        self.store.transition_user_tier(user_id, "free", needs_subscription=False)
         json_response(handler, 200, {"revoked": True, "user_id": user_id})
 
     def handle_admin_set_tier(self, handler: BaseHTTPRequestHandler, user_id: str) -> None:
@@ -605,21 +607,24 @@ class Backend:
         if not is_valid(tier):
             error_response(handler, 400, f"Tier invalido: {tier}", "bad_tier")
             return
-        if requires_subscription(tier) and not user["subscription_id"]:
-            sub = self.store.next_available()
-            if sub is None:
-                error_response(handler, 409, "No hay suscripciones disponibles para asignar al subir de tier", "no_subscriptions_available")
-                return
-            self.store.update_user_subscription(user_id, sub["id"])
-        elif not requires_subscription(tier) and user["subscription_id"]:
-            self.store.revoke_subscription(user["subscription_id"])
-            self.store.update_user_subscription(user_id, None)
-        self.store.set_user_tier(user_id, tier)
-        updated = self.store.get_user_by_id(user_id)
+        try:
+            updated = self.store.transition_user_tier(
+                user_id,
+                tier,
+                needs_subscription=requires_subscription(tier),
+            )
+        except NoSubscriptionAvailable:
+            error_response(
+                handler,
+                409,
+                "No hay suscripciones disponibles para asignar al subir de tier",
+                "no_subscriptions_available",
+            )
+            return
         json_response(handler, 200, {
             "user_id": user_id,
             "tier": tier,
-            "subscription_id": updated["subscription_id"] if updated else None,
+            "subscription_id": updated["subscription_id"],
         })
 
     def handle_admin_usage(self, handler: BaseHTTPRequestHandler) -> None:
@@ -719,6 +724,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(cfg: Config) -> None:
+    validate_admin_token(cfg.admin_token)
     if not cfg.admin_token:
         cfg.admin_token = secrets.token_hex(16)
         print(f"[config] ADMIN_TOKEN no definido; generado: {cfg.admin_token}", file=sys.stderr)
@@ -758,11 +764,17 @@ def cli() -> None:
         cfg.port = args.port
         if "PI_BACKEND_URL" not in os.environ:
             cfg.pi_backend_url = f"http://127.0.0.1:{cfg.port}"
+    if args.cmd == "serve":
+        try:
+            serve(cfg)
+        except UnsafeConfigurationError as exc:
+            print(f"[config] {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return
+
     backend = Backend(cfg)
     if args.cmd == "init-db":
         print(f"[ok] base de datos en {cfg.db_path}")
-    elif args.cmd == "serve":
-        serve(cfg)
     elif args.cmd == "users":
         for u in backend.store.list_users():
             print(u["id"], "|", u.get("name") or "-", "|", u.get("email") or "-",

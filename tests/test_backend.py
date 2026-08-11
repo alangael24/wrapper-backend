@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import http.client
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -19,8 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from go_backend.server import Config, Backend, Handler, serve  # noqa: E402
-from go_backend.store import Store  # noqa: E402
+from go_backend.server import (  # noqa: E402
+    Backend,
+    Config,
+    Handler,
+    UnsafeConfigurationError,
+    serve,
+)
+from go_backend.store import NoSubscriptionAvailable, Store  # noqa: E402
 
 
 class MockUpstream(BaseHTTPRequestHandler):
@@ -216,10 +223,21 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 201)
         return body
 
-    def new_user(self, name=None):
-        self.add_pool_keys(1)
+    def new_user(self, name=None, tier="pro"):
         status, signup = self.ws.req("POST", "/v1/signup", {"name": name} if name else {})
         self.assertEqual(status, 201)
+        self.assertEqual(signup["tier"], "free")
+        if tier != "free":
+            self.add_pool_keys(1)
+            status, upgraded = self.ws.req(
+                "POST",
+                f"/admin/users/{signup['user_id']}/tier",
+                {"tier": tier},
+                headers=self.ws.admin_headers,
+            )
+            self.assertEqual(status, 200)
+            signup["tier"] = tier
+            signup["subscription_id"] = upgraded["subscription_id"]
         return signup
 
     def image_data_url(self):
@@ -237,39 +255,43 @@ class TestBackend(unittest.TestCase):
         return payloads
 
     # ---------- pool / signup ----------
-    def test_signup_assigns_subscription(self):
+    def test_public_signup_always_free_and_never_consumes_pool(self):
         ws = self.ws
-        # pool vacio -> 409
-        status, body = ws.req("POST", "/v1/signup", {"name": "a"})
-        self.assertEqual(status, 409)
-        # agregar 2 keys al pool
-        body = self.add_pool_keys(2, prefix="sk-go-x")
-        self.assertEqual(len(body["created"]), 2)
-        # primer signup -> asigna una
-        status, body = ws.req("POST", "/v1/signup", {"name": "usuario-uno", "email": "u1@x.com"})
-        self.assertEqual(status, 201)
-        self.assertIn("api_key", body)
-        self.assertTrue(body["api_key"].startswith("test") or len(body["api_key"]) == 64)
-        self.assertEqual(body["subscription_status"], "assigned")
-        self.assertEqual(body["available_left"], 1)
-        # segundo signup -> asigna la segunda
-        status2, body2 = ws.req("POST", "/v1/signup", {"name": "usuario-dos"})
-        self.assertEqual(status2, 201)
-        self.assertEqual(body2["available_left"], 0)
-        # pool vacio otra vez -> 409
-        status3, _ = ws.req("POST", "/v1/signup", {"name": "usuario-tres"})
-        self.assertEqual(status3, 409)
+        created = self.add_pool_keys(2, prefix="sk-go-x")
+        self.assertEqual(len(created["created"]), 2)
+
+        for requested_tier in (None, "basic", "pro", "ultra"):
+            payload = {"name": f"usuario-{requested_tier or 'default'}"}
+            if requested_tier is not None:
+                payload["tier"] = requested_tier
+            status, body = ws.req("POST", "/v1/signup", payload)
+            self.assertEqual(status, 201)
+            self.assertIn("api_key", body)
+            self.assertEqual(len(body["api_key"]), 64)
+            self.assertEqual(body["tier"], "free")
+            self.assertIsNone(body["subscription_id"])
+            self.assertEqual(body["subscription_status"], "none")
+            self.assertEqual(body["available_left"], 2)
+
+        self.assertEqual(ws.backend.store.available_count(), 2)
 
     def test_keys_encrypted_at_rest(self):
+        self.add_pool_keys(1)
         store = self.ws.backend.store
         for sub in store.list_subscriptions():
             blob = sub["api_key_enc"]
-            self.assertTrue(blob.startswith(b"aes:"))
+            self.assertTrue(blob.startswith((b"aes:", b"kc:")))
             self.assertNotIn(b"sk-go-", blob)
 
     def test_admin_auth_required(self):
         status, _ = self.ws.req("POST", "/admin/subscriptions", {"keys": ["x"]})
         self.assertEqual(status, 401)
+
+    def test_server_rejects_published_example_admin_token(self):
+        cfg = Config()
+        cfg.admin_token = "  CAMBIA-ESTE-TOKEN  "
+        with self.assertRaisesRegex(UnsafeConfigurationError, "valor inseguro de ejemplo"):
+            serve(cfg)
 
     def test_models_proxy(self):
         ws = self.ws
@@ -612,6 +634,14 @@ class TestBackend(unittest.TestCase):
         ws = self.ws
         ws.req("POST", "/admin/subscriptions", {"keys": ["sk-go-zzz"]}, ws.admin_headers)
         status, signup = ws.req("POST", "/v1/signup", {})
+        self.assertEqual(status, 201)
+        status, _ = ws.req(
+            "POST",
+            f"/admin/users/{signup['user_id']}/tier",
+            {"tier": "pro"},
+            headers=ws.admin_headers,
+        )
+        self.assertEqual(status, 200)
         user = ws.backend.store.get_user_by_api_key(signup["api_key"])
         status, body = ws.req("POST", f"/admin/users/{user['id']}/revoke", headers=ws.admin_headers)
         self.assertEqual(status, 200)
@@ -647,39 +677,120 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(usage["tier"], "free")
         self.assertEqual(usage["windows"]["5h"]["limit_usd"], 0.0)
 
-    def test_signup_tier_invalid(self):
-        status, body = self.ws.req("POST", "/v1/signup", {"tier": "ultra"})
-        self.assertEqual(status, 400)
-        self.assertEqual(body["error"]["type"], "bad_tier")
-
-    def test_signup_basic_pro_require_pool(self):
+    def test_paid_tiers_require_verified_admin_transition(self):
         ws = self.ws
-        # sin pool -> 409 para basic y pro
-        status, _ = ws.req("POST", "/v1/signup", {"tier": "basic"})
-        self.assertEqual(status, 409)
-        status, _ = ws.req("POST", "/v1/signup", {"tier": "pro"})
-        self.assertEqual(status, 409)
-        # con pool -> se asignan y el tier queda registrado
         self.add_pool_keys(2)
+
         status, basic = ws.req("POST", "/v1/signup", {"name": "b", "tier": "basic"})
         self.assertEqual(status, 201)
-        self.assertEqual(basic["tier"], "basic")
-        self.assertIsNotNone(basic["subscription_id"])
-        self.assertEqual(basic["limits"]["5h"], 6.0)
-        self.assertEqual(basic["limits"]["week"], 15.0)
-        self.assertEqual(basic["limits"]["month"], 30.0)
+        self.assertEqual(basic["tier"], "free")
+        self.assertIsNone(basic["subscription_id"])
+        status, basic_upgrade = ws.req(
+            "POST",
+            f"/admin/users/{basic['user_id']}/tier",
+            {"tier": "basic"},
+            headers=ws.admin_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(basic_upgrade["tier"], "basic")
+        self.assertIsNotNone(basic_upgrade["subscription_id"])
+
         status, pro = ws.req("POST", "/v1/signup", {"name": "p", "tier": "pro"})
         self.assertEqual(status, 201)
-        self.assertEqual(pro["tier"], "pro")
-        self.assertEqual(pro["limits"]["5h"], 12.0)
-        self.assertEqual(pro["limits"]["week"], 30.0)
-        self.assertEqual(pro["limits"]["month"], 60.0)
+        self.assertEqual(pro["tier"], "free")
+        self.assertIsNone(pro["subscription_id"])
+        status, pro_upgrade = ws.req(
+            "POST",
+            f"/admin/users/{pro['user_id']}/tier",
+            {"tier": "pro"},
+            headers=ws.admin_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(pro_upgrade["tier"], "pro")
+        self.assertIsNotNone(pro_upgrade["subscription_id"])
+
+        for signup, expected_tier, expected_limit in (
+            (basic, "basic", 6.0),
+            (pro, "pro", 12.0),
+        ):
+            headers = {"Authorization": f"Bearer {signup['api_key']}"}
+            status, me = ws.req("GET", "/v1/me", headers=headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(me["tier"], expected_tier)
+            self.assertEqual(me["limits"]["5h"], expected_limit)
+
+    def test_atomic_tier_transition_cannot_double_assign_subscription(self):
+        db_path = Path(self.tmp) / "race.sqlite"
+        store_a = Store(db_path)
+        store_b = Store(db_path)
+        user_a = store_a.create_user("race-api-a", "a", None)
+        user_b = store_a.create_user("race-api-b", "b", None)
+        store_a.add_subscription(b"encrypted", "race-key", "race", sub_id="sub_race")
+        barrier = threading.Barrier(3)
+        outcomes: list[tuple[str, str]] = []
+
+        def upgrade(store, user_id):
+            barrier.wait()
+            try:
+                store.transition_user_tier(user_id, "pro", needs_subscription=True)
+                outcomes.append((user_id, "assigned"))
+            except NoSubscriptionAvailable:
+                outcomes.append((user_id, "no_capacity"))
+
+        threads = [
+            threading.Thread(target=upgrade, args=(store_a, user_a["id"])),
+            threading.Thread(target=upgrade, args=(store_b, user_b["id"])),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(sorted(outcome for _, outcome in outcomes), ["assigned", "no_capacity"])
+        assigned_users = [
+            user for user in store_a.list_users() if user["subscription_id"] == "sub_race"
+        ]
+        self.assertEqual(len(assigned_users), 1)
+        subscription = store_a.get_subscription("sub_race")
+        self.assertEqual(subscription["assigned_user_id"], assigned_users[0]["id"])
+        index_sql = store_a._one(  # noqa: SLF001 - verifica la defensa del esquema
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='uniq_user_subscription'"
+        )["sql"]
+        self.assertIn("WHERE subscription_id IS NOT NULL", index_sql)
+
+    def test_existing_database_default_is_migrated_to_free(self):
+        db_path = Path(self.tmp) / "legacy.sqlite"
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            """CREATE TABLE users (
+              id TEXT PRIMARY KEY,
+              name TEXT,
+              email TEXT,
+              api_key_hash TEXT UNIQUE NOT NULL,
+              subscription_id TEXT,
+              tier TEXT NOT NULL DEFAULT 'basic',
+              created_at REAL NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO users VALUES('legacy', NULL, NULL, 'hash', NULL, 'basic', 1)"
+        )
+        connection.commit()
+        connection.close()
+
+        store = Store(db_path)
+        tier_column = next(
+            row for row in store._q("PRAGMA table_info(users)") if row["name"] == "tier"
+        )
+        self.assertEqual(tier_column["dflt_value"], "'free'")
+        self.assertEqual(store.get_user_by_id("legacy")["tier"], "basic")
 
     def test_usage_limits_basic_vs_pro(self):
         ws = self.ws
-        self.add_pool_keys(2)
-        _, basic = ws.req("POST", "/v1/signup", {"tier": "basic"})
-        _, pro = ws.req("POST", "/v1/signup", {"tier": "pro"})
+        basic = self.new_user(tier="basic")
+        pro = self.new_user(tier="pro")
         basic_headers = {"Authorization": f"Bearer {basic['api_key']}"}
         pro_headers = {"Authorization": f"Bearer {pro['api_key']}"}
         basic_user = ws.backend.store.get_user_by_api_key(basic["api_key"])

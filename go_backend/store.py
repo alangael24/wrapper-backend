@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
   email           TEXT,
   api_key_hash    TEXT UNIQUE NOT NULL,
   subscription_id TEXT,
-  tier            TEXT NOT NULL DEFAULT 'basic',
+  tier            TEXT NOT NULL DEFAULT 'free',
   created_at      REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS go_subscriptions (
@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS kv (
   v TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_users_subscription ON users(subscription_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_subscription
+  ON users(subscription_id) WHERE subscription_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_subs_status ON go_subscriptions(status);
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_events(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_sub_time ON usage_events(subscription_id, created_at);
@@ -61,6 +63,10 @@ CREATE INDEX IF NOT EXISTS idx_usage_sub_time ON usage_events(subscription_id, c
 
 def _now() -> float:
     return time.time()
+
+
+class NoSubscriptionAvailable(RuntimeError):
+    pass
 
 
 def new_id(prefix: str) -> str:
@@ -79,11 +85,53 @@ class Store:
             self._conn.executescript(SCHEMA)
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(users)").fetchall()}
             if "tier" not in cols:
-                self._conn.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'basic'")
-            row = self._conn.execute("SELECT v FROM kv WHERE k='schema_version'").fetchone()
-            if row is None:
-                self._conn.execute("INSERT INTO kv(k,v) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+                self._conn.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
+                self._conn.commit()
+            tier_column = next(
+                row for row in self._conn.execute("PRAGMA table_info(users)") if row[1] == "tier"
+            )
+            if str(tier_column[4]).strip("'\"").lower() != "free":
+                self._migrate_users_default_to_free()
+            self._conn.execute(
+                "INSERT INTO kv(k,v) VALUES('schema_version', ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (str(SCHEMA_VERSION),),
+            )
             self._conn.commit()
+
+    def _migrate_users_default_to_free(self) -> None:
+        """Reconstruye la tabla para cambiar el DEFAULT de bases ya existentes."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute("ALTER TABLE users RENAME TO users_legacy_default_basic")
+            self._conn.execute(
+                """CREATE TABLE users (
+                  id              TEXT PRIMARY KEY,
+                  name            TEXT,
+                  email           TEXT,
+                  api_key_hash    TEXT UNIQUE NOT NULL,
+                  subscription_id TEXT,
+                  tier            TEXT NOT NULL DEFAULT 'free',
+                  created_at      REAL NOT NULL
+                )"""
+            )
+            self._conn.execute(
+                "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier, created_at) "
+                "SELECT id, name, email, api_key_hash, subscription_id, tier, created_at "
+                "FROM users_legacy_default_basic"
+            )
+            self._conn.execute("DROP TABLE users_legacy_default_basic")
+            self._conn.execute(
+                "CREATE INDEX idx_users_subscription ON users(subscription_id)"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX uniq_user_subscription ON users(subscription_id) "
+                "WHERE subscription_id IS NOT NULL"
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ---------- helpers ----------
     def _q(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -101,7 +149,7 @@ class Store:
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,
-                    subscription_id: str | None = None, tier: str = "basic") -> dict:
+                    subscription_id: str | None = None, tier: str = "free") -> dict:
         user_id = new_id("usr")
         created = _now()
         with self._lock:
@@ -165,22 +213,12 @@ class Store:
         row = self._one("SELECT * FROM go_subscriptions WHERE id=?", (sub_id,))
         return dict(row) if row else None
 
-    def next_available(self) -> dict | None:
-        row = self._one("SELECT * FROM go_subscriptions WHERE status='available' ORDER BY created_at LIMIT 1")
-        return dict(row) if row else None
-
     def available_count(self) -> int:
         row = self._one("SELECT COUNT(*) AS n FROM go_subscriptions WHERE status='available'")
         return int(row["n"]) if row else 0
 
     def list_subscriptions(self) -> list[dict]:
         return [dict(r) for r in self._q("SELECT * FROM go_subscriptions ORDER BY created_at")]
-
-    def revoke_subscription(self, sub_id: str) -> None:
-        self._exec(
-            "UPDATE go_subscriptions SET status='available', assigned_user_id=NULL WHERE id=?",
-            (sub_id,),
-        )
 
     # ---------- uso ----------
     def record_usage(
@@ -208,10 +246,64 @@ class Store:
             )
             self._conn.commit()
 
-    def set_user_tier(self, user_id: str, tier: str) -> None:
-        self._exec("UPDATE users SET tier=? WHERE id=?", (tier, user_id))
+    def transition_user_tier(
+        self, user_id: str, tier: str, *, needs_subscription: bool
+    ) -> dict:
+        """Cambia tier y asignación dentro de una sola transacción de escritura.
 
-    def usage_summary(self, user_id: str, subscription_id: str | None, tier: str = "basic") -> dict:
+        BEGIN IMMEDIATE serializa esta operación incluso entre conexiones o
+        procesos. El UPDATE condicional y el índice único son defensas extra
+        para impedir que una suscripción termine asociada a dos usuarios.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._conn.execute(
+                    "SELECT id, subscription_id FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                if user is None:
+                    raise KeyError(user_id)
+
+                subscription_id = user["subscription_id"]
+                if needs_subscription and not subscription_id:
+                    available = self._conn.execute(
+                        "SELECT id FROM go_subscriptions "
+                        "WHERE status='available' ORDER BY created_at LIMIT 1"
+                    ).fetchone()
+                    if available is None:
+                        raise NoSubscriptionAvailable
+                    subscription_id = available["id"]
+                    claimed = self._conn.execute(
+                        "UPDATE go_subscriptions "
+                        "SET status='assigned', assigned_user_id=? "
+                        "WHERE id=? AND status='available'",
+                        (user_id, subscription_id),
+                    )
+                    if claimed.rowcount != 1:
+                        raise NoSubscriptionAvailable
+                elif not needs_subscription and subscription_id:
+                    self._conn.execute(
+                        "UPDATE go_subscriptions "
+                        "SET status='available', assigned_user_id=NULL WHERE id=?",
+                        (subscription_id,),
+                    )
+                    subscription_id = None
+
+                self._conn.execute(
+                    "UPDATE users SET subscription_id=?, tier=? WHERE id=?",
+                    (subscription_id, tier, user_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+            updated = self._conn.execute(
+                "SELECT * FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def usage_summary(self, user_id: str, subscription_id: str | None, tier: str = "free") -> dict:
         """Resume de uso por ventanas (5h/semana/mes) para el usuario.
 
         Los limites se ajustan al tier: basic=50% de la suscripcion Go,

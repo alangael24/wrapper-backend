@@ -1,9 +1,11 @@
 # Wrapper Backend — OpenCode Go por usuario
 
-Backend para tu wrapper: **cada usuario nuevo recibe automáticamente una
-suscripción de OpenCode Go asignada** (una key por usuario). El backend
-proxya las requests de LLM al upstream de Go con la key de ese usuario,
-registra uso y vigila los límites de la suscripción. También puede ejecutar
+Backend para tu wrapper: **cada usuario nuevo empieza en `free`, sin capacidad
+de pago asignada**. Una suscripción de OpenCode Go solo se reclama después de
+que un webhook de pago verificado o un administrador autenticado activa
+`basic`/`pro`. El backend proxya las requests de LLM al upstream de Go con la
+key asignada a ese usuario, registra uso y vigila los límites de la
+suscripción. También puede ejecutar
 tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
 **GPT-5.6 Luna**, con MiMo como fallback.
@@ -22,13 +24,16 @@ de OpenCode Go ($12 / 5h, $30 / semana, $60 / mes):
 | `basic` | 50% | $6 / $15 / $30 | ✅ |
 | `pro` | 100% | $12 / $30 / $60 | ✅ |
 
-- En el signup se elige el tier con `{"tier": "basic"}` (default: `basic`).
+- `POST /v1/signup` siempre crea `free`. Cualquier `tier` enviado por el
+  cliente se ignora y nunca consume una key del pool.
 - `free` se crea **sin** suscripción y no puede llamar modelos.
-- `basic` y `pro` necesitan una key disponible en el pool (si no hay, el
-  signup responde `409 no_subscriptions_available`).
-- El administrador puede cambiar el tier de un usuario con
+- `basic` y `pro` necesitan una key disponible en el pool.
+- Después de verificar el pago, el administrador puede cambiar el tier con
   `POST /admin/users/<id>/tier` `{"tier": "pro"}`: subir de tier asigna una
   suscripción del pool si no tiene una; bajarlo la libera de vuelta al pool.
+- La activación y la reclamación de capacidad se ejecutan bajo
+  `BEGIN IMMEDIATE`; un índice único parcial impide asociar una misma
+  suscripción a dos usuarios.
 - Los límites se reescalan según el tier: un usuario `basic` recibe 429 al
   llegar a $6 en 5h; uno `pro` al llegar a $12.
 
@@ -40,11 +45,18 @@ solo un miembro por workspace puede suscribirse a Go). Por eso el backend
 funciona con un **pool de suscripciones**:
 
 1. El operador carga las keys de Go compradas al pool (una por usuario final).
-2. Cada usuario nuevo que se registra (`POST /v1/signup`) recibe
-   **automáticamente** una key disponible del pool (1:1, sin intervención).
-3. El usuario también puede traer su propia key (`POST /v1/byok`).
-4. El backend proxya `chat/completions`, `responses` y `messages` al upstream
+2. Cada registro público (`POST /v1/signup`) crea un usuario `free` sin key.
+3. Un webhook de Stripe con firma verificada —o, mientras se implementa, un
+   administrador que ya comprobó el pago— activa `basic`/`pro`.
+4. La transición pagada reclama una sola key del pool de forma atómica.
+5. El usuario también puede traer su propia key (`POST /v1/byok`), pero el
+   acceso sigue dependiendo del tier guardado por el servidor.
+6. El backend proxya `chat/completions`, `responses` y `messages` al upstream
    con la key asignada, y registra el uso por ventanas.
+
+El repositorio todavía no incluye el webhook de Stripe. No publiques un
+checkout que prometa activación automática hasta añadir y verificar ese flujo;
+el endpoint admin es la ruta segura provisional.
 
 ## Requisitos
 
@@ -84,7 +96,12 @@ Probar el flujo:
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/signup \
   -H 'Content-Type: application/json' -d '{"name":"ana"}'
-# -> { "api_key": "...", "subscription_id": "sub_...", ... }  (guárdalo)
+# -> { "api_key": "...", "tier": "free", "subscription_id": null, ... }
+
+# Solo después de verificar el pago:
+curl -X POST http://127.0.0.1:8787/admin/users/USER_ID/tier \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"tier":"pro"}'
 
 curl http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $API_KEY"
 ```
@@ -156,7 +173,7 @@ Públicos (Bearer = api key del usuario del wrapper):
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| POST | `/v1/signup` | Crea usuario (tier opcional) y le asigna una suscripción Go del pool si aplica |
+| POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
 | POST | `/v1/byok` | El usuario registra su propia key de Go `{apiKey}` |
 | GET | `/v1/models` | Catálogo de modelos (proxy a Go) |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
@@ -195,7 +212,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 |---|---|---|
 | `PORT` | `8787` | Puerto HTTP |
 | `WRAPPER_SECRET` | auto | Clave maestra para cifrar keys Go |
-| `ADMIN_TOKEN` | auto-generado | Token de los endpoints admin |
+| `ADMIN_TOKEN` | auto-generado | Token de admin; el valor publicado `cambia-este-token` impide arrancar |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
 | `ENFORCE_LIMITS` | `1` | Rechazar al superar límites de Go |
@@ -230,6 +247,13 @@ Admin (Bearer = `ADMIN_TOKEN`):
   el Keychain de macOS (fallback). Nunca se persisten en claro.
 - Las api keys de los usuarios del wrapper se guardan hasheadas (SHA-256);
   solo se muestran una vez en el signup.
+- El signup público siempre crea `free`. Solo una transición autenticada tras
+  comprobar el pago puede activar `basic`/`pro` y reclamar capacidad.
+- La asignación de suscripciones usa `BEGIN IMMEDIATE` y el índice único
+  `uniq_user_subscription`; dos activaciones concurrentes no pueden compartir
+  una key.
+- El servidor se niega a arrancar con `ADMIN_TOKEN=cambia-este-token`. En
+  producción define un token aleatorio largo y mantenlo fuera del repositorio.
 - Los secretos viven en `data/secret.key` (0600); si usas `WRAPPER_SECRET`
   en producción, bórralo y apóyalo en tu gestor de secretos.
 - Pi puede ejecutar comandos y manipular archivos con los permisos del proceso
@@ -252,7 +276,8 @@ Admin (Bearer = `ADMIN_TOKEN`):
 ```
 
 Corren contra un upstream mock (sin llamadas reales a OpenCode Go) y cubren:
-signup/asignación, proxy de modelos, chat/responses/messages, streaming,
+signup siempre-free, activación admin, carrera de asignación, rechazo del token
+inseguro, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
 cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
 falso, el puente Luna/MiMo y la carga/autorización de pi-chrome, sin consumir

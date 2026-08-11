@@ -31,8 +31,7 @@ TIERS: dict[str, dict] = {
     },
 }
 
-DEFAULT_TIER = "basic"
-SIGNUP_TIERS = ("free", "basic", "pro")
+DEFAULT_TIER = "free"
 
 
 def is_valid(tier: str) -> bool:
