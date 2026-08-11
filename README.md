@@ -148,21 +148,37 @@ imagen → Luna → reporte visual no confiable → DeepSeek V4 → respuesta/ac
 ## Navegación con pi-chrome
 
 `pi-chrome` está fijado en `package.json` y Pi carga automáticamente su extensión
-desde `node_modules`. Chrome requiere una instalación manual única de la
-extensión companion unpacked, porque usa el perfil real ya autenticado:
+desde `node_modules`. El backend **no usa ni acepta un perfil Chrome compartido**.
+Para cada llamada con `browser:true` crea:
+
+- un proceso Chrome separado;
+- un `--user-data-dir` nuevo y vacío;
+- una copia privada de la extensión companion;
+- un puerto bridge local exclusivo.
+
+El proceso y sus cookies se eliminan al terminar la ejecución. No cargues la
+extensión companion manualmente en tu Chrome real. Para verificar la instalación:
 
 ```bash
 pnpm install
-./scripts/setup-pi-chrome.sh --open
+./scripts/setup-pi-chrome.sh
 ```
 
-El script copia la ruta correcta y abre `chrome://extensions`. Activa
-**Developer mode**, elige **Load unpacked** y pega la ruta mostrada. Después:
+Después:
 
 1. Configura `PI_ENABLED=1`.
-2. Configura `PI_CHROME_AUTO_AUTHORIZE=1` únicamente en una máquina y perfil
-   Chrome dedicados y de confianza.
-3. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
+2. Mantén `PI_CHROME_ISOLATION=per_run` y, si no se autodetecta, define
+   `PI_CHROME_BIN` con el ejecutable de Chrome for Testing o Chromium. Chrome
+   estable no sirve: [desde v137 ignora `--load-extension`](https://developer.chrome.com/blog/extension-news-june-2025).
+   Puedes instalar [Chrome for Testing](https://developer.chrome.com/blog/chrome-for-testing/)
+   con `npx @puppeteer/browsers install chrome@stable`.
+3. Configura `PI_CHROME_AUTO_AUTHORIZE=1`. Esta autorización solo cubre el
+   perfil efímero de la ejecución actual.
+4. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
+
+El servidor se niega a arrancar con `PI_CHROME_ISOLATION=shared` o cualquier
+otro modo. Un perfil nuevo no contiene sesiones autenticadas: si una tarea debe
+iniciar sesión, debe hacerlo dentro de esa ejecución y esos datos no se conservan.
 
 Las capturas que produzca `pi-chrome` pasan por Luna antes de llegar a DeepSeek,
 de modo que el agente puede observar la página y decidir su siguiente acción.
@@ -238,8 +254,10 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_MAX_CONCURRENT` | `2` | Procesos Pi simultáneos |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
 | `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Extensión Pi de pi-chrome |
-| `PI_CHROME_AUTO_AUTHORIZE` | `0` | Permitir autorización automática de Chrome |
-| `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración de la autorización de Chrome |
+| `PI_CHROME_BIN` | autodetectado | Ejecutable de Chrome for Testing/Chromium; no es una ruta de perfil |
+| `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
+| `PI_CHROME_AUTO_AUTHORIZE` | `0` | Autorizar automáticamente solo el Chrome efímero de esa ejecución |
+| `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración máxima; el proceso se cierra antes si termina la tarea |
 
 ## Seguridad
 
@@ -261,13 +279,14 @@ Admin (Bearer = `ADMIN_TOKEN`):
   contenedor o sandbox por tarea, sin montar secretos ni el código del servidor.
 - El subproceso de Pi recibe un entorno limpio: no hereda `ADMIN_TOKEN`,
   `WRAPPER_SECRET` ni las demás API keys del servidor.
-- `pi-chrome` controla un perfil Chrome real con permisos amplios. Su bridge se
-  limita a `127.0.0.1:17318`, pero otros procesos locales del mismo usuario son
-  parte de su superficie de confianza.
-- Activar `PI_CHROME_AUTO_AUTHORIZE=1` permite que cualquier usuario con acceso
-  válido a `agent/run` y `browser:true` controle ese perfil. No lo actives en un
-  backend multiusuario público; usa un host/perfil dedicado o una capa adicional
-  de autorización.
+- `pi-chrome` nunca recibe el perfil real del operador. Cada ejecución obtiene
+  un perfil vacío y un bridge loopback propio; ambos procesos se terminan y el
+  perfil se borra al finalizar. El arranque rechaza explícitamente el modo
+  compartido.
+- El aislamiento de perfil evita compartir cookies, sesiones y almacenamiento
+  entre clientes. Pi todavía ejecuta con el usuario del sistema del backend;
+  para aislamiento fuerte entre tenants usa además un contenedor o usuario del
+  sistema distinto por tarea.
 
 ## Tests
 
@@ -280,5 +299,5 @@ signup siempre-free, activación admin, carrera de asignación, rechazo del toke
 inseguro, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
 cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
-falso, el puente Luna/MiMo y la carga/autorización de pi-chrome, sin consumir
-saldo real.
+falso, el puente Luna/MiMo y el aislamiento de proceso, perfil y bridge de
+pi-chrome, sin consumir saldo real.

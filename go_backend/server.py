@@ -43,7 +43,12 @@ from urllib.parse import urlparse
 from . import __version__
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .go_prices import estimate_cost_usd
-from .pi_harness import PiHarness, PiHarnessBusy, PiHarnessError
+from .pi_harness import (
+    CHROME_ISOLATION_PER_RUN,
+    PiHarness,
+    PiHarnessBusy,
+    PiHarnessError,
+)
 from .tiers import DEFAULT_TIER, effective_limits, is_valid, requires_subscription, tier_label
 from .store import NoSubscriptionAvailable, Store, new_id
 from .upstream import DEFAULT_UA, proxy_request
@@ -101,6 +106,15 @@ def validate_admin_token(admin_token: str | None) -> None:
         )
 
 
+def validate_pi_chrome_security(chrome_isolation: str) -> None:
+    """Prohibe perfiles compartidos en el backend multiusuario."""
+    if chrome_isolation != CHROME_ISOLATION_PER_RUN:
+        raise UnsafeConfigurationError(
+            "PI_CHROME_ISOLATION debe ser 'per_run'. Los perfiles Chrome compartidos "
+            "estan prohibidos en este backend multiusuario."
+        )
+
+
 class Config:
     def __init__(self):
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
@@ -145,6 +159,10 @@ class Config:
             self.pi_chrome_extension = str(DEFAULT_PI_CHROME_EXTENSION)
         self.pi_chrome_auto_authorize = os.environ.get("PI_CHROME_AUTO_AUTHORIZE", "0") == "1"
         self.pi_chrome_authorize_minutes = int(os.environ.get("PI_CHROME_AUTHORIZE_MINUTES", "30"))
+        self.pi_chrome_bin = (os.environ.get("PI_CHROME_BIN") or "").strip() or None
+        self.pi_chrome_isolation = os.environ.get(
+            "PI_CHROME_ISOLATION", CHROME_ISOLATION_PER_RUN
+        ).strip().lower()
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
@@ -163,6 +181,7 @@ def error_response(handler: BaseHTTPRequestHandler, status: int, message: str, c
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
@@ -195,6 +214,8 @@ class Backend:
             chrome_extension=cfg.pi_chrome_extension,
             chrome_auto_authorize=cfg.pi_chrome_auto_authorize,
             chrome_authorize_minutes=cfg.pi_chrome_authorize_minutes,
+            chrome_binary=cfg.pi_chrome_bin,
+            chrome_isolation=cfg.pi_chrome_isolation,
         )
 
     # ---------- auth helpers ----------

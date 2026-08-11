@@ -9,6 +9,10 @@ from pathlib import Path
 
 
 config_dir = Path(os.environ["PI_CODING_AGENT_DIR"])
+if os.environ.get("PI_CHROME_BRIDGE_PORT"):
+    (config_dir / "chrome-bridge-port.txt").write_text(
+        os.environ["PI_CHROME_BRIDGE_PORT"], encoding="utf-8"
+    )
 config = json.loads((config_dir / "models.json").read_text(encoding="utf-8"))
 provider = config["providers"]["wrapper-backend"]
 wrapper_key = os.environ[provider["apiKey"].lstrip("$")]

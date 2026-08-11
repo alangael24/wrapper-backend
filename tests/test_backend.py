@@ -160,10 +160,49 @@ class WrapperServer:
         self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
         self.backend.pi.timeout_seconds = 5
         if browser:
-            fake_extension = Path(self.cfg.db_path).parent / "fake-pi-chrome.ts"
+            fake_root = Path(self.cfg.db_path).parent / "fake-pi-chrome"
+            fake_extension = fake_root / "index.ts"
+            companion = fake_root / "browser-extension"
+            companion.mkdir(parents=True, exist_ok=True)
             fake_extension.write_text("export default () => {}\n", encoding="utf-8")
+            (companion / "service_worker.js").write_text(
+                'const BRIDGE_URL = "http://127.0.0.1:17318";\n',
+                encoding="utf-8",
+            )
+            (companion / "manifest.json").write_text(
+                json.dumps({
+                    "manifest_version": 3,
+                    "name": "Fake Pi Chrome Connector",
+                    "version": "1.0.0",
+                    "permissions": ["tabs"],
+                    "host_permissions": ["<all_urls>", "http://127.0.0.1:17318/*"],
+                    "background": {"service_worker": "service_worker.js"},
+                }),
+                encoding="utf-8",
+            )
+            chrome_log = Path(self.cfg.db_path).parent / "fake-chrome.jsonl"
+            fake_chrome = Path(self.cfg.db_path).parent / "fake_chrome.py"
+            fake_chrome.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, signal, sys, time\n"
+                "from pathlib import Path\n"
+                f"log_path = Path({str(chrome_log)!r})\n"
+                "with log_path.open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(json.dumps({'argv': sys.argv[1:], "
+                "'has_admin_token': 'ADMIN_TOKEN' in os.environ}) + '\\n')\n"
+                "def stop(*_):\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "while True:\n"
+                "    time.sleep(0.05)\n",
+                encoding="utf-8",
+            )
+            fake_chrome.chmod(0o755)
             self.backend.pi.chrome_extension = str(fake_extension)
             self.backend.pi.chrome_auto_authorize = True
+            self.backend.pi.chrome_binary = str(fake_chrome)
+            self.backend.pi.chrome_isolation = "per_run"
+            self.backend.pi.chrome_test_log = chrome_log
 
     def stop(self):
         self.httpd.shutdown()
@@ -292,6 +331,12 @@ class TestBackend(unittest.TestCase):
         cfg.admin_token = "  CAMBIA-ESTE-TOKEN  "
         with self.assertRaisesRegex(UnsafeConfigurationError, "valor inseguro de ejemplo"):
             serve(cfg)
+
+    def test_server_rejects_shared_chrome_profiles(self):
+        cfg = Config()
+        cfg.pi_chrome_isolation = "shared"
+        with self.assertRaisesRegex(UnsafeConfigurationError, "per_run"):
+            Backend(cfg)
 
     def test_models_proxy(self):
         ws = self.ws
@@ -902,7 +947,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
 
-    def test_pi_chrome_extension_is_loaded_and_authorized_for_browser_run(self):
+    def test_pi_chrome_uses_a_fresh_profile_and_bridge_for_each_run(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi(browser=True)
@@ -911,19 +956,66 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(info["browser_available"])
         self.assertTrue(info["browser_auto_authorize"])
+        self.assertEqual(info["browser_isolation"], "per_run")
+        self.assertEqual(info["browser_profile_scope"], "ephemeral_run")
+        self.assertFalse(
+            self.ws.backend.pi._supports_unpacked_extensions(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )
+        )
+        self.assertTrue(
+            self.ws.backend.pi._supports_unpacked_extensions(
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+            )
+        )
         command = self.ws.backend.pi._command(browser=True)
         self.assertIn("--extension", command)
-        self.assertTrue(command[command.index("--extension") + 1].endswith("fake-pi-chrome.ts"))
+        self.assertTrue(command[command.index("--extension") + 1].endswith("index.ts"))
 
-        status, result = self.ws.req(
-            "POST",
-            "/v1/agent/run",
-            {"prompt": "revisa la pagina", "browser": True},
-            headers=headers,
-        )
-        self.assertEqual(status, 200)
-        self.assertTrue(result["browser"])
-        self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
+        results = []
+        for prompt in ("revisa la pagina", "abre otra sesion"):
+            status, result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {"prompt": prompt, "browser": True},
+                headers=headers,
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(result["browser"])
+            self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
+            results.append(result)
+
+        run_dirs = [self.ws.backend.pi.runs_dir / result["run_id"] for result in results]
+        self.assertNotEqual(run_dirs[0], run_dirs[1])
+        bridge_ports = []
+        for run_dir in run_dirs:
+            self.assertFalse((run_dir / "chrome-profile").exists())
+            worker = (run_dir / "chrome-extension" / "service_worker.js").read_text()
+            self.assertNotIn("127.0.0.1:17318", worker)
+            bridge_port = (run_dir / "config" / "chrome-bridge-port.txt").read_text().strip()
+            self.assertIn(f"127.0.0.1:{bridge_port}", worker)
+            manifest = json.loads(
+                (run_dir / "chrome-extension" / "manifest.json").read_text()
+            )
+            self.assertIn(
+                f"http://127.0.0.1:{bridge_port}/*", manifest["host_permissions"]
+            )
+            bridge_ports.append(bridge_port)
+
+        launches = [
+            json.loads(line)
+            for line in self.ws.backend.pi.chrome_test_log.read_text().splitlines()
+        ]
+        self.assertEqual(len(launches), 2)
+        profile_args = []
+        for launch, run_dir in zip(launches, run_dirs):
+            profile_arg = f"--user-data-dir={run_dir / 'chrome-profile'}"
+            extension_arg = f"--load-extension={run_dir / 'chrome-extension'}"
+            self.assertIn(profile_arg, launch["argv"])
+            self.assertIn(extension_arg, launch["argv"])
+            self.assertFalse(launch["has_admin_token"])
+            profile_args.append(profile_arg)
+        self.assertNotEqual(profile_args[0], profile_args[1])
 
 
 if __name__ == "__main__":
