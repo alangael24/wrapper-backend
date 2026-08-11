@@ -26,6 +26,8 @@ from go_backend.store import Store  # noqa: E402
 class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     requests: list = []
+    fail_luna = False
+    fail_mimo = False
 
     def log_message(self, fmt, *args):
         pass
@@ -53,6 +55,17 @@ class MockUpstream(BaseHTTPRequestHandler):
         type(self).requests.append((self.command, self.path, dict(self.headers), body))
         payload = json.loads(body) if body else {}
         if self.path == "/v1/chat/completions":
+            if payload.get("model") == "mimo-v2.5":
+                if type(self).fail_mimo:
+                    self._send(503, json.dumps({"error": {"message": "mimo unavailable"}}).encode())
+                    return
+                resp = {
+                    "id": "vision-fallback", "model": "mimo-v2.5",
+                    "choices": [{"message": {"role": "assistant", "content": "IMAGE 1: panel azul, texto OK"}}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                }
+                self._send(200, json.dumps(resp).encode())
+                return
             if payload.get("stream"):
                 self._send(
                     200,
@@ -73,6 +86,18 @@ class MockUpstream(BaseHTTPRequestHandler):
                 }
                 self._send(200, json.dumps(resp).encode())
         elif self.path == "/v1/responses":
+            if payload.get("model") == "gpt-5.6-luna":
+                if type(self).fail_luna:
+                    self._send(503, json.dumps({"error": {"message": "luna unavailable"}}).encode())
+                    return
+                resp = {
+                    "id": "vision-luna", "model": "gpt-5.6-luna",
+                    "output_text": "IMAGE 1: panel azul, texto OK",
+                    "output": [],
+                    "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16},
+                }
+                self._send(200, json.dumps(resp).encode())
+                return
             resp = {
                 "id": "resp-test", "model": "deepseek-v4-flash",
                 "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hola"}]}],
@@ -105,6 +130,10 @@ class WrapperServer:
         os.environ["SECRET_FILE"] = os.path.join(tmp, "secret.key")
         os.environ["ADMIN_TOKEN"] = "test-admin"
         os.environ["ENFORCE_LIMITS"] = "1"
+        os.environ["VISION_ENABLED"] = "1"
+        os.environ["VISION_MODEL"] = "gpt-5.6-luna"
+        os.environ["VISION_FALLBACK_MODEL"] = "mimo-v2.5"
+        os.environ["VISION_TARGET_MODELS"] = "deepseek-v4"
         os.environ["PI_ENABLED"] = "0"
         os.environ.pop("WRAPPER_SECRET", None)
         self.cfg = Config()
@@ -116,19 +145,24 @@ class WrapperServer:
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.admin_headers = {"Authorization": "Bearer test-admin"}
 
-    def enable_fake_pi(self):
+    def enable_fake_pi(self, browser=False):
         fake_pi = Path(__file__).resolve().parent / "fake_pi.py"
         self.backend.pi.enabled = True
         self.backend.pi.binary = str(fake_pi)
         self.backend.pi.backend_url = self.base
         self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
         self.backend.pi.timeout_seconds = 5
+        if browser:
+            fake_extension = Path(self.cfg.db_path).parent / "fake-pi-chrome.ts"
+            fake_extension.write_text("export default () => {}\n", encoding="utf-8")
+            self.backend.pi.chrome_extension = str(fake_extension)
+            self.backend.pi.chrome_auto_authorize = True
 
     def stop(self):
         self.httpd.shutdown()
         self.httpd.server_close()
 
-    def req(self, method, path, body=None, headers=None, raw=False):
+    def req(self, method, path, body=None, headers=None, raw=False, include_headers=False):
         url = self.base + path
         data = json.dumps(body).encode() if body is not None else None
         hdrs = {"Content-Type": "application/json", **(headers or {})}
@@ -136,13 +170,18 @@ class WrapperServer:
         try:
             with urllib.request.urlopen(request, timeout=10) as resp:
                 content = resp.read()
-                return resp.status, (content if raw else (json.loads(content) if content else None))
+                parsed = content if raw else (json.loads(content) if content else None)
+                if include_headers:
+                    return resp.status, parsed, dict(resp.headers)
+                return resp.status, parsed
         except urllib.error.HTTPError as e:
             content = e.read()
             try:
                 parsed = json.loads(content) if content else None
             except Exception:
                 parsed = content
+            if include_headers:
+                return e.code, parsed, dict(e.headers)
             return e.code, parsed
 
 
@@ -160,10 +199,14 @@ class TestBackend(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="wrapper-test-")
         self.ws = WrapperServer(self.mock_base, self.tmp)
         MockUpstream.requests.clear()
+        MockUpstream.fail_luna = False
+        MockUpstream.fail_mimo = False
 
     def tearDown(self):
         self.ws.stop()
         MockUpstream.requests.clear()
+        MockUpstream.fail_luna = False
+        MockUpstream.fail_mimo = False
 
 
     # ---------- helpers ----------
@@ -178,6 +221,20 @@ class TestBackend(unittest.TestCase):
         status, signup = self.ws.req("POST", "/v1/signup", {"name": name} if name else {})
         self.assertEqual(status, 201)
         return signup
+
+    def image_data_url(self):
+        # Firma PNG suficiente para probar normalizacion, deduplicacion y routing.
+        return "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+
+    def upstream_payloads(self, path, model=None):
+        payloads = []
+        for request in MockUpstream.requests:
+            if len(request) < 4 or request[1] != path:
+                continue
+            payload = json.loads(request[3])
+            if model is None or payload.get("model") == model:
+                payloads.append(payload)
+        return payloads
 
     # ---------- pool / signup ----------
     def test_signup_assigns_subscription(self):
@@ -258,6 +315,223 @@ class TestBackend(unittest.TestCase):
         self.assertIn("cache_read_input_tokens", body["usage"])
         status, usage = ws.req("GET", "/v1/usage", headers=headers)
         self.assertEqual(usage["windows"]["5h"]["requests"], 2)
+
+    def test_responses_images_are_analyzed_by_luna_for_deepseek(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        payload = {
+            "model": "deepseek-v4-flash",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Que texto aparece?"},
+                    {"type": "input_image", "image_url": self.image_data_url()},
+                ],
+            }],
+        }
+
+        status, body, response_headers = self.ws.req(
+            "POST", "/v1/responses", payload, headers=headers, include_headers=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
+        self.assertEqual(body["output"][0]["content"][0]["text"], "hola")
+
+        luna_calls = self.upstream_payloads("/v1/responses", "gpt-5.6-luna")
+        deepseek_calls = self.upstream_payloads("/v1/responses", "deepseek-v4-flash")
+        self.assertEqual(len(luna_calls), 1)
+        self.assertEqual(len(deepseek_calls), 1)
+        self.assertIn("input_image", json.dumps(luna_calls[0]))
+        forwarded = json.dumps(deepseek_calls[0])
+        self.assertNotIn("input_image", forwarded)
+        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
+        self.assertIn("untrusted visual evidence", forwarded)
+
+        _, usage = self.ws.req("GET", "/v1/usage", headers=headers)
+        self.assertEqual(usage["windows"]["5h"]["requests"], 2)
+        self.assertIn("gpt-5.6-luna", usage["by_model"])
+        self.assertIn("deepseek-v4-flash", usage["by_model"])
+        _, admin_usage = self.ws.req("GET", "/admin/usage", headers=self.ws.admin_headers)
+        self.assertEqual(
+            {event["endpoint"] for event in admin_usage["events"]},
+            {"/vision/responses", "/responses"},
+        )
+
+    def test_chat_images_are_converted_for_pi_protocol(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        payload = {
+            "model": "deepseek-v4-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe el panel"},
+                    {"type": "image_url", "image_url": {"url": self.image_data_url()}},
+                ],
+            }],
+        }
+
+        status, _body, response_headers = self.ws.req(
+            "POST", "/v1/chat/completions", payload, headers=headers, include_headers=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
+        forwarded = json.dumps(
+            self.upstream_payloads("/v1/chat/completions", "deepseek-v4-flash")[0]
+        )
+        self.assertNotIn("image_url", forwarded)
+        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
+
+    def test_anthropic_message_images_are_converted(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        encoded_image = self.image_data_url().split(",", 1)[1]
+        payload = {
+            "model": "deepseek-v4-pro",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Que ves?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": encoded_image,
+                        },
+                    },
+                ],
+            }],
+        }
+
+        status, _body, response_headers = self.ws.req(
+            "POST", "/v1/messages", payload, headers=headers, include_headers=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
+        forwarded = json.dumps(self.upstream_payloads("/v1/messages", "deepseek-v4-pro")[0])
+        self.assertNotIn('"type": "image"', forwarded)
+        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
+
+    def test_streaming_with_images_preserves_sse_and_vision_header(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        payload = {
+            "model": "deepseek-v4-flash",
+            "stream": True,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Lee la captura"},
+                    {"type": "image_url", "image_url": {"url": self.image_data_url()}},
+                ],
+            }],
+        }
+        status, body, response_headers = self.ws.req(
+            "POST",
+            "/v1/chat/completions",
+            payload,
+            headers=headers,
+            raw=True,
+            include_headers=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
+        self.assertIn(b"data:", body)
+        self.assertIn(b"[DONE]", body)
+
+    def test_luna_failure_falls_back_to_mimo(self):
+        MockUpstream.fail_luna = True
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        payload = {
+            "model": "deepseek-v4-flash",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": self.image_data_url()}],
+            }],
+        }
+
+        status, _body, response_headers = self.ws.req(
+            "POST", "/v1/responses", payload, headers=headers, include_headers=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "mimo-v2.5")
+        self.assertEqual(len(self.upstream_payloads("/v1/responses", "gpt-5.6-luna")), 1)
+        self.assertEqual(len(self.upstream_payloads("/v1/chat/completions", "mimo-v2.5")), 1)
+        forwarded = json.dumps(
+            self.upstream_payloads("/v1/responses", "deepseek-v4-flash")[0]
+        )
+        self.assertIn('model=\\"mimo-v2.5\\"', forwarded)
+
+    def test_vision_cache_includes_the_user_prompt(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+
+        def request(prompt):
+            return self.ws.req(
+                "POST",
+                "/v1/responses",
+                {
+                    "model": "deepseek-v4-flash",
+                    "input": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": self.image_data_url()},
+                        ],
+                    }],
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(request("Lee el titulo")[0], 200)
+        self.assertEqual(request("Lee el titulo")[0], 200)
+        self.assertEqual(request("Lee el precio")[0], 200)
+        self.assertEqual(len(self.upstream_payloads("/v1/responses", "gpt-5.6-luna")), 2)
+        self.assertEqual(len(self.upstream_payloads("/v1/responses", "deepseek-v4-flash")), 3)
+
+    def test_vision_failure_does_not_send_images_to_deepseek(self):
+        MockUpstream.fail_luna = True
+        MockUpstream.fail_mimo = True
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        status, body = self.ws.req(
+            "POST",
+            "/v1/responses",
+            {
+                "model": "deepseek-v4-flash",
+                "input": [{
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": self.image_data_url()}],
+                }],
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["type"], "vision_error")
+        self.assertEqual(len(self.upstream_payloads("/v1/responses", "deepseek-v4-flash")), 0)
+
+    def test_visual_request_limit_prevents_unbounded_auxiliary_calls(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        images = [
+            {"type": "input_image", "image_url": f"https://example.test/image-{index}.png"}
+            for index in range(13)
+        ]
+        status, body = self.ws.req(
+            "POST",
+            "/v1/responses",
+            {
+                "model": "deepseek-v4-flash",
+                "input": [{"role": "user", "content": images}],
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["type"], "vision_limit")
+        self.assertEqual(len(self.upstream_payloads("/v1/responses")), 0)
 
     def test_streaming_passthrough(self):
         ws = self.ws
@@ -482,6 +756,9 @@ class TestBackend(unittest.TestCase):
         status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
         self.assertEqual(status, 200)
         self.assertFalse(info["enabled"])
+        self.assertTrue(info["image_input"])
+        self.assertTrue(info["vision"]["enabled"])
+        self.assertEqual(info["vision"]["primary_model"], "gpt-5.6-luna")
         self.assertNotIn("binary", info)
         status, body = self.ws.req(
             "POST", "/v1/agent/run", {"prompt": "haz una tarea"}, headers=headers
@@ -513,6 +790,29 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
+
+    def test_pi_chrome_extension_is_loaded_and_authorized_for_browser_run(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi(browser=True)
+
+        status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(info["browser_available"])
+        self.assertTrue(info["browser_auto_authorize"])
+        command = self.ws.backend.pi._command(browser=True)
+        self.assertIn("--extension", command)
+        self.assertTrue(command[command.index("--extension") + 1].endswith("fake-pi-chrome.ts"))
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {"prompt": "revisa la pagina", "browser": True},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["browser"])
+        self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
 
 
 if __name__ == "__main__":

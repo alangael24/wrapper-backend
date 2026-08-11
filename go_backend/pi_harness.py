@@ -76,6 +76,7 @@ class PiHarness:
         timeout_seconds: int,
         max_concurrent: int,
         max_prompt_chars: int,
+        supports_images: bool = False,
         node_bin_dir: str | None = None,
         chrome_extension: str | None = None,
         chrome_auto_authorize: bool = False,
@@ -90,6 +91,7 @@ class PiHarness:
         self.timeout_seconds = timeout_seconds
         self.max_concurrent = max(1, max_concurrent)
         self.max_prompt_chars = max_prompt_chars
+        self.supports_images = supports_images
         self.node_bin_dir = node_bin_dir
         self.chrome_extension = chrome_extension
         self.chrome_auto_authorize = chrome_auto_authorize
@@ -102,8 +104,15 @@ class PiHarness:
             return str(path) if path.is_file() and os.access(path, os.X_OK) else None
         return shutil.which(self.binary)
 
+    def _resolved_chrome_extension(self) -> str | None:
+        if not self.chrome_extension:
+            return None
+        path = Path(self.chrome_extension).expanduser()
+        return str(path.resolve()) if path.is_file() else None
+
     def status(self) -> dict[str, Any]:
         resolved = self._resolved_binary()
+        chrome_extension = self._resolved_chrome_extension()
         runtime_path = os.environ.get("PATH", "/usr/bin:/bin")
         if self.node_bin_dir:
             runtime_path = self.node_bin_dir + os.pathsep + runtime_path
@@ -113,9 +122,10 @@ class PiHarness:
             "binary": resolved,
             "model": self.model,
             "thinking": self.thinking,
+            "image_input": self.supports_images,
             "max_concurrent": self.max_concurrent,
             "node_available": bool(shutil.which("node", path=runtime_path)),
-            "browser_available": bool(self.chrome_extension),
+            "browser_available": bool(chrome_extension),
             "browser_auto_authorize": self.chrome_auto_authorize,
         }
 
@@ -130,9 +140,10 @@ class PiHarness:
             raise PiHarnessError(
                 f"El prompt excede PI_MAX_PROMPT_CHARS ({self.max_prompt_chars})"
             )
-        if browser and (not self.chrome_extension or not self.chrome_auto_authorize):
+        if browser and (not self._resolved_chrome_extension() or not self.chrome_auto_authorize):
             raise PiHarnessError(
-                "Chrome requiere PI_CHROME_EXTENSION y PI_CHROME_AUTO_AUTHORIZE=1"
+                "Chrome requiere pi-chrome instalado (o PI_CHROME_EXTENSION valido) "
+                "y PI_CHROME_AUTO_AUTHORIZE=1"
             )
         if not self._slots.acquire(blocking=False):
             raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
@@ -154,7 +165,7 @@ class PiHarness:
                             "id": self.model,
                             "name": f"{self.model} (wrapper)",
                             "reasoning": True,
-                            "input": ["text"],
+                            "input": ["text", "image"] if self.supports_images else ["text"],
                             "cost": {
                                 "input": 0.14,
                                 "output": 0.28,
@@ -221,8 +232,9 @@ class PiHarness:
             "--no-approve",
             "--offline",
         ]
-        if browser and self.chrome_extension:
-            command.extend(["--extension", self.chrome_extension])
+        chrome_extension = self._resolved_chrome_extension()
+        if browser and chrome_extension:
+            command.extend(["--extension", chrome_extension])
         return command
 
     def _run(self, *, user_api_key: str, prompt: str, browser: bool) -> PiRunResult:

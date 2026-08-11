@@ -47,11 +47,20 @@ from .pi_harness import PiHarness, PiHarnessBusy, PiHarnessError
 from .tiers import DEFAULT_TIER, SIGNUP_TIERS, effective_limits, is_valid, requires_subscription, tier_label
 from .store import Store, new_id
 from .upstream import DEFAULT_UA, proxy_request
+from .vision import VisionError, VisionRouter
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "secret.key"
 DEFAULT_PI_RUNS = Path(__file__).resolve().parent.parent / "data" / "pi-runs"
 DEFAULT_PI_BIN = Path(__file__).resolve().parent.parent / "node_modules" / ".bin" / "pi"
+DEFAULT_PI_CHROME_EXTENSION = (
+    Path(__file__).resolve().parent.parent
+    / "node_modules"
+    / "pi-chrome"
+    / "extensions"
+    / "chrome-profile-bridge"
+    / "index.ts"
+)
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
 
@@ -87,6 +96,23 @@ class Config:
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
         self.admin_token = os.environ.get("ADMIN_TOKEN") or None
+        self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
+        self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
+        self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
+        self.vision_target_models = tuple(
+            value.strip()
+            for value in os.environ.get("VISION_TARGET_MODELS", "deepseek-v4").split(",")
+            if value.strip()
+        )
+        self.vision_max_output_tokens = int(os.environ.get("VISION_MAX_OUTPUT_TOKENS", "2048"))
+        self.vision_fallback_max_output_tokens = int(
+            os.environ.get("VISION_FALLBACK_MAX_OUTPUT_TOKENS", "4096")
+        )
+        self.vision_reasoning_effort = os.environ.get("VISION_REASONING_EFFORT", "minimal")
+        self.vision_report_limit = int(os.environ.get("VISION_REPORT_LIMIT", "8000"))
+        self.vision_cache_entries = int(os.environ.get("VISION_CACHE_ENTRIES", "128"))
+        self.vision_max_groups = int(os.environ.get("VISION_MAX_GROUPS", "6"))
+        self.vision_max_images = int(os.environ.get("VISION_MAX_IMAGES", "12"))
         self.pi_enabled = os.environ.get("PI_ENABLED", "0") == "1"
         self.pi_bin = os.environ.get("PI_BIN", str(DEFAULT_PI_BIN))
         self.pi_backend_url = os.environ.get(
@@ -99,7 +125,10 @@ class Config:
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "2"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
         self.pi_node_bin_dir = os.environ.get("PI_NODE_BIN_DIR") or None
-        self.pi_chrome_extension = os.environ.get("PI_CHROME_EXTENSION") or None
+        if "PI_CHROME_EXTENSION" in os.environ:
+            self.pi_chrome_extension = os.environ.get("PI_CHROME_EXTENSION") or None
+        else:
+            self.pi_chrome_extension = str(DEFAULT_PI_CHROME_EXTENSION)
         self.pi_chrome_auto_authorize = os.environ.get("PI_CHROME_AUTO_AUTHORIZE", "0") == "1"
         self.pi_chrome_authorize_minutes = int(os.environ.get("PI_CHROME_AUTHORIZE_MINUTES", "30"))
 
@@ -123,6 +152,20 @@ class Backend:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(cfg.db_path)
+        self.vision = VisionRouter(
+            enabled=cfg.vision_enabled,
+            base_url=cfg.go_base_url,
+            primary_model=cfg.vision_model,
+            fallback_model=cfg.vision_fallback_model,
+            target_model_prefixes=cfg.vision_target_models,
+            max_output_tokens=cfg.vision_max_output_tokens,
+            fallback_max_output_tokens=cfg.vision_fallback_max_output_tokens,
+            reasoning_effort=cfg.vision_reasoning_effort,
+            report_limit=cfg.vision_report_limit,
+            cache_entries=cfg.vision_cache_entries,
+            max_groups=cfg.vision_max_groups,
+            max_images=cfg.vision_max_images,
+        )
         self.pi = PiHarness(
             enabled=cfg.pi_enabled,
             binary=cfg.pi_bin,
@@ -133,6 +176,7 @@ class Backend:
             timeout_seconds=cfg.pi_timeout_seconds,
             max_concurrent=cfg.pi_max_concurrent,
             max_prompt_chars=cfg.pi_max_prompt_chars,
+            supports_images=self.vision.supports_model(cfg.pi_model),
             node_bin_dir=cfg.pi_node_bin_dir,
             chrome_extension=cfg.pi_chrome_extension,
             chrome_auto_authorize=cfg.pi_chrome_auto_authorize,
@@ -279,6 +323,25 @@ class Backend:
             return
 
         body = self.read_body(handler)
+        vision_models: tuple[str, ...] = ()
+        if body and handler.command == "POST":
+            try:
+                vision_result = self.vision.transform(path, body, go_key)
+            except VisionError as e:
+                for analysis in e.analyses:
+                    self.record(user, sub, analysis.path, analysis.status, analysis.usage)
+                error_response(
+                    handler,
+                    e.status,
+                    f"No se pudo analizar la imagen: {e}",
+                    e.code,
+                )
+                return
+            body = vision_result.body
+            vision_models = vision_result.models
+            for analysis in vision_result.analyses:
+                self.record(user, sub, analysis.path, analysis.status, analysis.usage)
+
         ua = handler.headers.get("user-agent", "")
         headers = {
             "content-type": handler.headers.get("content-type", "application/json"),
@@ -305,6 +368,8 @@ class Backend:
                     if k.lower() in ("content-length", "transfer-encoding"):
                         continue
                     handler.send_header(k, v)
+                if vision_models:
+                    handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
                 handler.end_headers()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -320,7 +385,7 @@ class Backend:
             handler.command, self.cfg.go_base_url, path, headers, body, go_key,
             on_chunk=on_chunk, on_headers=on_headers,
         )
-        self.record(handler, user, sub, path, status, usage)
+        self.record(user, sub, path, status, usage)
 
         if stream_state["started"]:
             handler.close_connection = True
@@ -334,6 +399,8 @@ class Backend:
                 if k.lower() in ("content-length", "transfer-encoding"):
                     continue
                 handler.send_header(k, v)
+            if vision_models:
+                handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
             handler.send_header("Content-Length", str(len(raw)))
             handler.end_headers()
             if raw:
@@ -341,8 +408,8 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def record(self, handler, user, sub, path, status, usage) -> None:
-        model = usage.model if usage.any() else None
+    def record(self, user, sub, path, status, usage) -> None:
+        model = usage.model
         cost = estimate_cost_usd(model, usage.input_tokens, usage.output_tokens,
                                  usage.cached_read, usage.cached_write) if usage.any() else 0.0
         self.store.record_usage(
@@ -360,6 +427,7 @@ class Backend:
             return
         status = self.pi.status()
         status.pop("binary", None)  # no exponer rutas internas del servidor
+        status["vision"] = self.vision.status()
         json_response(handler, 200, status)
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
@@ -660,6 +728,7 @@ def serve(cfg: Config) -> None:
     print(f"[server] wrapper backend v{__version__} escuchando en http://127.0.0.1:{cfg.port}")
     print(f"[server] upstream Go: {cfg.go_base_url}")
     print(f"[server] enforce_limits={cfg.enforce_limits} db={cfg.db_path}")
+    print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
     print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
     try:
         httpd.serve_forever()

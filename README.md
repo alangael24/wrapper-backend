@@ -5,6 +5,8 @@ suscripción de OpenCode Go asignada** (una key por usuario). El backend
 proxya las requests de LLM al upstream de Go con la key de ese usuario,
 registra uso y vigila los límites de la suscripción. También puede ejecutar
 tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
+Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
+**GPT-5.6 Luna**, con MiMo como fallback.
 
 El backend base solo requiere Python y `cryptography`; Pi es una dependencia
 opcional de Node.js y viene desactivado por defecto.
@@ -53,7 +55,7 @@ funciona con un **pool de suscripciones**:
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install cryptography
-pnpm install                  # instala Pi 0.84.1, fijado en package.json
+pnpm install                  # instala Pi 0.84.1 y pi-chrome 0.15.46
 ```
 
 ## Arranque rápido
@@ -105,6 +107,49 @@ Por eso las llamadas que hace Pi usan la suscripción asignada al
 usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
 propios bajo `PI_RUNS_DIR`.
 
+## Visión para DeepSeek
+
+El puente multimodal viene activo por defecto para modelos cuyo nombre empieza
+con `deepseek-v4` y funciona en `responses`, `chat/completions` y `messages`:
+
+```text
+imagen → Luna → reporte visual no confiable → DeepSeek V4 → respuesta/acciones
+                  ↘ MiMo-V2.5 si Luna falla
+```
+
+- Luna recibe las imágenes con la misma suscripción Go asignada al usuario.
+- DeepSeek recibe texto/OCR, estado de UI, defectos y evidencia relevante; no
+  recibe los bytes de la imagen que no sabe interpretar.
+- El consumo de Luna/MiMo y el de DeepSeek se registran como eventos separados.
+- Los reportes se cachean por contenido de imagen **y prompt**, con límite LRU.
+- Cada request admite como máximo 6 grupos y 12 imágenes para evitar ráfagas
+  accidentales de llamadas visuales.
+- `X-Wrapper-Vision-Model` indica qué modelo visual se usó.
+- El reporte se marca explícitamente como evidencia no confiable para evitar
+  que instrucciones escritas dentro de una imagen controlen al agente.
+
+## Navegación con pi-chrome
+
+`pi-chrome` está fijado en `package.json` y Pi carga automáticamente su extensión
+desde `node_modules`. Chrome requiere una instalación manual única de la
+extensión companion unpacked, porque usa el perfil real ya autenticado:
+
+```bash
+pnpm install
+./scripts/setup-pi-chrome.sh --open
+```
+
+El script copia la ruta correcta y abre `chrome://extensions`. Activa
+**Developer mode**, elige **Load unpacked** y pega la ruta mostrada. Después:
+
+1. Configura `PI_ENABLED=1`.
+2. Configura `PI_CHROME_AUTO_AUTHORIZE=1` únicamente en una máquina y perfil
+   Chrome dedicados y de confianza.
+3. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
+
+Las capturas que produzca `pi-chrome` pasan por Luna antes de llegar a DeepSeek,
+de modo que el agente puede observar la página y decidir su siguiente acción.
+
 ## Endpoints
 
 Públicos (Bearer = api key del usuario del wrapper):
@@ -154,6 +199,17 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
 | `ENFORCE_LIMITS` | `1` | Rechazar al superar límites de Go |
+| `VISION_ENABLED` | `1` | Añadir visión a los modelos objetivo de solo texto |
+| `VISION_MODEL` | `gpt-5.6-luna` | Modelo primario de percepción visual |
+| `VISION_FALLBACK_MODEL` | `mimo-v2.5` | Fallback visual; vacío lo desactiva |
+| `VISION_TARGET_MODELS` | `deepseek-v4` | Prefijos de modelo separados por coma |
+| `VISION_MAX_OUTPUT_TOKENS` | `2048` | Máximo del reporte de Luna |
+| `VISION_FALLBACK_MAX_OUTPUT_TOKENS` | `4096` | Máximo del reporte fallback |
+| `VISION_REASONING_EFFORT` | `minimal` | Esfuerzo de Luna para percepción |
+| `VISION_REPORT_LIMIT` | `8000` | Caracteres máximos inyectados por reporte |
+| `VISION_CACHE_ENTRIES` | `128` | Máximo de reportes visuales en caché LRU |
+| `VISION_MAX_GROUPS` | `6` | Máximo de grupos visuales por request |
+| `VISION_MAX_IMAGES` | `12` | Máximo de imágenes únicas por request |
 | `PI_ENABLED` | `0` | Habilitar el endpoint de tareas de Pi |
 | `PI_BIN` | `./node_modules/.bin/pi` | Ejecutable de Pi |
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
@@ -164,7 +220,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `2` | Procesos Pi simultáneos |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
-| `PI_CHROME_EXTENSION` | vacío | Ruta a una extensión Chrome compatible con Pi |
+| `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Extensión Pi de pi-chrome |
 | `PI_CHROME_AUTO_AUTHORIZE` | `0` | Permitir autorización automática de Chrome |
 | `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración de la autorización de Chrome |
 
@@ -181,6 +237,13 @@ Admin (Bearer = `ADMIN_TOKEN`):
   contenedor o sandbox por tarea, sin montar secretos ni el código del servidor.
 - El subproceso de Pi recibe un entorno limpio: no hereda `ADMIN_TOKEN`,
   `WRAPPER_SECRET` ni las demás API keys del servidor.
+- `pi-chrome` controla un perfil Chrome real con permisos amplios. Su bridge se
+  limita a `127.0.0.1:17318`, pero otros procesos locales del mismo usuario son
+  parte de su superficie de confianza.
+- Activar `PI_CHROME_AUTO_AUTHORIZE=1` permite que cualquier usuario con acceso
+  válido a `agent/run` y `browser:true` controle ese perfil. No lo actives en un
+  backend multiusuario público; usa un host/perfil dedicado o una capa adicional
+  de autorización.
 
 ## Tests
 
@@ -192,4 +255,5 @@ Corren contra un upstream mock (sin llamadas reales a OpenCode Go) y cubren:
 signup/asignación, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
 cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
-falso, sin consumir saldo real.
+falso, el puente Luna/MiMo y la carga/autorización de pi-chrome, sin consumir
+saldo real.

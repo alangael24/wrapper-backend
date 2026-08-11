@@ -15,7 +15,22 @@ wrapper_key = os.environ[provider["apiKey"].lstrip("$")]
 
 for line in sys.stdin:
     command = json.loads(line)
+    if command.get("type") == "extension_ui_response" and command.get("id") == "fake-chrome-confirm":
+        print(json.dumps({
+            "id": "chrome-authorize",
+            "type": "response",
+            "success": bool(command.get("confirmed")),
+        }), flush=True)
+        continue
     if command.get("type") != "prompt":
+        continue
+    if command.get("id") == "chrome-authorize":
+        print(json.dumps({
+            "id": "fake-chrome-confirm",
+            "type": "extension_ui_request",
+            "method": "confirm",
+            "title": "Authorize pi-chrome control?",
+        }), flush=True)
         continue
     model = provider["models"][0]["id"]
     request = urllib.request.Request(
