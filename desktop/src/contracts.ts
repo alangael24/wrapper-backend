@@ -59,6 +59,17 @@ export const MANAGED_CONNECTOR_IDS = Object.freeze([
   "apollo", "ashby", "vercel", "hex", "amplitude", "mixpanel", "databricks"
 ]);
 
+// Provider-native flows hosted by the Outcome service. Their credentials are
+// validated server-side and encrypted in the private connector store.
+export const DIRECT_CONNECTOR_IDS = Object.freeze([
+  "outreach", "woocommerce", "tableau", "snowflake", "clay"
+]);
+
+export const HOSTED_CONNECTOR_IDS = Object.freeze([
+  ...MANAGED_CONNECTOR_IDS,
+  ...DIRECT_CONNECTOR_IDS
+]);
+
 export const BOT_COLORS = Object.freeze([
   "#a66d35", "#ff2f43", "#ff6a00", "#ff9300", "#08be70",
   "#11b9a9", "#2f91f5", "#8654ed", "#f35ca7", "#808080"

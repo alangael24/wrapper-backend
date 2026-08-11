@@ -8,11 +8,11 @@ import type {
   ConnectorConnectionStatus,
   OAuthProviderId
 } from "./contracts";
-import { CONNECTOR_CATALOG, MANAGED_CONNECTOR_IDS } from "./contracts";
+import { CONNECTOR_CATALOG, HOSTED_CONNECTOR_IDS, MANAGED_CONNECTOR_IDS } from "./contracts";
 
 const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
-const CONNECTOR_AUTH_ATTEMPTS = 150;
+const CONNECTOR_AUTH_ATTEMPTS = 300;
 const OAUTH_POLL_MS = 2_000;
 
 interface AccountIdentity {
@@ -67,6 +67,7 @@ export const CONNECTOR_PROVIDER: Readonly<Record<string, OAuthProviderId | undef
 });
 
 export const COMPOSIO_CONNECTOR_IDS: ReadonlySet<string> = new Set(MANAGED_CONNECTOR_IDS);
+export const REMOTE_CONNECTOR_IDS: ReadonlySet<string> = new Set(HOSTED_CONNECTOR_IDS);
 
 const PROVIDER_LABELS: Readonly<Record<OAuthProviderId, string>> = Object.freeze({
   google: "Google Workspace",
@@ -126,7 +127,7 @@ export class DesktopOAuthController {
       ])
     );
     this.managedConnectorSessions = new Map(
-      [...COMPOSIO_CONNECTOR_IDS].map((connectorId) => {
+      [...REMOTE_CONNECTOR_IDS].map((connectorId) => {
         const definition = CONNECTOR_CATALOG.find((item) => item.id === connectorId)!;
         return [
           connectorId,
@@ -600,7 +601,7 @@ function isManagedConnectorPayload(value: unknown): value is Pick<ManagedConnect
     && typeof value.managed_connection_id === "string"
     && value.managed_connection_id.length > 5
     && typeof value.connector_id === "string"
-    && COMPOSIO_CONNECTOR_IDS.has(value.connector_id);
+    && REMOTE_CONNECTOR_IDS.has(value.connector_id);
 }
 
 function isManagedConnectorSession(value: unknown): value is ManagedConnectorSession {

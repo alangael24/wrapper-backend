@@ -20,6 +20,8 @@ test("ships the complete connector catalog from work and commerce apps", () => {
     "tableau", "hex", "amplitude", "mixpanel", "snowflake", "databricks",
     "mailchimp"
   ]) assert.ok(ids.includes(id), `missing connector ${id}`);
+  assert.deepEqual([...contracts.DIRECT_CONNECTOR_IDS], ["outreach", "woocommerce", "tableau", "snowflake", "clay"]);
+  assert.equal(contracts.HOSTED_CONNECTOR_IDS.length, 36);
 });
 
 test("keeps Electron, the Python broker, and the Pi extension connector ids aligned", async () => {

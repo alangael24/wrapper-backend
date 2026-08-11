@@ -107,17 +107,20 @@ para 31 proveedores mediante el gateway administrado de Composio: Google
 Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
 Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
-Amplitude, Mixpanel y Databricks. Microsoft 365, HubSpot y Salesforce conservan
-sus adaptadores OAuth directos. La primera conexión abre el
+Amplitude, Mixpanel y Databricks. Outreach, WooCommerce, Tableau, Snowflake y
+Clay usan adaptadores nativos del servicio con credenciales cifradas por
+cuenta; Microsoft 365, HubSpot y Salesforce conservan sus adaptadores OAuth
+directos. La primera conexión abre el
 inicio de sesión de Agent Genia y después el consentimiento oficial del
 proveedor; los tokens administrados permanecen en el servicio, nunca en el
 renderer ni en Pi.
 
-Los proveedores que exigen credenciales propias o no tienen un toolkit
-compatible se muestran como `Próximamente`: seleccionarlos solo los asigna al
-bot y no inventa una autenticación. El servicio se configura con
+Los demás proveedores que todavía exigen credenciales propias o no tienen un
+toolkit compatible se muestran como `Próximamente`: seleccionarlos solo los
+asigna al bot y no inventa una autenticación. El servicio se configura con
 `OUTCOME_SERVICE_URL`, debe usar HTTPS fuera de loopback y guarda su
-`COMPOSIO_API_KEY` exclusivamente en el entorno privado de producción.
+`COMPOSIO_API_KEY` y `CONNECTOR_CREDENTIALS_KEY` exclusivamente en el entorno
+privado de producción.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con

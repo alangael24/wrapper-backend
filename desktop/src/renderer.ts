@@ -19,7 +19,7 @@ import {
   BOT_SHAPES,
   BOT_TEMPLATES,
   CONNECTOR_CATALOG,
-  MANAGED_CONNECTOR_IDS,
+  HOSTED_CONNECTOR_IDS,
   type AppState,
   type BotDraft,
   type BotPatch,
@@ -1042,7 +1042,7 @@ function emptyConnectionSnapshot(): ConnectorConnectionSnapshot {
     hubspot: "hubspot",
     salesforce: "salesforce"
   };
-  const managed = new Set<string>(MANAGED_CONNECTOR_IDS);
+  const managed = new Set<string>(HOSTED_CONNECTOR_IDS);
   return {
     account: { connected: false, required: true, email: "", name: "" },
     connectors: CONNECTOR_CATALOG.map((connector) => ({
