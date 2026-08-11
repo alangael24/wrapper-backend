@@ -120,7 +120,9 @@ Para producción:
    `https://api.tu-dominio.com/v1/account-auth/google/callback` como redirect URI.
 3. Define `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` y
    `GOOGLE_OAUTH_REDIRECT_URI` únicamente en el entorno privado del backend.
-4. Compila Electron con `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`.
+4. En un host como Render configura `HOST=0.0.0.0` y conserva SQLite y
+   `secret.key` en un disco persistente.
+5. Compila Electron con `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`.
 
 La sesión principal y la sesión del broker de conectores se guardan en archivos
 cifrados distintos. Así, un token de Google/Agent Genia no se puede presentar

@@ -131,6 +131,7 @@ class Config:
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
         self.secret_file = Path(os.environ.get("SECRET_FILE", str(DEFAULT_SECRET_FILE)))
         self.go_base_url = os.environ.get("GO_BASE_URL", DEFAULT_GO_BASE).rstrip("/")
+        self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
@@ -953,8 +954,8 @@ def serve(cfg: Config) -> None:
         print(f"[config] ADMIN_TOKEN no definido; generado: {cfg.admin_token}", file=sys.stderr)
     backend = Backend(cfg)
     Handler.backend = backend
-    httpd = ThreadingHTTPServer(("127.0.0.1", cfg.port), Handler)
-    print(f"[server] wrapper backend v{__version__} escuchando en http://127.0.0.1:{cfg.port}")
+    httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
+    print(f"[server] wrapper backend v{__version__} escuchando en http://{cfg.host}:{cfg.port}")
     print(f"[server] upstream Go: {cfg.go_base_url}")
     print(f"[server] enforce_limits={cfg.enforce_limits} db={cfg.db_path}")
     print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
