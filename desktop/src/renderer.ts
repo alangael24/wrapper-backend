@@ -39,7 +39,7 @@ declare global {
   }
 }
 
-type View = "connectors" | "bot-builder" | "bot-detail";
+type View = "connectors" | "plugins" | "bot-builder" | "bot-detail";
 
 const appRootElement = document.querySelector<HTMLDivElement>("#app");
 if (!appRootElement) throw new Error("No se encontró la raíz de la aplicación.");
@@ -63,6 +63,8 @@ const iconCatalog: Record<string, SimpleIcon> = {
 let state = initialAppState();
 let activeView: View = "connectors";
 let connectorQuery = "";
+let pluginQuery = "";
+let pluginTab: "marketplace" | "yours" = "marketplace";
 let selectedConnectorIds = new Set<string>();
 let botDraft: BotDraft = { name: "", color: BOT_COLORS[6], shape: BOT_SHAPES[0] };
 let transientError = "";
@@ -87,7 +89,11 @@ async function initialize(): Promise<void> {
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
     const preview = new URLSearchParams(window.location.search).get("preview");
-    if (!window.wrapperDesktop && preview === "bot") {
+    if (!window.wrapperDesktop && preview === "plugins") {
+      selectedConnectorIds = new Set(["google-workspace", "slack", "github"]);
+      state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds] };
+      activeView = "plugins";
+    } else if (!window.wrapperDesktop && preview === "bot") {
       selectedConnectorIds = new Set(["google-workspace", "slack", "notion", "shopify"]);
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds] };
       activeView = "bot-builder";
@@ -112,6 +118,7 @@ async function initialize(): Promise<void> {
 
 function render(): void {
   if (activeView === "connectors") renderConnectors();
+  else if (activeView === "plugins") renderPluginMarketplace();
   else if (activeView === "bot-builder") renderBotBuilder();
   else renderBotDetail();
 }
@@ -308,6 +315,117 @@ async function disconnectConnector(connectorId: string): Promise<void> {
   render();
 }
 
+function renderPluginMarketplace(): void {
+  const normalizedQuery = pluginQuery.trim().toLocaleLowerCase("es");
+  const installed = CONNECTOR_CATALOG.filter((connector) => selectedConnectorIds.has(connector.id));
+  const source = pluginTab === "yours" ? installed : [...CONNECTOR_CATALOG];
+  const visible = source.filter((connector) => (
+    !normalizedQuery
+    || `${connector.name} ${connector.category} ${connector.description}`.toLocaleLowerCase("es").includes(normalizedQuery)
+  ));
+  const groups = pluginTab === "marketplace"
+    ? ["Trabajo", "Ventas", "Desarrollo", "Diseño", "Comercio"]
+    : ["Tus plugins"];
+
+  appRoot.innerHTML = `
+    <main class="plugin-marketplace">
+      <header class="plugin-marketplace-header">
+        <h1>Plugins</h1>
+        <button type="button" data-close-plugins aria-label="Cerrar">×</button>
+      </header>
+      <section class="plugin-toolbar">
+        <nav class="plugin-tabs" aria-label="Secciones de plugins">
+          <button type="button" data-plugin-tab="marketplace" class="${pluginTab === "marketplace" ? "selected" : ""}">Marketplace</button>
+          <button type="button" data-plugin-tab="yours" class="${pluginTab === "yours" ? "selected" : ""}">Yours <span>${installed.length}</span></button>
+        </nav>
+        <label class="plugin-search"><span>⌕</span><input type="search" id="plugin-search" placeholder="Buscar plugins" value="${escapeAttribute(pluginQuery)}" /></label>
+      </section>
+      ${renderAccountBanner()}
+      <section class="plugin-list" aria-label="${pluginTab === "yours" ? "Plugins instalados" : "Marketplace de plugins"}">
+        ${groups.map((group) => {
+          const items = pluginTab === "marketplace"
+            ? visible.filter((connector) => connector.category === group)
+            : visible;
+          if (!items.length) return "";
+          return `
+            <section class="plugin-section">
+              <h2>${group}</h2>
+              <div class="plugin-grid">
+                ${items.map((connector) => renderPluginRow(connector.id)).join("")}
+              </div>
+            </section>`;
+        }).join("")}
+        ${visible.length ? "" : `<div class="plugin-empty"><strong>${pluginTab === "yours" ? "Todavía no tienes plugins instalados" : "No encontramos ese plugin"}</strong><span>${pluginTab === "yours" ? "Ve a Marketplace y presiona Add para instalar uno." : "Prueba con otro nombre o categoría."}</span></div>`}
+      </section>
+      ${renderError()}
+    </main>`;
+
+  document.querySelector("[data-close-plugins]")?.addEventListener("click", () => {
+    activeView = state.bots.length ? "bot-detail" : "bot-builder";
+    render();
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-plugin-tab]")) {
+    button.addEventListener("click", () => {
+      pluginTab = button.dataset.pluginTab === "yours" ? "yours" : "marketplace";
+      pluginQuery = "";
+      renderPluginMarketplace();
+    });
+  }
+  document.querySelector<HTMLInputElement>("#plugin-search")?.addEventListener("input", (event) => {
+    pluginQuery = (event.currentTarget as HTMLInputElement).value;
+    renderPluginMarketplace();
+    const input = document.querySelector<HTMLInputElement>("#plugin-search");
+    input?.focus();
+    input?.setSelectionRange(pluginQuery.length, pluginQuery.length);
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-install-plugin]")) {
+    button.addEventListener("click", () => void setPluginInstalled(button.dataset.installPlugin ?? "", true));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-remove-plugin]")) {
+    button.addEventListener("click", () => void setPluginInstalled(button.dataset.removePlugin ?? "", false));
+  }
+  bindConnectionActions();
+  bindAccountActions();
+}
+
+function renderPluginRow(connectorId: string): string {
+  const connector = CONNECTOR_CATALOG.find((item) => item.id === connectorId);
+  if (!connector) return "";
+  const installed = selectedConnectorIds.has(connector.id);
+  const connection = connectorConnection(connector.id);
+  const secondary = pluginTab === "yours" && installed
+    ? connection.available
+      ? renderConnectorAuthAction(connector.id)
+      : '<span class="plugin-local-status">Instalado localmente</span>'
+    : "";
+  const primary = pluginTab === "marketplace"
+    ? installed
+      ? '<span class="plugin-added">✓ Added</span>'
+      : `<button type="button" class="plugin-add-button" data-install-plugin="${connector.id}">Add</button>`
+    : `<button type="button" class="plugin-remove-button" data-remove-plugin="${connector.id}">Remove</button>`;
+  return `
+    <article class="plugin-row${installed ? " installed" : ""}">
+      ${renderConnectorIcon(connector.icon, connector.name)}
+      <span class="plugin-row-copy"><strong>${connector.name}</strong><small>${connector.description}</small></span>
+      <span class="plugin-row-actions">${secondary}${primary}</span>
+    </article>`;
+}
+
+async function setPluginInstalled(connectorId: string, installed: boolean): Promise<void> {
+  if (!CONNECTOR_CATALOG.some((connector) => connector.id === connectorId)) return;
+  transientError = "";
+  if (installed) selectedConnectorIds.add(connectorId);
+  else selectedConnectorIds.delete(connectorId);
+  try {
+    state = await desktopApi.saveConnectors([...selectedConnectorIds], state.onboardingCompleted);
+  } catch (error) {
+    if (installed) selectedConnectorIds.delete(connectorId);
+    else selectedConnectorIds.add(connectorId);
+    transientError = errorMessage(error);
+  }
+  renderPluginMarketplace();
+}
+
 async function leaveConnectors(nextView: View): Promise<void> {
   setBusy(true);
   transientError = "";
@@ -326,7 +444,7 @@ function renderBotBuilder(): void {
       <header class="workspace-topbar">
         <span>${renderMascot("circle", "#2f91f5", "tiny")}</span>
         <strong>Nuevo bot</strong>
-        <button id="open-connectors" class="topbar-link" type="button">${selectedConnectorIds.size} conectores elegidos</button>
+        <button id="open-connectors" class="topbar-link" type="button">${selectedConnectorIds.size} plugins instalados</button>
       </header>
       <div class="bot-builder-scroll">
         <form id="bot-form" class="bot-form">
@@ -356,7 +474,7 @@ function renderBotBuilder(): void {
     </section>
   `, "new");
   bindSidebar();
-  document.querySelector("#open-connectors")?.addEventListener("click", () => { activeView = "connectors"; render(); });
+  document.querySelector("#open-connectors")?.addEventListener("click", () => { activeView = "plugins"; render(); });
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-bot-color]")) {
     button.addEventListener("click", () => {
       botDraft = { ...botDraft, color: button.dataset.botColor ?? BOT_COLORS[6] };
@@ -426,7 +544,7 @@ function renderBotOnboarding(bot: BotProfile): void {
       <header class="workspace-topbar">
         <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Conectores</button></div>
+        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
       </header>
       <div id="bot-setup-thread" class="bot-setup-thread">
         <div class="thread-date">Hoy · ${new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(new Date())}</div>
@@ -439,7 +557,7 @@ function renderBotOnboarding(bot: BotProfile): void {
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
   bindBotSetup(bot);
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
+  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
   requestAnimationFrame(() => {
     const thread = document.querySelector<HTMLElement>("#bot-setup-thread");
     if (thread) thread.scrollTop = thread.scrollHeight;
@@ -595,7 +713,7 @@ function renderReadyBot(bot: BotProfile): void {
       <header class="workspace-topbar">
         <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Conectores</button></div>
+        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
       </header>
       <div class="bot-detail-content">
         <div class="detail-avatar">${renderBotAvatar(bot, "hero")}</div>
@@ -614,7 +732,7 @@ function renderReadyBot(bot: BotProfile): void {
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
   bindConnectionActions();
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
+  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
   document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
   document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
 }
@@ -640,7 +758,7 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
         <div class="sidebar-brand">${renderMascot("circle", "#2f91f5", "tiny")}<strong>Agent Genia</strong></div>
         <nav class="sidebar-nav" aria-label="Navegación de bots">
           <button class="sidebar-row${activeId === "new" ? " selected" : ""}" type="button" data-new-bot>${renderMascot("circle", "#2f91f5", "small")}<span><strong>Crear un bot</strong><small>Personaliza un nuevo agente</small></span></button>
-          <button class="sidebar-row connector-row" type="button" data-open-connectors><span class="sidebar-connector-icon">⌘</span><span><strong>Conectores</strong><small>${selectedConnectorIds.size} herramientas elegidas</small></span></button>
+          <button class="sidebar-row connector-row" type="button" data-open-connectors><span class="sidebar-connector-icon">⌘</span><span><strong>Plugins</strong><small>${selectedConnectorIds.size} instalados</small></span></button>
           ${state.bots.length ? '<div class="sidebar-label">TUS BOTS</div>' : ""}
           ${state.bots.map((bot) => `<button class="sidebar-row${activeId === bot.id ? " selected" : ""}" type="button" data-select-bot="${bot.id}">${renderBotAvatar(bot, "small")}<span><strong>${escapeHtml(bot.name)}</strong><small>${bot.setup.step === "complete" ? `${bot.connectorIds.length} conectores` : "Configurando perfil…"}</small></span></button>`).join("")}
         </nav>
@@ -823,7 +941,7 @@ async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<voi
 
 function bindSidebar(): void {
   document.querySelector("[data-new-bot]")?.addEventListener("click", () => { closeBotSettings(); activeView = "bot-builder"; render(); });
-  document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "connectors"; render(); });
+  document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-bot]")) {
     button.addEventListener("click", () => void selectBot(button.dataset.selectBot ?? ""));
   }

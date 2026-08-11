@@ -117,6 +117,16 @@ test("opens personalization from the bot avatar instead of after bot creation", 
   assert.match(renderer, /function closeBotSettings\(\): void/);
 });
 
+test("opens a post-onboarding plugin marketplace and derives Yours from installed connectors", async () => {
+  const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
+  assert.match(renderer, /type View = "connectors" \| "plugins"/);
+  assert.match(renderer, /data-plugin-tab="marketplace"/);
+  assert.match(renderer, /data-plugin-tab="yours"/);
+  assert.match(renderer, /CONNECTOR_CATALOG\.filter\(\(connector\) => selectedConnectorIds\.has\(connector\.id\)\)/);
+  assert.match(renderer, /\[data-open-connectors\][\s\S]{0,180}activeView = "plugins"/);
+  assert.doesNotMatch(renderer, /\[data-open-connectors\][\s\S]{0,180}activeView = "connectors"/);
+});
+
 test("keeps Electron renderer isolated from Node and external network", async () => {
   const [main, preload, html] = await Promise.all([
     readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),

@@ -113,6 +113,40 @@ button { color: inherit; }
 .danger-action { background: #fff0f1; color: #c83243; }
 .inline-error { margin: 10px 0 0; border-radius: 10px; background: #fff0f1; padding: 10px 12px; color: #b82b3b; font-size: 12px; text-align: center; }
 
+.plugin-marketplace { display: flex; flex-direction: column; height: 100%; overflow: hidden; background: #fcfcfc; padding: 34px 42px 0; }
+.plugin-marketplace-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.plugin-marketplace-header h1 { margin: 0; font-size: 23px; font-weight: 630; letter-spacing: -.02em; }
+.plugin-marketplace-header button { display: grid; width: 38px; height: 38px; place-items: center; border: 0; border-radius: 12px; background: transparent; color: #747478; font-size: 30px; line-height: 1; cursor: pointer; }
+.plugin-marketplace-header button:hover { background: #ededee; color: #222; }
+.plugin-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 420px); align-items: center; gap: 28px; margin-top: 42px; }
+.plugin-tabs { display: flex; align-items: center; gap: 3px; }
+.plugin-tabs button { border: 0; border-radius: 12px; background: transparent; padding: 10px 13px; color: #85858a; cursor: pointer; }
+.plugin-tabs button.selected { background: #ededee; color: #222; }
+.plugin-tabs span { display: inline-grid; min-width: 18px; height: 18px; margin-left: 4px; place-items: center; border-radius: 9px; background: #dedee0; font-size: 9px; }
+.plugin-search { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; border-radius: 16px; background: #f0f0f1; padding: 0 15px; color: #99999d; }
+.plugin-search > span { font-size: 24px; transform: rotate(-18deg); }
+.plugin-search input { min-width: 0; border: 0; outline: 0; background: transparent; padding: 13px 0; font-size: 14px; }
+.plugin-marketplace > .account-banner { align-self: flex-end; width: min(520px, 100%); margin-top: 16px; }
+.plugin-list { display: grid; gap: 34px; overflow-y: auto; margin: 28px -8px 0 0; padding: 0 8px 50px 0; scrollbar-color: #d2d2d4 transparent; }
+.plugin-section { display: grid; gap: 12px; }
+.plugin-section h2 { margin: 0 0 2px 8px; color: #98989c; font-size: 12px; font-weight: 540; }
+.plugin-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 18px; }
+.plugin-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 72px; border-radius: 17px; padding: 10px 13px; transition: background .15s; }
+.plugin-row:hover { background: #f0f0f1; }
+.plugin-row-copy { display: grid; min-width: 0; gap: 4px; }
+.plugin-row-copy strong, .plugin-row-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-row-copy strong { font-size: 14px; }
+.plugin-row-copy small { color: #858589; font-size: 11px; }
+.plugin-row-actions { display: flex; align-items: center; gap: 7px; }
+.plugin-add-button, .plugin-remove-button { border: 0; border-radius: 999px; background: #ededee; padding: 8px 12px; font-size: 10px; font-weight: 650; cursor: pointer; }
+.plugin-add-button:hover { background: #dedee0; }
+.plugin-remove-button { background: #fff0f1; color: #bd3444; }
+.plugin-added { color: #96969a; font-size: 11px; white-space: nowrap; }
+.plugin-local-status { color: #8c8c91; font-size: 9px; white-space: nowrap; }
+.plugin-empty { display: grid; justify-items: center; gap: 7px; padding: 80px 20px; color: #88888d; text-align: center; }
+.plugin-empty strong { color: #333337; }
+.plugin-empty span { font-size: 11px; }
+
 .desktop-shell { position: relative; display: grid; grid-template-columns: 310px minmax(0, 1fr); height: 100%; overflow: hidden; background: white; }
 .desktop-shell.has-settings { grid-template-columns: 310px minmax(0, 1fr) 420px; }
 .desktop-sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid #dadadc; background: #f7f7f7; padding: 70px 12px 14px; }
@@ -313,6 +347,7 @@ button:disabled { cursor: wait; }
 
 @media (max-width: 1120px) {
   .connector-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .plugin-grid { grid-template-columns: 1fr; }
   .desktop-shell { grid-template-columns: 260px minmax(0, 1fr); }
   .desktop-shell.has-settings { grid-template-columns: 260px minmax(0, 1fr); }
   .bot-settings-panel { position: absolute; top: 0; right: 0; width: min(420px, calc(100vw - 260px)); box-shadow: -18px 0 45px #1113; }
@@ -331,4 +366,7 @@ button:disabled { cursor: wait; }
   .sidebar-user { justify-content: center; }
   .workspace-topbar { grid-template-columns: auto minmax(0, 1fr); }
   .topbar-link { display: none; }
+  .plugin-marketplace { padding-inline: 20px; }
+  .plugin-toolbar { grid-template-columns: 1fr; gap: 12px; margin-top: 24px; }
+  .plugin-marketplace > .account-banner { align-self: stretch; }
 }

@@ -115,6 +115,12 @@ registrar su propia app OAuth y añadirla a la lista cerrada de proveedores. El
 servicio se configura con `OUTCOME_SERVICE_URL` y debe usar HTTPS fuera de
 loopback.
 
+El selector grande de herramientas aparece únicamente durante el onboarding
+inicial. Después, el acceso `Plugins` abre un marketplace independiente con
+búsqueda y las pestañas `Marketplace` y `Yours`. `Yours` se deriva de los IDs
+instalados en `selectedConnectorIds`; desde ahí el usuario puede conectar,
+desconectar o remover cada plugin sin volver al onboarding.
+
 La sesión OAuth de Electron y el adaptador del broker de Pi son límites de
 confianza distintos. Conectar una cuenta en la interfaz prueba y conserva el
 consentimiento real del usuario; para que una ejecución HTTP de Pi use esa
