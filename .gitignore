@@ -1,0 +1,17 @@
+# Entorno y dependencias
+.venv/
+__pycache__/
+*.pyc
+
+# Secretos y datos locales
+.env
+.env.*
+!.env.example
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+secret.key
+
+# macOS
+.DS_Store
