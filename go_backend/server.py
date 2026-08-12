@@ -6,6 +6,11 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/account-auth/google/callback
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
+  GET  /v1/connectors            Catalogo y conexiones del usuario
+  GET  /v1/connectors/<id>       Estado de una cuenta conectada
+  POST /v1/connectors/start      Crear un Connect Link de Composio
+  GET  /v1/connectors/status/<id> Consultar el consentimiento
+  POST /v1/connectors/disconnect Revocar la cuenta del usuario
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
   GET  /v1/billing         Consultar plan y suscripción Stripe
   POST /v1/billing/checkout Crear Checkout para Plus/Pro
@@ -52,8 +57,13 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .billing import BillingConfig, BillingError, BillingService
+from .connector_adapters import (
+    ComposioConnectorAdapter,
+    ComposioConnectorGateway,
+    parse_config_mapping,
+)
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
-from .connectors import ConnectorBroker, ConnectorBrokerError
+from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
 from .go_prices import estimate_cost_usd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
@@ -150,6 +160,15 @@ class Config:
         self.account_access_ttl_seconds = int(os.environ.get("ACCOUNT_ACCESS_TTL_SECONDS", "900"))
         self.account_refresh_ttl_seconds = int(os.environ.get("ACCOUNT_REFRESH_TTL_SECONDS", str(30 * 86400)))
         self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
+        self.composio_api_key = (os.environ.get("COMPOSIO_API_KEY") or "").strip()
+        self.composio_public_url = (os.environ.get("COMPOSIO_PUBLIC_URL") or "").strip()
+        self.composio_auth_configs_json = os.environ.get("COMPOSIO_AUTH_CONFIGS_JSON", "")
+        self.composio_toolkit_overrides_json = os.environ.get(
+            "COMPOSIO_TOOLKIT_OVERRIDES_JSON", ""
+        )
+        self.composio_auth_attempt_ttl_seconds = int(
+            os.environ.get("COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS", "600")
+        )
         self.stripe_enabled = os.environ.get("STRIPE_ENABLED", "0") == "1"
         self.stripe_live_mode = os.environ.get("STRIPE_LIVE_MODE", "1") != "0"
         self.stripe_secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip() or None
@@ -285,6 +304,27 @@ class Backend:
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
+        try:
+            self.connector_gateway = ComposioConnectorGateway(
+                api_key=cfg.composio_api_key,
+                public_base_url=cfg.composio_public_url,
+                auth_configs=parse_config_mapping(
+                    cfg.composio_auth_configs_json,
+                    name="COMPOSIO_AUTH_CONFIGS_JSON",
+                ),
+                toolkit_overrides=parse_config_mapping(
+                    cfg.composio_toolkit_overrides_json,
+                    name="COMPOSIO_TOOLKIT_OVERRIDES_JSON",
+                ),
+                attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise UnsafeConfigurationError(f"Configuracion de conectores invalida: {exc}") from exc
+        for connector_id in self.connector_gateway.toolkits:
+            self.connectors.register_adapter(
+                connector_id,
+                ComposioConnectorAdapter(self.connector_gateway, connector_id),
+            )
         self.vision = VisionRouter(
             enabled=cfg.vision_enabled,
             base_url=cfg.go_base_url,
@@ -388,6 +428,53 @@ class Backend:
             error_response(handler, 401, "La sesión ya no es válida", "unauthorized")
             return
         json_response(handler, 200, {"revoked": True})
+
+    # ---------- connector accounts ----------
+    def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(
+            handler,
+            200,
+            {"connectors": self.connector_gateway.snapshot(user["id"])},
+        )
+
+    def handle_connector_status_public(
+        self, handler: BaseHTTPRequestHandler, connector_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.connector_gateway.status(user["id"], connector_id))
+
+    def handle_connector_start(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        connector_id = body.get("connector_id")
+        if not isinstance(connector_id, str):
+            raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
+        json_response(handler, 201, self.connector_gateway.start(user["id"], connector_id))
+
+    def handle_connector_auth_status(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.connector_gateway.poll(user["id"], attempt_id))
+
+    def handle_connector_disconnect(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        connector_id = body.get("connector_id")
+        if not isinstance(connector_id, str):
+            raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
+        json_response(handler, 200, self.connector_gateway.disconnect(user["id"], connector_id))
 
     def handle_signup(self, handler: BaseHTTPRequestHandler) -> None:
         body = self.read_json(handler) or {}
@@ -952,6 +1039,18 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_refresh(self)
             elif self.command == "POST" and path == "/v1/account-auth/logout":
                 backend.handle_account_auth_logout(self)
+            elif self.command == "GET" and path == "/connections/complete":
+                html_response(self, 200, completion_html())
+            elif self.command == "GET" and path.startswith("/v1/connectors/status/"):
+                backend.handle_connector_auth_status(self, path.rsplit("/", 1)[-1])
+            elif self.command == "POST" and path == "/v1/connectors/start":
+                backend.handle_connector_start(self)
+            elif self.command == "POST" and path == "/v1/connectors/disconnect":
+                backend.handle_connector_disconnect(self)
+            elif self.command == "GET" and path == "/v1/connectors":
+                backend.handle_connectors_snapshot(self)
+            elif self.command == "GET" and path.startswith("/v1/connectors/"):
+                backend.handle_connector_status_public(self, path.rsplit("/", 1)[-1])
             elif self.command == "POST" and path == "/v1/signup":
                 backend.handle_signup(self)
             elif self.command == "GET" and path == "/v1/billing":
@@ -999,6 +1098,7 @@ class Handler(BaseHTTPRequestHandler):
                     "google_auth_configured": backend.google_auth.configured,
                     "stripe_configured": backend.billing.configured,
                     "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
+                    "connectors": backend.connector_gateway.health(),
                 })
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
@@ -1011,6 +1111,8 @@ class Handler(BaseHTTPRequestHandler):
         except GoogleAuthError as e:
             error_response(self, e.status, str(e), e.code)
         except BillingError as e:
+            error_response(self, e.status, str(e), e.code)
+        except ConnectorBrokerError as e:
             error_response(self, e.status, str(e), e.code)
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:

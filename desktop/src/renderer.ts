@@ -33,7 +33,6 @@ import {
 } from "simple-icons";
 import {
   BOT_COLORS,
-  BOT_SETUP_OPTIONS,
   BOT_SHAPES,
   BOT_TEMPLATES,
   CONNECTOR_CATALOG,
@@ -43,10 +42,8 @@ import {
   type BotDraft,
   type BotPatch,
   type BotProfile,
-  type BotSetupAnswer,
   type ConnectorConnectionSnapshot,
   type DesktopApi,
-  applyBotSetupAnswer,
   createBotProfile,
   initialAppState,
   normalizeConnectorIds,
@@ -123,6 +120,9 @@ let billing = emptyBillingSnapshot();
 let billingLoaded = false;
 let billingBusy = false;
 let billingNotice = "";
+let agentBusyBotId = "";
+let pendingUserMessage = "";
+const botMessageDrafts = new Map<string, string>();
 const settingsSaveTimers = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
@@ -148,12 +148,7 @@ async function initialize(): Promise<void> {
       activeView = "bot-builder";
     } else if (!window.wrapperDesktop && ["setup", "connections", "settings", "settings-avatar"].includes(preview ?? "")) {
       selectedConnectorIds = new Set(["google-workspace", "slack"]);
-      let bot = createBotProfile({ name: "Juan", color: "#2f91f5", shape: "drop" }, [...selectedConnectorIds], "preview-bot");
-      if (preview === "connections") {
-        bot = applyBotSetupAnswer(bot, { step: "purpose", value: "work" });
-        bot = applyBotSetupAnswer(bot, { step: "workspace", value: "mix" });
-        bot = applyBotSetupAnswer(bot, { step: "project", value: "notion" });
-      }
+      const bot = createBotProfile({ name: "Juan", color: "#2f91f5", shape: "drop" }, [...selectedConnectorIds], "preview-bot");
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds], bots: [bot], activeBotId: bot.id };
       activeView = "bot-detail";
       settingsOpen = preview === "settings" || preview === "settings-avatar";
@@ -188,7 +183,7 @@ function renderConnectors(): void {
       <header class="connector-heading">
         <span class="eyebrow">CONECTA TU FLUJO</span>
         <h1>¿Qué usas todos los días?</h1>
-        <p>Elige las herramientas y autoriza tu propia cuenta. Las sesiones quedan cifradas en este dispositivo y nunca se comparten con otros usuarios.</p>
+        <p>Elige las herramientas y autoriza tu propia cuenta. El acceso queda aislado en el backend para tu usuario y nunca se comparte con otras cuentas.</p>
       </header>
       ${renderAccountBanner()}
       <label class="connector-search">
@@ -311,6 +306,9 @@ async function signInAccount(): Promise<void> {
   render();
   try {
     connections = await desktopApi.signIn();
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
+    activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
@@ -325,6 +323,10 @@ async function signOutAccount(): Promise<void> {
   render();
   try {
     connections = await desktopApi.signOut();
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set();
+    closeBotSettings();
+    activeView = "connectors";
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
@@ -707,6 +709,10 @@ async function createBot(): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
+  const created = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (created && !created.messages.length) {
+    void initializeBotConversation(created.id);
+  }
 }
 
 async function createDefaultBot(): Promise<void> {
@@ -731,6 +737,10 @@ async function createDefaultBot(): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
+  const created = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (created && !created.messages.length) {
+    void initializeBotConversation(created.id);
+  }
 }
 
 function renderBotDetail(): void {
@@ -740,212 +750,135 @@ function renderBotDetail(): void {
     renderBotBuilder();
     return;
   }
-  if (bot.setup.step !== "complete") {
-    renderBotOnboarding(bot);
-    return;
-  }
   renderReadyBot(bot);
 }
 
-function renderBotOnboarding(bot: BotProfile): void {
+function renderReadyBot(bot: BotProfile): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-chat-view">
       <header class="workspace-topbar">
         <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
+        <div class="topbar-actions">
+          <span>${bot.connectorIds.length} plugins</span>
+          <button id="edit-connectors" class="topbar-link" type="button">Plugins</button>
+          <button id="delete-bot" class="topbar-link" type="button">Eliminar</button>
+        </div>
       </header>
-      <div id="bot-setup-thread" class="bot-setup-thread">
-        <div class="thread-date">Hoy · ${new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(new Date())}</div>
-        <div class="assistant-bubble">Hola, soy ${escapeHtml(bot.name)}. Qué gusto conocerte.</div>
-        ${renderSetupHistory(bot)}
-        ${renderCurrentSetupStep(bot)}
+      <div id="bot-conversation-thread" class="bot-setup-thread bot-conversation-thread">
+        <div class="thread-date">Hoy</div>
+        ${bot.messages.length ? bot.messages.map((message, index) => {
+          const hasLaterUserMessage = bot.messages.slice(index + 1).some((item) => item.role === "user");
+          return `
+            <div class="chat-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"}">${escapeHtml(message.text).replace(/\n/g, "<br />")}</div>
+            ${message.widget && (!hasLaterUserMessage || !message.widget.dismissOnMoveOn)
+              ? renderGeneratedQuestion(message, !hasLaterUserMessage)
+              : ""}`;
+        }).join("") : agentBusyBotId === bot.id ? "" : `
+          <div class="conversation-empty">${renderBotAvatar(bot, "large")}<strong>${escapeHtml(bot.name)} está listo</strong><span>Escríbele qué necesitas y generará su respuesta con el modelo.</span></div>
+        `}
+        ${agentBusyBotId === bot.id && pendingUserMessage ? `<div class="chat-bubble user-bubble">${escapeHtml(pendingUserMessage)}</div>` : ""}
+        ${agentBusyBotId === bot.id ? '<div class="assistant-bubble agent-thinking"><i></i><i></i><i></i></div>' : ""}
         ${renderError()}
       </div>
-      ${renderMessageComposer(bot.name)}
+      ${renderMessageComposer(bot.name, bot.id)}
     </section>
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
-  bindBotSetup(bot);
+  bindBotChat(bot);
   document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
+  document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
   requestAnimationFrame(() => {
-    const thread = document.querySelector<HTMLElement>("#bot-setup-thread");
+    const thread = document.querySelector<HTMLElement>("#bot-conversation-thread");
     if (thread) thread.scrollTop = thread.scrollHeight;
   });
 }
 
-function renderSetupHistory(bot: BotProfile): string {
-  const setup = bot.setup;
-  const chunks: string[] = [];
-  if (setup.purpose) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Para qué quieres usarme principalmente?",
-      setupLabel("purpose", setup.purpose, setup.customAnswers.purpose)
-    ));
-    chunks.push(`<div class="assistant-bubble">${setup.purpose === "work" ? "Entendido: seré tu compañero de trabajo." : setup.purpose === "coding" ? "Perfecto: modo tecnología activado." : "Perfecto, ajustaré mi forma de trabajar a eso."}</div>`);
-  }
-  if (setup.workspace) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Dónde vive tu trabajo en el día a día?",
-      setupLabel("workspace", setup.workspace, setup.customAnswers.workspace)
-    ));
-    chunks.push(`<div class="assistant-bubble">${setup.workspace === "mix" ? "Perfecto, ese es todo el stack. Vamos a conectarlo." : "Listo, usaré esa herramienta como tu espacio principal."}</div>`);
-  }
-  if (setup.projectTool) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Qué herramienta de proyectos debo usar?",
-      setupLabel("project", setup.projectTool, setup.customAnswers.project)
-    ));
-    chunks.push('<div class="assistant-bubble">Ya tengo el contexto. Preparé tus conectores recomendados.</div>');
-  }
-  return chunks.join("");
-}
-
-function renderCurrentSetupStep(bot: BotProfile): string {
-  if (bot.setup.step === "connections") return renderConnectionRecommendations(bot);
-  const questions = {
-    purpose: {
-      title: "¿Para qué quieres usarme principalmente?",
-      subtitle: "Ajustaré mi forma de trabajar a partir de tu respuesta.",
-      placeholder: "Escribe tu propia respuesta"
-    },
-    workspace: {
-      title: "¿Dónde vive tu trabajo en el día a día?",
-      subtitle: "Puedo preparar estas herramientas para encontrarte información.",
-      placeholder: "Escribe otra herramienta"
-    },
-    project: {
-      title: "¿Qué herramienta de proyectos debo usar?",
-      subtitle: "La añadiré junto con las demás herramientas que elegiste.",
-      placeholder: "Escribe otra herramienta de proyectos"
-    }
-  } as const;
-  const step = bot.setup.step as keyof typeof questions;
-  const question = questions[step];
-  const options = BOT_SETUP_OPTIONS[step];
-  return `
-    <section class="setup-question-card">
-      <button class="question-close" type="button" aria-label="Omitir pregunta" data-skip-setup>×</button>
-      <h2>${question.title}</h2>
-      <p>${question.subtitle}</p>
-      <div class="setup-options">
-        ${options.map((option, index) => `<button type="button" data-setup-answer="${option.id}"><kbd>${String.fromCharCode(65 + index)}</kbd><span>${option.label}</span></button>`).join("")}
-      </div>
-      <form id="custom-setup-answer" class="custom-answer-form">
-        <input name="customAnswer" maxlength="300" placeholder="${question.placeholder}" autocomplete="off" />
-        <button type="submit">Enviar</button>
-      </form>
-    </section>`;
-}
-
-function renderAnsweredQuestion(title: string, answer: string): string {
-  return `
-    <section class="setup-question-card answered">
-      <h2>${title}</h2>
-      <div class="answered-row"><kbd>✓</kbd><span>${escapeHtml(answer)}</span><i>✓</i></div>
-    </section>`;
-}
-
-function renderConnectionRecommendations(bot: BotProfile): string {
-  const cards = connectionCards(bot);
-  return `
-    <div class="assistant-bubble">Voy a preparar estas herramientas. Autoriza tus cuentas y las guardaré cifradas solamente para tu usuario.</div>
-    <section class="setup-question-card connection-setup-card">
-      <h2>Conectores recomendados</h2>
-      <p>Cada botón abre el inicio de sesión oficial del proveedor.</p>
-      <div class="setup-connection-list">
-        ${cards.length ? cards.map((connection) => `
-          <article class="setup-connection-row">
-            ${renderConnectorIcon(connection.icon, connection.name)}
-            <span><strong>${connection.name}</strong><small>${connection.description}</small></span>
-            ${renderConnectorAuthAction(connection.connectorId)}
-          </article>`).join("") : '<div class="no-recommendations">No seleccionaste conectores. Puedes agregarlos después.</div>'}
-      </div>
-      <div class="oauth-truth-note"><strong>${connections.account.connected ? "Sesión personal activa" : "Primero inicia sesión"}</strong><span>${connections.account.connected ? escapeHtml(connections.account.email) : "Al conectar una herramienta abriremos el acceso de Agent Genia y después el del proveedor."}</span></div>
-      <button id="finish-bot-setup" class="primary-action compact" type="button">Continuar con el bot</button>
-    </section>`;
-}
-
-function connectionCards(bot: BotProfile): Array<{ connectorId: string; name: string; icon: string; description: string }> {
-  const cards: Array<{ connectorId: string; name: string; icon: string; description: string }> = [];
-  for (const connector of CONNECTOR_CATALOG.filter((item) => bot.connectorIds.includes(item.id))) {
-    if (connector.id === "google-workspace") {
-      cards.push(
-        { connectorId: connector.id, name: "Gmail", icon: "google", description: "Correo, búsqueda y borradores" },
-        { connectorId: connector.id, name: "Google Calendar", icon: "google", description: "Agenda, reuniones y eventos" }
-      );
-    } else cards.push({ connectorId: connector.id, name: connector.name, icon: connector.icon, description: connector.description });
-  }
-  return cards;
-}
-
-function setupLabel(group: keyof typeof BOT_SETUP_OPTIONS, value: string, custom?: string): string {
-  return custom || BOT_SETUP_OPTIONS[group].find((option) => option.id === value)?.label || value;
-}
-
-function bindBotSetup(bot: BotProfile): void {
-  bindConnectionActions();
-  document.querySelector(".message-composer")?.addEventListener("submit", (event) => event.preventDefault());
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-setup-answer]")) {
-    button.addEventListener("click", () => void answerCurrentSetup(bot, button.dataset.setupAnswer ?? ""));
-  }
-  document.querySelector("[data-skip-setup]")?.addEventListener("click", () => {
-    const fallback = bot.setup.step === "purpose" ? "everything" : bot.setup.step === "workspace" ? "other" : "skip";
-    void answerCurrentSetup(bot, fallback);
-  });
-  document.querySelector("#custom-setup-answer")?.addEventListener("submit", (event) => {
+function bindBotChat(bot: BotProfile): void {
+  const form = document.querySelector<HTMLFormElement>(".message-composer");
+  const input = form?.elements.namedItem("message") as HTMLInputElement | null;
+  input?.addEventListener("input", () => botMessageDrafts.set(bot.id, input.value));
+  form?.addEventListener("submit", (event) => {
     event.preventDefault();
-    const input = (event.currentTarget as HTMLFormElement).elements.namedItem("customAnswer") as HTMLInputElement | null;
-    const customText = input?.value.trim() ?? "";
-    if (!customText) return input?.focus();
-    const value = bot.setup.step === "purpose" ? "specific" : bot.setup.step === "workspace" ? "other" : "skip";
-    void answerCurrentSetup(bot, value, customText);
+    const message = input?.value.trim() ?? "";
+    if (!message || agentBusyBotId) return input?.focus();
+    botMessageDrafts.delete(bot.id);
+    void sendBotMessage(bot.id, message);
   });
-  document.querySelector("#finish-bot-setup")?.addEventListener("click", () => void answerCurrentSetup(bot, "complete"));
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-widget-message][data-widget-option]")) {
+    button.addEventListener("click", () => {
+      if (agentBusyBotId || button.disabled) return;
+      const message = bot.messages.find((item) => item.id === button.dataset.widgetMessage);
+      const optionIndex = Number(button.dataset.widgetOption);
+      const option = message?.widget?.options[optionIndex];
+      if (option) void sendBotMessage(bot.id, option.value);
+    });
+  }
+  for (const customForm of document.querySelectorAll<HTMLFormElement>("[data-widget-custom]")) {
+    customForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (agentBusyBotId) return;
+      const customInput = customForm.elements.namedItem("customAnswer") as HTMLInputElement | null;
+      const answer = customInput?.value.trim() ?? "";
+      if (answer) void sendBotMessage(bot.id, answer);
+    });
+  }
 }
 
-async function answerCurrentSetup(bot: BotProfile, value: string, customText?: string): Promise<void> {
-  if (bot.setup.step === "complete") return;
-  setBusy(true);
+function renderGeneratedQuestion(message: BotProfile["messages"][number], active: boolean): string {
+  const widget = message.widget;
+  if (!widget) return "";
+  return `
+    <section class="setup-question-card generated-question-widget${active ? "" : " answered"}">
+      <h2>${escapeHtml(widget.prompt)}</h2>
+      ${widget.helpText ? `<p>${escapeHtml(widget.helpText)}</p>` : ""}
+      <div class="setup-options">
+        ${widget.options.map((option, index) => `
+          <button type="button" data-widget-message="${escapeAttribute(message.id)}" data-widget-option="${index}" ${active ? "" : "disabled"}>
+            <kbd>${String.fromCharCode(65 + index)}</kbd>
+            <span><strong>${escapeHtml(option.label)}</strong>${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}</span>
+          </button>`).join("")}
+      </div>
+      ${widget.allowCustom && active ? `
+        <form class="custom-answer-form" data-widget-custom="${escapeAttribute(message.id)}">
+          <input name="customAnswer" maxlength="300" placeholder="Escribe tu propia respuesta" autocomplete="off" />
+          <button type="submit">Enviar</button>
+        </form>` : ""}
+    </section>`;
+}
+
+async function initializeBotConversation(botId: string): Promise<void> {
+  if (agentBusyBotId) return;
+  agentBusyBotId = botId;
+  pendingUserMessage = "";
   transientError = "";
+  render();
   try {
-    const answer: BotSetupAnswer = { step: bot.setup.step, value, ...(customText ? { customText } : {}) };
-    state = await desktopApi.answerBotSetup(bot.id, answer);
+    state = await desktopApi.runBotAgent(botId, "", true);
   } catch (error) {
     transientError = errorMessage(error);
+  } finally {
+    agentBusyBotId = "";
+    pendingUserMessage = "";
+    render();
   }
-  render();
 }
 
-function renderReadyBot(bot: BotProfile): void {
-  const connectors = CONNECTOR_CATALOG.filter((connector) => bot.connectorIds.includes(connector.id));
-  appRoot.innerHTML = renderDesktopShell(`
-    <section class="bot-detail-view">
-      <header class="workspace-topbar">
-        <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
-        <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
-      </header>
-      <div class="bot-detail-content">
-        <div class="detail-avatar">${renderBotAvatar(bot, "hero")}</div>
-        <span class="ready-pill">BOT LISTO</span>
-        <h1>${escapeHtml(bot.name)}</h1>
-        <p>${connections.account.connected ? `Sesión activa como ${escapeHtml(connections.account.email)}. Cada conector usa únicamente la cuenta que tú autorizaste.` : "Inicia sesión al conectar una herramienta; cada proveedor abrirá su autorización oficial."}</p>
-        <div class="selected-tools detailed">
-          ${connectors.length ? connectors.map((connector) => `<article>${renderConnectorIcon(connector.icon, connector.name, true)}<strong>${connector.name}</strong>${renderConnectorAuthAction(connector.id)}</article>`).join("") : "<em>Sin conectores seleccionados</em>"}
-        </div>
-        <div class="detail-actions">
-          <button id="new-bot-from-detail" class="primary-action compact" type="button">Crear otro bot</button>
-          <button id="delete-bot" class="danger-action" type="button">Eliminar bot</button>
-        </div>
-      </div>
-    </section>
-  `, bot.id, settingsOpen ? bot : undefined);
-  bindSidebar();
-  bindConnectionActions();
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
-  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => void createDefaultBot());
-  document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
+async function sendBotMessage(botId: string, message: string): Promise<void> {
+  agentBusyBotId = botId;
+  pendingUserMessage = message;
+  transientError = "";
+  render();
+  try {
+    state = await desktopApi.runBotAgent(botId, message);
+  } catch (error) {
+    botMessageDrafts.set(botId, message);
+    transientError = errorMessage(error);
+  } finally {
+    agentBusyBotId = "";
+    pendingUserMessage = "";
+    render();
+  }
 }
 
 async function deleteActiveBot(bot: BotProfile): Promise<void> {
@@ -991,10 +924,8 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
 
 function botSidebarPreview(bot: BotProfile): string {
   if (bot.title) return bot.title;
-  if (bot.setup.step === "purpose") return "¿Con qué debería ayudarte más?";
-  if (bot.setup.step === "workspace") return "¿Dónde vive tu trabajo?";
-  if (bot.setup.step === "project") return "Elige tu herramienta de proyectos";
-  if (bot.setup.step === "connections") return "Conecta tus herramientas";
+  const latest = bot.messages.at(-1);
+  if (latest) return latest.text.slice(0, 90);
   return bot.connectorIds.length ? `${bot.connectorIds.length} plugins conectados` : "Listo para trabajar";
 }
 
@@ -1004,12 +935,13 @@ function formatBotTime(createdAt: string): string {
   return new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
-function renderMessageComposer(botName: string): string {
+function renderMessageComposer(botName: string, botId = ""): string {
+  const busy = botId && agentBusyBotId === botId;
   return `
     <form class="message-composer" aria-label="Mensaje para ${escapeAttribute(botName)}">
       <button type="button" aria-label="Agregar">＋</button>
-      <input type="text" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" />
-      <button class="composer-mic" type="button" aria-label="Mensaje de voz"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="8" height="12" rx="4"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg></button>
+      <input name="message" type="text" maxlength="20000" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" value="${escapeAttribute(botId ? botMessageDrafts.get(botId) ?? "" : "")}" ${busy ? "disabled" : ""} />
+      <button class="composer-send" type="submit" aria-label="Enviar" ${busy ? "disabled" : ""}>↑</button>
     </form>`;
 }
 
@@ -1375,8 +1307,28 @@ function createPreviewApi(): DesktopApi {
       previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },
-    async answerBotSetup(botId, answer) {
-      const bots = previewState.bots.map((bot) => bot.id === botId ? applyBotSetupAnswer(bot, answer) : bot);
+    async runBotAgent(botId, prompt, initial = false) {
+      const now = new Date().toISOString();
+      const bots = previewState.bots.map((bot) => bot.id === botId ? {
+        ...bot,
+        messages: [
+          ...bot.messages,
+          ...(!initial ? [{ id: crypto.randomUUID(), role: "user" as const, text: prompt, createdAt: now }] : []),
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            text: initial ? `${bot.name} está listo para conocerte.` : `Entendido: ${prompt}`,
+            ...(initial ? { widget: {
+              prompt: "¿Qué quieres lograr primero?",
+              helpText: "Esta vista previa representa contenido generado por el modelo.",
+              options: [{ label: "Empezar", value: "Quiero empezar", description: "" }],
+              allowCustom: true,
+              dismissOnMoveOn: true
+            } } : {}),
+            createdAt: now
+          }
+        ]
+      } : bot);
       previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },

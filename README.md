@@ -120,30 +120,33 @@ ADMIN_TOKEN=mi-token .venv/bin/python -m go_backend.server serve --port 8787
 El repositorio incluye una interfaz de escritorio separada del backend y del
 harness. Permite elegir conectores, buscar por herramienta, crear varios bots,
 personalizar su color/forma/nombre y guardar qué conectores utilizará cada bot.
-Después de crear un bot, una conversación guiada pregunta para qué se usará,
-dónde vive el trabajo y qué sistema de proyectos debe considerar; con esas
-respuestas recomienda y asigna conectores al perfil.
+Después de crear un bot, el modelo genera el saludo y, cuando ayuda, un widget
+genérico de pregunta con entre una y seis opciones. La interfaz solo valida y
+renderiza ese schema: las preguntas, opciones y respuestas no están
+hardcodeadas ni forman parte del onboarding de la aplicación.
 
 ```bash
 pnpm install
 pnpm desktop
 ```
 
-La app guarda preferencias y perfiles de bots en `desktop-state.json`, dentro
-del directorio `userData` de Electron. Las sesiones de cuenta y de proveedores
-se guardan aparte, cifradas con `safeStorage`/Keychain, con permisos `0600` y
-ligadas al ID de la cuenta que inició sesión. Cerrar sesión borra también las
-sesiones de proveedores para que otra persona del equipo no las herede. El
-renderer no tiene acceso a Node.js, tokens ni red: toda autenticación pasa por
-un `preload` aislado y una lista cerrada de operaciones IPC.
+La app guarda preferencias y perfiles de bots en un archivo aislado por cuenta
+dentro de `userData/accounts` de Electron. Al cerrar sesión carga un estado
+vacío en memoria y no expone los bots de la cuenta anterior. Una instalación
+existente migra una sola vez su antiguo `desktop-state.json` a la cuenta que ya
+estaba autenticada y retira el archivo compartido del flujo normal. Solo la
+sesión opaca de Agent Genia se
+guarda cifrada con `safeStorage`/Keychain y permisos `0600`. Los tokens de cada
+proveedor permanecen en Composio bajo el `user_id` autenticado y nunca entran a
+Electron ni a Pi. El renderer no tiene acceso a Node.js, tokens ni red: toda
+autenticación pasa por un `preload` aislado y una lista cerrada de operaciones
+IPC.
 
 ### Login con Google
 
-Electron usa el login Google público que ya ofrece `OUTCOME_SERVICE_URL`. No
-requiere desplegar otro servicio: si `WRAPPER_SERVICE_URL` está vacío, la cuenta
-y los conectores comparten ese broker y una sola sesión cifrada. La
-implementación equivalente incluida en `wrapper-backend` queda disponible para
-una futura separación del modelo y se activa únicamente al definir su URL.
+Electron usa exclusivamente `WRAPPER_SERVICE_URL` para el login Google, billing,
+conectores y agentes. La build distribuida apunta a
+`https://agentgenia-api.onrender.com`; desarrollo puede usar un loopback HTTP.
 
 El flujo usa Authorization Code con PKCE, valida el `state` y consulta la
 identidad verificada de Google. Google se identifica por su `sub` estable; una
@@ -162,34 +165,26 @@ Para reemplazar el broker actual por una instancia propia:
    `https://api.tu-dominio.com/v1/account-auth/google/callback` como redirect URI.
 3. Define `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` y
    `GOOGLE_OAUTH_REDIRECT_URI` únicamente en el entorno privado del backend.
-4. Si eliges desplegar una instancia separada, configura `HOST=0.0.0.0` y conserva SQLite y
-   `secret.key` en un disco persistente.
-5. Define `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`; si la omites se
-   conserva automáticamente el login actual de `OUTCOME_SERVICE_URL`.
+4. Configura `HOST=0.0.0.0` y usa `DATABASE_URL` con Supabase/Postgres.
+5. Define `WRAPPER_SERVICE_URL=https://api.tu-dominio.com` al compilar o lanzar
+   Electron si no usas el dominio de producción predeterminado.
 
-La sesión principal y la sesión del broker de conectores se guardan en archivos
-cifrados distintos. Así, un token de Google/Agent Genia no se puede presentar
-accidentalmente ante Composio, Slack, Notion u otro proveedor.
-
-El catálogo de Agent Genia ofrece conexión real y aislada por usuario para 31
-proveedores mediante el gateway administrado de Composio: Google
+El catálogo de Agent Genia ofrece conexión real y aislada por usuario mediante
+el gateway de Composio que vive dentro de `wrapper-backend`: Google
 Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
 Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
-Amplitude, Mixpanel y Databricks. Outreach, WooCommerce, Tableau, Snowflake y
-Clay usan adaptadores nativos del servicio con credenciales cifradas por
-cuenta; Microsoft 365, HubSpot y Salesforce conservan sus adaptadores OAuth
-directos. La primera conexión abre el
-inicio de sesión de Agent Genia y después el consentimiento oficial del
-proveedor; los tokens administrados permanecen en el servicio, nunca en el
-renderer ni en Pi.
+Amplitude, Mixpanel y Databricks. Microsoft 365 y HubSpot usan también Managed
+Auth. Los proveedores que requieren una app propia se activan con
+`COMPOSIO_AUTH_CONFIGS_JSON`. La primera conexión abre el inicio de sesión de
+Agent Genia y después el Connect Link oficial; los tokens administrados
+permanecen en Composio, nunca en el renderer ni en Pi.
 
 Los demás proveedores que todavía exigen credenciales propias o no tienen un
 toolkit compatible se muestran como `Próximamente`: seleccionarlos solo los
-asigna al bot y no inventa una autenticación. El servicio se configura con
-`OUTCOME_SERVICE_URL`, debe usar HTTPS fuera de loopback y guarda su
-`COMPOSIO_API_KEY` y `CONNECTOR_CREDENTIALS_KEY` exclusivamente en el entorno
-privado de producción.
+asigna al bot y no inventa una autenticación. `COMPOSIO_API_KEY`, los Auth
+Config IDs y cualquier client secret viven exclusivamente en el entorno privado
+de `wrapper-backend`.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con
@@ -206,11 +201,13 @@ Ashby, Greenhouse, Vercel, Tableau, Hex, Amplitude, Mixpanel, Snowflake,
 Databricks y Mailchimp. Que aparezcan en el catálogo no implica autenticación:
 sin app OAuth y adaptador registrados se muestran como `Próximamente`.
 
-La sesión OAuth de Electron y el adaptador del broker de Pi son límites de
-confianza distintos. Conectar una cuenta en la interfaz prueba y conserva el
-consentimiento real del usuario; para que una ejecución HTTP de Pi use esa
-cuenta, el backend todavía necesita un adaptador del proveedor registrado para
-ese mismo usuario. Pi nunca recibe refresh tokens ni client secrets.
+La sesión de Electron y el broker efímero de Pi son límites de confianza
+distintos. Conectar una cuenta crea una conexión real en Composio; al ejecutar,
+el adaptador registrado en `wrapper-backend` busca y llama la herramienta en
+una sesión limitada al toolkit y al mismo usuario. Pi nunca recibe refresh
+tokens, API keys de Composio ni client secrets. Electron consulta todas sus
+conexiones con un único `GET /v1/connectors`; el backend es la fuente de verdad
+y no persiste estados OAuth de proveedores en el dispositivo.
 
 Cargar keys de Go al pool:
 
@@ -277,14 +274,14 @@ El aislamiento es por ejecución:
 4. Los endpoints internos aceptan únicamente tráfico loopback y limitan cada
    operación al grant. El token se revoca al terminar o fallar la tarea y además
    tiene una expiración máxima de una hora.
-5. El adaptador del proveedor conserva y refresca sus credenciales dentro del
-   backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
+5. Composio conserva y refresca las credenciales; el adaptador se ejecuta dentro
+   del backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
    con `connector_not_configured` o `connector_not_connected`.
 
 La extensión y el broker no inventan una sesión OAuth: son la ruta segura entre
-Pi y los adaptadores reales. Registrar las apps OAuth, callbacks y almacenamiento
-cifrado sigue siendo obligatorio por proveedor. La selección visual de un bot
-solamente determina el `connector_ids` que debe enviarse al ejecutar ese bot.
+Pi y el gateway real. Los proveedores sin Managed Auth requieren un Auth Config
+de Composio registrado por el operador. La selección visual de un bot solamente
+determina el `connector_ids` que debe enviarse al ejecutar ese bot.
 
 ```bash
 pnpm test:connectors
@@ -362,6 +359,11 @@ aceptan API key o access token de una sesión Google):
 | GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
 | POST | `/v1/account-auth/refresh` | Rota access y refresh token ligados al dispositivo |
 | POST | `/v1/account-auth/logout` | Revoca la sesión actual |
+| GET | `/v1/connectors` | Catálogo y conexiones reales del usuario en una sola consulta |
+| GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
+| POST | `/v1/connectors/start` | Crea un Connect Link de Composio con límite por usuario |
+| GET | `/v1/connectors/status/<attempt_id>` | Consulta un consentimiento sin exponer credenciales |
+| POST | `/v1/connectors/disconnect` | Revoca las cuentas activas de ese toolkit para el usuario |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
 | POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |

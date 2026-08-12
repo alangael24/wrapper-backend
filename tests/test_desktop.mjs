@@ -20,8 +20,11 @@ test("ships the complete connector catalog from work and commerce apps", () => {
     "tableau", "hex", "amplitude", "mixpanel", "snowflake", "databricks",
     "mailchimp"
   ]) assert.ok(ids.includes(id), `missing connector ${id}`);
-  assert.deepEqual([...contracts.DIRECT_CONNECTOR_IDS], ["outreach", "woocommerce", "tableau", "snowflake", "clay"]);
-  assert.equal(contracts.HOSTED_CONNECTOR_IDS.length, 36);
+  assert.deepEqual([...contracts.DIRECT_CONNECTOR_IDS], [
+    "salesforce", "docusign", "outreach", "clay", "zoominfo", "netsuite",
+    "ramp", "workday", "tableau", "snowflake", "woocommerce"
+  ]);
+  assert.equal(contracts.HOSTED_CONNECTOR_IDS.length, 44);
 });
 
 test("renders a bundled brand logo for every plugin", async () => {
@@ -77,7 +80,7 @@ test("normalizes connector selection and persisted bot state", () => {
   assert.deepEqual(state.selectedConnectorIds, ["github"]);
   assert.equal(state.bots[0].name, "Mi bot");
   assert.deepEqual(state.bots[0].connectorIds, ["github"]);
-  assert.equal(state.bots[0].setup.step, "purpose");
+  assert.deepEqual(state.bots[0].messages, []);
   assert.equal(state.bots[0].title, "");
   assert.equal(state.bots[0].description, "");
   assert.equal(state.bots[0].avatarDataUrl, "");
@@ -85,25 +88,22 @@ test("normalizes connector selection and persisted bot state", () => {
   assert.equal(state.activeBotId, "bot-1");
 });
 
-test("walks a new bot through work setup and connector recommendations", () => {
-  let bot = contracts.createBotProfile({
-    name: "Juan",
-    color: "#2f91f5",
-    shape: "drop"
-  }, [], "bot-setup", new Date("2026-08-11T01:02:03.000Z"));
-  assert.equal(bot.setup.step, "purpose");
-
-  bot = contracts.applyBotSetupAnswer(bot, { step: "purpose", value: "work" });
-  assert.equal(bot.setup.step, "workspace");
-  bot = contracts.applyBotSetupAnswer(bot, { step: "workspace", value: "mix" });
-  assert.equal(bot.setup.step, "project");
-  assert.deepEqual(bot.connectorIds, ["google-workspace", "slack"]);
-  bot = contracts.applyBotSetupAnswer(bot, { step: "project", value: "notion" });
-  assert.equal(bot.setup.step, "connections");
-  assert.deepEqual(bot.connectorIds, ["google-workspace", "slack", "notion"]);
-  bot = contracts.applyBotSetupAnswer(bot, { step: "connections", value: "complete" });
-  assert.equal(bot.setup.step, "complete");
-  assert.throws(() => contracts.applyBotSetupAnswer(bot, { step: "purpose", value: "personal" }));
+test("validates the generic LLM question widget without hardcoded onboarding content", () => {
+  const widget = contracts.normalizeQuestionWidget({
+    prompt: "  Pregunta generada  ",
+    helpText: "Contexto generado",
+    options: Array.from({ length: 8 }, (_item, index) => ({
+      label: `Opción ${index + 1}`,
+      value: `Quiero la opción ${index + 1}`,
+      description: index === 0 ? "Detalle" : ""
+    })),
+    allowCustom: true,
+    dismissOnMoveOn: true
+  });
+  assert.equal(widget.prompt, "Pregunta generada");
+  assert.equal(widget.options.length, 6);
+  assert.equal(widget.options[0].value, "Quiero la opción 1");
+  assert.equal(contracts.normalizeQuestionWidget({ prompt: "sin opciones", options: [] }), undefined);
 });
 
 test("creates bots with bounded validated fields", () => {
@@ -119,7 +119,7 @@ test("creates bots with bounded validated fields", () => {
   assert.throws(() => contracts.createBotProfile({ name: "", color: "", shape: "" }, [], "bot-3"));
 });
 
-test("updates persisted bot personalization without touching its setup", () => {
+test("updates persisted bot personalization without touching its messages", () => {
   const original = contracts.createBotProfile({
     name: "Nuevo bot",
     color: "#2f91f5",
@@ -141,7 +141,7 @@ test("updates persisted bot personalization without touching its setup", () => {
   assert.equal(updated.shape, "hexagon");
   assert.match(updated.avatarDataUrl, /^data:image\/png;base64,/);
   assert.equal(updated.notificationsEnabled, false);
-  assert.deepEqual(updated.setup, original.setup);
+  assert.deepEqual(updated.messages, original.messages);
   assert.deepEqual(updated.connectorIds, ["slack"]);
   assert.throws(() => contracts.updateBotProfile(original, { name: "" }));
   assert.throws(() => contracts.updateBotProfile(original, { avatarDataUrl: "data:image/svg+xml;base64,PHN2Zz4=" }));
@@ -161,16 +161,54 @@ test("matches the conversation shell with bot search, plus-only creation, and co
   assert.doesNotMatch(renderer, /class="sidebar-draft/);
   assert.match(renderer, /function botSidebarPreview/);
   assert.match(renderer, /function renderMessageComposer/);
-  assert.match(renderer, /\$\{renderMessageComposer\(bot\.name\)\}/);
+  assert.match(renderer, /\$\{renderMessageComposer\(bot\.name, bot\.id\)\}/);
 });
 
-test("keeps the first-bot builder but creates later bots immediately with defaults", async () => {
+test("keeps the first-bot builder and starts every created bot with the LLM", async () => {
   const renderer = await readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8");
   assert.match(renderer, /async function createDefaultBot\(\): Promise<void>/);
   assert.match(renderer, /if \(!state\.bots\.length\)[\s\S]{0,180}activeView = "bot-builder"/);
   assert.match(renderer, /name: "Nuevo bot",\s+color: BOT_COLORS\[6\],\s+shape: BOT_SHAPES\[0\]/);
+  assert.match(renderer, /initializeBotConversation\(created\.id\)/);
+  assert.doesNotMatch(renderer, /skipSetup|renderBotOnboarding|BOT_SETUP_OPTIONS/);
   assert.match(renderer, /\[data-new-bot\][\s\S]{0,150}createDefaultBot\(\)/);
-  assert.match(renderer, /#new-bot-from-detail[\s\S]{0,120}createDefaultBot\(\)/);
+});
+
+test("runs bot conversations through wrapper-backend without hardcoded replies", async () => {
+  const [main, preload, oauth, renderer] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:run-bot-agent/);
+  assert.match(main, /buildBotPrompt\(\{ \.\.\.bot, connectorIds \}, prompt, initial\)/);
+  assert.match(main, /\.\.\.before\.selectedConnectorIds/);
+  assert.match(main, /\.\.\.bot\.connectorIds/);
+  assert.match(oauth, /"\/v1\/agent\/run"/);
+  assert.match(oauth, /connector_ids: connectorIds/);
+  assert.match(preload, /runBotAgent/);
+  assert.match(renderer, /desktopApi\.runBotAgent\(botId, message\)/);
+  assert.match(main, /normalizeQuestionWidget\(record\.widget\)/);
+  assert.match(main, /Devuelve exclusivamente JSON válido/);
+  assert.match(renderer, /renderGeneratedQuestion/);
+  assert.doesNotMatch(`${main}\n${renderer}`, /Hey — I'm New Bot|What should I help with most|Hola, soy \$\{escapeHtml\(bot\.name\)\}/);
+});
+
+test("isolates desktop bot state by signed-in account and clears the signed-out view", async () => {
+  const [main, renderer, oauth] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /createHash\("sha256"\)\.update\(accountId\)/);
+  assert.match(main, /path\.join\(userDataPath, "accounts"\)/);
+  assert.match(main, /await stateStore\.activateAccount\(null\)/);
+  assert.match(main, /claimGuest: wasSignedOut/);
+  assert.match(main, /desktop-state\.json\.migrated|\$\{migratedLegacyFilePath\}\.migrated/);
+  assert.match(oauth, /async accountId\(\): Promise<string \| null>/);
+  assert.match(renderer, /connections = await desktopApi\.signOut\(\);\s+state = await desktopApi\.bootstrap\(\)/);
+  assert.doesNotMatch(main, /new DesktopStateStore\(path\.join\(userDataPath, "desktop-state\.json"\)\)/);
 });
 
 test("opens a post-onboarding plugin marketplace and derives Yours from installed connectors", async () => {
@@ -225,19 +263,19 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
   ]);
   assert.match(oauth, /safeStorage\.encryptString/);
   assert.match(oauth, /agent-genia-account\.bin/);
-  assert.match(oauth, /agent-genia-connectors-account\.bin/);
-  assert.match(oauth, /accountClient/);
-  assert.match(oauth, /connectorClient/);
-  assert.match(oauth, /sameAccountService/);
-  assert.match(main, /WRAPPER_SERVICE_URL\?\.trim\(\) \|\| outcomeServiceUrl/);
-  assert.match(oauth, /owner_account_id/);
+  assert.doesNotMatch(oauth, /agent-genia-connectors-account\.bin/);
+  assert.match(oauth, /WrapperServiceClient/);
+  assert.match(main, /WRAPPER_SERVICE_URL\?\.trim\(\)/);
+  assert.match(main, /https:\/\/agentgenia-api\.onrender\.com/);
   assert.match(oauth, /managed_connection_id/);
+  assert.match(oauth, /"\/v1\/connectors"/);
   assert.match(oauth, /\/v1\/connectors\/start/);
   assert.match(oauth, /COMPOSIO_CONNECTOR_IDS/);
-  assert.match(oauth, /https:\/\/outcome-service\.onrender\.com|baseUrl/);
+  assert.match(oauth, /baseUrl/);
   assert.match(main, /DesktopOAuthController/);
   assert.match(main, /WRAPPER_SERVICE_URL/);
-  assert.match(main, /OUTCOME_SERVICE_URL/);
+  assert.doesNotMatch(main, /OUTCOME_SERVICE_URL|outcome-service/);
+  assert.doesNotMatch(oauth, /OutcomeOAuthClient|ManagedProviderSession|connector-managed-|owner_account_id|access_token/);
   assert.match(preload, /connectConnector/);
   assert.doesNotMatch(preload, /access_token|refresh_token|client_secret/);
   assert.match(renderer, /Próximamente/);

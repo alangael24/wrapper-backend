@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { BotDraft, BotPatch, BotSetupAnswer, DesktopApi } from "./contracts";
+import type { BotDraft, BotPatch, DesktopApi } from "./contracts";
 
 const api: DesktopApi = Object.freeze({
   bootstrap: () => ipcRenderer.invoke("desktop:bootstrap"),
@@ -16,7 +16,9 @@ const api: DesktopApi = Object.freeze({
   ),
   createBot: (draft: BotDraft) => ipcRenderer.invoke("desktop:create-bot", draft),
   updateBot: (botId: string, patch: BotPatch) => ipcRenderer.invoke("desktop:update-bot", botId, patch),
-  answerBotSetup: (botId: string, answer: BotSetupAnswer) => ipcRenderer.invoke("desktop:answer-bot-setup", botId, answer),
+  runBotAgent: (botId: string, prompt: string, initial?: boolean) => (
+    ipcRenderer.invoke("desktop:run-bot-agent", botId, prompt, initial)
+  ),
   setActiveBot: (botId: string | null) => ipcRenderer.invoke("desktop:set-active-bot", botId),
   deleteBot: (botId: string) => ipcRenderer.invoke("desktop:delete-bot", botId)
 });
