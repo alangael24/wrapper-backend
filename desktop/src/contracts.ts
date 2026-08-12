@@ -1,50 +1,50 @@
 export const CONNECTOR_CATALOG = Object.freeze([
-  connector("google-workspace", "Google Workspace", "google", "Trabajo", "Correo, Drive, Calendar, Contacts y Sheets", "outcome"),
-  connector("slack", "Slack", "slack", "Trabajo", "Canales, mensajes y coordinación de equipo", "outcome"),
-  connector("notion", "Notion", "notion", "Trabajo", "Páginas, bases de datos y conocimiento", "outcome"),
-  connector("salesforce", "Salesforce", "salesforce", "Ventas", "Cuentas, contactos y oportunidades", "outcome"),
-  connector("microsoft-365", "Microsoft 365", "microsoft", "Trabajo", "Outlook, OneDrive, Calendar y Teams", "outcome"),
-  connector("linkedin", "LinkedIn", "linkedin", "Ventas", "Contactos, perfiles y relaciones profesionales", "outcome"),
-  connector("zoom", "Zoom", "zoom", "Trabajo", "Reuniones y seguimiento de llamadas", "outcome"),
-  connector("github", "GitHub", "github", "Desarrollo", "Repositorios, issues y pull requests", "outcome"),
-  connector("jira", "Jira", "jira", "Desarrollo", "Proyectos, tickets y ciclos de trabajo", "outcome"),
-  connector("linear", "Linear", "linear", "Desarrollo", "Issues, proyectos y ciclos de producto", "outcome"),
-  connector("asana", "Asana", "asana", "Trabajo", "Proyectos, tareas y responsables", "outcome"),
-  connector("clickup", "ClickUp", "clickup", "Trabajo", "Tareas, documentos y seguimiento de proyectos", "outcome"),
-  connector("figma", "Figma", "figma", "Diseño", "Archivos, comentarios y entregables de diseño", "outcome"),
-  connector("hubspot", "HubSpot", "hubspot", "Ventas", "Contactos, empresas y oportunidades", "outcome"),
-  connector("canva", "Canva", "canva", "Diseño", "Diseños, plantillas y contenido de marca", "outcome"),
-  connector("trello", "Trello", "trello", "Trabajo", "Tableros, listas, tarjetas y responsables", "outcome"),
-  connector("monday-com", "monday.com", "monday", "Trabajo", "Tableros, proyectos y automatizaciones de trabajo", "outcome"),
-  connector("intercom", "Intercom", "intercom", "Soporte", "Conversaciones, usuarios y atención al cliente", "outcome"),
-  connector("zendesk", "Zendesk", "zendesk", "Soporte", "Tickets, usuarios y operaciones de soporte", "outcome"),
-  connector("box", "Box", "box", "Trabajo", "Archivos, carpetas y colaboración empresarial", "outcome"),
-  connector("dropbox", "Dropbox", "dropbox", "Trabajo", "Archivos, carpetas y contenido compartido", "outcome"),
-  connector("docusign", "DocuSign", "docusign", "Trabajo", "Sobres, firmas y seguimiento de documentos", "outcome"),
-  connector("calendly", "Calendly", "calendly", "Trabajo", "Tipos de evento, disponibilidad y reuniones", "outcome"),
-  connector("loom", "Loom", "loom", "Trabajo", "Videos, transcripciones y espacios de equipo", "outcome"),
-  connector("outreach", "Outreach", "outreach", "Ventas", "Prospectos, secuencias y actividades comerciales", "outcome"),
-  connector("salesloft", "Salesloft", "salesloft", "Ventas", "Cadencias, personas y actividades de ventas", "outcome"),
-  connector("apollo", "Apollo", "apollo", "Ventas", "Personas, empresas y enriquecimiento comercial", "outcome"),
-  connector("clay", "Clay", "clay", "Ventas", "Tablas, enriquecimiento y flujos de prospección", "outcome"),
-  connector("zoominfo", "ZoomInfo", "zoominfo", "Ventas", "Contactos, empresas e inteligencia comercial", "outcome"),
-  connector("nooks", "Nooks", "nooks", "Ventas", "Marcador, sesiones y productividad de ventas", "outcome"),
-  connector("stripe", "Stripe", "stripe", "Finanzas", "Clientes, pagos, facturas y suscripciones", "outcome"),
-  connector("quickbooks", "QuickBooks", "quickbooks", "Finanzas", "Contabilidad, facturas, gastos y clientes", "outcome"),
-  connector("netsuite", "NetSuite", "netsuite", "Finanzas", "ERP, finanzas, clientes y operaciones", "outcome"),
-  connector("ramp", "Ramp", "ramp", "Finanzas", "Tarjetas, gastos, reembolsos y proveedores", "outcome"),
-  connector("workday", "Workday", "workday", "RR. HH.", "Personas, puestos y operaciones de recursos humanos", "outcome"),
-  connector("rippling", "Rippling", "rippling", "RR. HH.", "Empleados, nómina, dispositivos y aplicaciones", "outcome"),
-  connector("ashby", "Ashby", "ashby", "RR. HH.", "Candidatos, vacantes y procesos de contratación", "outcome"),
-  connector("greenhouse", "Greenhouse", "greenhouse", "RR. HH.", "Candidatos, entrevistas y vacantes", "outcome"),
-  connector("vercel", "Vercel", "vercel", "Desarrollo", "Proyectos, deployments, dominios y logs", "outcome"),
-  connector("tableau", "Tableau", "tableau", "Datos", "Fuentes, workbooks y visualizaciones", "outcome"),
-  connector("hex", "Hex", "hex", "Datos", "Proyectos, notebooks y análisis colaborativo", "outcome"),
-  connector("amplitude", "Amplitude", "amplitude", "Datos", "Analítica de producto, eventos y cohortes", "outcome"),
-  connector("mixpanel", "Mixpanel", "mixpanel", "Datos", "Eventos, funnels, retención y perfiles", "outcome"),
-  connector("snowflake", "Snowflake", "snowflake", "Datos", "Warehouses, bases de datos y consultas", "outcome"),
-  connector("databricks", "Databricks", "databricks", "Datos", "Lakehouse, notebooks, jobs y consultas", "outcome"),
-  connector("mailchimp", "Mailchimp", "mailchimp", "Marketing", "Audiencias, campañas y automatizaciones", "outcome"),
+  connector("google-workspace", "Google Workspace", "google", "Trabajo", "Correo, Drive, Calendar, Contacts y Sheets", "wrapper"),
+  connector("slack", "Slack", "slack", "Trabajo", "Canales, mensajes y coordinación de equipo", "wrapper"),
+  connector("notion", "Notion", "notion", "Trabajo", "Páginas, bases de datos y conocimiento", "wrapper"),
+  connector("salesforce", "Salesforce", "salesforce", "Ventas", "Cuentas, contactos y oportunidades", "wrapper"),
+  connector("microsoft-365", "Microsoft 365", "microsoft", "Trabajo", "Outlook, OneDrive, Calendar y Teams", "wrapper"),
+  connector("linkedin", "LinkedIn", "linkedin", "Ventas", "Contactos, perfiles y relaciones profesionales", "wrapper"),
+  connector("zoom", "Zoom", "zoom", "Trabajo", "Reuniones y seguimiento de llamadas", "wrapper"),
+  connector("github", "GitHub", "github", "Desarrollo", "Repositorios, issues y pull requests", "wrapper"),
+  connector("jira", "Jira", "jira", "Desarrollo", "Proyectos, tickets y ciclos de trabajo", "wrapper"),
+  connector("linear", "Linear", "linear", "Desarrollo", "Issues, proyectos y ciclos de producto", "wrapper"),
+  connector("asana", "Asana", "asana", "Trabajo", "Proyectos, tareas y responsables", "wrapper"),
+  connector("clickup", "ClickUp", "clickup", "Trabajo", "Tareas, documentos y seguimiento de proyectos", "wrapper"),
+  connector("figma", "Figma", "figma", "Diseño", "Archivos, comentarios y entregables de diseño", "wrapper"),
+  connector("hubspot", "HubSpot", "hubspot", "Ventas", "Contactos, empresas y oportunidades", "wrapper"),
+  connector("canva", "Canva", "canva", "Diseño", "Diseños, plantillas y contenido de marca", "wrapper"),
+  connector("trello", "Trello", "trello", "Trabajo", "Tableros, listas, tarjetas y responsables", "wrapper"),
+  connector("monday-com", "monday.com", "monday", "Trabajo", "Tableros, proyectos y automatizaciones de trabajo", "wrapper"),
+  connector("intercom", "Intercom", "intercom", "Soporte", "Conversaciones, usuarios y atención al cliente", "wrapper"),
+  connector("zendesk", "Zendesk", "zendesk", "Soporte", "Tickets, usuarios y operaciones de soporte", "wrapper"),
+  connector("box", "Box", "box", "Trabajo", "Archivos, carpetas y colaboración empresarial", "wrapper"),
+  connector("dropbox", "Dropbox", "dropbox", "Trabajo", "Archivos, carpetas y contenido compartido", "wrapper"),
+  connector("docusign", "DocuSign", "docusign", "Trabajo", "Sobres, firmas y seguimiento de documentos", "wrapper"),
+  connector("calendly", "Calendly", "calendly", "Trabajo", "Tipos de evento, disponibilidad y reuniones", "wrapper"),
+  connector("loom", "Loom", "loom", "Trabajo", "Videos, transcripciones y espacios de equipo", "wrapper"),
+  connector("outreach", "Outreach", "outreach", "Ventas", "Prospectos, secuencias y actividades comerciales", "wrapper"),
+  connector("salesloft", "Salesloft", "salesloft", "Ventas", "Cadencias, personas y actividades de ventas", "wrapper"),
+  connector("apollo", "Apollo", "apollo", "Ventas", "Personas, empresas y enriquecimiento comercial", "wrapper"),
+  connector("clay", "Clay", "clay", "Ventas", "Tablas, enriquecimiento y flujos de prospección", "wrapper"),
+  connector("zoominfo", "ZoomInfo", "zoominfo", "Ventas", "Contactos, empresas e inteligencia comercial", "wrapper"),
+  connector("nooks", "Nooks", "nooks", "Ventas", "Marcador, sesiones y productividad de ventas", "wrapper"),
+  connector("stripe", "Stripe", "stripe", "Finanzas", "Clientes, pagos, facturas y suscripciones", "wrapper"),
+  connector("quickbooks", "QuickBooks", "quickbooks", "Finanzas", "Contabilidad, facturas, gastos y clientes", "wrapper"),
+  connector("netsuite", "NetSuite", "netsuite", "Finanzas", "ERP, finanzas, clientes y operaciones", "wrapper"),
+  connector("ramp", "Ramp", "ramp", "Finanzas", "Tarjetas, gastos, reembolsos y proveedores", "wrapper"),
+  connector("workday", "Workday", "workday", "RR. HH.", "Personas, puestos y operaciones de recursos humanos", "wrapper"),
+  connector("rippling", "Rippling", "rippling", "RR. HH.", "Empleados, nómina, dispositivos y aplicaciones", "wrapper"),
+  connector("ashby", "Ashby", "ashby", "RR. HH.", "Candidatos, vacantes y procesos de contratación", "wrapper"),
+  connector("greenhouse", "Greenhouse", "greenhouse", "RR. HH.", "Candidatos, entrevistas y vacantes", "wrapper"),
+  connector("vercel", "Vercel", "vercel", "Desarrollo", "Proyectos, deployments, dominios y logs", "wrapper"),
+  connector("tableau", "Tableau", "tableau", "Datos", "Fuentes, workbooks y visualizaciones", "wrapper"),
+  connector("hex", "Hex", "hex", "Datos", "Proyectos, notebooks y análisis colaborativo", "wrapper"),
+  connector("amplitude", "Amplitude", "amplitude", "Datos", "Analítica de producto, eventos y cohortes", "wrapper"),
+  connector("mixpanel", "Mixpanel", "mixpanel", "Datos", "Eventos, funnels, retención y perfiles", "wrapper"),
+  connector("snowflake", "Snowflake", "snowflake", "Datos", "Warehouses, bases de datos y consultas", "wrapper"),
+  connector("databricks", "Databricks", "databricks", "Datos", "Lakehouse, notebooks, jobs y consultas", "wrapper"),
+  connector("mailchimp", "Mailchimp", "mailchimp", "Marketing", "Audiencias, campañas y automatizaciones", "wrapper"),
   connector("shopify", "Shopify", "shopify", "Comercio", "Catálogo, tienda y herramientas publicadas", "ecom"),
   connector("tiendanube", "Tiendanube", "tiendanube", "Comercio", "Catálogo y contexto de la tienda", "ecom"),
   connector("woocommerce", "WooCommerce", "woocommerce", "Comercio", "Productos y contexto de WordPress Commerce", "ecom")
@@ -56,13 +56,15 @@ export const MANAGED_CONNECTOR_IDS = Object.freeze([
   "google-workspace", "slack", "notion", "linkedin", "zoom", "github", "jira", "linear",
   "asana", "clickup", "figma", "canva", "trello", "monday-com", "intercom", "zendesk",
   "box", "dropbox", "calendly", "stripe", "quickbooks", "greenhouse", "mailchimp", "shopify",
-  "apollo", "ashby", "vercel", "hex", "amplitude", "mixpanel", "databricks"
+  "apollo", "ashby", "vercel", "hex", "amplitude", "mixpanel", "databricks",
+  "microsoft-365", "hubspot"
 ]);
 
-// Provider-native flows hosted by the Outcome service. Their credentials are
-// validated server-side and encrypted in the private connector store.
+// Toolkits that require an Auth Config owned by Agent Genia. Composio still
+// stores and refreshes the resulting per-user credentials.
 export const DIRECT_CONNECTOR_IDS = Object.freeze([
-  "outreach", "woocommerce", "tableau", "snowflake", "clay"
+  "salesforce", "docusign", "outreach", "clay", "zoominfo", "netsuite",
+  "ramp", "workday", "tableau", "snowflake", "woocommerce"
 ]);
 
 export const HOSTED_CONNECTOR_IDS = Object.freeze([
@@ -103,34 +105,9 @@ export const BOT_TEMPLATES = Object.freeze([
   })
 ]);
 
-export const BOT_SETUP_OPTIONS = Object.freeze({
-  purpose: Object.freeze([
-    option("work", "Trabajo"),
-    option("personal", "Vida personal"),
-    option("coding", "Programación / tecnología"),
-    option("everything", "Un poco de todo"),
-    option("specific", "Algo específico")
-  ]),
-  workspace: Object.freeze([
-    option("google", "Gmail + Google Calendar"),
-    option("slack", "Slack"),
-    option("projects", "Linear / Notion / Asana"),
-    option("mix", "Una mezcla de esas"),
-    option("other", "Otra herramienta")
-  ]),
-  project: Object.freeze([
-    option("linear", "Linear"),
-    option("notion", "Notion"),
-    option("asana", "Asana"),
-    option("clickup", "ClickUp"),
-    option("skip", "Omitir proyectos por ahora")
-  ])
-});
-
 export type ConnectorDefinition = (typeof CONNECTOR_CATALOG)[number];
 export type BotColor = (typeof BOT_COLORS)[number];
 export type BotShape = (typeof BOT_SHAPES)[number];
-export type BotSetupStep = "purpose" | "workspace" | "project" | "connections" | "complete";
 export type OAuthProviderId = "google" | "microsoft" | "hubspot" | "salesforce" | "pipedrive" | "zoho" | "composio";
 
 export interface AccountConnectionStatus {
@@ -154,18 +131,24 @@ export interface ConnectorConnectionSnapshot {
   connectors: ConnectorConnectionStatus[];
 }
 
-export interface BotSetupState {
-  step: BotSetupStep;
-  purpose: string;
-  workspace: string;
-  projectTool: string;
-  customAnswers: Partial<Record<"purpose" | "workspace" | "project", string>>;
+export interface BillingSubscriptionStatus {
+  stripe_subscription_id: string;
+  tier: "basic" | "pro";
+  stripe_price_id: string;
+  status: string;
+  cancel_at_period_end: boolean;
+  current_period_end: number | null;
 }
 
-export interface BotSetupAnswer {
-  step: "purpose" | "workspace" | "project" | "connections";
-  value: string;
-  customText?: string;
+export interface BillingSnapshot {
+  configured: boolean;
+  tier: "free" | "basic" | "pro";
+  customer: boolean;
+  subscription: BillingSubscriptionStatus | null;
+  plans: {
+    basic: { name: string; amount: number; currency: string; interval: string };
+    pro: { name: string; amount: number; currency: string; interval: string };
+  };
 }
 
 export interface BotProfile {
@@ -178,8 +161,79 @@ export interface BotProfile {
   avatarDataUrl: string;
   notificationsEnabled: boolean;
   connectorIds: string[];
-  setup: BotSetupState;
+  messages: BotMessage[];
+  workflows: BotWorkflow[];
   createdAt: string;
+}
+
+export interface BotWorkflow {
+  id: string;
+  title: string;
+  summary: string;
+  steps: string[];
+  recordingId: string;
+  recordingMimeType: "video/webm" | "video/mp4" | "";
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt: string;
+}
+
+export interface BotWorkflowDraft {
+  title: string;
+  summary: string;
+  steps: string[];
+}
+
+export type TeachEntryPoint = "top_bar" | "composer_menu" | "screen_hover";
+export type TeachRecordingPhase = "idle" | "recording" | "processing";
+
+export interface TeachRecordingStatus {
+  phase: TeachRecordingPhase;
+  botId: string;
+  botName: string;
+  entryPoint: TeachEntryPoint | "";
+  startedAt: string;
+}
+
+export interface TeachCapture {
+  durationMs: number;
+  frames: string[];
+  mimeType: "video/webm" | "video/mp4" | "";
+  videoBytes: Uint8Array;
+}
+
+export type BotComputerState = "disabled" | "pulling" | "running" | "hibernated" | "off" | "error";
+
+export interface BotComputerSnapshot {
+  configured: boolean;
+  bot_id: string;
+  provider: string | null;
+  state: BotComputerState;
+  viewer_url: string;
+  viewer_expires_at: number;
+  reason: string;
+}
+
+export interface BotMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  widget?: BotQuestionWidget;
+  createdAt: string;
+}
+
+export interface BotQuestionWidget {
+  prompt: string;
+  helpText: string;
+  options: BotQuestionOption[];
+  allowCustom: boolean;
+  dismissOnMoveOn: boolean;
+}
+
+export interface BotQuestionOption {
+  label: string;
+  value: string;
+  description: string;
 }
 
 export interface AppState {
@@ -213,10 +267,24 @@ export interface DesktopApi {
   signOut(): Promise<ConnectorConnectionSnapshot>;
   connectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   disconnectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
+  billingSnapshot(): Promise<BillingSnapshot>;
+  startCheckout(tier: "basic" | "pro"): Promise<void>;
+  openBillingPortal(): Promise<void>;
+  computerStatus(botId: string): Promise<BotComputerSnapshot>;
+  ensureComputer(botId: string, botName: string): Promise<BotComputerSnapshot>;
+  handBackComputer(botId: string): Promise<BotComputerSnapshot>;
+  deleteComputer(botId: string): Promise<{ deleted: boolean }>;
+  openComputerViewer(url: string): Promise<void>;
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;
-  answerBotSetup(botId: string, answer: BotSetupAnswer): Promise<AppState>;
+  runBotAgent(botId: string, prompt: string, initial?: boolean): Promise<AppState>;
+  getTeachRecordingStatus(): Promise<TeachRecordingStatus>;
+  startTeachRecording(botId: string, entryPoint: TeachEntryPoint): Promise<TeachRecordingStatus>;
+  stopTeachRecording(botId: string, capture: TeachCapture): Promise<AppState>;
+  discardTeachRecording(botId: string): Promise<TeachRecordingStatus>;
+  runBotWorkflow(botId: string, workflowId: string): Promise<AppState>;
+  deleteBotWorkflow(botId: string, workflowId: string): Promise<AppState>;
   setActiveBot(botId: string | null): Promise<AppState>;
   deleteBot(botId: string): Promise<AppState>;
 }
@@ -272,7 +340,8 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
     avatarDataUrl: "",
     notificationsEnabled: true,
     connectorIds: normalizeConnectorIds(connectorIds),
-    setup: initialBotSetup(),
+    messages: [],
+    workflows: [],
     createdAt: now.toISOString()
   };
 }
@@ -299,49 +368,8 @@ export function updateBotProfile(bot: BotProfile, patch: BotPatch): BotProfile {
   };
 }
 
-export function initialBotSetup(): BotSetupState {
-  return { step: "purpose", purpose: "", workspace: "", projectTool: "", customAnswers: {} };
-}
-
-export function applyBotSetupAnswer(bot: BotProfile, answer: BotSetupAnswer): BotProfile {
-  if (bot.setup.step !== answer.step) throw new Error("Esta pregunta ya no está activa.");
-  const customText = cleanAnswer(answer.customText);
-  const connectorIds = new Set(bot.connectorIds);
-  const setup: BotSetupState = structuredClone(bot.setup);
-
-  if (answer.step === "purpose") {
-    assertOption("purpose", answer.value);
-    setup.purpose = answer.value;
-    if (answer.value === "specific" && customText) setup.customAnswers.purpose = customText;
-    if (answer.value === "coding") connectorIds.add("github");
-    setup.step = ["work", "everything"].includes(answer.value) ? "workspace" : "connections";
-  } else if (answer.step === "workspace") {
-    assertOption("workspace", answer.value);
-    setup.workspace = answer.value;
-    if (answer.value === "other" && customText) setup.customAnswers.workspace = customText;
-    if (["google", "mix"].includes(answer.value)) connectorIds.add("google-workspace");
-    if (["slack", "mix"].includes(answer.value)) connectorIds.add("slack");
-    setup.step = ["projects", "mix"].includes(answer.value) ? "project" : "connections";
-  } else if (answer.step === "project") {
-    assertOption("project", answer.value);
-    setup.projectTool = answer.value;
-    if (answer.value !== "skip") connectorIds.add(answer.value);
-    if (customText) setup.customAnswers.project = customText;
-    setup.step = "connections";
-  } else {
-    if (answer.value !== "complete") throw new Error("Respuesta de configuración inválida.");
-    setup.step = "complete";
-  }
-
-  return { ...bot, setup, connectorIds: normalizeConnectorIds([...connectorIds]) };
-}
-
-function connector(id: string, name: string, icon: string, category: string, description: string, source: "outcome" | "ecom") {
+function connector(id: string, name: string, icon: string, category: string, description: string, source: "wrapper" | "ecom") {
   return Object.freeze({ id, name, icon, category, description, source });
-}
-
-function option(id: string, label: string) {
-  return Object.freeze({ id, label });
 }
 
 function normalizeBot(value: unknown): BotProfile | null {
@@ -361,42 +389,76 @@ function normalizeBot(value: unknown): BotProfile | null {
       description: cleanProfileText(value.description, 600),
       avatarDataUrl: safeAvatarDataUrl(value.avatarDataUrl),
       notificationsEnabled: value.notificationsEnabled !== false,
-      setup: normalizeBotSetup(value.setup)
+      messages: normalizeBotMessages(value.messages),
+      workflows: normalizeBotWorkflows(value.workflows)
     };
   } catch {
     return null;
   }
 }
 
-function normalizeBotSetup(value: unknown): BotSetupState {
-  if (!isRecord(value)) return initialBotSetup();
-  const steps: BotSetupStep[] = ["purpose", "workspace", "project", "connections", "complete"];
-  const customAnswers = isRecord(value.customAnswers) ? value.customAnswers : {};
+export function createBotWorkflow(
+  draft: BotWorkflowDraft,
+  id: string,
+  recordingId: string,
+  recordingMimeType: BotWorkflow["recordingMimeType"],
+  now = new Date()
+): BotWorkflow {
+  const title = cleanProfileText(draft.title, 120).replace(/\s+/g, " ");
+  const steps = normalizeWorkflowSteps(draft.steps);
+  if (!title || !steps.length) throw new Error("No pudimos extraer los pasos de la tarea.");
+  const timestamp = now.toISOString();
   return {
-    step: steps.includes(value.step as BotSetupStep) ? value.step as BotSetupStep : "purpose",
-    purpose: optionValue("purpose", value.purpose),
-    workspace: optionValue("workspace", value.workspace),
-    projectTool: optionValue("project", value.projectTool),
-    customAnswers: {
-      ...(cleanAnswer(customAnswers.purpose) ? { purpose: cleanAnswer(customAnswers.purpose) } : {}),
-      ...(cleanAnswer(customAnswers.workspace) ? { workspace: cleanAnswer(customAnswers.workspace) } : {}),
-      ...(cleanAnswer(customAnswers.project) ? { project: cleanAnswer(customAnswers.project) } : {})
-    }
+    id: id.slice(0, 100),
+    title,
+    summary: cleanProfileText(draft.summary, 500),
+    steps,
+    recordingId: recordingId.slice(0, 100),
+    recordingMimeType,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastRunAt: ""
   };
 }
 
-function assertOption(group: keyof typeof BOT_SETUP_OPTIONS, value: string): void {
-  if (!BOT_SETUP_OPTIONS[group].some((item) => item.id === value)) {
-    throw new Error("Respuesta de configuración inválida.");
-  }
+function normalizeBotWorkflows(value: unknown): BotWorkflow[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-50).flatMap((item): BotWorkflow[] => {
+    if (!isRecord(item)) return [];
+    try {
+      const createdAt = normalizeDate(item.createdAt);
+      const workflow = createBotWorkflow({
+        title: typeof item.title === "string" ? item.title : "",
+        summary: typeof item.summary === "string" ? item.summary : "",
+        steps: Array.isArray(item.steps) ? item.steps.filter((step): step is string => typeof step === "string") : []
+      }, typeof item.id === "string" ? item.id : crypto.randomUUID(), typeof item.recordingId === "string" ? item.recordingId : "", normalizeRecordingMimeType(item.recordingMimeType), new Date(createdAt));
+      return [{
+        ...workflow,
+        updatedAt: normalizeDate(item.updatedAt, createdAt),
+        lastRunAt: item.lastRunAt ? normalizeDate(item.lastRunAt, "") : ""
+      }];
+    } catch {
+      return [];
+    }
+  });
 }
 
-function optionValue(group: keyof typeof BOT_SETUP_OPTIONS, value: unknown): string {
-  return typeof value === "string" && BOT_SETUP_OPTIONS[group].some((item) => item.id === value) ? value : "";
+function normalizeWorkflowSteps(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 30).flatMap((step): string[] => {
+    const normalized = cleanProfileText(step, 600);
+    return normalized ? [normalized] : [];
+  });
 }
 
-function cleanAnswer(value: unknown): string {
-  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+function normalizeRecordingMimeType(value: unknown): BotWorkflow["recordingMimeType"] {
+  return value === "video/webm" || value === "video/mp4" ? value : "";
+}
+
+function normalizeDate(value: unknown, fallback = new Date().toISOString()): string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value))
+    ? new Date(value).toISOString()
+    : fallback;
 }
 
 function cleanBotName(value: unknown): string {
@@ -406,6 +468,51 @@ function cleanBotName(value: unknown): string {
 
 function cleanProfileText(value: unknown, limit: number): string {
   return typeof value === "string" ? value.replace(/\r\n?/g, "\n").trim().slice(0, limit) : "";
+}
+
+function normalizeBotMessages(value: unknown): BotMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-200).flatMap((item): BotMessage[] => {
+    if (!isRecord(item) || (item.role !== "user" && item.role !== "assistant")) return [];
+    const text = cleanProfileText(item.text, 20_000);
+    if (!text) return [];
+    const createdAt = typeof item.createdAt === "string" && !Number.isNaN(Date.parse(item.createdAt))
+      ? new Date(item.createdAt).toISOString()
+      : new Date().toISOString();
+    return [{
+      id: typeof item.id === "string" && item.id ? item.id.slice(0, 100) : crypto.randomUUID(),
+      role: item.role,
+      text,
+      ...(item.role === "assistant" && normalizeQuestionWidget(item.widget)
+        ? { widget: normalizeQuestionWidget(item.widget)! }
+        : {}),
+      createdAt
+    }];
+  });
+}
+
+export function normalizeQuestionWidget(value: unknown): BotQuestionWidget | undefined {
+  if (!isRecord(value)) return undefined;
+  const prompt = cleanProfileText(value.prompt, 300);
+  if (!prompt || !Array.isArray(value.options)) return undefined;
+  const options = value.options.slice(0, 6).flatMap((item): BotQuestionOption[] => {
+    if (!isRecord(item)) return [];
+    const label = cleanProfileText(item.label, 120);
+    if (!label) return [];
+    return [{
+      label,
+      value: cleanProfileText(item.value, 300) || label,
+      description: cleanProfileText(item.description, 240)
+    }];
+  });
+  if (!options.length) return undefined;
+  return {
+    prompt,
+    helpText: cleanProfileText(value.helpText, 300),
+    options,
+    allowCustom: value.allowCustom !== false,
+    dismissOnMoveOn: value.dismissOnMoveOn !== false
+  };
 }
 
 function normalizeAvatarDataUrl(value: unknown): string {

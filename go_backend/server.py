@@ -6,7 +6,16 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/account-auth/google/callback
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
+  GET  /v1/connectors            Catalogo y conexiones del usuario
+  GET  /v1/connectors/<id>       Estado de una cuenta conectada
+  POST /v1/connectors/start      Crear un Connect Link de Composio
+  GET  /v1/connectors/status/<id> Consultar el consentimiento
+  POST /v1/connectors/disconnect Revocar la cuenta del usuario
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
+  GET  /v1/billing         Consultar plan y suscripción Stripe
+  POST /v1/billing/checkout Crear Checkout para Plus/Pro
+  POST /v1/billing/portal  Abrir Customer Portal
+  POST /v1/billing/webhook Procesar eventos Stripe firmados
   POST /v1/byok            El usuario registra su propia key de Go
   GET  /v1/models          Catalogo de modelos (proxy a Go)
   POST /v1/chat/completions
@@ -14,6 +23,10 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/messages
   GET  /v1/agent/status    Estado del harness de Pi
   POST /v1/agent/run       Ejecutar una tarea con Pi
+  GET  /v1/computers/<bot_id> Estado de la computadora persistente del bot
+  POST /v1/computers/<bot_id>/ensure Crear/despertar y obtener un viewer firmado
+  POST /v1/computers/<bot_id>/hand-back Hibernar conservando el filesystem
+  POST /v1/computers/<bot_id>/delete Eliminar la computadora del bot
   GET  /v1/usage           Uso por ventanas con limites ajustados al tier
   GET  /v1/me
 
@@ -47,8 +60,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from .billing import BillingConfig, BillingError, BillingService
+from .connector_adapters import (
+    ComposioConnectorAdapter,
+    ComposioConnectorGateway,
+    parse_config_mapping,
+)
+from .native_connectors import NativeConnectorGateway
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
-from .connectors import ConnectorBroker, ConnectorBrokerError
+from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
+from .computers import ComputerConfig, ComputerError, ComputerManager
 from .go_prices import estimate_cost_usd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
@@ -57,8 +78,9 @@ from .pi_harness import (
     PiHarnessBusy,
     PiHarnessError,
 )
+from .postgres_store import create_store
 from .tiers import DEFAULT_TIER, effective_limits, is_valid, requires_subscription, tier_label
-from .store import NoSubscriptionAvailable, Store, new_id
+from .store import NoSubscriptionAvailable, new_id
 from .upstream import DEFAULT_UA, proxy_request
 from .vision import VisionError, VisionRouter
 
@@ -79,6 +101,7 @@ DEFAULT_PI_CONNECTOR_EXTENSION = (
 )
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
+MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 
 # Rutas expuestas por el wrapper -> rutas relativas al upstream de Go
@@ -129,6 +152,7 @@ def validate_pi_chrome_security(chrome_isolation: str) -> None:
 class Config:
     def __init__(self):
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
+        self.database_url = (os.environ.get("DATABASE_URL") or "").strip() or None
         self.secret_file = Path(os.environ.get("SECRET_FILE", str(DEFAULT_SECRET_FILE)))
         self.go_base_url = os.environ.get("GO_BASE_URL", DEFAULT_GO_BASE).rstrip("/")
         self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -142,6 +166,32 @@ class Config:
         self.account_access_ttl_seconds = int(os.environ.get("ACCOUNT_ACCESS_TTL_SECONDS", "900"))
         self.account_refresh_ttl_seconds = int(os.environ.get("ACCOUNT_REFRESH_TTL_SECONDS", str(30 * 86400)))
         self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
+        self.composio_api_key = (os.environ.get("COMPOSIO_API_KEY") or "").strip()
+        self.composio_public_url = (os.environ.get("COMPOSIO_PUBLIC_URL") or "").strip()
+        self.connector_public_url = (
+            os.environ.get("CONNECTOR_PUBLIC_URL") or self.composio_public_url
+        ).strip()
+        self.composio_auth_configs_json = os.environ.get("COMPOSIO_AUTH_CONFIGS_JSON", "")
+        self.composio_toolkit_overrides_json = os.environ.get(
+            "COMPOSIO_TOOLKIT_OVERRIDES_JSON", ""
+        )
+        self.composio_auth_attempt_ttl_seconds = int(
+            os.environ.get("COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS", "600")
+        )
+        self.stripe_enabled = os.environ.get("STRIPE_ENABLED", "0") == "1"
+        self.stripe_live_mode = os.environ.get("STRIPE_LIVE_MODE", "1") != "0"
+        self.stripe_secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip() or None
+        self.stripe_webhook_secret = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip() or None
+        self.stripe_plus_price_id = (os.environ.get("STRIPE_PLUS_PRICE_ID") or "").strip() or None
+        self.stripe_pro_price_id = (os.environ.get("STRIPE_PRO_PRICE_ID") or "").strip() or None
+        self.stripe_success_url = (os.environ.get("STRIPE_SUCCESS_URL") or "").strip() or None
+        self.stripe_cancel_url = (os.environ.get("STRIPE_CANCEL_URL") or "").strip() or None
+        self.stripe_portal_return_url = (
+            (os.environ.get("STRIPE_PORTAL_RETURN_URL") or "").strip() or None
+        )
+        self.stripe_webhook_tolerance_seconds = int(
+            os.environ.get("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300")
+        )
         self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
         self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
         self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
@@ -193,6 +243,18 @@ class Config:
         self.pi_chrome_isolation = os.environ.get(
             "PI_CHROME_ISOLATION", CHROME_ISOLATION_PER_RUN
         ).strip().lower()
+        self.computers_enabled = os.environ.get("COMPUTERS_ENABLED", "0") == "1"
+        self.daytona_api_key = (os.environ.get("DAYTONA_API_KEY") or "").strip()
+        self.daytona_api_url = (os.environ.get("DAYTONA_API_URL") or "").strip()
+        self.daytona_target = (os.environ.get("DAYTONA_TARGET") or "").strip()
+        self.daytona_snapshot = (os.environ.get("DAYTONA_SNAPSHOT") or "").strip()
+        self.computer_auto_stop_minutes = int(os.environ.get("COMPUTER_AUTO_STOP_MINUTES", "15"))
+        self.computer_auto_archive_minutes = int(os.environ.get("COMPUTER_AUTO_ARCHIVE_MINUTES", "1440"))
+        self.computer_preview_ttl_seconds = int(os.environ.get("COMPUTER_PREVIEW_TTL_SECONDS", "3600"))
+        self.computer_vnc_port = int(os.environ.get("COMPUTER_VNC_PORT", "6080"))
+        self.computer_vnc_resolution = os.environ.get("COMPUTER_VNC_RESOLUTION", "1440x900").strip()
+        self.computer_basic_limit = int(os.environ.get("COMPUTER_BASIC_LIMIT", "1"))
+        self.computer_pro_limit = int(os.environ.get("COMPUTER_PRO_LIMIT", "3"))
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
@@ -228,13 +290,47 @@ def html_response(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> 
     handler.wfile.write(body)
 
 
+def connector_html_response(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
+    """HTML hardened for the unauthenticated, one-time connector setup form."""
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Referrer-Policy", "no-referrer")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header(
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    )
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
-        self.store = Store(cfg.db_path)
+        self.store = create_store(database_url=cfg.database_url, db_path=cfg.db_path)
+        try:
+            billing_config = BillingConfig.from_values(
+                enabled=cfg.stripe_enabled,
+                live_mode=cfg.stripe_live_mode,
+                secret_key=cfg.stripe_secret_key,
+                webhook_secret=cfg.stripe_webhook_secret,
+                basic_price_id=cfg.stripe_plus_price_id,
+                pro_price_id=cfg.stripe_pro_price_id,
+                success_url=cfg.stripe_success_url,
+                cancel_url=cfg.stripe_cancel_url,
+                portal_return_url=cfg.stripe_portal_return_url,
+                webhook_tolerance_seconds=cfg.stripe_webhook_tolerance_seconds,
+            )
+        except ValueError as exc:
+            raise UnsafeConfigurationError(f"Configuración de Stripe inválida: {exc}") from exc
+        self.billing = BillingService(self.store, billing_config)
         self.google_auth = GoogleAccountAuth(
             store=self.store,
             client_id=cfg.google_oauth_client_id,
@@ -247,6 +343,55 @@ class Backend:
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
+        try:
+            self.native_connector_gateway = NativeConnectorGateway(
+                store=self.store,
+                secret_env=cfg.wrapper_secret,
+                secret_path=cfg.secret_file,
+                public_base_url=cfg.connector_public_url,
+                attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
+            )
+            self.connector_gateway = ComposioConnectorGateway(
+                api_key=cfg.composio_api_key,
+                public_base_url=cfg.composio_public_url,
+                auth_configs=parse_config_mapping(
+                    cfg.composio_auth_configs_json,
+                    name="COMPOSIO_AUTH_CONFIGS_JSON",
+                ),
+                toolkit_overrides=parse_config_mapping(
+                    cfg.composio_toolkit_overrides_json,
+                    name="COMPOSIO_TOOLKIT_OVERRIDES_JSON",
+                ),
+                attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
+                native_gateway=self.native_connector_gateway,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise UnsafeConfigurationError(f"Configuracion de conectores invalida: {exc}") from exc
+        for connector_id in CONNECTOR_CATALOG:
+            self.connectors.register_adapter(
+                connector_id,
+                ComposioConnectorAdapter(self.connector_gateway, connector_id),
+            )
+        try:
+            self.computers = ComputerManager(
+                store=self.store,
+                config=ComputerConfig(
+                    enabled=cfg.computers_enabled,
+                    api_key=cfg.daytona_api_key,
+                    api_url=cfg.daytona_api_url,
+                    target=cfg.daytona_target,
+                    snapshot=cfg.daytona_snapshot,
+                    auto_stop_minutes=cfg.computer_auto_stop_minutes,
+                    auto_archive_minutes=cfg.computer_auto_archive_minutes,
+                    preview_ttl_seconds=cfg.computer_preview_ttl_seconds,
+                    vnc_port=cfg.computer_vnc_port,
+                    vnc_resolution=cfg.computer_vnc_resolution,
+                    basic_limit=cfg.computer_basic_limit,
+                    pro_limit=cfg.computer_pro_limit,
+                ),
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise UnsafeConfigurationError(f"Configuración de computadoras inválida: {exc}") from exc
         self.vision = VisionRouter(
             enabled=cfg.vision_enabled,
             base_url=cfg.go_base_url,
@@ -351,6 +496,86 @@ class Backend:
             return
         json_response(handler, 200, {"revoked": True})
 
+    # ---------- connector accounts ----------
+    def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(
+            handler,
+            200,
+            {"connectors": self.connector_gateway.snapshot(user["id"])},
+        )
+
+    def handle_connector_status_public(
+        self, handler: BaseHTTPRequestHandler, connector_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.connector_gateway.status(user["id"], connector_id))
+
+    def handle_connector_start(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        connector_id = body.get("connector_id")
+        if not isinstance(connector_id, str):
+            raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
+        json_response(handler, 201, self.connector_gateway.start(user["id"], connector_id))
+
+    def handle_connector_auth_status(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.connector_gateway.poll(user["id"], attempt_id))
+
+    def handle_connector_disconnect(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        connector_id = body.get("connector_id")
+        if not isinstance(connector_id, str):
+            raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
+        json_response(handler, 200, self.connector_gateway.disconnect(user["id"], connector_id))
+
+    def handle_native_connector_setup(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        connector_html_response(
+            handler,
+            200,
+            self.native_connector_gateway.setup_html(attempt_id),
+        )
+
+    def handle_native_connector_submit(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/x-www-form-urlencoded":
+            raise ConnectorBrokerError(415, "Formulario no compatible", "bad_connector_credentials")
+        try:
+            length = int(handler.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ConnectorBrokerError(400, "Content-Length invalido", "bad_connector_credentials") from exc
+        if length <= 0 or length > 64 * 1024:
+            raise ConnectorBrokerError(413, "Formulario demasiado grande", "bad_connector_credentials")
+        try:
+            raw = handler.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConnectorBrokerError(400, "Formulario invalido", "bad_connector_credentials") from exc
+        parsed = parse_qs(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=20)
+        values = {key: items[-1] for key, items in parsed.items() if items}
+        connector_html_response(
+            handler,
+            200,
+            self.native_connector_gateway.submit(attempt_id, values),
+        )
+
     def handle_signup(self, handler: BaseHTTPRequestHandler) -> None:
         body = self.read_json(handler) or {}
         name = body.get("name")
@@ -375,6 +600,34 @@ class Backend:
                 "basic/pro se activan exclusivamente después de verificar el pago."
             ),
         })
+
+    # ---------- billing ----------
+    def handle_billing_status(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.billing.status(user))
+
+    def handle_billing_checkout(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        tier = body.get("tier")
+        if not isinstance(tier, str):
+            raise BillingError("Falta el plan solicitado", code="invalid_plan")
+        json_response(handler, 201, self.billing.create_checkout(user, tier))
+
+    def handle_billing_portal(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 201, self.billing.create_portal(user))
+
+    def handle_billing_webhook(self, handler: BaseHTTPRequestHandler) -> None:
+        signature = handler.headers.get("Stripe-Signature", "")
+        payload = self.read_body(handler, max_bytes=MAX_STRIPE_WEBHOOK_BODY)
+        json_response(handler, 200, self.billing.process_webhook(payload, signature))
 
     def handle_byok(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -581,12 +834,20 @@ class Backend:
         body = self.read_json(handler) or {}
         prompt = body.get("prompt")
         browser = body.get("browser", False)
+        computer_requested = body.get("computer", False)
+        bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
         if not isinstance(prompt, str) or not prompt.strip():
             error_response(handler, 400, "Envia un prompt de texto no vacio", "bad_prompt")
             return
         if not isinstance(browser, bool):
             error_response(handler, 400, "browser debe ser true o false", "bad_browser")
+            return
+        if not isinstance(computer_requested, bool):
+            error_response(handler, 400, "computer debe ser true o false", "bad_computer")
+            return
+        if computer_requested and (not isinstance(bot_id, str) or not bot_id):
+            error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
             return
         try:
             connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
@@ -606,7 +867,8 @@ class Backend:
         ):
             error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
             return
-        if connector_ids and not pi_status["connectors_available"]:
+        computer_enabled = bool(computer_requested and self.computers.configured)
+        if (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
             error_response(
                 handler,
                 409,
@@ -618,8 +880,12 @@ class Backend:
         api_key = self.bearer(handler)
         assert api_key is not None
         connector_run_token = (
-            self.connectors.issue(user_id=user["id"], connector_ids=connector_ids)
-            if connector_ids
+            self.connectors.issue(
+                user_id=user["id"],
+                connector_ids=connector_ids,
+                computer_id=bot_id if computer_enabled else None,
+            )
+            if connector_ids or computer_enabled
             else None
         )
         try:
@@ -639,7 +905,43 @@ class Backend:
             self.connectors.revoke(connector_run_token)
         payload = result.as_dict()
         payload["connector_ids"] = list(connector_ids)
+        payload["computer_enabled"] = computer_enabled
         json_response(handler, 200, payload)
+
+    # ---------- computadoras persistentes por bot ----------
+    def handle_computer_status(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.status(user_id=user["id"], bot_id=bot_id))
+
+    def handle_computer_ensure(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        tier = user.get("tier") or DEFAULT_TIER
+        if not requires_subscription(tier):
+            error_response(handler, 402, "Tu plan no incluye una computadora persistente", "tier_requires_upgrade")
+            return
+        body = self.read_json(handler) or {}
+        bot_name = body.get("bot_name") if isinstance(body.get("bot_name"), str) else "Bot"
+        json_response(
+            handler,
+            200,
+            self.computers.ensure(user_id=user["id"], bot_id=bot_id, bot_name=bot_name),
+        )
+
+    def handle_computer_hand_back(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.hand_back(user_id=user["id"], bot_id=bot_id))
+
+    def handle_computer_delete(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.delete(user_id=user["id"], bot_id=bot_id))
 
     # ---------- broker interno de conectores ----------
     @staticmethod
@@ -665,10 +967,11 @@ class Backend:
             return
         try:
             connectors = self.connectors.catalog(token)
+            computer = self.connectors.has_computer(token)
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
-        json_response(handler, 200, {"connectors": connectors})
+        json_response(handler, 200, {"connectors": connectors, "computer": computer})
 
     def handle_connector_execute(self, handler: BaseHTTPRequestHandler) -> None:
         token = self._connector_token(handler)
@@ -687,8 +990,22 @@ class Backend:
             return
         json_response(handler, 200, result)
 
+    def handle_computer_execute(self, handler: BaseHTTPRequestHandler) -> None:
+        token = self._connector_token(handler)
+        if not token:
+            return
+        user_id, bot_id = self.connectors.computer(token)
+        body = self.read_json(handler) or {}
+        result = self.computers.execute(
+            user_id=user_id,
+            bot_id=bot_id,
+            operation=body.get("operation"),
+            arguments=body.get("arguments", {}),
+        )
+        json_response(handler, 200, result)
+
     # ---------- body helpers ----------
-    def read_body(self, handler: BaseHTTPRequestHandler) -> bytes:
+    def read_body(self, handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_BODY) -> bytes:
         transfer_encoding = handler.headers.get("transfer-encoding", "").lower()
         if "chunked" in (part.strip() for part in transfer_encoding.split(",")):
             chunks: list[bytes] = []
@@ -714,9 +1031,9 @@ class Backend:
                             raise RequestBodyError("Trailer chunked invalido")
                     break
                 total += size
-                if total > MAX_BODY:
+                if total > max_bytes:
                     handler.close_connection = True
-                    raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
+                    raise RequestBodyTooLarge(f"Body mayor a {max_bytes} bytes")
                 chunk = handler.rfile.read(size)
                 ending = handler.rfile.read(2)
                 if len(chunk) != size or ending != b"\r\n":
@@ -727,9 +1044,9 @@ class Backend:
         length = handler.headers.get("content-length")
         if length and length.isdigit():
             n = int(length)
-            if n > MAX_BODY:
+            if n > max_bytes:
                 handler.close_connection = True
-                raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
+                raise RequestBodyTooLarge(f"Body mayor a {max_bytes} bytes")
             return handler.rfile.read(n)
         return b""
 
@@ -886,8 +1203,36 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_refresh(self)
             elif self.command == "POST" and path == "/v1/account-auth/logout":
                 backend.handle_account_auth_logout(self)
+            elif self.command == "GET" and path == "/connections/complete":
+                html_response(self, 200, completion_html())
+            elif path.startswith("/v1/connectors/native/setup/"):
+                attempt_id = path.rsplit("/", 1)[-1]
+                if self.command == "GET":
+                    backend.handle_native_connector_setup(self, attempt_id)
+                elif self.command == "POST":
+                    backend.handle_native_connector_submit(self, attempt_id)
+                else:
+                    error_response(self, 405, "Metodo no permitido", "method_not_allowed")
+            elif self.command == "GET" and path.startswith("/v1/connectors/status/"):
+                backend.handle_connector_auth_status(self, path.rsplit("/", 1)[-1])
+            elif self.command == "POST" and path == "/v1/connectors/start":
+                backend.handle_connector_start(self)
+            elif self.command == "POST" and path == "/v1/connectors/disconnect":
+                backend.handle_connector_disconnect(self)
+            elif self.command == "GET" and path == "/v1/connectors":
+                backend.handle_connectors_snapshot(self)
+            elif self.command == "GET" and path.startswith("/v1/connectors/"):
+                backend.handle_connector_status_public(self, path.rsplit("/", 1)[-1])
             elif self.command == "POST" and path == "/v1/signup":
                 backend.handle_signup(self)
+            elif self.command == "GET" and path == "/v1/billing":
+                backend.handle_billing_status(self)
+            elif self.command == "POST" and path == "/v1/billing/checkout":
+                backend.handle_billing_checkout(self)
+            elif self.command == "POST" and path == "/v1/billing/portal":
+                backend.handle_billing_portal(self)
+            elif self.command == "POST" and path == "/v1/billing/webhook":
+                backend.handle_billing_webhook(self)
             elif self.command == "POST" and path == "/v1/byok":
                 backend.handle_byok(self)
             elif path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
@@ -902,10 +1247,26 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_status(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
+            elif path.startswith("/v1/computers/"):
+                parts = path.strip("/").split("/")
+                bot_id = parts[2] if len(parts) >= 3 else ""
+                action = parts[3] if len(parts) == 4 else ""
+                if self.command == "GET" and len(parts) == 3:
+                    backend.handle_computer_status(self, bot_id)
+                elif self.command == "POST" and action == "ensure":
+                    backend.handle_computer_ensure(self, bot_id)
+                elif self.command == "POST" and action == "hand-back":
+                    backend.handle_computer_hand_back(self, bot_id)
+                elif self.command == "POST" and action == "delete":
+                    backend.handle_computer_delete(self, bot_id)
+                else:
+                    error_response(self, 405, "Operación de computadora no permitida", "method_not_allowed")
             elif self.command == "GET" and path == "/v1/internal/connectors/catalog":
                 backend.handle_connector_catalog(self)
             elif self.command == "POST" and path == "/v1/internal/connectors/execute":
                 backend.handle_connector_execute(self)
+            elif self.command == "POST" and path == "/v1/internal/computers/execute":
+                backend.handle_computer_execute(self)
             elif self.command == "POST" and path == "/admin/subscriptions":
                 backend.handle_admin_add_subscriptions(self)
             elif self.command == "GET" and path == "/admin/subscriptions":
@@ -923,6 +1284,10 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "version": __version__,
                     "google_auth_configured": backend.google_auth.configured,
+                    "stripe_configured": backend.billing.configured,
+                    "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
+                    "connectors": backend.connector_gateway.health(),
+                    "computers": backend.computers.health(),
                 })
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
@@ -933,6 +1298,12 @@ class Handler(BaseHTTPRequestHandler):
         except RequestBodyError as e:
             error_response(self, 400, str(e), "bad_body")
         except GoogleAuthError as e:
+            error_response(self, e.status, str(e), e.code)
+        except BillingError as e:
+            error_response(self, e.status, str(e), e.code)
+        except ConnectorBrokerError as e:
+            error_response(self, e.status, str(e), e.code)
+        except ComputerError as e:
             error_response(self, e.status, str(e), e.code)
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:
@@ -957,9 +1328,11 @@ def serve(cfg: Config) -> None:
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     print(f"[server] wrapper backend v{__version__} escuchando en http://{cfg.host}:{cfg.port}")
     print(f"[server] upstream Go: {cfg.go_base_url}")
-    print(f"[server] enforce_limits={cfg.enforce_limits} db={cfg.db_path}")
+    database_backend = "postgres" if cfg.database_url else f"sqlite:{cfg.db_path}"
+    print(f"[server] enforce_limits={cfg.enforce_limits} database={database_backend}")
     print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
     print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
+    print(f"[server] computers={backend.computers.health()}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -998,7 +1371,8 @@ def cli() -> None:
 
     backend = Backend(cfg)
     if args.cmd == "init-db":
-        print(f"[ok] base de datos en {cfg.db_path}")
+        location = "Supabase/Postgres" if cfg.database_url else str(cfg.db_path)
+        print(f"[ok] base de datos en {location}")
     elif args.cmd == "users":
         for u in backend.store.list_users():
             print(u["id"], "|", u.get("name") or "-", "|", u.get("email") or "-",

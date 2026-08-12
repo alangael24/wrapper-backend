@@ -19,6 +19,8 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -29,7 +31,16 @@ from go_backend.server import (  # noqa: E402
     UnsafeConfigurationError,
     serve,
 )
-from go_backend.connectors import ConnectorBroker, ConnectorBrokerError  # noqa: E402
+from go_backend.connectors import (  # noqa: E402
+    CONNECTOR_CATALOG,
+    ConnectorBroker,
+    ConnectorBrokerError,
+)
+from go_backend.connector_adapters import (  # noqa: E402
+    ComposioConnectorAdapter,
+    ComposioConnectorGateway,
+)
+from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.store import NoSubscriptionAvailable, Store  # noqa: E402
 
 
@@ -149,6 +160,24 @@ class WrapperServer:
         os.environ.pop("GOOGLE_OAUTH_CLIENT_ID", None)
         os.environ.pop("GOOGLE_OAUTH_CLIENT_SECRET", None)
         os.environ.pop("GOOGLE_OAUTH_REDIRECT_URI", None)
+        for name in (
+            "COMPOSIO_API_KEY", "COMPOSIO_PUBLIC_URL", "COMPOSIO_AUTH_CONFIGS_JSON",
+            "COMPOSIO_TOOLKIT_OVERRIDES_JSON", "COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS",
+        ):
+            os.environ.pop(name, None)
+        for name in (
+            "STRIPE_ENABLED", "STRIPE_LIVE_MODE", "STRIPE_SECRET_KEY",
+            "STRIPE_WEBHOOK_SECRET", "STRIPE_PLUS_PRICE_ID", "STRIPE_PRO_PRICE_ID",
+            "STRIPE_SUCCESS_URL", "STRIPE_CANCEL_URL", "STRIPE_PORTAL_RETURN_URL",
+        ):
+            os.environ.pop(name, None)
+        for name in (
+            "COMPUTERS_ENABLED", "DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET",
+            "DAYTONA_SNAPSHOT", "COMPUTER_AUTO_STOP_MINUTES", "COMPUTER_AUTO_ARCHIVE_MINUTES",
+            "COMPUTER_PREVIEW_TTL_SECONDS", "COMPUTER_VNC_PORT", "COMPUTER_VNC_RESOLUTION", "COMPUTER_BASIC_LIMIT",
+            "COMPUTER_PRO_LIMIT",
+        ):
+            os.environ.pop(name, None)
         self.cfg = Config()
         self.cfg.go_base_url = upstream_base + "/v1"
         self.backend = Backend(self.cfg)
@@ -249,6 +278,92 @@ class FakeGitHubAdapter:
     def execute(self, user_id: str, operation: str, arguments: dict):
         self.calls.append((user_id, operation, arguments))
         return {"items": [{"name": "wrapper-backend", "private": True}]}
+
+
+class FakeComposioAccounts:
+    def __init__(self):
+        self.items: dict[str, SimpleNamespace] = {}
+        self.list_calls: list[dict] = []
+        self.get_calls: list[str] = []
+
+    def list(self, *, user_ids, statuses, limit, toolkit_slugs=None):
+        self.list_calls.append({
+            "user_ids": user_ids,
+            "toolkit_slugs": toolkit_slugs,
+            "statuses": statuses,
+            "limit": limit,
+        })
+        matches = [
+            account for account in self.items.values()
+            if account.user_id in user_ids
+            and (toolkit_slugs is None or account.toolkit in toolkit_slugs)
+            and account.status in statuses
+        ][:limit]
+        return SimpleNamespace(items=matches)
+
+    def get(self, account_id):
+        self.get_calls.append(account_id)
+        return self.items[account_id]
+
+    def delete(self, account_id):
+        self.items.pop(account_id, None)
+
+
+class FakeComposioSession:
+    def __init__(self, client, user_id, toolkit):
+        self.client = client
+        self.user_id = user_id
+        self.toolkit = toolkit
+        self.deleted = False
+
+    def authorize(self, toolkit, **_options):
+        account_id = f"ca_{len(self.client.connected_accounts.items) + 1}"
+        self.client.connected_accounts.items[account_id] = SimpleNamespace(
+            id=account_id,
+            user_id=self.user_id,
+            toolkit=toolkit,
+            status="INITIATED",
+            alias="",
+            data={},
+            status_reason="",
+        )
+        return SimpleNamespace(
+            id=account_id,
+            redirect_url=f"https://connect.composio.dev/link/{account_id}",
+        )
+
+    def search(self, *, query):
+        self.client.searches.append((self.toolkit, query))
+        return SimpleNamespace(
+            results=[SimpleNamespace(primary_tool_slugs=[f"{self.toolkit.upper()}_SEARCH"])]
+        )
+
+    def execute(self, slug, *, arguments):
+        self.client.executions.append((slug, arguments))
+        return SimpleNamespace(data={"items": [{"name": "wrapper-backend"}]}, error=None)
+
+    def delete(self):
+        self.deleted = True
+
+
+class FakeComposioSessions:
+    def __init__(self, client):
+        self.client = client
+
+    def create(self, **options):
+        self.client.session_options.append(options)
+        return FakeComposioSession(
+            self.client, options["user_id"], options["toolkits"][0]
+        )
+
+
+class FakeComposioClient:
+    def __init__(self):
+        self.connected_accounts = FakeComposioAccounts()
+        self.sessions = FakeComposioSessions(self)
+        self.session_options: list[dict] = []
+        self.searches: list[tuple[str, str]] = []
+        self.executions: list[tuple[str, dict]] = []
 
 
 class TestBackend(unittest.TestCase):
@@ -1180,6 +1295,162 @@ class TestBackend(unittest.TestCase):
             broker.catalog(token)
         self.assertEqual(error.exception.status, 401)
         self.assertEqual(error.exception.code, "connector_token_invalid")
+
+    def test_composio_gateway_owns_auth_status_and_execution_by_wrapper_user(self):
+        client = FakeComposioClient()
+        clock = [100.0]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+            now=lambda: clock[0],
+        )
+        self.assertTrue(gateway.describe("github")["available"])
+        self.assertTrue(gateway.describe("salesforce")["available"])
+        self.assertFalse(gateway.status("usr_alice", "github")["connected"])
+
+        started = gateway.start("usr_alice", "github")
+        self.assertRegex(started["attempt_id"], r"^[A-Za-z0-9_-]+$")
+        self.assertEqual(
+            started["authorize_url"],
+            "https://connect.composio.dev/link/ca_1",
+        )
+        self.assertEqual(gateway.poll("usr_alice", started["attempt_id"]), {"status": "pending"})
+        client.connected_accounts.items["ca_1"].status = "ACTIVE"
+        self.assertEqual(gateway.poll("usr_alice", started["attempt_id"]), {"status": "pending"})
+        self.assertEqual(client.connected_accounts.get_calls, ["ca_1"])
+        clock[0] += 2.1
+        completed = gateway.poll("usr_alice", started["attempt_id"])
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(completed["session"]["connector_id"], "github")
+        self.assertTrue(gateway.status("usr_alice", "github")["connected"])
+        self.assertFalse(gateway.status("usr_bob", "github")["connected"])
+
+        client.connected_accounts.list_calls.clear()
+        snapshot = gateway.snapshot("usr_alice")
+        github = next(item for item in snapshot if item["connector_id"] == "github")
+        slack = next(item for item in snapshot if item["connector_id"] == "slack")
+        self.assertTrue(github["connected"])
+        self.assertFalse(slack["connected"])
+        self.assertEqual(len(client.connected_accounts.list_calls), 1)
+        self.assertIsNone(client.connected_accounts.list_calls[0]["toolkit_slugs"])
+
+        adapter = ComposioConnectorAdapter(gateway, "github")
+        self.assertTrue(adapter.is_connected("usr_alice"))
+        result = adapter.execute(
+            "usr_alice", "search_repositories", {"query": "wrapper"}
+        )
+        self.assertEqual(result["items"][0]["name"], "wrapper-backend")
+        self.assertEqual(
+            client.executions,
+            [("GITHUB_SEARCH", {"query": "wrapper"})],
+        )
+        self.assertEqual(client.session_options[-1]["user_id"], "usr_alice")
+        self.assertEqual(client.session_options[-1]["toolkits"], ["github"])
+        self.assertFalse(client.session_options[-1]["manage_connections"])
+        self.assertEqual(client.session_options[-1]["workbench"], {"enable": False})
+
+        gateway.disconnect("usr_alice", "github")
+        self.assertFalse(gateway.status("usr_alice", "github")["connected"])
+
+    def test_composio_gateway_fails_closed_without_private_auth_config(self):
+        gateway = ComposioConnectorGateway(client=FakeComposioClient())
+        salesforce = gateway.describe("salesforce")
+        self.assertFalse(salesforce["available"])
+        self.assertIn("Auth Config", salesforce["reason"])
+        with self.assertRaises(ConnectorBrokerError) as error:
+            gateway.start("usr_alice", "salesforce")
+        self.assertEqual(error.exception.code, "connector_not_configured")
+
+    def test_composio_gateway_rate_limits_new_links_per_user(self):
+        gateway = ComposioConnectorGateway(client=FakeComposioClient(), now=lambda: 100.0)
+        for _ in range(12):
+            gateway.start("usr_alice", "github")
+        with self.assertRaises(ConnectorBrokerError) as error:
+            gateway.start("usr_alice", "github")
+        self.assertEqual(error.exception.status, 429)
+        self.assertEqual(error.exception.code, "connector_rate_limit")
+
+    def test_native_connector_fallback_is_encrypted_isolated_and_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "native.sqlite")
+            alice = store.create_user("alice-key", "Alice", "alice@example.com")
+            bob = store.create_user("bob-key", "Bob", "bob@example.com")
+            native = NativeConnectorGateway(
+                store=store,
+                secret_env="native-test-secret",
+                secret_path=Path(tmp) / "secret.key",
+                public_base_url="https://agentgenia-api.onrender.com",
+            )
+            gateway = ComposioConnectorGateway(
+                client=FakeComposioClient(),
+                native_gateway=native,
+            )
+
+            self.assertEqual(gateway.describe("nooks")["driver"], "native")
+            self.assertTrue(gateway.describe("nooks")["available"])
+            self.assertFalse(gateway.describe("loom")["available"])
+
+            started = gateway.start(alice["id"], "nooks")
+            self.assertTrue(started["attempt_id"].startswith("nat_"))
+            page = native.setup_html(started["attempt_id"]).decode()
+            self.assertIn("Conectar Nooks", page)
+            self.assertIn('type="password"', page)
+
+            complete_page = native.submit(
+                started["attempt_id"],
+                {"access_token": "nooks-api-super-secret", "account_label": "Ventas"},
+            ).decode()
+            self.assertIn("Cuenta conectada", complete_page)
+            row = store.get_connector_credentials(alice["id"], "nooks")
+            self.assertIsNotNone(row)
+            self.assertNotIn(b"nooks-api-super-secret", bytes(row["credentials_enc"]))
+            self.assertTrue(gateway.status(alice["id"], "nooks")["connected"])
+            self.assertFalse(gateway.status(bob["id"], "nooks")["connected"])
+            self.assertEqual(gateway.poll(alice["id"], started["attempt_id"])["status"], "complete")
+
+            with (
+                patch(
+                    "go_backend.native_connectors.socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ),
+                patch(
+                    "go_backend.native_connectors._request_json",
+                    return_value={"data": [{"id": "call-1"}]},
+                ) as request_json,
+            ):
+                result = gateway.execute(alice["id"], "nooks", "list_calls", {"page[size]": 25})
+            self.assertEqual(result["data"][0]["id"], "call-1")
+            url = request_json.call_args.args[0]
+            self.assertIn("partner-api.nooks.in/v1/calls", url)
+            self.assertIn("page%5Bsize%5D=25", url)
+            self.assertEqual(
+                request_json.call_args.kwargs["headers"]["Authorization"],
+                "Bearer nooks-api-super-secret",
+            )
+
+            gateway.disconnect(alice["id"], "nooks")
+            self.assertFalse(gateway.status(alice["id"], "nooks")["connected"])
+
+    def test_connector_account_routes_are_authenticated_and_execution_is_internal_only(self):
+        status, body = self.ws.req("GET", "/v1/connectors")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "unauthorized")
+
+        signup = self.new_user(tier="free")
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        status, body = self.ws.req("GET", "/v1/connectors", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["connectors"]), len(CONNECTOR_CATALOG))
+        self.assertTrue(all(not item["connected"] for item in body["connectors"]))
+
+        status, _body = self.ws.req(
+            "POST",
+            "/v1/connectors/execute",
+            {"connector_id": "github", "operation": "search_repositories", "arguments": {}},
+            headers=headers,
+        )
+        self.assertEqual(status, 404)
 
     def test_pi_connectors_are_passed_to_child_and_revoked_after_run(self):
         signup = self.new_user()

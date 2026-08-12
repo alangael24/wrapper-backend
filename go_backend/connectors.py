@@ -315,6 +315,7 @@ class ConnectorAdapter(Protocol):
 class ConnectorRunGrant:
     user_id: str
     connector_ids: frozenset[str]
+    computer_id: str | None
     expires_at: float
 
 
@@ -355,9 +356,10 @@ class ConnectorBroker:
         *,
         user_id: str,
         connector_ids: tuple[str, ...],
+        computer_id: str | None = None,
         ttl_seconds: int | None = None,
     ) -> str:
-        if not connector_ids:
+        if not connector_ids and not computer_id:
             raise ValueError("No se emiten grants vacios")
         expires_in = self.default_ttl_seconds if ttl_seconds is None else max(
             1, min(int(ttl_seconds), self.default_ttl_seconds)
@@ -366,6 +368,7 @@ class ConnectorBroker:
         grant = ConnectorRunGrant(
             user_id=user_id,
             connector_ids=frozenset(connector_ids),
+            computer_id=computer_id,
             expires_at=self._now() + expires_in,
         )
         with self._lock:
@@ -395,6 +398,20 @@ class ConnectorBroker:
                     connected = False
             result.append({**item, "connected": connected})
         return result
+
+    def computer(self, token: str) -> tuple[str, str]:
+        """Devuelve el único (usuario, bot) autorizado para esta ejecución."""
+        grant = self._require_grant(token)
+        if not grant.computer_id:
+            raise ConnectorBrokerError(
+                403,
+                "Esta ejecución no tiene una computadora autorizada",
+                "computer_forbidden",
+            )
+        return grant.user_id, grant.computer_id
+
+    def has_computer(self, token: str) -> bool:
+        return bool(self._require_grant(token).computer_id)
 
     def execute(
         self,

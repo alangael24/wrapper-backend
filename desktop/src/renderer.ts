@@ -33,19 +33,22 @@ import {
 } from "simple-icons";
 import {
   BOT_COLORS,
-  BOT_SETUP_OPTIONS,
   BOT_SHAPES,
   BOT_TEMPLATES,
   CONNECTOR_CATALOG,
   HOSTED_CONNECTOR_IDS,
   type AppState,
+  type BillingSnapshot,
+  type BotComputerSnapshot,
   type BotDraft,
   type BotPatch,
   type BotProfile,
-  type BotSetupAnswer,
   type ConnectorConnectionSnapshot,
   type DesktopApi,
-  applyBotSetupAnswer,
+  type TeachCapture,
+  type TeachEntryPoint,
+  type TeachRecordingStatus,
+  createBotWorkflow,
   createBotProfile,
   initialAppState,
   normalizeConnectorIds,
@@ -59,7 +62,7 @@ declare global {
   }
 }
 
-type View = "connectors" | "plugins" | "bot-builder" | "bot-detail";
+type View = "connectors" | "plugins" | "billing" | "bot-builder" | "bot-detail";
 
 const CONNECTOR_CATEGORIES = Object.freeze([
   "Trabajo", "Ventas", "Soporte", "Desarrollo", "Diseño",
@@ -118,17 +121,47 @@ let avatarEditorTab: "bot" | "generate" | "upload" = "bot";
 let connections: ConnectorConnectionSnapshot = emptyConnectionSnapshot();
 let authBusyConnectorId = "";
 let accountAuthBusy = false;
+let billing = emptyBillingSnapshot();
+let billingLoaded = false;
+let billingBusy = false;
+let billingNotice = "";
+let agentBusyBotId = "";
+let pendingUserMessage = "";
+let teachStatus = idleTeachStatus();
+let teachRecorder: MediaRecorder | null = null;
+let teachStream: MediaStream | null = null;
+let teachVideo: HTMLVideoElement | null = null;
+let teachStartedAt = 0;
+let teachSampleTimer = 0;
+let teachLimitTimer = 0;
+let teachClockTimer = 0;
+let teachStopping = false;
+let teachChunks: Blob[] = [];
+let teachFrames: string[] = [];
+let teachBytes = 0;
+let composerMenuOpen = false;
+let workflowPanelOpen = false;
+let computerSnapshot = idleComputerSnapshot();
+let computerLoadedBotId = "";
+let computerBusy = false;
+const botMessageDrafts = new Map<string, string>();
 const settingsSaveTimers = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
 
 void initialize();
+window.addEventListener("beforeunload", () => {
+  if (!teachStatus.botId) return;
+  cleanupTeachMedia();
+  void desktopApi.discardTeachRecording(teachStatus.botId);
+});
 
 async function initialize(): Promise<void> {
   try {
-    [state, connections] = await Promise.all([
+    [state, connections, teachStatus] = await Promise.all([
       desktopApi.bootstrap(),
-      desktopApi.connectionSnapshot()
+      desktopApi.connectionSnapshot(),
+      desktopApi.getTeachRecordingStatus()
     ]);
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
@@ -141,28 +174,28 @@ async function initialize(): Promise<void> {
       selectedConnectorIds = new Set(["google-workspace", "slack", "notion", "shopify"]);
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds] };
       activeView = "bot-builder";
-    } else if (!window.wrapperDesktop && ["setup", "connections", "settings", "settings-avatar"].includes(preview ?? "")) {
+    } else if (!window.wrapperDesktop && ["setup", "connections", "settings", "settings-avatar", "teach", "teach-recording"].includes(preview ?? "")) {
       selectedConnectorIds = new Set(["google-workspace", "slack"]);
-      let bot = createBotProfile({ name: "Juan", color: "#2f91f5", shape: "drop" }, [...selectedConnectorIds], "preview-bot");
-      if (preview === "connections") {
-        bot = applyBotSetupAnswer(bot, { step: "purpose", value: "work" });
-        bot = applyBotSetupAnswer(bot, { step: "workspace", value: "mix" });
-        bot = applyBotSetupAnswer(bot, { step: "project", value: "notion" });
-      }
+      const bot = createBotProfile({ name: "Juan", color: "#2f91f5", shape: "drop" }, [...selectedConnectorIds], "preview-bot");
       state = { ...state, onboardingCompleted: true, selectedConnectorIds: [...selectedConnectorIds], bots: [bot], activeBotId: bot.id };
       activeView = "bot-detail";
       settingsOpen = preview === "settings" || preview === "settings-avatar";
       avatarEditorOpen = preview === "settings-avatar";
+      workflowPanelOpen = preview === "teach";
     }
   } catch (error) {
     transientError = errorMessage(error);
   }
   render();
+  const activeBotId = state.activeBotId ?? state.bots[0]?.id ?? "";
+  if (activeView === "bot-detail" && activeBotId) void refreshComputerStatus(activeBotId);
+  window.setInterval(() => void refreshTeachStatus(), 1_000);
 }
 
 function render(): void {
   if (activeView === "connectors") renderConnectors();
   else if (activeView === "plugins") renderPluginMarketplace();
+  else if (activeView === "billing") renderBilling();
   else if (activeView === "bot-builder") renderBotBuilder();
   else renderBotDetail();
 }
@@ -182,7 +215,7 @@ function renderConnectors(): void {
       <header class="connector-heading">
         <span class="eyebrow">CONECTA TU FLUJO</span>
         <h1>¿Qué usas todos los días?</h1>
-        <p>Elige las herramientas y autoriza tu propia cuenta. Las sesiones quedan cifradas en este dispositivo y nunca se comparten con otros usuarios.</p>
+        <p>Elige las herramientas y autoriza tu propia cuenta. El acceso queda aislado en el backend para tu usuario y nunca se comparte con otras cuentas.</p>
       </header>
       ${renderAccountBanner()}
       <label class="connector-search">
@@ -305,6 +338,11 @@ async function signInAccount(): Promise<void> {
   render();
   try {
     connections = await desktopApi.signIn();
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
+    computerSnapshot = idleComputerSnapshot();
+    computerLoadedBotId = "";
+    activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
@@ -319,6 +357,13 @@ async function signOutAccount(): Promise<void> {
   render();
   try {
     connections = await desktopApi.signOut();
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set();
+    computerSnapshot = idleComputerSnapshot();
+    computerLoadedBotId = "";
+    computerBusy = false;
+    closeBotSettings();
+    activeView = "connectors";
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
@@ -482,6 +527,141 @@ async function leaveConnectors(nextView: View): Promise<void> {
   render();
 }
 
+function renderBilling(): void {
+  const tier = billing.tier;
+  const subscription = billing.subscription;
+  const currentLabel = tier === "basic" ? "Plus" : tier === "pro" ? "Pro" : "Free";
+  appRoot.innerHTML = renderDesktopShell(`
+    <section class="billing-view">
+      <header class="workspace-topbar">
+        <span class="billing-mark">$</span>
+        <strong>Plan y facturación</strong>
+        <button class="topbar-link" type="button" data-refresh-billing ${billingBusy ? "disabled" : ""}>Actualizar</button>
+      </header>
+      <div class="billing-scroll">
+        <div class="billing-heading">
+          <span class="eyebrow">AGENTGENIA</span>
+          <h1>Elige el plan que acompaña tu trabajo</h1>
+          <p>Los cobros y datos de tarjeta se procesan directamente en Stripe. Agentgenia activa el acceso únicamente después de recibir un webhook firmado.</p>
+        </div>
+        ${!connections.account.connected ? `
+          <section class="billing-signin-card">
+            <strong>Inicia sesión para administrar tu plan</strong>
+            <p>Tu suscripción se vincula a tu cuenta verificada de Agentgenia.</p>
+            <button class="primary-action compact" type="button" data-billing-sign-in>Iniciar sesión</button>
+          </section>` : !billingLoaded ? `
+          <section class="billing-signin-card"><strong>Cargando tus planes…</strong></section>` : `
+          <div class="billing-current">
+            <span><small>Plan actual</small><strong>${currentLabel}</strong></span>
+            ${subscription ? `<span><small>Estado</small><strong>${escapeHtml(subscription.status)}</strong></span>` : ""}
+            ${subscription?.cancel_at_period_end ? '<em>Se cancelará al finalizar el periodo actual.</em>' : ""}
+            ${billing.customer ? '<button type="button" class="secondary-action" data-open-billing-portal>Administrar en Stripe</button>' : ""}
+          </div>
+          <div class="billing-plans">
+            ${renderBillingPlan("free", "Free", 0, "Para explorar Agentgenia", ["Crea y personaliza bots", "Conecta tus herramientas", "Sin acceso al modelo incluido"], tier)}
+            ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", ["Acceso al modelo incluido", "50% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
+            ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", ["Acceso al modelo incluido", "100% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
+          </div>`}
+        ${billingNotice ? `<p class="billing-notice">${escapeHtml(billingNotice)}</p>` : ""}
+        ${!billing.configured && billingLoaded && connections.account.connected ? '<p class="inline-error">El servicio de pagos todavía no está habilitado en producción.</p>' : renderError()}
+      </div>
+    </section>
+  `, "billing");
+  bindSidebar();
+  document.querySelector("[data-refresh-billing]")?.addEventListener("click", () => void refreshBilling());
+  document.querySelector("[data-billing-sign-in]")?.addEventListener("click", async () => {
+    await signInAccount();
+    if (connections.account.connected) await refreshBilling();
+  });
+  document.querySelector("[data-open-billing-portal]")?.addEventListener("click", () => void openBillingPortal());
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-plan]")) {
+    button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro"));
+  }
+}
+
+function renderBillingPlan(
+  id: "free" | "basic" | "pro",
+  name: string,
+  amount: number,
+  subtitle: string,
+  features: string[],
+  currentTier: string
+): string {
+  const current = id === currentTier;
+  const paid = id === "basic" || id === "pro";
+  return `
+    <article class="billing-plan${id === "pro" ? " featured" : ""}${current ? " current" : ""}">
+      <span class="plan-kicker">${id === "pro" ? "MÁS CAPACIDAD" : current ? "TU PLAN" : "MENSUAL"}</span>
+      <h2>${escapeHtml(name)}</h2>
+      <p>${escapeHtml(subtitle)}</p>
+      <div class="plan-price"><strong>$${amount}</strong><span>${amount ? "USD / mes" : "para siempre"}</span></div>
+      <ul>${features.map((feature) => `<li>✓ ${escapeHtml(feature)}</li>`).join("")}</ul>
+      ${current
+        ? '<button type="button" disabled>Plan actual</button>'
+        : paid
+          ? `<button type="button" data-select-plan="${id}" ${!billing.configured || billingBusy ? "disabled" : ""}>Elegir ${escapeHtml(name)}</button>`
+          : '<button type="button" disabled>Incluido</button>'}
+    </article>`;
+}
+
+async function openBillingView(): Promise<void> {
+  closeBotSettings();
+  activeView = "billing";
+  transientError = "";
+  billingNotice = "";
+  render();
+  if (connections.account.connected) await refreshBilling();
+}
+
+async function refreshBilling(): Promise<void> {
+  if (!connections.account.connected || billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  render();
+  try {
+    billing = await desktopApi.billingSnapshot();
+    billingLoaded = true;
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
+  }
+  render();
+}
+
+async function startCheckout(tier: "basic" | "pro"): Promise<void> {
+  if (billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  billingNotice = "";
+  render();
+  try {
+    await desktopApi.startCheckout(tier);
+    billingNotice = "Abrimos el Checkout seguro de Stripe en tu navegador. Al terminar, vuelve aquí y presiona Actualizar.";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
+  }
+  render();
+}
+
+async function openBillingPortal(): Promise<void> {
+  if (billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  render();
+  try {
+    await desktopApi.openBillingPortal();
+    billingNotice = "Abrimos tu portal de Stripe para actualizar el método de pago, cambiar o cancelar el plan.";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
+  }
+  render();
+}
+
 function renderBotBuilder(): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-builder-view">
@@ -566,6 +746,10 @@ async function createBot(): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
+  const created = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (created && !created.messages.length) {
+    void initializeBotConversation(created.id);
+  }
 }
 
 async function createDefaultBot(): Promise<void> {
@@ -590,6 +774,10 @@ async function createDefaultBot(): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
+  const created = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (created && !created.messages.length) {
+    void initializeBotConversation(created.id);
+  }
 }
 
 function renderBotDetail(): void {
@@ -599,212 +787,504 @@ function renderBotDetail(): void {
     renderBotBuilder();
     return;
   }
-  if (bot.setup.step !== "complete") {
-    renderBotOnboarding(bot);
-    return;
-  }
   renderReadyBot(bot);
 }
 
-function renderBotOnboarding(bot: BotProfile): void {
+function renderReadyBot(bot: BotProfile): void {
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-chat-view">
       <header class="workspace-topbar">
         <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
         <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
+        <div class="topbar-actions">
+          <span>${bot.connectorIds.length} plugins</span>
+          <button class="teach-task-button" type="button" data-teach-task="top_bar" title="Record yourself doing a task. ${escapeAttribute(bot.name)} learns the steps and can run them again on its own." ${teachStatus.phase !== "idle" ? "disabled" : ""}>Teach a task</button>
+          ${bot.workflows.length ? `<button class="topbar-link" type="button" data-open-workflows>${bot.workflows.length} aprendidas</button>` : ""}
+          <button id="edit-connectors" class="topbar-link" type="button">Plugins</button>
+          <button id="delete-bot" class="topbar-link" type="button">Eliminar</button>
+        </div>
       </header>
-      <div id="bot-setup-thread" class="bot-setup-thread">
-        <div class="thread-date">Hoy · ${new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(new Date())}</div>
-        <div class="assistant-bubble">Hola, soy ${escapeHtml(bot.name)}. Qué gusto conocerte.</div>
-        ${renderSetupHistory(bot)}
-        ${renderCurrentSetupStep(bot)}
+      ${renderComputerStrip(bot)}
+      <div id="bot-conversation-thread" class="bot-setup-thread bot-conversation-thread">
+        <div class="thread-date">Hoy</div>
+        ${bot.messages.length ? bot.messages.map((message, index) => {
+          const hasLaterUserMessage = bot.messages.slice(index + 1).some((item) => item.role === "user");
+          return `
+            <div class="chat-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"}">${escapeHtml(message.text).replace(/\n/g, "<br />")}</div>
+            ${message.widget && (!hasLaterUserMessage || !message.widget.dismissOnMoveOn)
+              ? renderGeneratedQuestion(message, !hasLaterUserMessage)
+              : ""}`;
+        }).join("") : agentBusyBotId === bot.id ? "" : `
+          <div class="conversation-empty">${renderBotAvatar(bot, "large")}<strong>${escapeHtml(bot.name)} está listo</strong><span>Escríbele qué necesitas y generará su respuesta con el modelo.</span></div>
+        `}
+        ${agentBusyBotId === bot.id && pendingUserMessage ? `<div class="chat-bubble user-bubble">${escapeHtml(pendingUserMessage)}</div>` : ""}
+        ${agentBusyBotId === bot.id ? '<div class="assistant-bubble agent-thinking"><i></i><i></i><i></i></div>' : ""}
         ${renderError()}
       </div>
-      ${renderMessageComposer(bot.name)}
+      ${workflowPanelOpen ? renderWorkflowPanel(bot) : ""}
+      ${renderTeachOverlay(bot)}
+      ${renderMessageComposer(bot.name, bot.id)}
     </section>
   `, bot.id, settingsOpen ? bot : undefined);
   bindSidebar();
-  bindBotSetup(bot);
+  bindBotChat(bot);
+  document.querySelector("[data-computer-open]")?.addEventListener("click", () => void openBotComputer(bot));
+  document.querySelector("[data-computer-hand-back]")?.addEventListener("click", () => void handBackBotComputer(bot.id));
+  document.querySelector("[data-teach-task]")?.addEventListener("click", () => void startTeachTask(bot, "top_bar"));
+  document.querySelector("[data-open-workflows]")?.addEventListener("click", () => {
+    workflowPanelOpen = !workflowPanelOpen;
+    composerMenuOpen = false;
+    render();
+  });
   document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
+  document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
   requestAnimationFrame(() => {
-    const thread = document.querySelector<HTMLElement>("#bot-setup-thread");
+    const thread = document.querySelector<HTMLElement>("#bot-conversation-thread");
     if (thread) thread.scrollTop = thread.scrollHeight;
   });
+  if (computerLoadedBotId !== bot.id && !computerBusy) void refreshComputerStatus(bot.id);
 }
 
-function renderSetupHistory(bot: BotProfile): string {
-  const setup = bot.setup;
-  const chunks: string[] = [];
-  if (setup.purpose) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Para qué quieres usarme principalmente?",
-      setupLabel("purpose", setup.purpose, setup.customAnswers.purpose)
-    ));
-    chunks.push(`<div class="assistant-bubble">${setup.purpose === "work" ? "Entendido: seré tu compañero de trabajo." : setup.purpose === "coding" ? "Perfecto: modo tecnología activado." : "Perfecto, ajustaré mi forma de trabajar a eso."}</div>`);
-  }
-  if (setup.workspace) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Dónde vive tu trabajo en el día a día?",
-      setupLabel("workspace", setup.workspace, setup.customAnswers.workspace)
-    ));
-    chunks.push(`<div class="assistant-bubble">${setup.workspace === "mix" ? "Perfecto, ese es todo el stack. Vamos a conectarlo." : "Listo, usaré esa herramienta como tu espacio principal."}</div>`);
-  }
-  if (setup.projectTool) {
-    chunks.push(renderAnsweredQuestion(
-      "¿Qué herramienta de proyectos debo usar?",
-      setupLabel("project", setup.projectTool, setup.customAnswers.project)
-    ));
-    chunks.push('<div class="assistant-bubble">Ya tengo el contexto. Preparé tus conectores recomendados.</div>');
-  }
-  return chunks.join("");
-}
-
-function renderCurrentSetupStep(bot: BotProfile): string {
-  if (bot.setup.step === "connections") return renderConnectionRecommendations(bot);
-  const questions = {
-    purpose: {
-      title: "¿Para qué quieres usarme principalmente?",
-      subtitle: "Ajustaré mi forma de trabajar a partir de tu respuesta.",
-      placeholder: "Escribe tu propia respuesta"
-    },
-    workspace: {
-      title: "¿Dónde vive tu trabajo en el día a día?",
-      subtitle: "Puedo preparar estas herramientas para encontrarte información.",
-      placeholder: "Escribe otra herramienta"
-    },
-    project: {
-      title: "¿Qué herramienta de proyectos debo usar?",
-      subtitle: "La añadiré junto con las demás herramientas que elegiste.",
-      placeholder: "Escribe otra herramienta de proyectos"
-    }
-  } as const;
-  const step = bot.setup.step as keyof typeof questions;
-  const question = questions[step];
-  const options = BOT_SETUP_OPTIONS[step];
+function renderComputerStrip(bot: BotProfile): string {
+  const loaded = computerLoadedBotId === bot.id;
+  const snapshot = loaded ? computerSnapshot : idleComputerSnapshot(bot.id);
+  const stateLabel = !loaded
+    ? "Consultando…"
+    : snapshot.state === "running"
+      ? "En línea"
+      : snapshot.state === "pulling"
+        ? "Preparando…"
+        : snapshot.state === "hibernated"
+          ? "Hibernada"
+          : snapshot.state === "off"
+            ? "Sin crear"
+            : snapshot.state === "error"
+              ? "Necesita atención"
+              : "No disponible";
+  const detail = !loaded
+    ? "Buscando la computadora privada de este bot."
+    : snapshot.state === "running"
+      ? "Perfil, archivos y sesiones aislados para este bot."
+      : snapshot.state === "hibernated"
+        ? "Conserva sus archivos y sesiones sin consumir cómputo."
+        : snapshot.state === "off"
+          ? "Se crea bajo demanda y se detiene automáticamente cuando no se usa."
+          : snapshot.reason || "La infraestructura de computadoras todavía no está habilitada.";
+  const canStart = loaded && snapshot.configured && ["off", "hibernated", "error"].includes(snapshot.state);
+  const running = loaded && snapshot.state === "running";
   return `
-    <section class="setup-question-card">
-      <button class="question-close" type="button" aria-label="Omitir pregunta" data-skip-setup>×</button>
-      <h2>${question.title}</h2>
-      <p>${question.subtitle}</p>
-      <div class="setup-options">
-        ${options.map((option, index) => `<button type="button" data-setup-answer="${option.id}"><kbd>${String.fromCharCode(65 + index)}</kbd><span>${option.label}</span></button>`).join("")}
-      </div>
-      <form id="custom-setup-answer" class="custom-answer-form">
-        <input name="customAnswer" maxlength="300" placeholder="${question.placeholder}" autocomplete="off" />
-        <button type="submit">Enviar</button>
-      </form>
+    <section class="computer-monitor-strip computer-${escapeAttribute(snapshot.state)}" aria-label="Computadora de ${escapeAttribute(bot.name)}">
+      <span class="computer-monitor-icon" aria-hidden="true">▣</span>
+      <span class="computer-monitor-copy">
+        <span><strong>Computadora</strong><i>${escapeHtml(stateLabel)}</i></span>
+        <small>${escapeHtml(detail)}</small>
+      </span>
+      <span class="computer-monitor-actions">
+        ${running ? '<button type="button" data-computer-open>Abrir</button><button type="button" class="secondary" data-computer-hand-back>Hibernar</button>' : ""}
+        ${canStart ? `<button type="button" data-computer-open>${snapshot.state === "off" ? "Crear y abrir" : "Encender"}</button>` : ""}
+        ${computerBusy || snapshot.state === "pulling" || !loaded ? '<span class="computer-monitor-spinner" aria-label="Cargando"></span>' : ""}
+      </span>
     </section>`;
 }
 
-function renderAnsweredQuestion(title: string, answer: string): string {
-  return `
-    <section class="setup-question-card answered">
-      <h2>${title}</h2>
-      <div class="answered-row"><kbd>✓</kbd><span>${escapeHtml(answer)}</span><i>✓</i></div>
-    </section>`;
-}
-
-function renderConnectionRecommendations(bot: BotProfile): string {
-  const cards = connectionCards(bot);
-  return `
-    <div class="assistant-bubble">Voy a preparar estas herramientas. Autoriza tus cuentas y las guardaré cifradas solamente para tu usuario.</div>
-    <section class="setup-question-card connection-setup-card">
-      <h2>Conectores recomendados</h2>
-      <p>Cada botón abre el inicio de sesión oficial del proveedor.</p>
-      <div class="setup-connection-list">
-        ${cards.length ? cards.map((connection) => `
-          <article class="setup-connection-row">
-            ${renderConnectorIcon(connection.icon, connection.name)}
-            <span><strong>${connection.name}</strong><small>${connection.description}</small></span>
-            ${renderConnectorAuthAction(connection.connectorId)}
-          </article>`).join("") : '<div class="no-recommendations">No seleccionaste conectores. Puedes agregarlos después.</div>'}
-      </div>
-      <div class="oauth-truth-note"><strong>${connections.account.connected ? "Sesión personal activa" : "Primero inicia sesión"}</strong><span>${connections.account.connected ? escapeHtml(connections.account.email) : "Al conectar una herramienta abriremos el acceso de Agent Genia y después el del proveedor."}</span></div>
-      <button id="finish-bot-setup" class="primary-action compact" type="button">Continuar con el bot</button>
-    </section>`;
-}
-
-function connectionCards(bot: BotProfile): Array<{ connectorId: string; name: string; icon: string; description: string }> {
-  const cards: Array<{ connectorId: string; name: string; icon: string; description: string }> = [];
-  for (const connector of CONNECTOR_CATALOG.filter((item) => bot.connectorIds.includes(item.id))) {
-    if (connector.id === "google-workspace") {
-      cards.push(
-        { connectorId: connector.id, name: "Gmail", icon: "google", description: "Correo, búsqueda y borradores" },
-        { connectorId: connector.id, name: "Google Calendar", icon: "google", description: "Agenda, reuniones y eventos" }
-      );
-    } else cards.push({ connectorId: connector.id, name: connector.name, icon: connector.icon, description: connector.description });
+async function refreshComputerStatus(botId: string): Promise<void> {
+  if (!botId || computerBusy) return;
+  if (!connections.account.connected) {
+    computerSnapshot = {
+      ...idleComputerSnapshot(botId),
+      reason: "Inicia sesión para crear la computadora privada de este bot."
+    };
+    computerLoadedBotId = botId;
+    if (activeView === "bot-detail" && state.activeBotId === botId) render();
+    return;
   }
-  return cards;
-}
-
-function setupLabel(group: keyof typeof BOT_SETUP_OPTIONS, value: string, custom?: string): string {
-  return custom || BOT_SETUP_OPTIONS[group].find((option) => option.id === value)?.label || value;
-}
-
-function bindBotSetup(bot: BotProfile): void {
-  bindConnectionActions();
-  document.querySelector(".message-composer")?.addEventListener("submit", (event) => event.preventDefault());
-  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-setup-answer]")) {
-    button.addEventListener("click", () => void answerCurrentSetup(bot, button.dataset.setupAnswer ?? ""));
-  }
-  document.querySelector("[data-skip-setup]")?.addEventListener("click", () => {
-    const fallback = bot.setup.step === "purpose" ? "everything" : bot.setup.step === "workspace" ? "other" : "skip";
-    void answerCurrentSetup(bot, fallback);
-  });
-  document.querySelector("#custom-setup-answer")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const input = (event.currentTarget as HTMLFormElement).elements.namedItem("customAnswer") as HTMLInputElement | null;
-    const customText = input?.value.trim() ?? "";
-    if (!customText) return input?.focus();
-    const value = bot.setup.step === "purpose" ? "specific" : bot.setup.step === "workspace" ? "other" : "skip";
-    void answerCurrentSetup(bot, value, customText);
-  });
-  document.querySelector("#finish-bot-setup")?.addEventListener("click", () => void answerCurrentSetup(bot, "complete"));
-}
-
-async function answerCurrentSetup(bot: BotProfile, value: string, customText?: string): Promise<void> {
-  if (bot.setup.step === "complete") return;
-  setBusy(true);
-  transientError = "";
   try {
-    const answer: BotSetupAnswer = { step: bot.setup.step, value, ...(customText ? { customText } : {}) };
-    state = await desktopApi.answerBotSetup(bot.id, answer);
+    const snapshot = await desktopApi.computerStatus(botId);
+    if (!state.bots.some((bot) => bot.id === botId)) return;
+    computerSnapshot = snapshot;
+    computerLoadedBotId = botId;
+  } catch (error) {
+    computerSnapshot = {
+      ...idleComputerSnapshot(botId),
+      state: "error",
+      reason: errorMessage(error)
+    };
+    computerLoadedBotId = botId;
+  }
+  if (activeView === "bot-detail" && state.activeBotId === botId) {
+    render();
+    if (computerSnapshot.state === "pulling") {
+      window.setTimeout(() => void refreshComputerStatus(botId), 2_000);
+    }
+  }
+}
+
+async function openBotComputer(bot: BotProfile): Promise<void> {
+  if (computerBusy) return;
+  computerBusy = true;
+  computerLoadedBotId = bot.id;
+  computerSnapshot = { ...computerSnapshot, bot_id: bot.id, configured: true, state: "pulling", reason: "" };
+  transientError = "";
+  render();
+  try {
+    computerSnapshot = await desktopApi.ensureComputer(bot.id, bot.name);
+    computerLoadedBotId = bot.id;
+    if (!computerSnapshot.viewer_url) throw new Error("La computadora inició, pero no devolvió una vista segura.");
+    await desktopApi.openComputerViewer(computerSnapshot.viewer_url);
+  } catch (error) {
+    const message = errorMessage(error);
+    transientError = message;
+    computerSnapshot = { ...computerSnapshot, state: "error", viewer_url: "", viewer_expires_at: 0, reason: message };
+  } finally {
+    computerBusy = false;
+    render();
+  }
+}
+
+async function handBackBotComputer(botId: string): Promise<void> {
+  if (computerBusy) return;
+  computerBusy = true;
+  transientError = "";
+  render();
+  try {
+    computerSnapshot = await desktopApi.handBackComputer(botId);
+    computerLoadedBotId = botId;
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    computerBusy = false;
+    render();
+  }
+}
+
+function bindBotChat(bot: BotProfile): void {
+  const form = document.querySelector<HTMLFormElement>(".message-composer");
+  const input = form?.elements.namedItem("message") as HTMLInputElement | null;
+  input?.addEventListener("input", () => botMessageDrafts.set(bot.id, input.value));
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const message = input?.value.trim() ?? "";
+    if (!message || agentBusyBotId) return input?.focus();
+    botMessageDrafts.delete(bot.id);
+    void sendBotMessage(bot.id, message);
+  });
+  document.querySelector("[data-composer-add]")?.addEventListener("click", () => {
+    composerMenuOpen = !composerMenuOpen;
+    render();
+  });
+  document.querySelector("[data-composer-teach]")?.addEventListener("click", () => void startTeachTask(bot, "composer_menu"));
+  document.querySelector("[data-composer-workflows]")?.addEventListener("click", () => {
+    composerMenuOpen = false;
+    workflowPanelOpen = true;
+    render();
+  });
+  document.querySelector("[data-stop-teach]")?.addEventListener("click", () => void stopTeachTask(bot.id));
+  document.querySelector("[data-discard-teach]")?.addEventListener("click", () => void discardTeachTask(bot.id));
+  document.querySelector("[data-close-workflows]")?.addEventListener("click", () => {
+    workflowPanelOpen = false;
+    render();
+  });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-run-workflow]")) {
+    button.addEventListener("click", () => void runLearnedWorkflow(bot.id, button.dataset.runWorkflow ?? ""));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-delete-workflow]")) {
+    button.addEventListener("click", () => void deleteLearnedWorkflow(bot, button.dataset.deleteWorkflow ?? ""));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-widget-message][data-widget-option]")) {
+    button.addEventListener("click", () => {
+      if (agentBusyBotId || button.disabled) return;
+      const message = bot.messages.find((item) => item.id === button.dataset.widgetMessage);
+      const optionIndex = Number(button.dataset.widgetOption);
+      const option = message?.widget?.options[optionIndex];
+      if (option) void sendBotMessage(bot.id, option.value);
+    });
+  }
+  for (const customForm of document.querySelectorAll<HTMLFormElement>("[data-widget-custom]")) {
+    customForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (agentBusyBotId) return;
+      const customInput = customForm.elements.namedItem("customAnswer") as HTMLInputElement | null;
+      const answer = customInput?.value.trim() ?? "";
+      if (answer) void sendBotMessage(bot.id, answer);
+    });
+  }
+}
+
+function renderGeneratedQuestion(message: BotProfile["messages"][number], active: boolean): string {
+  const widget = message.widget;
+  if (!widget) return "";
+  return `
+    <section class="setup-question-card generated-question-widget${active ? "" : " answered"}">
+      <h2>${escapeHtml(widget.prompt)}</h2>
+      ${widget.helpText ? `<p>${escapeHtml(widget.helpText)}</p>` : ""}
+      <div class="setup-options">
+        ${widget.options.map((option, index) => `
+          <button type="button" data-widget-message="${escapeAttribute(message.id)}" data-widget-option="${index}" ${active ? "" : "disabled"}>
+            <kbd>${String.fromCharCode(65 + index)}</kbd>
+            <span><strong>${escapeHtml(option.label)}</strong>${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}</span>
+          </button>`).join("")}
+      </div>
+      ${widget.allowCustom && active ? `
+        <form class="custom-answer-form" data-widget-custom="${escapeAttribute(message.id)}">
+          <input name="customAnswer" maxlength="300" placeholder="Escribe tu propia respuesta" autocomplete="off" />
+          <button type="submit">Enviar</button>
+        </form>` : ""}
+    </section>`;
+}
+
+async function initializeBotConversation(botId: string): Promise<void> {
+  if (agentBusyBotId) return;
+  agentBusyBotId = botId;
+  pendingUserMessage = "";
+  transientError = "";
+  render();
+  try {
+    state = await desktopApi.runBotAgent(botId, "", true);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    agentBusyBotId = "";
+    pendingUserMessage = "";
+    render();
+    void refreshComputerStatus(botId);
+  }
+}
+
+async function sendBotMessage(botId: string, message: string): Promise<void> {
+  agentBusyBotId = botId;
+  pendingUserMessage = message;
+  transientError = "";
+  render();
+  try {
+    state = await desktopApi.runBotAgent(botId, message);
+  } catch (error) {
+    botMessageDrafts.set(botId, message);
+    transientError = errorMessage(error);
+  } finally {
+    agentBusyBotId = "";
+    pendingUserMessage = "";
+    render();
+    void refreshComputerStatus(botId);
+  }
+}
+
+async function startTeachTask(bot: BotProfile, entryPoint: TeachEntryPoint): Promise<void> {
+  if (teachStatus.phase !== "idle" || teachRecorder || teachStopping) return;
+  transientError = "";
+  composerMenuOpen = false;
+  workflowPanelOpen = false;
+  try {
+    teachStatus = await desktopApi.startTeachRecording(bot.id, entryPoint);
+    if (!navigator.mediaDevices?.getDisplayMedia) throw new Error("Este sistema no permite grabar la pantalla.");
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 6, max: 12 } },
+      audio: false
+    });
+    const mimeType = preferredTeachMimeType();
+    const recorder = new MediaRecorder(stream, {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: 1_500_000
+    });
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    await video.play();
+    teachRecorder = recorder;
+    teachStream = stream;
+    teachVideo = video;
+    teachStartedAt = Date.now();
+    teachChunks = [];
+    teachFrames = [];
+    teachBytes = 0;
+    teachStopping = false;
+    recorder.addEventListener("dataavailable", (event) => {
+      if (!event.data.size) return;
+      teachBytes += event.data.size;
+      teachChunks.push(event.data);
+      if (teachBytes > 64 * 1024 * 1024 && !teachStopping) void stopTeachTask(bot.id);
+    });
+    for (const track of stream.getTracks()) {
+      track.addEventListener("ended", () => {
+        if (!teachStopping && teachStatus.phase === "recording") void stopTeachTask(bot.id);
+      }, { once: true });
+    }
+    recorder.start(1_000);
+    window.setTimeout(captureTeachFrame, 450);
+    teachSampleTimer = window.setInterval(captureTeachFrame, 3_000);
+    teachLimitTimer = window.setTimeout(() => void stopTeachTask(bot.id), 300_000);
+    teachClockTimer = window.setInterval(updateTeachClock, 1_000);
+    render();
+  } catch (error) {
+    cleanupTeachMedia();
+    await desktopApi.discardTeachRecording(bot.id).catch(() => idleTeachStatus());
+    teachStatus = idleTeachStatus();
+    transientError = errorMessage(error);
+    render();
+  }
+}
+
+async function stopTeachTask(botId: string): Promise<void> {
+  if (!teachRecorder || teachStopping || teachStatus.phase !== "recording") return;
+  teachStopping = true;
+  captureTeachFrame();
+  const recorder = teachRecorder;
+  try {
+    await stopMediaRecorder(recorder);
+    const durationMs = Math.max(1_000, Date.now() - teachStartedAt);
+    const blob = new Blob(teachChunks, { type: recorder.mimeType || "video/webm" });
+    if (blob.size > 64 * 1024 * 1024) throw new Error("La grabación excedió el límite de 64 MB. Graba una tarea más corta.");
+    const frames = selectTeachFrames(teachFrames, 12);
+    if (frames.length < 2) throw new Error("No pudimos leer suficientes fotogramas de la grabación.");
+    const mimeType: TeachCapture["mimeType"] = recorder.mimeType.startsWith("video/mp4") ? "video/mp4" : "video/webm";
+    const videoBytes = new Uint8Array(await blob.arrayBuffer());
+    stopTeachTracks();
+    teachStatus = { ...teachStatus, phase: "processing" };
+    render();
+    state = await desktopApi.stopTeachRecording(botId, { durationMs, frames, mimeType, videoBytes });
+    workflowPanelOpen = true;
+  } catch (error) {
+    await desktopApi.discardTeachRecording(botId).catch(() => idleTeachStatus());
+    transientError = errorMessage(error);
+  } finally {
+    cleanupTeachMedia();
+    teachStatus = await desktopApi.getTeachRecordingStatus().catch(() => idleTeachStatus());
+    teachStopping = false;
+    render();
+  }
+}
+
+async function discardTeachTask(botId: string): Promise<void> {
+  if (teachStopping) return;
+  teachStopping = true;
+  try {
+    if (teachRecorder?.state !== "inactive") teachRecorder?.stop();
+    stopTeachTracks();
+    teachStatus = await desktopApi.discardTeachRecording(botId);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    cleanupTeachMedia();
+    teachStopping = false;
+    render();
+  }
+}
+
+function captureTeachFrame(): void {
+  const video = teachVideo;
+  if (!video?.videoWidth || !video.videoHeight) return;
+  const width = Math.min(960, video.videoWidth);
+  const height = Math.max(1, Math.round(video.videoHeight * (width / video.videoWidth)));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) return;
+  context.drawImage(video, 0, 0, width, height);
+  const frame = canvas.toDataURL("image/jpeg", .72);
+  if (frame.length <= 1_500_000 && frame !== teachFrames.at(-1)) teachFrames.push(frame);
+  if (teachFrames.length > 100) teachFrames.splice(1, teachFrames.length - 100);
+}
+
+function selectTeachFrames(frames: string[], limit: number): string[] {
+  if (frames.length <= limit) return [...frames];
+  const selected = new Set<number>();
+  for (let index = 0; index < limit; index += 1) {
+    selected.add(Math.round(index * (frames.length - 1) / (limit - 1)));
+  }
+  return [...selected].map((index) => frames[index]);
+}
+
+function preferredTeachMimeType(): string {
+  for (const mimeType of ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"]) {
+    if (MediaRecorder.isTypeSupported(mimeType)) return mimeType;
+  }
+  return "";
+}
+
+function stopMediaRecorder(recorder: MediaRecorder): Promise<void> {
+  if (recorder.state === "inactive") return Promise.resolve();
+  return new Promise((resolve) => {
+    recorder.addEventListener("stop", () => resolve(), { once: true });
+    recorder.stop();
+  });
+}
+
+function stopTeachTracks(): void {
+  for (const track of teachStream?.getTracks() ?? []) track.stop();
+  if (teachVideo) teachVideo.srcObject = null;
+}
+
+function cleanupTeachMedia(): void {
+  if (teachSampleTimer) window.clearInterval(teachSampleTimer);
+  if (teachLimitTimer) window.clearTimeout(teachLimitTimer);
+  if (teachClockTimer) window.clearInterval(teachClockTimer);
+  stopTeachTracks();
+  teachRecorder = null;
+  teachStream = null;
+  teachVideo = null;
+  teachStartedAt = 0;
+  teachSampleTimer = 0;
+  teachLimitTimer = 0;
+  teachClockTimer = 0;
+  teachChunks = [];
+  teachFrames = [];
+  teachBytes = 0;
+}
+
+async function refreshTeachStatus(): Promise<void> {
+  updateTeachClock();
+  const remote = await desktopApi.getTeachRecordingStatus().catch(() => teachStatus);
+  if (teachRecorder && remote.phase === "idle") {
+    cleanupTeachMedia();
+    teachStopping = false;
+  }
+  const changed = JSON.stringify(remote) !== JSON.stringify(teachStatus);
+  teachStatus = remote;
+  if (changed) render();
+}
+
+function updateTeachClock(): void {
+  const clock = document.querySelector<HTMLElement>("[data-teach-clock]");
+  if (clock) clock.textContent = formatTeachElapsed();
+}
+
+function formatTeachElapsed(): string {
+  const startedAt = teachStartedAt || Date.parse(teachStatus.startedAt);
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1_000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+async function runLearnedWorkflow(botId: string, workflowId: string): Promise<void> {
+  if (!workflowId || agentBusyBotId) return;
+  const bot = state.bots.find((item) => item.id === botId);
+  const workflow = bot?.workflows.find((item) => item.id === workflowId);
+  if (!workflow) return;
+  agentBusyBotId = botId;
+  pendingUserMessage = `Ejecuta la tarea aprendida: ${workflow.title}`;
+  transientError = "";
+  workflowPanelOpen = false;
+  render();
+  try {
+    state = await desktopApi.runBotWorkflow(botId, workflowId);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    agentBusyBotId = "";
+    pendingUserMessage = "";
+    render();
+  }
+}
+
+async function deleteLearnedWorkflow(bot: BotProfile, workflowId: string): Promise<void> {
+  const workflow = bot.workflows.find((item) => item.id === workflowId);
+  if (!workflow || !window.confirm(`¿Eliminar la tarea aprendida “${workflow.title}”?`)) return;
+  try {
+    state = await desktopApi.deleteBotWorkflow(bot.id, workflow.id);
   } catch (error) {
     transientError = errorMessage(error);
   }
   render();
-}
-
-function renderReadyBot(bot: BotProfile): void {
-  const connectors = CONNECTOR_CATALOG.filter((connector) => bot.connectorIds.includes(connector.id));
-  appRoot.innerHTML = renderDesktopShell(`
-    <section class="bot-detail-view">
-      <header class="workspace-topbar">
-        <button class="bot-avatar-trigger" type="button" data-open-settings aria-label="Personalizar ${escapeAttribute(bot.name)}">${renderBotAvatar(bot, "tiny")}</button>
-        <strong>${escapeHtml(bot.name)}</strong>
-        <div class="topbar-actions"><button id="edit-connectors" class="topbar-link" type="button">Plugins</button></div>
-      </header>
-      <div class="bot-detail-content">
-        <div class="detail-avatar">${renderBotAvatar(bot, "hero")}</div>
-        <span class="ready-pill">BOT LISTO</span>
-        <h1>${escapeHtml(bot.name)}</h1>
-        <p>${connections.account.connected ? `Sesión activa como ${escapeHtml(connections.account.email)}. Cada conector usa únicamente la cuenta que tú autorizaste.` : "Inicia sesión al conectar una herramienta; cada proveedor abrirá su autorización oficial."}</p>
-        <div class="selected-tools detailed">
-          ${connectors.length ? connectors.map((connector) => `<article>${renderConnectorIcon(connector.icon, connector.name, true)}<strong>${connector.name}</strong>${renderConnectorAuthAction(connector.id)}</article>`).join("") : "<em>Sin conectores seleccionados</em>"}
-        </div>
-        <div class="detail-actions">
-          <button id="new-bot-from-detail" class="primary-action compact" type="button">Crear otro bot</button>
-          <button id="delete-bot" class="danger-action" type="button">Eliminar bot</button>
-        </div>
-      </div>
-    </section>
-  `, bot.id, settingsOpen ? bot : undefined);
-  bindSidebar();
-  bindConnectionActions();
-  document.querySelector("#edit-connectors")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
-  document.querySelector("#new-bot-from-detail")?.addEventListener("click", () => void createDefaultBot());
-  document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
 }
 
 async function deleteActiveBot(bot: BotProfile): Promise<void> {
@@ -840,7 +1320,7 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
         ${normalizedSidebarQuery && !visibleBots.length ? '<div class="sidebar-empty">No encontramos ese bot</div>' : ""}
         <div class="sidebar-footer">
           <button class="sidebar-footer-row" type="button" data-open-connectors><span class="sidebar-connector-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3v5M16 3v5M5 8h14v2a7 7 0 0 1-7 7 7 7 0 0 1-7-7V8Zm7 9v4"></path></svg></span><strong>Plugins</strong><small>${selectedConnectorIds.size ? `${selectedConnectorIds.size} instalados` : ""}</small></button>
-          <div class="sidebar-user"><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong></div>
+          <button class="sidebar-user" type="button" data-open-billing><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong><small>${connections.account.connected ? "Plan y facturación" : "Iniciar sesión"}</small></button>
         </div>
       </aside>
       <div class="desktop-content">${content}</div>
@@ -850,10 +1330,8 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
 
 function botSidebarPreview(bot: BotProfile): string {
   if (bot.title) return bot.title;
-  if (bot.setup.step === "purpose") return "¿Con qué debería ayudarte más?";
-  if (bot.setup.step === "workspace") return "¿Dónde vive tu trabajo?";
-  if (bot.setup.step === "project") return "Elige tu herramienta de proyectos";
-  if (bot.setup.step === "connections") return "Conecta tus herramientas";
+  const latest = bot.messages.at(-1);
+  if (latest) return latest.text.slice(0, 90);
   return bot.connectorIds.length ? `${bot.connectorIds.length} plugins conectados` : "Listo para trabajar";
 }
 
@@ -863,13 +1341,83 @@ function formatBotTime(createdAt: string): string {
   return new Intl.DateTimeFormat("es-MX", { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
-function renderMessageComposer(botName: string): string {
+function formatRelativeTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("es-MX", { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function idleTeachStatus(): TeachRecordingStatus {
+  return { phase: "idle", botId: "", botName: "", entryPoint: "", startedAt: "" };
+}
+
+function idleComputerSnapshot(botId = ""): BotComputerSnapshot {
+  return {
+    configured: false,
+    bot_id: botId,
+    provider: null,
+    state: "disabled",
+    viewer_url: "",
+    viewer_expires_at: 0,
+    reason: ""
+  };
+}
+
+function renderMessageComposer(botName: string, botId = ""): string {
+  const busy = botId && agentBusyBotId === botId;
   return `
     <form class="message-composer" aria-label="Mensaje para ${escapeAttribute(botName)}">
-      <button type="button" aria-label="Agregar">＋</button>
-      <input type="text" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" />
-      <button class="composer-mic" type="button" aria-label="Mensaje de voz"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="8" height="12" rx="4"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg></button>
+      <span class="composer-menu-anchor">
+        <button type="button" data-composer-add aria-label="Agregar" aria-expanded="${composerMenuOpen}">＋</button>
+        ${composerMenuOpen ? `
+          <span class="composer-menu" role="menu">
+            <button type="button" role="menuitem" data-composer-teach ${teachStatus.phase !== "idle" ? "disabled" : ""}><strong>Teach a task</strong><small>Record yourself doing a task</small></button>
+            <button type="button" role="menuitem" data-composer-workflows><strong>Learned tasks</strong><small>Run a saved workflow again</small></button>
+          </span>` : ""}
+      </span>
+      <input name="message" type="text" maxlength="20000" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" value="${escapeAttribute(botId ? botMessageDrafts.get(botId) ?? "" : "")}" ${busy ? "disabled" : ""} />
+      <button class="composer-send" type="submit" aria-label="Enviar" ${busy ? "disabled" : ""}>↑</button>
     </form>`;
+}
+
+function renderTeachOverlay(bot: BotProfile): string {
+  if (teachStatus.phase === "idle") return "";
+  if (teachStatus.botId !== bot.id) {
+    return `<aside class="teach-recording-overlay compact"><span class="recording-dot"></span><strong>Recording another agent's computer</strong><small>${escapeHtml(teachStatus.botName)}</small></aside>`;
+  }
+  if (teachStatus.phase === "processing") {
+    return `
+      <aside class="teach-recording-overlay processing" aria-live="assertive">
+        <span class="teach-spinner" aria-hidden="true"></span>
+        <span><strong>${escapeHtml(bot.name)} is learning your steps…</strong><small>Luna is reading the recording and DeepSeek is building a reusable workflow.</small></span>
+      </aside>`;
+  }
+  return `
+    <aside class="teach-recording-overlay" aria-live="assertive">
+      <span class="recording-dot"></span>
+      <span><strong>Recording ${escapeHtml(bot.name)}'s computer</strong><small>${escapeHtml(bot.name)} is learning your steps… · <time data-teach-clock>${formatTeachElapsed()}</time></small></span>
+      <button class="teach-stop-button" type="button" data-stop-teach>Stop &amp; save</button>
+      <button class="teach-discard-button" type="button" data-discard-teach aria-label="Discard recording">Discard</button>
+    </aside>`;
+}
+
+function renderWorkflowPanel(bot: BotProfile): string {
+  return `
+    <section class="workflow-panel" aria-label="Learned tasks">
+      <header><span><strong>Learned tasks</strong><small>${bot.workflows.length} workflows for ${escapeHtml(bot.name)}</small></span><button type="button" data-close-workflows aria-label="Close">×</button></header>
+      <div class="workflow-list">
+        ${bot.workflows.length ? bot.workflows.map((workflow) => `
+          <article class="workflow-card">
+            <div><strong>${escapeHtml(workflow.title)}</strong>${workflow.summary ? `<p>${escapeHtml(workflow.summary)}</p>` : ""}</div>
+            <ol>${workflow.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>
+            <footer>
+              <small>${workflow.lastRunAt ? `Última ejecución ${escapeHtml(formatRelativeTime(workflow.lastRunAt))}` : "Todavía no se ha ejecutado"}</small>
+              <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId ? "disabled" : ""}>Run now</button></span>
+            </footer>
+          </article>`).join("") : `
+          <div class="workflow-empty"><strong>No learned tasks yet</strong><p>Record yourself doing a task. ${escapeHtml(bot.name)} learns the steps and can run them again on its own.</p><button type="button" data-composer-teach>Teach a task</button></div>`}
+      </div>
+    </section>`;
 }
 
 function renderBotSettings(bot: BotProfile): string {
@@ -1044,6 +1592,7 @@ async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<voi
 function bindSidebar(): void {
   document.querySelector("[data-new-bot]")?.addEventListener("click", () => void createDefaultBot());
   document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
+  document.querySelector("[data-open-billing]")?.addEventListener("click", () => void openBillingView());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-bot]")) {
     button.addEventListener("click", () => void selectBot(button.dataset.selectBot ?? ""));
   }
@@ -1067,10 +1616,13 @@ async function selectBot(botId: string): Promise<void> {
     state = await desktopApi.setActiveBot(botId);
     activeView = "bot-detail";
     closeBotSettings();
+    workflowPanelOpen = false;
+    composerMenuOpen = false;
   } catch (error) {
     transientError = errorMessage(error);
   }
   render();
+  if (state.activeBotId === botId) void refreshComputerStatus(botId);
 }
 
 function closeBotSettings(): void {
@@ -1163,9 +1715,33 @@ function emptyConnectionSnapshot(): ConnectorConnectionSnapshot {
   };
 }
 
+function emptyBillingSnapshot(): BillingSnapshot {
+  return {
+    configured: false,
+    tier: "free",
+    customer: false,
+    subscription: null,
+    plans: {
+      basic: { name: "Plus", amount: 50, currency: "usd", interval: "month" },
+      pro: { name: "Pro", amount: 200, currency: "usd", interval: "month" }
+    }
+  };
+}
+
 function createPreviewApi(): DesktopApi {
+  const previewMode = new URLSearchParams(window.location.search).get("preview");
   let previewState = initialAppState();
   let previewConnections = emptyConnectionSnapshot();
+  let previewBilling = { ...emptyBillingSnapshot(), configured: true };
+  let previewComputer: BotComputerSnapshot = {
+    ...idleComputerSnapshot("preview-bot"),
+    configured: true,
+    state: "hibernated",
+    provider: "daytona"
+  };
+  let previewTeachStatus: TeachRecordingStatus = previewMode === "teach-recording"
+    ? { phase: "recording", botId: "preview-bot", botName: "Juan", entryPoint: "top_bar", startedAt: new Date().toISOString() }
+    : idleTeachStatus();
   return {
     async bootstrap() { return structuredClone(previewState); },
     async connectionSnapshot() { return structuredClone(previewConnections); },
@@ -1196,6 +1772,35 @@ function createPreviewApi(): DesktopApi {
       };
       return structuredClone(previewConnections);
     },
+    async billingSnapshot() { return structuredClone(previewBilling); },
+    async startCheckout(tier) {
+      previewBilling = { ...previewBilling, tier };
+    },
+    async openBillingPortal() {},
+    async computerStatus(botId) {
+      return structuredClone({ ...previewComputer, bot_id: botId });
+    },
+    async ensureComputer(botId) {
+      previewComputer = {
+        ...previewComputer,
+        configured: true,
+        bot_id: botId,
+        state: "running",
+        viewer_url: "http://127.0.0.1:6080/vnc.html",
+        viewer_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        reason: ""
+      };
+      return structuredClone(previewComputer);
+    },
+    async handBackComputer(botId) {
+      previewComputer = { ...previewComputer, bot_id: botId, state: "hibernated", viewer_url: "", viewer_expires_at: 0 };
+      return structuredClone(previewComputer);
+    },
+    async deleteComputer() {
+      previewComputer = { ...idleComputerSnapshot(), configured: true, provider: "daytona", state: "off" };
+      return { deleted: true };
+    },
+    async openComputerViewer() {},
     async saveConnectors(connectorIds, onboardingCompleted) {
       previewState = {
         ...previewState,
@@ -1214,9 +1819,77 @@ function createPreviewApi(): DesktopApi {
       previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },
-    async answerBotSetup(botId, answer) {
-      const bots = previewState.bots.map((bot) => bot.id === botId ? applyBotSetupAnswer(bot, answer) : bot);
+    async runBotAgent(botId, prompt, initial = false) {
+      const now = new Date().toISOString();
+      const bots = previewState.bots.map((bot) => bot.id === botId ? {
+        ...bot,
+        messages: [
+          ...bot.messages,
+          ...(!initial ? [{ id: crypto.randomUUID(), role: "user" as const, text: prompt, createdAt: now }] : []),
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            text: initial ? `${bot.name} está listo para conocerte.` : `Entendido: ${prompt}`,
+            ...(initial ? { widget: {
+              prompt: "¿Qué quieres lograr primero?",
+              helpText: "Esta vista previa representa contenido generado por el modelo.",
+              options: [{ label: "Empezar", value: "Quiero empezar", description: "" }],
+              allowCustom: true,
+              dismissOnMoveOn: true
+            } } : {}),
+            createdAt: now
+          }
+        ]
+      } : bot);
       previewState = { ...previewState, bots, activeBotId: botId };
+      return structuredClone(previewState);
+    },
+    async getTeachRecordingStatus() { return structuredClone(previewTeachStatus); },
+    async startTeachRecording(botId, entryPoint) {
+      const bot = previewState.bots.find((item) => item.id === botId);
+      if (!bot) throw new Error("No encontramos ese bot.");
+      previewTeachStatus = { phase: "recording", botId, botName: bot.name, entryPoint, startedAt: new Date().toISOString() };
+      return structuredClone(previewTeachStatus);
+    },
+    async stopTeachRecording(botId, capture) {
+      const now = new Date();
+      const workflow = createBotWorkflow({
+        title: "Tarea aprendida",
+        summary: `Workflow extraído de ${capture.frames.length} fotogramas.`,
+        steps: ["Abrir la herramienta indicada.", "Repetir las acciones visibles en orden.", "Confirmar el resultado final."]
+      }, crypto.randomUUID(), crypto.randomUUID(), capture.mimeType, now);
+      previewState = {
+        ...previewState,
+        bots: previewState.bots.map((bot) => bot.id === botId ? { ...bot, workflows: [...bot.workflows, workflow] } : bot),
+        activeBotId: botId
+      };
+      previewTeachStatus = idleTeachStatus();
+      return structuredClone(previewState);
+    },
+    async discardTeachRecording() {
+      previewTeachStatus = idleTeachStatus();
+      return structuredClone(previewTeachStatus);
+    },
+    async runBotWorkflow(botId, workflowId) {
+      const now = new Date().toISOString();
+      previewState = {
+        ...previewState,
+        bots: previewState.bots.map((bot) => bot.id === botId ? {
+          ...bot,
+          workflows: bot.workflows.map((workflow) => workflow.id === workflowId ? { ...workflow, lastRunAt: now } : workflow),
+          messages: [...bot.messages, { id: crypto.randomUUID(), role: "assistant", text: "Workflow completed.", createdAt: now }]
+        } : bot),
+        activeBotId: botId
+      };
+      return structuredClone(previewState);
+    },
+    async deleteBotWorkflow(botId, workflowId) {
+      previewState = {
+        ...previewState,
+        bots: previewState.bots.map((bot) => bot.id === botId
+          ? { ...bot, workflows: bot.workflows.filter((workflow) => workflow.id !== workflowId) }
+          : bot)
+      };
       return structuredClone(previewState);
     },
     async setActiveBot(botId) {

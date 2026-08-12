@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -75,6 +75,53 @@ CREATE TABLE IF NOT EXISTS account_sessions (
   created_at         REAL NOT NULL,
   FOREIGN KEY(account_id) REFERENCES account_identities(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS billing_customers (
+  user_id            TEXT PRIMARY KEY,
+  stripe_customer_id TEXT UNIQUE NOT NULL,
+  created_at         REAL NOT NULL,
+  updated_at         REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS billing_subscriptions (
+  stripe_subscription_id TEXT PRIMARY KEY,
+  user_id                 TEXT NOT NULL,
+  tier                    TEXT NOT NULL,
+  stripe_price_id         TEXT,
+  status                  TEXT NOT NULL,
+  cancel_at_period_end    INTEGER NOT NULL DEFAULT 0,
+  current_period_end      INTEGER,
+  updated_at              REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS stripe_events (
+  event_id     TEXT PRIMARY KEY,
+  event_type   TEXT NOT NULL,
+  processed_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connector_credentials (
+  user_id         TEXT NOT NULL,
+  connector_id    TEXT NOT NULL,
+  credentials_enc BLOB NOT NULL,
+  key_id           TEXT NOT NULL,
+  account_label    TEXT,
+  created_at       REAL NOT NULL,
+  updated_at       REAL NOT NULL,
+  PRIMARY KEY(user_id, connector_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS bot_computers (
+  user_id        TEXT NOT NULL,
+  bot_id         TEXT NOT NULL,
+  provider       TEXT NOT NULL,
+  provider_ref   TEXT,
+  state          TEXT NOT NULL DEFAULT 'pulling',
+  last_error     TEXT,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  last_active_at REAL,
+  PRIMARY KEY(user_id, bot_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -88,6 +135,14 @@ CREATE INDEX IF NOT EXISTS idx_usage_sub_time ON usage_events(subscription_id, c
 CREATE INDEX IF NOT EXISTS idx_account_identity_user ON account_identities(user_id);
 CREATE INDEX IF NOT EXISTS idx_account_session_account ON account_sessions(account_id);
 CREATE INDEX IF NOT EXISTS idx_account_session_refresh ON account_sessions(refresh_token_hash);
+CREATE INDEX IF NOT EXISTS idx_billing_subscription_user ON billing_subscriptions(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_billing_subscription_status ON billing_subscriptions(status);
+CREATE INDEX IF NOT EXISTS idx_connector_credentials_user
+  ON connector_credentials(user_id, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_bot_computer_provider_ref
+  ON bot_computers(provider, provider_ref) WHERE provider_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_bot_computers_user
+  ON bot_computers(user_id, updated_at);
 """
 
 
@@ -96,6 +151,10 @@ def _now() -> float:
 
 
 class NoSubscriptionAvailable(RuntimeError):
+    pass
+
+
+class ComputerLimitReached(RuntimeError):
     pass
 
 
@@ -180,6 +239,146 @@ class Store:
         with self._lock:
             self._conn.execute(sql, params)
             self._conn.commit()
+
+    # ---------- credenciales privadas de conectores ----------
+    def upsert_connector_credentials(
+        self,
+        *,
+        user_id: str,
+        connector_id: str,
+        credentials_enc: bytes,
+        key_id: str,
+        account_label: str,
+    ) -> None:
+        now = _now()
+        self._exec(
+            "INSERT INTO connector_credentials("
+            "user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(user_id,connector_id) DO UPDATE SET "
+            "credentials_enc=excluded.credentials_enc,key_id=excluded.key_id,"
+            "account_label=excluded.account_label,updated_at=excluded.updated_at",
+            (
+                user_id,
+                connector_id,
+                credentials_enc,
+                key_id,
+                account_label[:160],
+                now,
+                now,
+            ),
+        )
+
+    def get_connector_credentials(self, user_id: str, connector_id: str) -> dict | None:
+        row = self._one(
+            "SELECT user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at "
+            "FROM connector_credentials WHERE user_id=? AND connector_id=?",
+            (user_id, connector_id),
+        )
+        return dict(row) if row else None
+
+    def delete_connector_credentials(self, user_id: str, connector_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM connector_credentials WHERE user_id=? AND connector_id=?",
+                (user_id, connector_id),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
+    # ---------- computadoras persistentes por bot ----------
+    def claim_bot_computer(
+        self,
+        user_id: str,
+        bot_id: str,
+        provider: str,
+        max_computers: int,
+    ) -> dict:
+        """Reserva de forma atómica la identidad remota de un bot."""
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+                    (user_id, bot_id),
+                ).fetchone()
+                if row is None:
+                    count_row = self._conn.execute(
+                        "SELECT COUNT(*) AS computer_count FROM bot_computers WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()
+                    count = int(count_row["computer_count"])
+                    if count >= max_computers:
+                        raise ComputerLimitReached(
+                            f"La cuenta alcanzó su límite de {max_computers} computadoras"
+                        )
+                    self._conn.execute(
+                        "INSERT INTO bot_computers("
+                        "user_id,bot_id,provider,provider_ref,state,last_error,created_at,updated_at,last_active_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        (user_id, bot_id, provider, None, "pulling", "", now, now, None),
+                    )
+                    row = self._conn.execute(
+                        "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+                        (user_id, bot_id),
+                    ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError("No se pudo reservar la computadora")
+        result = dict(row)
+        if result["provider"] != provider:
+            raise RuntimeError("El bot ya pertenece a otro proveedor de computadoras")
+        return result
+
+    def get_bot_computer(self, user_id: str, bot_id: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+            (user_id, bot_id),
+        )
+        return dict(row) if row else None
+
+    def update_bot_computer(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        provider_ref: str | None = None,
+        state: str | None = None,
+        last_error: str | None = None,
+        touch: bool = False,
+    ) -> None:
+        assignments = ["updated_at=?"]
+        params: list = [_now()]
+        if provider_ref is not None:
+            assignments.append("provider_ref=?")
+            params.append(provider_ref)
+        if state is not None:
+            assignments.append("state=?")
+            params.append(state)
+        if last_error is not None:
+            assignments.append("last_error=?")
+            params.append(last_error[:500])
+        if touch:
+            assignments.append("last_active_at=?")
+            params.append(_now())
+        params.extend((user_id, bot_id))
+        self._exec(
+            f"UPDATE bot_computers SET {','.join(assignments)} WHERE user_id=? AND bot_id=?",
+            tuple(params),
+        )
+
+    def delete_bot_computer(self, user_id: str, bot_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM bot_computers WHERE user_id=? AND bot_id=?",
+                (user_id, bot_id),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,
@@ -458,41 +657,7 @@ class Store:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                user = self._conn.execute(
-                    "SELECT id, subscription_id FROM users WHERE id=?", (user_id,)
-                ).fetchone()
-                if user is None:
-                    raise KeyError(user_id)
-
-                subscription_id = user["subscription_id"]
-                if needs_subscription and not subscription_id:
-                    available = self._conn.execute(
-                        "SELECT id FROM go_subscriptions "
-                        "WHERE status='available' ORDER BY created_at LIMIT 1"
-                    ).fetchone()
-                    if available is None:
-                        raise NoSubscriptionAvailable
-                    subscription_id = available["id"]
-                    claimed = self._conn.execute(
-                        "UPDATE go_subscriptions "
-                        "SET status='assigned', assigned_user_id=? "
-                        "WHERE id=? AND status='available'",
-                        (user_id, subscription_id),
-                    )
-                    if claimed.rowcount != 1:
-                        raise NoSubscriptionAvailable
-                elif not needs_subscription and subscription_id:
-                    self._conn.execute(
-                        "UPDATE go_subscriptions "
-                        "SET status='available', assigned_user_id=NULL WHERE id=?",
-                        (subscription_id,),
-                    )
-                    subscription_id = None
-
-                self._conn.execute(
-                    "UPDATE users SET subscription_id=?, tier=? WHERE id=?",
-                    (subscription_id, tier, user_id),
-                )
+                self._transition_user_tier_locked(user_id, tier, needs_subscription=needs_subscription)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -502,6 +667,169 @@ class Store:
                 "SELECT * FROM users WHERE id=?", (user_id,)
             ).fetchone()
             return dict(updated)
+
+    def _transition_user_tier_locked(
+        self, user_id: str, tier: str, *, needs_subscription: bool
+    ) -> None:
+        user = self._conn.execute(
+            "SELECT id, subscription_id FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+        if user is None:
+            raise KeyError(user_id)
+        subscription_id = user["subscription_id"]
+        if needs_subscription and not subscription_id:
+            available = self._conn.execute(
+                "SELECT id FROM go_subscriptions "
+                "WHERE status='available' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if available is None:
+                raise NoSubscriptionAvailable
+            subscription_id = available["id"]
+            claimed = self._conn.execute(
+                "UPDATE go_subscriptions SET status='assigned', assigned_user_id=? "
+                "WHERE id=? AND status='available'",
+                (user_id, subscription_id),
+            )
+            if claimed.rowcount != 1:
+                raise NoSubscriptionAvailable
+        elif not needs_subscription and subscription_id:
+            self._conn.execute(
+                "UPDATE go_subscriptions SET status='available', assigned_user_id=NULL WHERE id=?",
+                (subscription_id,),
+            )
+            subscription_id = None
+        self._conn.execute(
+            "UPDATE users SET subscription_id=?, tier=? WHERE id=?",
+            (subscription_id, tier, user_id),
+        )
+
+    # ---------- facturación Stripe ----------
+    def get_billing_status(self, user_id: str) -> dict:
+        customer = self._one(
+            "SELECT stripe_customer_id FROM billing_customers WHERE user_id=?", (user_id,)
+        )
+        subscription = self._one(
+            "SELECT stripe_subscription_id,tier,stripe_price_id,status,cancel_at_period_end,"
+            "current_period_end,updated_at FROM billing_subscriptions "
+            "WHERE user_id=? ORDER BY updated_at DESC LIMIT 1",
+            (user_id,),
+        )
+        result = dict(subscription) if subscription else None
+        if result:
+            result["cancel_at_period_end"] = bool(result["cancel_at_period_end"])
+        return {
+            "customer_id": customer["stripe_customer_id"] if customer else None,
+            "subscription": result,
+        }
+
+    def apply_billing_event(self, action: dict) -> dict:
+        """Aplica un evento firmado y el entitlement en una transacción idempotente."""
+        now = _now()
+        event_id = action["event_id"]
+        event_type = action["event_type"]
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._conn.execute(
+                    "SELECT 1 FROM stripe_events WHERE event_id=?", (event_id,)
+                ).fetchone():
+                    self._conn.rollback()
+                    return {"duplicate": True}
+                if not action.get("recognized"):
+                    self._conn.execute(
+                        "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
+                        (event_id, event_type, now),
+                    )
+                    self._conn.commit()
+                    return {"ignored": True}
+
+                user_id = action.get("user_id")
+                customer_id = action.get("customer_id")
+                stripe_subscription_id = action.get("stripe_subscription_id")
+                if customer_id:
+                    bound = self._conn.execute(
+                        "SELECT user_id FROM billing_customers WHERE stripe_customer_id=?",
+                        (customer_id,),
+                    ).fetchone()
+                    if bound:
+                        if user_id and user_id != bound["user_id"]:
+                            raise ValueError("El customer de Stripe ya pertenece a otro usuario")
+                        user_id = bound["user_id"]
+                existing = None
+                if stripe_subscription_id:
+                    existing = self._conn.execute(
+                        "SELECT * FROM billing_subscriptions WHERE stripe_subscription_id=?",
+                        (stripe_subscription_id,),
+                    ).fetchone()
+                    if existing:
+                        if user_id and user_id != existing["user_id"]:
+                            raise ValueError("La suscripción de Stripe ya pertenece a otro usuario")
+                        user_id = existing["user_id"]
+                if not user_id or not self._conn.execute(
+                    "SELECT 1 FROM users WHERE id=?", (user_id,)
+                ).fetchone():
+                    self._conn.execute(
+                        "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
+                        (event_id, event_type, now),
+                    )
+                    self._conn.commit()
+                    return {"ignored": True}
+
+                if customer_id:
+                    own_customer = self._conn.execute(
+                        "SELECT stripe_customer_id FROM billing_customers WHERE user_id=?", (user_id,)
+                    ).fetchone()
+                    if own_customer and own_customer["stripe_customer_id"] != customer_id:
+                        raise ValueError("El usuario ya está ligado a otro customer de Stripe")
+                    self._conn.execute(
+                        "INSERT INTO billing_customers(user_id,stripe_customer_id,created_at,updated_at) "
+                        "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET updated_at=excluded.updated_at",
+                        (user_id, customer_id, now, now),
+                    )
+
+                tier = action.get("tier") or (existing["tier"] if existing else None)
+                price_id = action.get("stripe_price_id") or (
+                    existing["stripe_price_id"] if existing else None
+                )
+                status = action.get("status") or (existing["status"] if existing else "unknown")
+                if stripe_subscription_id and tier in {"basic", "pro"}:
+                    self._conn.execute(
+                        "INSERT INTO billing_subscriptions("
+                        "stripe_subscription_id,user_id,tier,stripe_price_id,status,"
+                        "cancel_at_period_end,current_period_end,updated_at"
+                        ") VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stripe_subscription_id) DO UPDATE SET "
+                        "tier=excluded.tier,stripe_price_id=excluded.stripe_price_id,status=excluded.status,"
+                        "cancel_at_period_end=excluded.cancel_at_period_end,"
+                        "current_period_end=excluded.current_period_end,updated_at=excluded.updated_at",
+                        (
+                            stripe_subscription_id,
+                            user_id,
+                            tier,
+                            price_id,
+                            status,
+                            int(bool(action.get("cancel_at_period_end"))),
+                            action.get("current_period_end"),
+                            now,
+                        ),
+                    )
+
+                tier_action = action.get("tier_action")
+                if tier_action == "activate":
+                    if tier not in {"basic", "pro"}:
+                        raise ValueError("No se pudo resolver el tier pagado del evento Stripe")
+                    self._transition_user_tier_locked(user_id, tier, needs_subscription=True)
+                elif tier_action == "free":
+                    self._transition_user_tier_locked(user_id, "free", needs_subscription=False)
+
+                self._conn.execute(
+                    "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
+                    (event_id, event_type, now),
+                )
+                self._conn.commit()
+                return {"user_id": user_id, "tier": tier if tier_action == "activate" else None}
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def usage_summary(self, user_id: str, subscription_id: str | None, tier: str = "free") -> dict:
         """Resume de uso por ventanas (5h/semana/mes) para el usuario.

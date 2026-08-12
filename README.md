@@ -10,8 +10,9 @@ tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
 **GPT-5.6 Luna**, con MiMo como fallback.
 
-El backend base solo requiere Python y `cryptography`; Pi es una dependencia
-opcional de Node.js y viene desactivado por defecto.
+El backend base requiere Python, `cryptography` y `psycopg` cuando usa
+Supabase/Postgres; Pi es una dependencia opcional de Node.js y viene
+desactivado por defecto.
 
 ## Tiers de usuario
 
@@ -46,27 +47,63 @@ funciona con un **pool de suscripciones**:
 
 1. El operador carga las keys de Go compradas al pool (una por usuario final).
 2. Cada registro público (`POST /v1/signup`) crea un usuario `free` sin key.
-3. Un webhook de Stripe con firma verificada —o, mientras se implementa, un
-   administrador que ya comprobó el pago— activa `basic`/`pro`.
+3. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
+   con firma verificada activa `basic`/`pro` después del pago.
 4. La transición pagada reclama una sola key del pool de forma atómica.
 5. El usuario también puede traer su propia key (`POST /v1/byok`), pero el
    acceso sigue dependiendo del tier guardado por el servidor.
 6. El backend proxya `chat/completions`, `responses` y `messages` al upstream
    con la key asignada, y registra el uso por ventanas.
 
-El repositorio todavía no incluye el webhook de Stripe. No publiques un
-checkout que prometa activación automática hasta añadir y verificar ese flujo;
-el endpoint admin es la ruta segura provisional.
+### Persistencia gratuita con Supabase
+
+Producción usa el esquema privado `agentgenia` del proyecto Supabase
+`agent-genia-prod`. Las tablas no se exponen al Data API, no otorgan permisos a
+`anon`/`authenticated` y tienen RLS habilitado como defensa adicional. El
+backend se conecta exclusivamente con `DATABASE_URL` guardada como secreto del
+host. Desarrollo y las pruebas conservan SQLite cuando esa variable está vacía.
+
+La migración versionada vive en `supabase/migrations/`. En Postgres, las
+transiciones de tier, el procesamiento idempotente de webhooks y la reclamación
+de keys mantienen una transacción de escritura serializada; los índices únicos
+parciales siguen impidiendo compartir una suscripción entre usuarios.
+
+Para Render Free define al menos `DATABASE_URL`, `WRAPPER_SECRET` y
+`ADMIN_TOKEN` como secretos. No uses `DB_PATH` ni `secret.key` como estado
+persistente: el filesystem gratuito es efímero. El harness y sus directorios de
+ejecución siguen siendo temporales y no forman parte de la base de datos.
+
+### Stripe Checkout en producción
+
+La integración usa Checkout alojado, el Customer Portal y webhooks idempotentes.
+Electron nunca recibe la secret key, el webhook secret ni un price ID arbitrario.
+El cliente solo solicita `basic` (Plus) o `pro`; el backend resuelve el price ID
+live configurado y el tier no cambia hasta recibir un evento firmado.
+
+1. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
+   del host y establece `STRIPE_ENABLED=1`.
+2. Registra `https://TU-BACKEND/v1/billing/webhook` como destino de eventos live.
+3. Suscribe al menos `checkout.session.completed`,
+   `customer.subscription.created`, `customer.subscription.updated`,
+   `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` e
+   `invoice.payment_action_required`.
+4. Copia el signing secret `whsec_...` al entorno privado como
+   `STRIPE_WEBHOOK_SECRET`.
+
+Los estados `active` y `trialing` activan acceso. `past_due` conserva el acceso
+durante los reintentos de Stripe; `unpaid`, `canceled`, `paused` e
+`incomplete_expired` vuelven a `free` y liberan la capacidad. Si el pool no tiene
+una key disponible, la transacción se revierte y Stripe reintenta el webhook.
 
 ## Requisitos
 
 - Python 3.12 (`python3.12` o el que tengas; si no, instálalo).
-- `cryptography` (solo para cifrado AES; sin él usa el Keychain de macOS).
+- `cryptography` para cifrado AES y `psycopg[binary]` para Supabase/Postgres.
 - Node.js y `pnpm` para habilitar el harness de Pi.
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install cryptography
+.venv/bin/pip install -r requirements.txt
 pnpm install                  # instala Pi 0.84.1 y pi-chrome 0.15.46
 ```
 
@@ -83,30 +120,142 @@ ADMIN_TOKEN=mi-token .venv/bin/python -m go_backend.server serve --port 8787
 El repositorio incluye una interfaz de escritorio separada del backend y del
 harness. Permite elegir conectores, buscar por herramienta, crear varios bots,
 personalizar su color/forma/nombre y guardar qué conectores utilizará cada bot.
-Después de crear un bot, una conversación guiada pregunta para qué se usará,
-dónde vive el trabajo y qué sistema de proyectos debe considerar; con esas
-respuestas recomienda y asigna conectores al perfil.
+Después de crear un bot, el modelo genera el saludo y, cuando ayuda, un widget
+genérico de pregunta con entre una y seis opciones. La interfaz solo valida y
+renderiza ese schema: las preguntas, opciones y respuestas no están
+hardcodeadas ni forman parte del onboarding de la aplicación.
 
 ```bash
 pnpm install
 pnpm desktop
 ```
 
-La app guarda preferencias y perfiles de bots en `desktop-state.json`, dentro
-del directorio `userData` de Electron. Las sesiones de cuenta y de proveedores
-se guardan aparte, cifradas con `safeStorage`/Keychain, con permisos `0600` y
-ligadas al ID de la cuenta que inició sesión. Cerrar sesión borra también las
-sesiones de proveedores para que otra persona del equipo no las herede. El
-renderer no tiene acceso a Node.js, tokens ni red: toda autenticación pasa por
-un `preload` aislado y una lista cerrada de operaciones IPC.
+## App de iOS (SwiftUI)
+
+La app nativa para iPhone y iPad vive en `ios/AgentGenia`. Usa el mismo
+`wrapper-backend` de producción y no contiene una copia del harness de Pi. El
+cliente llama a los contratos públicos de cuenta, agentes, conectores, billing
+y computadoras; por lo tanto, el modelo, las herramientas y sus límites siguen
+controlados por el servidor.
+
+```bash
+open ios/AgentGenia/AgentGenia.xcodeproj
+
+# comprobación reproducible sin firma
+xcodebuild \
+  -project ios/AgentGenia/AgentGenia.xcodeproj \
+  -scheme AgentGenia \
+  -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+La configuración Release apunta a `https://agentgenia-api.onrender.com`. Para
+desarrollo se puede definir `AGENTGENIA_API_BASE_URL` en el Scheme de Xcode; la
+app solo admite HTTPS, excepto loopback local. El bundle es
+`com.agentgenia.ios` y la configuración de firma usa el equipo de Apple
+Developer del proyecto.
+
+El login reutiliza Google Authorization Code + PKCE del backend. La app abre la
+autorización en una hoja segura y consulta el intento ligado a un UUID de
+dispositivo. Access token y refresh token se guardan en Keychain con protección
+`AfterFirstUnlockThisDeviceOnly`; los tokens OAuth de plugins nunca llegan a
+iOS. Cada cuenta guarda sus bots en un archivo distinto bajo Application
+Support, protegido por iOS, de modo que cerrar sesión no mezcla conversaciones.
+
+El chat llama realmente a `/v1/agent/run` y conserva los widgets de preguntas
+generados por el LLM, sin saludos ni opciones hardcodeadas. El marketplace
+muestra el catálogo completo, autoriza cuentas mediante el mismo gateway de
+Composio/adaptadores first-party y su pestaña `Tuyos` contiene únicamente
+conectores activos. La computadora de cada bot usa los endpoints
+`/v1/computers/*` y presenta el viewer firmado en un `WKWebView` efímero que
+rechaza navegación a otros orígenes.
+
+Stripe se abre fuera del contexto del agente y la app nunca incluye secret
+keys. Antes de enviar esta build al App Store se debe decidir si la compra de
+los planes se ofrece con In-App Purchase o mediante el enlace externo permitido
+para los storefronts y entitlements aplicables; el backend de Stripe sigue
+siendo válido para web y desktop.
+
+## App de Android (Kotlin + Jetpack Compose)
+
+La app nativa para teléfonos y tablets Android vive en `android/AgentGenia`.
+Comparte directamente los contratos públicos de `wrapper-backend` con Electron
+y iOS; no copia ni modifica el harness de Pi. Incluye login Google ligado al
+dispositivo, chat real con widgets generados por el LLM, marketplace y pestaña
+`Tuyos`, estado de billing y el viewer firmado de la computadora persistente de
+cada bot.
+
+```bash
+cd android/AgentGenia
+./gradlew testDebugUnitTest assembleDebug
+
+# APK de desarrollo
+open app/build/outputs/apk/debug
+```
+
+Para compilar se necesita JDK 17 y Android SDK Platform 37 con Build Tools
+36.0.0; Android Studio instala y administra esas dependencias. El Gradle
+Wrapper 9.5 queda incluido en el repositorio para que CI y Windows usen la
+misma versión.
+
+La build usa Kotlin, Jetpack Compose y `minSdk 26`. Los access/refresh tokens y
+los archivos de bots se cifran con AES-GCM usando una clave no exportable de
+Android Keystore; el estado se guarda por hash de cuenta en `noBackupFilesDir`
+y se excluye de cloud backup y device transfer. Los secretos OAuth de cada
+proveedor permanecen en el backend/Composio y nunca llegan al teléfono.
+
+La configuración predeterminada apunta a
+`https://agentgenia-api.onrender.com`. Para una variante interna se puede
+reemplazar `API_BASE_URL` en `app/build.gradle.kts`; el cliente solo admite
+HTTPS, salvo un loopback explícito para desarrollo. El WebView de la
+computadora desactiva acceso a archivos, contenido local, mixed content,
+ventanas adicionales y navegación fuera del host firmado.
+
+Antes de publicar en Google Play hay que generar un Android App Bundle firmado,
+completar Data Safety y confirmar si la venta del plan digital debe pasar por
+Google Play Billing en los países/canales de distribución elegidos. La app no
+incluye claves privadas de Stripe y presenta la administración del plan en el
+sitio seguro de Agent Genia.
+
+La app guarda preferencias y perfiles de bots en un archivo aislado por cuenta
+dentro de `userData/accounts` de Electron. Al cerrar sesión carga un estado
+vacío en memoria y no expone los bots de la cuenta anterior. Una instalación
+existente migra una sola vez su antiguo `desktop-state.json` a la cuenta que ya
+estaba autenticada y retira el archivo compartido del flujo normal. Solo la
+sesión opaca de Agent Genia se
+guarda cifrada con `safeStorage`/Keychain y permisos `0600`. Los tokens de cada
+proveedor permanecen en Composio bajo el `user_id` autenticado y nunca entran a
+Electron ni a Pi. El renderer no tiene acceso a Node.js, tokens ni red: toda
+autenticación pasa por un `preload` aislado y una lista cerrada de operaciones
+IPC.
+
+### Teach a task
+
+Cada bot ofrece `Teach a task` en el top bar y en el menú `+` del composer. La
+app abre el selector nativo de pantalla/ventana, reserva una sola grabación a la
+vez y muestra un overlay con cronómetro, `Stop & save` y `Discard`. La grabación
+no incluye audio, dura como máximo cinco minutos y se limita a 64 MB.
+
+Al guardar, Electron conserva el video con permisos `0600` dentro de
+`userData/teach-recordings/<hash-de-cuenta>` y envía hasta doce fotogramas
+cronológicos al endpoint `responses` del propio `wrapper-backend`. Luna convierte
+los fotogramas en evidencia visual y DeepSeek genera un workflow JSON con título,
+resumen y pasos. El workflow queda dentro del mismo estado local aislado por
+cuenta que el bot; eliminar el workflow o el bot elimina también su video.
+
+`Run now` vuelve a ejecutar los pasos mediante el endpoint existente de Pi con
+el navegador aislado y los conectores autorizados del bot. Esta función no
+modifica `go_backend/pi_harness.py` ni comparte el perfil original grabado: si
+la tarea necesita una sesión web, el usuario debe autorizarla en el perfil
+temporal de esa ejecución o usar un conector OAuth. La extracción requiere un
+plan con acceso a modelos y una sesión de Agent Genia iniciada.
 
 ### Login con Google
 
-Electron usa el login Google público que ya ofrece `OUTCOME_SERVICE_URL`. No
-requiere desplegar otro servicio: si `WRAPPER_SERVICE_URL` está vacío, la cuenta
-y los conectores comparten ese broker y una sola sesión cifrada. La
-implementación equivalente incluida en `wrapper-backend` queda disponible para
-una futura separación del modelo y se activa únicamente al definir su URL.
+Electron usa exclusivamente `WRAPPER_SERVICE_URL` para el login Google, billing,
+conectores y agentes. La build distribuida apunta a
+`https://agentgenia-api.onrender.com`; desarrollo puede usar un loopback HTTP.
 
 El flujo usa Authorization Code con PKCE, valida el `state` y consulta la
 identidad verificada de Google. Google se identifica por su `sub` estable; una
@@ -125,34 +274,33 @@ Para reemplazar el broker actual por una instancia propia:
    `https://api.tu-dominio.com/v1/account-auth/google/callback` como redirect URI.
 3. Define `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` y
    `GOOGLE_OAUTH_REDIRECT_URI` únicamente en el entorno privado del backend.
-4. Si eliges desplegar una instancia separada, configura `HOST=0.0.0.0` y conserva SQLite y
-   `secret.key` en un disco persistente.
-5. Define `WRAPPER_SERVICE_URL=https://api.tu-dominio.com`; si la omites se
-   conserva automáticamente el login actual de `OUTCOME_SERVICE_URL`.
+4. Configura `HOST=0.0.0.0` y usa `DATABASE_URL` con Supabase/Postgres.
+5. Define `WRAPPER_SERVICE_URL=https://api.tu-dominio.com` al compilar o lanzar
+   Electron si no usas el dominio de producción predeterminado.
 
-La sesión principal y la sesión del broker de conectores se guardan en archivos
-cifrados distintos. Así, un token de Google/Agent Genia no se puede presentar
-accidentalmente ante Composio, Slack, Notion u otro proveedor.
-
-El catálogo de Agent Genia ofrece conexión real y aislada por usuario para 31
-proveedores mediante el gateway administrado de Composio: Google
+El catálogo de Agent Genia ofrece conexión real y aislada por usuario mediante
+el gateway de Composio que vive dentro de `wrapper-backend`: Google
 Workspace, Slack, Notion, LinkedIn, Zoom, GitHub, Jira, Linear, Asana, ClickUp,
 Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
-Amplitude, Mixpanel y Databricks. Outreach, WooCommerce, Tableau, Snowflake y
-Clay usan adaptadores nativos del servicio con credenciales cifradas por
-cuenta; Microsoft 365, HubSpot y Salesforce conservan sus adaptadores OAuth
-directos. La primera conexión abre el
-inicio de sesión de Agent Genia y después el consentimiento oficial del
-proveedor; los tokens administrados permanecen en el servicio, nunca en el
-renderer ni en Pi.
+Amplitude, Mixpanel y Databricks. Microsoft 365 y HubSpot usan también Managed
+Auth. Los proveedores que requieren una app propia se activan con
+`COMPOSIO_AUTH_CONFIGS_JSON`. La primera conexión abre el inicio de sesión de
+Agent Genia y después el Connect Link oficial; los tokens administrados
+permanecen en Composio, nunca en el renderer ni en Pi.
 
-Los demás proveedores que todavía exigen credenciales propias o no tienen un
-toolkit compatible se muestran como `Próximamente`: seleccionarlos solo los
-asigna al bot y no inventa una autenticación. El servicio se configura con
-`OUTCOME_SERVICE_URL`, debe usar HTTPS fuera de loopback y guarda su
-`COMPOSIO_API_KEY` y `CONNECTOR_CREDENTIALS_KEY` exclusivamente en el entorno
-privado de producción.
+Cuando Composio no ofrece Managed Auth, `wrapper-backend` usa su adaptador REST
+first-party para Nooks, Rippling, Salesloft, Tiendanube, Clay, DocuSign,
+NetSuite, Outreach, Ramp, Tableau, WooCommerce, Workday y ZoomInfo. El usuario
+abre un formulario de un solo uso y aporta la credencial de API que le entrega
+su proveedor; el backend la cifra con `WRAPPER_SECRET` en
+`connector_credentials`. Electron y Pi nunca reciben el secreto. Si hay un Auth
+Config de Composio para el mismo proveedor, se prefiere su OAuth administrado.
+
+Loom permanece explícitamente como `Próximamente`: su portal público ofrece el
+Record SDK para grabar video, pero no una API de cuenta para buscar videos o
+leer transcripciones. No se presenta como conectado porque esas operaciones no
+serían reales.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con
@@ -166,14 +314,16 @@ Además de las herramientas iniciales, incluye Trello, monday.com, Intercom,
 Zendesk, Box, Dropbox, DocuSign, Calendly, Loom, Outreach, Salesloft, Apollo,
 Clay, ZoomInfo, Nooks, Stripe, QuickBooks, NetSuite, Ramp, Workday, Rippling,
 Ashby, Greenhouse, Vercel, Tableau, Hex, Amplitude, Mixpanel, Snowflake,
-Databricks y Mailchimp. Que aparezcan en el catálogo no implica autenticación:
-sin app OAuth y adaptador registrados se muestran como `Próximamente`.
+Databricks y Mailchimp. Un conector solo se habilita si tiene un toolkit OAuth
+configurado o uno de los adaptadores first-party anteriores.
 
-La sesión OAuth de Electron y el adaptador del broker de Pi son límites de
-confianza distintos. Conectar una cuenta en la interfaz prueba y conserva el
-consentimiento real del usuario; para que una ejecución HTTP de Pi use esa
-cuenta, el backend todavía necesita un adaptador del proveedor registrado para
-ese mismo usuario. Pi nunca recibe refresh tokens ni client secrets.
+La sesión de Electron y el broker efímero de Pi son límites de confianza
+distintos. Conectar una cuenta crea una conexión real en Composio; al ejecutar,
+el adaptador registrado en `wrapper-backend` busca y llama la herramienta en
+una sesión limitada al toolkit y al mismo usuario. Pi nunca recibe refresh
+tokens, API keys de Composio ni client secrets. Electron consulta todas sus
+conexiones con un único `GET /v1/connectors`; el backend es la fuente de verdad
+y no persiste estados OAuth de proveedores en el dispositivo.
 
 Cargar keys de Go al pool:
 
@@ -240,14 +390,14 @@ El aislamiento es por ejecución:
 4. Los endpoints internos aceptan únicamente tráfico loopback y limitan cada
    operación al grant. El token se revoca al terminar o fallar la tarea y además
    tiene una expiración máxima de una hora.
-5. El adaptador del proveedor conserva y refresca sus credenciales dentro del
-   backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
+5. Composio conserva y refresca las credenciales; el adaptador se ejecuta dentro
+   del backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
    con `connector_not_configured` o `connector_not_connected`.
 
 La extensión y el broker no inventan una sesión OAuth: son la ruta segura entre
-Pi y los adaptadores reales. Registrar las apps OAuth, callbacks y almacenamiento
-cifrado sigue siendo obligatorio por proveedor. La selección visual de un bot
-solamente determina el `connector_ids` que debe enviarse al ejecutar ese bot.
+Pi y el gateway real. Los proveedores sin Managed Auth requieren un Auth Config
+de Composio registrado por el operador. La selección visual de un bot solamente
+determina el `connector_ids` que debe enviarse al ejecutar ese bot.
 
 ```bash
 pnpm test:connectors
@@ -313,6 +463,32 @@ iniciar sesión, debe hacerlo dentro de esa ejecución y esos datos no se conser
 Las capturas que produzca `pi-chrome` pasan por Luna antes de llegar a DeepSeek,
 de modo que el agente puede observar la página y decidir su siguiente acción.
 
+## Computadora persistente por bot
+
+La computadora de un bot es distinta del Chrome efímero anterior. Con
+`COMPUTERS_ENABLED=1`, el backend crea una sandbox Daytona privada para la
+combinación exacta `(usuario, bot)` y conserva su filesystem, perfil y sesiones
+cuando se detiene. Electron permite crearla, abrir su viewer noVNC firmado e
+hibernarla; Pi controla la misma máquina mediante la herramienta `computer`
+(captura, mouse, teclado, shell y archivos), cargada por la extensión existente
+de conectores. No se modifica `go_backend/pi_harness.py`.
+
+Para habilitarla:
+
+1. Crea una API key server-side en Daytona y define `DAYTONA_API_KEY`.
+2. Define `COMPUTERS_ENABLED=1`. Opcionalmente usa `DAYTONA_SNAPSHOT` para una
+   imagen preparada con Chromium y las aplicaciones que quieras entregar.
+3. Aplica la migración `20260812233000_bot_computers.sql` en Supabase y despliega
+   el backend. `PI_CONNECTOR_EXTENSION` debe seguir apuntando a la extensión
+   first-party incluida en este repositorio.
+
+El estado normal es `off → pulling → running → hibernated`. El auto-stop de 15
+minutos conserva los datos y evita pagar cómputo ocioso; el auto-archive se
+activa tras 24 horas detenida. Un viewer nunca se guarda en la base de datos:
+se genera al abrir, expira y Electron solo acepta HTTPS (o HTTP loopback en
+desarrollo). Eliminar un bot elimina primero su sandbox remota para no dejar
+recursos facturables huérfanos.
+
 ## Endpoints
 
 Públicos (los endpoints de cuenta no requieren Bearer; los endpoints del modelo
@@ -325,7 +501,16 @@ aceptan API key o access token de una sesión Google):
 | GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
 | POST | `/v1/account-auth/refresh` | Rota access y refresh token ligados al dispositivo |
 | POST | `/v1/account-auth/logout` | Revoca la sesión actual |
+| GET | `/v1/connectors` | Catálogo y conexiones reales del usuario en una sola consulta |
+| GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
+| POST | `/v1/connectors/start` | Crea un Connect Link de Composio con límite por usuario |
+| GET | `/v1/connectors/status/<attempt_id>` | Consulta un consentimiento sin exponer credenciales |
+| POST | `/v1/connectors/disconnect` | Revoca las cuentas activas de ese toolkit para el usuario |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
+| GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
+| POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
+| POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
+| POST | `/v1/billing/webhook` | Webhook público que exige una firma `Stripe-Signature` válida |
 | POST | `/v1/byok` | El usuario registra su propia key de Go `{apiKey}` |
 | GET | `/v1/models` | Catálogo de modelos (proxy a Go) |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
@@ -334,7 +519,11 @@ aceptan API key o access token de una sesión Google):
 | GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
 | GET | `/v1/me` | Usuario, tier y suscripción asignada |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, connector_ids?: string[]}` y espera el resultado |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, computer?: false, bot_id?: string, connector_ids?: string[]}` y espera el resultado |
+| GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
+| POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
+| POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |
+| POST | `/v1/computers/<bot_id>/delete` | Elimina la computadora remota antes de borrar el bot |
 
 Admin (Bearer = `ADMIN_TOKEN`):
 
@@ -364,6 +553,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 |---|---|---|
 | `PORT` | `8787` | Puerto HTTP |
 | `WRAPPER_SECRET` | auto | Clave maestra para cifrar keys Go |
+| `CONNECTOR_PUBLIC_URL` | `COMPOSIO_PUBLIC_URL` | URL HTTPS para los formularios first-party de conexión |
 | `ADMIN_TOKEN` | auto-generado | Token de admin; el valor publicado `cambia-este-token` impide arrancar |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
@@ -396,6 +586,16 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
 | `PI_CHROME_AUTO_AUTHORIZE` | `0` | Autorizar automáticamente solo el Chrome efímero de esa ejecución |
 | `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración máxima; el proceso se cierra antes si termina la tarea |
+| `COMPUTERS_ENABLED` | `0` | Habilita una sandbox Daytona persistente por `(usuario, bot)` |
+| `DAYTONA_API_KEY` | vacío | Credencial server-side; obligatoria si la función está habilitada |
+| `DAYTONA_SNAPSHOT` | vacío | Snapshot opcional preparado con apps para la computadora |
+| `COMPUTER_AUTO_STOP_MINUTES` | `15` | Inactividad antes de detener cómputo conservando el filesystem |
+| `COMPUTER_AUTO_ARCHIVE_MINUTES` | `1440` | Tiempo detenida antes de archivar |
+| `COMPUTER_PREVIEW_TTL_SECONDS` | `3600` | Vigencia del viewer firmado solicitado por Electron |
+| `COMPUTER_VNC_PORT` | `6080` | Puerto noVNC expuesto mediante preview firmado |
+| `COMPUTER_VNC_RESOLUTION` | `1440x900` | Resolución fija del escritorio al crear la sandbox |
+| `COMPUTER_BASIC_LIMIT` | `1` | Máximo de computadoras persistentes para un usuario Plus |
+| `COMPUTER_PRO_LIMIT` | `3` | Máximo de computadoras persistentes para un usuario Pro |
 
 ## Seguridad
 
@@ -405,6 +605,11 @@ Admin (Bearer = `ADMIN_TOKEN`):
   solo se muestran una vez en el signup.
 - El signup público siempre crea `free`. Solo una transición autenticada tras
   comprobar el pago puede activar `basic`/`pro` y reclamar capacidad.
+- Los eventos Stripe se verifican con HMAC, tolerancia temporal y `livemode`;
+  `stripe_events.event_id` hace su procesamiento idempotente. Customer,
+  suscripción, usuario, tier y capacidad se enlazan en una sola transacción.
+- `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` solo viven en el backend. El
+  arranque rechaza claves test en modo live, URLs inseguras y price IDs inválidos.
 - La asignación de suscripciones usa `BEGIN IMMEDIATE` y el índice único
   `uniq_user_subscription`; dos activaciones concurrentes no pueden compartir
   una key.
@@ -425,18 +630,23 @@ Admin (Bearer = `ADMIN_TOKEN`):
   entre clientes. Pi todavía ejecuta con el usuario del sistema del backend;
   para aislamiento fuerte entre tenants usa además un contenedor o usuario del
   sistema distinto por tarea.
+- Las computadoras persistentes sí conservan cookies, pero solo dentro de la
+  sandbox privada de ese usuario y bot. El API key del proveedor nunca llega a
+  Electron o Pi; cada ejecución recibe un grant revocable para un único bot y
+  los viewers son URLs firmadas que no se persisten.
 
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_backend.py
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Corren contra un upstream mock (sin llamadas reales a OpenCode Go) y cubren:
+Corren contra un upstream mock (sin llamadas reales a OpenCode Go ni Stripe) y cubren:
 signup siempre-free, activación admin, carrera de asignación, rechazo del token
 inseguro, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
-cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
+cifrado en reposo, Checkout con price IDs allowlisted, firma e idempotencia de
+webhooks y cancelación. También validan el flujo Pi RPC completo con un ejecutable
 falso, el puente Luna/MiMo, los grants efímeros del broker, la carga dinámica de
 herramientas y el aislamiento de proceso, perfil y bridge de pi-chrome, sin
 consumir saldo real.

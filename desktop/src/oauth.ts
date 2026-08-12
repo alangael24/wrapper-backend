@@ -4,11 +4,13 @@ import path from "node:path";
 import type { SafeStorage, Shell } from "electron";
 import type {
   AccountConnectionStatus,
+  BillingSnapshot,
+  BotComputerSnapshot,
+  BotWorkflowDraft,
   ConnectorConnectionSnapshot,
-  ConnectorConnectionStatus,
-  OAuthProviderId
+  ConnectorConnectionStatus
 } from "./contracts";
-import { CONNECTOR_CATALOG, HOSTED_CONNECTOR_IDS, MANAGED_CONNECTOR_IDS } from "./contracts";
+import { CONNECTOR_CATALOG } from "./contracts";
 
 const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
@@ -29,28 +31,10 @@ interface AccountSession {
   account: AccountIdentity;
 }
 
-interface ProviderSessionPayload {
-  access_token: string;
-  refresh_token?: string;
-  expires_in?: number;
-  account_label?: string;
-  email?: string;
-  instance_url?: string;
-  api_domain?: string;
-  accounts_server?: string;
-}
-
-interface ProviderSession extends ProviderSessionPayload {
-  saved_at: number;
-  owner_account_id: string;
-}
-
-interface ManagedConnectorSession {
+interface ManagedConnectorPayload {
   managed_connection_id: string;
   connector_id: string;
   account_label?: string;
-  saved_at: number;
-  owner_account_id: string;
 }
 
 interface JsonRequestOptions {
@@ -60,44 +44,25 @@ interface JsonRequestOptions {
   signal?: AbortSignal;
 }
 
-export const CONNECTOR_PROVIDER: Readonly<Record<string, OAuthProviderId | undefined>> = Object.freeze({
-  "microsoft-365": "microsoft",
-  hubspot: "hubspot",
-  salesforce: "salesforce"
-});
-
-export const COMPOSIO_CONNECTOR_IDS: ReadonlySet<string> = new Set(MANAGED_CONNECTOR_IDS);
-export const REMOTE_CONNECTOR_IDS: ReadonlySet<string> = new Set(HOSTED_CONNECTOR_IDS);
-
-const PROVIDER_LABELS: Readonly<Record<OAuthProviderId, string>> = Object.freeze({
-  google: "Google Workspace",
-  microsoft: "Microsoft 365",
-  hubspot: "HubSpot",
-  salesforce: "Salesforce",
-  pipedrive: "Pipedrive",
-  zoho: "Zoho CRM",
-  composio: "Composio"
-});
+export const COMPOSIO_CONNECTOR_IDS: ReadonlySet<string> = new Set(
+  CONNECTOR_CATALOG.map((connector) => connector.id)
+);
+export const REMOTE_CONNECTOR_IDS: ReadonlySet<string> = COMPOSIO_CONNECTOR_IDS;
 
 export class DesktopOAuthController {
   private readonly accountStore: EncryptedJsonStore<AccountSession>;
-  private readonly connectorAccountStore: EncryptedJsonStore<AccountSession>;
   private readonly deviceStore: DeviceIdentityStore;
-  private readonly accountClient: OutcomeOAuthClient;
-  private readonly connectorClient: OutcomeOAuthClient;
-  private readonly providerSessions: Map<OAuthProviderId, ManagedProviderSession>;
+  private readonly client: WrapperServiceClient;
   private readonly managedConnectorSessions: Map<string, ManagedConnectorAccount>;
 
   constructor({
-    accountBaseUrl,
-    connectorBaseUrl,
+    baseUrl,
     safeStorage,
     userDataPath,
     shell,
     appVersion
   }: {
-    accountBaseUrl: string;
-    connectorBaseUrl: string;
+    baseUrl: string;
     safeStorage: SafeStorage;
     userDataPath: string;
     shell: Shell;
@@ -108,43 +73,14 @@ export class DesktopOAuthController {
       safeStorage,
       validate: isAccountSession
     });
-    const sameAccountService = normalizedServiceUrl(accountBaseUrl) === normalizedServiceUrl(connectorBaseUrl);
-    this.connectorAccountStore = sameAccountService
-      ? this.accountStore
-      : new EncryptedJsonStore({
-        filePath: path.join(userDataPath, "secrets", "agent-genia-connectors-account.bin"),
-        safeStorage,
-        validate: isAccountSession
-      });
     this.deviceStore = new DeviceIdentityStore({ safeStorage, userDataPath });
-    this.accountClient = new OutcomeOAuthClient({
-      baseUrl: accountBaseUrl,
+    this.client = new WrapperServiceClient({
+      baseUrl,
       accountStore: this.accountStore,
       deviceStore: this.deviceStore,
       appVersion,
       openExternal: (url) => shell.openExternal(url)
     });
-    this.connectorClient = new OutcomeOAuthClient({
-      baseUrl: connectorBaseUrl,
-      accountStore: this.connectorAccountStore,
-      deviceStore: this.deviceStore,
-      appVersion,
-      openExternal: (url) => shell.openExternal(url)
-    });
-    this.providerSessions = new Map(
-      (Object.keys(PROVIDER_LABELS) as OAuthProviderId[]).map((provider) => [
-        provider,
-        new ManagedProviderSession({
-          provider,
-          displayName: PROVIDER_LABELS[provider],
-          client: this.connectorClient,
-          accountStore: this.connectorAccountStore,
-          safeStorage,
-          userDataPath,
-          shell
-        })
-      ])
-    );
     this.managedConnectorSessions = new Map(
       [...REMOTE_CONNECTOR_IDS].map((connectorId) => {
         const definition = CONNECTOR_CATALOG.find((item) => item.id === connectorId)!;
@@ -153,10 +89,7 @@ export class DesktopOAuthController {
           new ManagedConnectorAccount({
             connectorId,
             displayName: definition.name,
-            client: this.connectorClient,
-            accountStore: this.connectorAccountStore,
-            safeStorage,
-            userDataPath,
+            client: this.client,
             shell
           })
         ];
@@ -166,70 +99,53 @@ export class DesktopOAuthController {
 
   async snapshot(): Promise<ConnectorConnectionSnapshot> {
     const account = await this.accountStatus();
-    const connectors = await Promise.all(CONNECTOR_CATALOG.map(async (connector): Promise<ConnectorConnectionStatus> => {
-      const provider = CONNECTOR_PROVIDER[connector.id];
-      const managed = this.managedConnectorSessions.get(connector.id);
-      if (managed) {
-        const status = await managed.status();
-        return {
-          connectorId: connector.id,
-          provider: "composio",
-          available: true,
-          connected: status.connected,
-          account: status.account,
-          reason: status.connected ? "" : account.connected ? "Listo para conectar tu cuenta real." : "Inicia sesión para conectar tu cuenta."
-        };
-      }
-      if (!provider) {
-        return {
-          connectorId: connector.id,
-          provider: null,
-          available: false,
-          connected: false,
-          account: "",
-          reason: "La app OAuth de este proveedor todavía no está registrada."
-        };
-      }
-      const status = await this.providerSessions.get(provider)!.status();
+    const response = account.connected ? await this.client.connectors().catch(() => null) : null;
+    const remoteConnectors = Array.isArray(response?.connectors) ? response.connectors : [];
+    const remoteById = new Map<string, Record<string, unknown>>(
+      remoteConnectors.filter(isRecord).map((item) => [stringValue(item.connector_id), item])
+    );
+    const connectors = CONNECTOR_CATALOG.map((connector): ConnectorConnectionStatus => {
+      const remote = remoteById.get(connector.id);
+      const available = remote?.available === true;
+      const connected = remote?.connected === true;
       return {
         connectorId: connector.id,
-        provider,
-        available: true,
-        connected: status.connected,
-        account: status.account,
-        reason: status.connected ? "" : account.connected ? "Listo para autorizar." : "Inicia sesión para conectar tu cuenta."
+        provider: available ? "composio" : null,
+        available,
+        connected,
+        account: connected ? stringValue(remote?.account) : "",
+        reason: connected
+          ? ""
+          : !account.connected
+            ? "Inicia sesión para conectar tu cuenta."
+            : typeof remote?.reason === "string" && remote.reason
+              ? remote.reason
+              : available ? "Listo para conectar tu cuenta real." : "Este conector todavía no está configurado."
       };
-    }));
+    });
     return { account, connectors };
   }
 
   async signIn(signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
-    await this.accountClient.signIn(shellSafeSignal(signal));
+    await this.client.signIn(shellSafeSignal(signal));
     return this.snapshot();
   }
 
   async signOut(): Promise<ConnectorConnectionSnapshot> {
-    await Promise.all([
-      ...[...this.providerSessions.values()].map((session) => session.disconnect()),
-      ...[...this.managedConnectorSessions.values()].map((session) => session.clearLocal())
-    ]);
-    await Promise.all([this.accountClient.signOut(), this.connectorClient.signOut()]);
+    await this.client.signOut();
     return this.snapshot();
   }
 
   async connect(connectorId: string, signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
     if (!await this.accountStore.get()) {
-      await this.accountClient.signIn(shellSafeSignal(signal));
+      await this.client.signIn(shellSafeSignal(signal));
     }
     const managed = this.managedConnectorSessions.get(connectorId);
     if (managed) {
       await managed.connect(shellSafeSignal(signal));
       return this.snapshot();
     }
-    const provider = CONNECTOR_PROVIDER[connectorId];
-    if (!provider) throw new Error("Este conector todavía no tiene una app OAuth pública configurada.");
-    await this.providerSessions.get(provider)!.connect(shellSafeSignal(signal));
-    return this.snapshot();
+    throw new Error("Conector desconocido.");
   }
 
   async disconnect(connectorId: string): Promise<ConnectorConnectionSnapshot> {
@@ -238,10 +154,51 @@ export class DesktopOAuthController {
       await managed.disconnect();
       return this.snapshot();
     }
-    const provider = CONNECTOR_PROVIDER[connectorId];
-    if (!provider) throw new Error("Este conector no admite desconexión OAuth.");
-    await this.providerSessions.get(provider)!.disconnect();
-    return this.snapshot();
+    throw new Error("Conector desconocido.");
+  }
+
+  async billingStatus(signal?: AbortSignal): Promise<BillingSnapshot> {
+    return parseBillingSnapshot(await this.client.billing(signal));
+  }
+
+  startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+    return this.client.startCheckout(tier, signal);
+  }
+
+  openBillingPortal(signal?: AbortSignal): Promise<void> {
+    return this.client.openBillingPortal(signal);
+  }
+
+  computerStatus(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.computerStatus(botId, signal);
+  }
+
+  ensureComputer(botId: string, botName: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.ensureComputer(botId, botName, signal);
+  }
+
+  handBackComputer(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.handBackComputer(botId, signal);
+  }
+
+  deleteComputer(botId: string, signal?: AbortSignal): Promise<{ deleted: boolean }> {
+    return this.client.deleteComputer(botId, signal);
+  }
+
+  runAgent(
+    prompt: string,
+    connectorIds: string[],
+    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+  ): Promise<Record<string, unknown>> {
+    return this.client.runAgent(prompt, connectorIds, options);
+  }
+
+  teachWorkflow(botName: string, frames: string[], durationMs: number, signal?: AbortSignal): Promise<BotWorkflowDraft> {
+    return this.client.teachWorkflow(botName, frames, durationMs, signal);
+  }
+
+  async accountId(): Promise<string | null> {
+    return (await this.accountStore.get())?.account.id ?? null;
   }
 
   private async accountStatus(): Promise<AccountConnectionStatus> {
@@ -253,30 +210,14 @@ export class DesktopOAuthController {
 }
 
 class ManagedConnectorAccount {
-  private readonly store: EncryptedJsonStore<ManagedConnectorSession>;
   private connectPromise: Promise<void> | null = null;
 
   constructor(private readonly options: {
     connectorId: string;
     displayName: string;
-    client: OutcomeOAuthClient;
-    accountStore: EncryptedJsonStore<AccountSession>;
-    safeStorage: SafeStorage;
-    userDataPath: string;
+    client: WrapperServiceClient;
     shell: Shell;
-  }) {
-    this.store = new EncryptedJsonStore({
-      filePath: path.join(options.userDataPath, "secrets", `connector-managed-${options.connectorId}.bin`),
-      safeStorage: options.safeStorage,
-      validate: isManagedConnectorSession
-    });
-  }
-
-  async status(): Promise<{ connected: boolean; account: string }> {
-    const [stored, account] = await Promise.all([this.store.get(), this.options.accountStore.get()]);
-    const connected = Boolean(stored?.managed_connection_id && account?.account.id && stored.owner_account_id === account.account.id);
-    return { connected, account: connected ? stored?.account_label || account?.account.email || "" : "" };
-  }
+  }) {}
 
   async connect(signal?: AbortSignal): Promise<void> {
     if (!this.connectPromise) this.connectPromise = this.connectOnce(signal).finally(() => { this.connectPromise = null; });
@@ -284,22 +225,10 @@ class ManagedConnectorAccount {
   }
 
   async disconnect(): Promise<void> {
-    const account = await this.options.accountStore.get();
-    if (account) await this.options.client.disconnectConnector(this.options.connectorId);
-    await this.store.clear();
-  }
-
-  clearLocal(): Promise<void> {
-    return this.store.clear();
+    await this.options.client.disconnectConnector(this.options.connectorId);
   }
 
   private async connectOnce(signal?: AbortSignal): Promise<void> {
-    let account = await this.options.accountStore.get();
-    if (!account) {
-      await this.options.client.signIn(signal);
-      account = await this.options.accountStore.get();
-    }
-    if (!account) throw new Error("No se pudo verificar tu cuenta de Agent Genia.");
     const provider = await this.options.client.connector(this.options.connectorId, signal);
     if (provider.available !== true) throw new Error(stringValue(provider.reason) || `${this.options.displayName} todavía no está configurado.`);
     const started = await this.options.client.startConnector(this.options.connectorId, signal);
@@ -307,11 +236,6 @@ class ManagedConnectorAccount {
     for (let attempt = 0; attempt < CONNECTOR_AUTH_ATTEMPTS; attempt += 1) {
       const status = await this.options.client.connectorStatus(stringValue(started.attempt_id), signal);
       if (status.status === "complete" && isManagedConnectorPayload(status.session)) {
-        await this.store.set({
-          ...status.session,
-          saved_at: Date.now(),
-          owner_account_id: account.account.id
-        });
         return;
       }
       if (status.status === "error") throw new Error(stringValue(status.message) || `${this.options.displayName} rechazó la conexión.`);
@@ -321,82 +245,7 @@ class ManagedConnectorAccount {
   }
 }
 
-class ManagedProviderSession {
-  private readonly store: EncryptedJsonStore<ProviderSession>;
-  private connectPromise: Promise<void> | null = null;
-
-  constructor(private readonly options: {
-    provider: OAuthProviderId;
-    displayName: string;
-    client: OutcomeOAuthClient;
-    accountStore: EncryptedJsonStore<AccountSession>;
-    safeStorage: SafeStorage;
-    userDataPath: string;
-    shell: Shell;
-  }) {
-    this.store = new EncryptedJsonStore({
-      filePath: path.join(options.userDataPath, "secrets", `connector-${options.provider}.bin`),
-      safeStorage: options.safeStorage,
-      validate: isProviderSession
-    });
-  }
-
-  async status(): Promise<{ connected: boolean; account: string }> {
-    const [providerSession, accountSession] = await Promise.all([this.store.get(), this.options.accountStore.get()]);
-    const connected = Boolean(
-      providerSession?.access_token
-      && accountSession?.account.id
-      && providerSession.owner_account_id === accountSession.account.id
-    );
-    return {
-      connected,
-      account: connected ? providerSession?.account_label ?? providerSession?.email ?? accountSession?.account.email ?? "" : ""
-    };
-  }
-
-  async connect(signal?: AbortSignal): Promise<void> {
-    if (!this.connectPromise) {
-      this.connectPromise = this.connectOnce(signal).finally(() => { this.connectPromise = null; });
-    }
-    await withSignal(this.connectPromise, signal);
-  }
-
-  async disconnect(): Promise<void> {
-    await this.store.clear();
-  }
-
-  private async connectOnce(signal?: AbortSignal): Promise<void> {
-    throwIfAborted(signal);
-    let account = await this.options.accountStore.get();
-    if (!account) {
-      await this.options.client.signIn(signal);
-      account = await this.options.accountStore.get();
-    }
-    if (!account) throw new Error("No se pudo verificar tu cuenta de Agent Genia.");
-
-    const providerInfo = await this.options.client.provider(this.options.provider, signal);
-    if (!providerInfo.configured) throw new Error(`${this.options.displayName} todavía no está configurado en producción.`);
-    const started = await this.options.client.startProvider(this.options.provider, signal);
-    await this.options.shell.openExternal(safeAuthorizationUrl(stringValue(started.authorize_url)));
-
-    for (let attempt = 0; attempt < CONNECTOR_AUTH_ATTEMPTS; attempt += 1) {
-      const status = await this.options.client.providerStatus(stringValue(started.attempt_id), signal);
-      if (status.status === "complete" && isProviderSessionPayload(status.session)) {
-        await this.store.set({
-          ...status.session,
-          saved_at: Date.now(),
-          owner_account_id: account.account.id
-        });
-        return;
-      }
-      if (status.status === "error") throw new Error(stringValue(status.message) || `${this.options.displayName} rechazó la conexión.`);
-      await delay(OAUTH_POLL_MS, signal);
-    }
-    throw new Error(`La conexión con ${this.options.displayName} expiró.`);
-  }
-}
-
-class OutcomeOAuthClient {
+class WrapperServiceClient {
   private session: { token: string; expiresAt: number } | null = null;
 
   constructor(private readonly options: {
@@ -453,20 +302,12 @@ class OutcomeOAuthClient {
     await this.options.accountStore.clear();
   }
 
-  provider(provider: OAuthProviderId, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.authorizedJson(`/v1/oauth/providers/${encodeURIComponent(provider)}`, { signal });
-  }
-
-  startProvider(provider: OAuthProviderId, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.authorizedJson("/v1/oauth/start", { method: "POST", body: { provider }, signal });
-  }
-
-  providerStatus(attemptId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.authorizedJson(`/v1/oauth/status/${encodeURIComponent(attemptId)}`, { signal });
-  }
-
   connector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.authorizedJson(`/v1/connectors/${encodeURIComponent(connectorId)}`, { signal });
+  }
+
+  connectors(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/connectors", { signal });
   }
 
   startConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -479,6 +320,105 @@ class OutcomeOAuthClient {
 
   disconnectConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.authorizedJson("/v1/connectors/disconnect", { method: "POST", body: { connector_id: connectorId }, signal });
+  }
+
+  runAgent(
+    prompt: string,
+    connectorIds: string[],
+    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+  ): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/agent/run", {
+      method: "POST",
+      body: {
+        prompt,
+        browser: options.browser === true,
+        computer: options.computer === true,
+        bot_id: options.botId ?? "",
+        connector_ids: connectorIds
+      },
+      signal: options.signal
+    });
+  }
+
+  async teachWorkflow(
+    botName: string,
+    frames: string[],
+    durationMs: number,
+    signal?: AbortSignal
+  ): Promise<BotWorkflowDraft> {
+    const response = await this.authorizedJson("/v1/responses", {
+      method: "POST",
+      body: {
+        model: "deepseek-v4-flash",
+        stream: false,
+        max_output_tokens: 3000,
+        input: [{
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `You are extracting a reusable workflow taught to the Agent Genia bot ${botName}.`,
+                `The screenshots are chronological samples from a ${Math.max(1, Math.round(durationMs / 1000))}-second screen recording.`,
+                "Infer only steps supported by visible transitions. Never include passwords, tokens, personal data, or invented values.",
+                "Write each step as an instruction the Pi agent can execute later with browser and connector tools.",
+                "Return JSON only: {\"title\":\"short task name\",\"summary\":\"one sentence\",\"steps\":[\"ordered step\"]}. Include 2-30 steps."
+              ].join("\n")
+            },
+            ...frames.map((imageUrl) => ({ type: "input_image", image_url: imageUrl }))
+          ]
+        }]
+      },
+      signal
+    });
+    return parseTeachWorkflow(responseText(response));
+  }
+
+  billing(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/billing", { signal });
+  }
+
+  async computerStatus(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}`,
+      { signal }
+    ));
+  }
+
+  async ensureComputer(botId: string, botName: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/ensure`,
+      { method: "POST", body: { bot_name: botName }, signal }
+    ));
+  }
+
+  async handBackComputer(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/hand-back`,
+      { method: "POST", signal }
+    ));
+  }
+
+  async deleteComputer(botId: string, signal?: AbortSignal): Promise<{ deleted: boolean }> {
+    const result = await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/delete`,
+      { method: "POST", signal }
+    );
+    return { deleted: result.deleted === true };
+  }
+
+  async startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+    const result = await this.authorizedJson("/v1/billing/checkout", {
+      method: "POST",
+      body: { tier },
+      signal
+    });
+    await this.options.openExternal(safeStripeUrl(stringValue(result.checkout_url), "checkout.stripe.com"));
+  }
+
+  async openBillingPortal(signal?: AbortSignal): Promise<void> {
+    const result = await this.authorizedJson("/v1/billing/portal", { method: "POST", signal });
+    await this.options.openExternal(safeStripeUrl(stringValue(result.portal_url), "billing.stripe.com"));
   }
 
   private async authorizedJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
@@ -613,34 +553,12 @@ function isAccountIdentity(value: unknown): value is AccountIdentity {
     && value.email.includes("@");
 }
 
-function isProviderSession(value: unknown): value is ProviderSession {
-  if (!isRecord(value) || !isProviderSessionPayload(value)) return false;
-  const persisted = value as ProviderSessionPayload & Record<string, unknown>;
-  return typeof persisted.saved_at === "number"
-    && Number.isFinite(persisted.saved_at)
-    && typeof persisted.owner_account_id === "string"
-    && persisted.owner_account_id.startsWith("acct_");
-}
-
-function isProviderSessionPayload(value: unknown): value is ProviderSessionPayload {
-  return isRecord(value) && typeof value.access_token === "string" && value.access_token.length > 10;
-}
-
-function isManagedConnectorPayload(value: unknown): value is Pick<ManagedConnectorSession, "managed_connection_id" | "connector_id" | "account_label"> {
+function isManagedConnectorPayload(value: unknown): value is ManagedConnectorPayload {
   return isRecord(value)
     && typeof value.managed_connection_id === "string"
     && value.managed_connection_id.length > 5
     && typeof value.connector_id === "string"
     && REMOTE_CONNECTOR_IDS.has(value.connector_id);
-}
-
-function isManagedConnectorSession(value: unknown): value is ManagedConnectorSession {
-  if (!isManagedConnectorPayload(value)) return false;
-  const persisted = value as typeof value & Record<string, unknown>;
-  return typeof persisted.saved_at === "number"
-    && Number.isFinite(persisted.saved_at)
-    && typeof persisted.owner_account_id === "string"
-    && persisted.owner_account_id.startsWith("acct_");
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -655,14 +573,124 @@ function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function responseText(payload: Record<string, unknown>): string {
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text.trim();
+  if (Array.isArray(payload.output)) {
+    for (const item of payload.output) {
+      if (!isRecord(item) || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (!isRecord(part)) continue;
+        if (typeof part.text === "string" && part.text.trim()) return part.text.trim();
+        if (typeof part.output_text === "string" && part.output_text.trim()) return part.output_text.trim();
+      }
+    }
+  }
+  if (Array.isArray(payload.choices)) {
+    const choice = payload.choices.find(isRecord);
+    const message = choice && isRecord(choice.message) ? choice.message : {};
+    if (typeof message.content === "string" && message.content.trim()) return message.content.trim();
+  }
+  throw new Error("El modelo no devolvió los pasos aprendidos.");
+}
+
+function parseTeachWorkflow(value: string): BotWorkflowDraft {
+  const candidate = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    throw new Error("El modelo devolvió un workflow inválido. Intenta grabar la tarea otra vez.");
+  }
+  if (!isRecord(parsed)) throw new Error("El modelo devolvió un workflow inválido.");
+  const title = stringValue(parsed.title).replace(/\s+/g, " ").trim().slice(0, 120);
+  const summary = stringValue(parsed.summary).replace(/\s+/g, " ").trim().slice(0, 500);
+  const steps = Array.isArray(parsed.steps)
+    ? parsed.steps.flatMap((step): string[] => {
+      const normalized = typeof step === "string" ? step.replace(/\s+/g, " ").trim().slice(0, 600) : "";
+      return normalized ? [normalized] : [];
+    }).slice(0, 30)
+    : [];
+  if (!title || steps.length < 2) throw new Error("No hubo suficientes pasos visibles para aprender la tarea.");
+  return { title, summary, steps };
+}
+
+function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
+  const tier = value.tier;
+  const plans = isRecord(value.plans) ? value.plans : {};
+  const basic = isRecord(plans.basic) ? plans.basic : {};
+  const pro = isRecord(plans.pro) ? plans.pro : {};
+  if (tier !== "free" && tier !== "basic" && tier !== "pro") {
+    throw new Error("El servicio devolvió un plan inválido.");
+  }
+  const parsePlan = (plan: Record<string, unknown>, fallbackName: string, fallbackAmount: number) => ({
+    name: stringValue(plan.name) || fallbackName,
+    amount: numberValue(plan.amount) || fallbackAmount,
+    currency: stringValue(plan.currency) || "usd",
+    interval: stringValue(plan.interval) || "month"
+  });
+  let subscription: BillingSnapshot["subscription"] = null;
+  if (isRecord(value.subscription)) {
+    const item = value.subscription;
+    const itemTier = item.tier;
+    if (itemTier === "basic" || itemTier === "pro") {
+      subscription = {
+        stripe_subscription_id: stringValue(item.stripe_subscription_id),
+        tier: itemTier,
+        stripe_price_id: stringValue(item.stripe_price_id),
+        status: stringValue(item.status),
+        cancel_at_period_end: item.cancel_at_period_end === true,
+        current_period_end: typeof item.current_period_end === "number" ? item.current_period_end : null
+      };
+    }
+  }
+  return {
+    configured: value.configured === true,
+    tier,
+    customer: value.customer === true,
+    subscription,
+    plans: { basic: parsePlan(basic, "Plus", 50), pro: parsePlan(pro, "Pro", 200) }
+  };
+}
+
+function parseComputerSnapshot(value: Record<string, unknown>): BotComputerSnapshot {
+  const state = stringValue(value.state);
+  if (!["disabled", "pulling", "running", "hibernated", "off", "error"].includes(state)) {
+    throw new Error("El servicio devolvió un estado de computadora inválido.");
+  }
+  const viewerUrl = stringValue(value.viewer_url);
+  if (viewerUrl) safeComputerViewerUrl(viewerUrl);
+  return {
+    configured: value.configured === true,
+    bot_id: stringValue(value.bot_id),
+    provider: stringValue(value.provider) || null,
+    state: state as BotComputerSnapshot["state"],
+    viewer_url: viewerUrl,
+    viewer_expires_at: numberValue(value.viewer_expires_at),
+    reason: stringValue(value.reason)
+  };
+}
+
+export function safeComputerViewerUrl(value: string): string {
+  const url = new URL(value);
+  const loopback = url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  if ((url.protocol !== "https:" && !loopback) || url.username || url.password || url.href.length > 4096) {
+    throw new Error("El servicio devolvió una URL de computadora insegura.");
+  }
+  return url.toString();
+}
+
 function safeAuthorizationUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" || url.username || url.password) throw new Error("El servicio devolvió una URL OAuth insegura.");
   return url.toString();
 }
 
-function normalizedServiceUrl(value: string): string {
-  return new URL(value).toString().replace(/\/$/, "");
+function safeStripeUrl(value: string, expectedHost: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.hostname !== expectedHost || url.username || url.password) {
+    throw new Error("El servicio devolvió una URL de Stripe insegura.");
+  }
+  return url.toString();
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
