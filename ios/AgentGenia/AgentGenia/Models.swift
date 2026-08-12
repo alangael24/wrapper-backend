@@ -99,6 +99,8 @@ struct ConnectorDefinition: Identifiable, Hashable, Sendable {
     let category: String
     let summary: String
 
+    var logoAsset: String { "logo_" + id.replacingOccurrences(of: "-", with: "_") }
+
     static let catalog: [ConnectorDefinition] = [
         connector("google-workspace", "Google Workspace", "g.circle.fill", "Trabajo", "Gmail, Drive, Calendar, Contacts y Sheets"),
         connector("slack", "Slack", "number.square.fill", "Trabajo", "Canales, mensajes y coordinación de equipo"),

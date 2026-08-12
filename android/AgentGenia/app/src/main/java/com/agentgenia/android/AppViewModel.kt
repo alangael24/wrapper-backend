@@ -14,6 +14,7 @@ import com.agentgenia.android.model.BotMessage
 import com.agentgenia.android.model.BotProfile
 import com.agentgenia.android.model.BotShape
 import com.agentgenia.android.model.ComputerSnapshot
+import com.agentgenia.android.model.ConnectorCatalog
 import com.agentgenia.android.model.ConnectorStatus
 import com.agentgenia.android.model.MessageRole
 import com.agentgenia.android.model.PersistedAccountState
@@ -136,7 +137,7 @@ class AppViewModel(
 
     fun refreshConnectors() = viewModelScope.launch {
         runCatching { api.connectors() }
-            .onSuccess { statuses -> _state.update { it.copy(connectorStatuses = statuses.associateBy(ConnectorStatus::connectorId)) } }
+            .onSuccess(::applyConnectorSnapshot)
             .onFailure(::report)
     }
 
@@ -233,12 +234,29 @@ class AppViewModel(
         val billing = viewModelScope.async { runCatching { api.billing() }.getOrNull() }
         val connectorValues = connectors.await()
         val billingValue = billing.await()
-        _state.update {
-            it.copy(
-                connectorStatuses = connectorValues.associateBy(ConnectorStatus::connectorId),
-                billing = billingValue,
+        applyConnectorSnapshot(connectorValues)
+        _state.update { it.copy(billing = billingValue) }
+    }
+
+    private fun applyConnectorSnapshot(statuses: List<ConnectorStatus>) {
+        val knownIds = ConnectorCatalog.all.mapTo(mutableSetOf()) { it.id }
+        val connectedIds = statuses.asSequence()
+            .filter { it.connected && it.connectorId in knownIds }
+            .map(ConnectorStatus::connectorId)
+            .distinct()
+            .sorted()
+            .toList()
+        val connectedSet = connectedIds.toSet()
+        _state.update { current ->
+            current.copy(
+                selectedConnectorIds = connectedIds,
+                connectorStatuses = statuses.associateBy(ConnectorStatus::connectorId),
+                bots = current.bots.map { bot ->
+                    bot.copy(connectorIds = bot.connectorIds.filter(connectedSet::contains))
+                },
             )
         }
+        persist()
     }
 
     private suspend fun pollSignIn(attemptId: String) {

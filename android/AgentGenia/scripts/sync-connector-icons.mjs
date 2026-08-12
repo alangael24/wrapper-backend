@@ -6,6 +6,7 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, "../../..");
 const drawableDirectory = path.join(repositoryRoot, "android/AgentGenia/app/src/main/res/drawable");
 const bitmapDirectory = path.join(repositoryRoot, "android/AgentGenia/app/src/main/res/drawable-nodpi");
+const iosAssetDirectory = path.join(repositoryRoot, "ios/AgentGenia/AgentGenia/Assets.xcassets");
 const simpleIconsRoot = path.join(repositoryRoot, "node_modules/simple-icons");
 const customSource = path.join(repositoryRoot, "desktop/src/connector-logo-data.ts");
 
@@ -38,12 +39,25 @@ for (const match of customText.matchAll(/  "([^"]+)": "data:image\/(png|jpeg);ba
 
 fs.mkdirSync(drawableDirectory, { recursive: true });
 fs.mkdirSync(bitmapDirectory, { recursive: true });
+fs.mkdirSync(iosAssetDirectory, { recursive: true });
 for (const [connectorId, [kind, source]] of Object.entries(icons)) {
   const resourceName = `logo_${connectorId.replaceAll("-", "_")}`;
+  const iosImageSet = path.join(iosAssetDirectory, `${resourceName}.imageset`);
+  fs.rmSync(iosImageSet, { recursive: true, force: true });
+  fs.mkdirSync(iosImageSet, { recursive: true });
   if (kind === "custom") {
     const value = custom.get(source);
     if (!value) throw new Error(`Missing custom icon: ${source}`);
     fs.writeFileSync(path.join(bitmapDirectory, `${resourceName}.${value.extension}`), value.data);
+    const images = ["1x", "2x", "3x"].map((scale) => {
+      const filename = `${resourceName}@${scale}.${value.extension}`;
+      fs.writeFileSync(path.join(iosImageSet, filename), value.data);
+      return { filename, idiom: "universal", scale };
+    });
+    fs.writeFileSync(
+      path.join(iosImageSet, "Contents.json"),
+      `${JSON.stringify({ images, info: { author: "xcode", version: 1 } }, null, 2)}\n`,
+    );
     continue;
   }
   const item = metadata.find((candidate) => candidate.slug === source);
@@ -53,6 +67,17 @@ for (const [connectorId, [kind, source]] of Object.entries(icons)) {
   if (!pathData) throw new Error(`Missing path: ${source}`);
   const vector = `<?xml version="1.0" encoding="utf-8"?>\n<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="24" android:viewportHeight="24">\n    <path android:fillColor="#${item.hex}" android:pathData="${pathData}" />\n</vector>\n`;
   fs.writeFileSync(path.join(drawableDirectory, `${resourceName}.xml`), vector);
+  const iosFilename = `${resourceName}.svg`;
+  const brandedSvg = svg.replace("<svg ", `<svg fill="#${item.hex}" `);
+  fs.writeFileSync(path.join(iosImageSet, iosFilename), brandedSvg);
+  fs.writeFileSync(
+    path.join(iosImageSet, "Contents.json"),
+    `${JSON.stringify({
+      images: [{ filename: iosFilename, idiom: "universal" }],
+      info: { author: "xcode", version: 1 },
+      properties: { "preserves-vector-representation": true },
+    }, null, 2)}\n`,
+  );
 }
 
-console.log(`Synchronized ${Object.keys(icons).length} Android connector icons.`);
+console.log(`Synchronized ${Object.keys(icons).length} Android and iOS connector icons.`);

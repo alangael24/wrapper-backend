@@ -165,10 +165,14 @@ private struct ConnectorRow: View {
         HStack(spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(uiColor: .secondarySystemBackground))
-                Image(systemName: connector.symbol)
-                    .font(.title2)
-                    .foregroundStyle(.primary)
+                    .fill(.white)
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color(uiColor: .separator).opacity(0.35), lineWidth: 1)
+                Image(connector.logoAsset)
+                    .resizable()
+                    .renderingMode(.original)
+                    .scaledToFit()
+                    .padding(9)
             }
             .frame(width: 48, height: 48)
             VStack(alignment: .leading, spacing: 3) {

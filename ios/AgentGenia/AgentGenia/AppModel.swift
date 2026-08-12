@@ -26,6 +26,7 @@ final class AppModel {
 
     private let api: APIClient
     private let stateStore = AccountStateStore()
+    private var connectorPollingTask: Task<Void, Never>?
 
     init(api: APIClient? = nil) {
         self.api = api ?? APIClient(baseURL: AppEnvironment.baseURL)
@@ -59,6 +60,9 @@ final class AppModel {
     }
 
     func signOut() async {
+        connectorPollingTask?.cancel()
+        connectorPollingTask = nil
+        isBusy = false
         await api.signOut()
         account = nil
         profile = nil
@@ -127,19 +131,36 @@ final class AppModel {
         do {
             let snapshot = try await api.connectors()
             connectorStatuses = Dictionary(uniqueKeysWithValues: snapshot.connectors.map { ($0.connectorID, $0) })
+            let knownIDs = Set(ConnectorDefinition.catalog.map(\.id))
+            let connectedIDs = snapshot.connectors
+                .filter { $0.connected && knownIDs.contains($0.connectorID) }
+                .map(\.connectorID)
+                .sorted()
+            let connectedSet = Set(connectedIDs)
+            let changed = selectedConnectorIDs != connectedIDs
+                || bots.contains { !Set($0.connectorIDs).isSubset(of: connectedSet) }
+            selectedConnectorIDs = connectedIDs
+            for index in bots.indices {
+                bots[index].connectorIDs = bots[index].connectorIDs.filter(connectedSet.contains)
+            }
+            if changed { await persist() }
         } catch { report(error) }
     }
 
     func connect(_ connectorID: String) async {
         guard !isBusy else { return }
         isBusy = true
-        defer { isBusy = false }
         do {
             let started = try await api.startConnector(connectorID)
             let url = try trustedHTTPSURL(started.authorizeURL)
             browserRequest = BrowserRequest(url: url, purpose: .connector(connectorID))
-            Task { await pollConnector(attemptID: started.attemptID, connectorID: connectorID) }
-        } catch { report(error) }
+            connectorPollingTask = Task { [weak self] in
+                await self?.pollConnector(attemptID: started.attemptID, connectorID: connectorID)
+            }
+        } catch {
+            isBusy = false
+            report(error)
+        }
     }
 
     func disconnect(_ connectorID: String) async {
@@ -208,6 +229,9 @@ final class AppModel {
     }
 
     func dismissBrowser() {
+        connectorPollingTask?.cancel()
+        connectorPollingTask = nil
+        isBusy = false
         browserRequest = nil
         Task {
             await refreshConnectors()
@@ -242,26 +266,37 @@ final class AppModel {
 
     private func pollConnector(attemptID: String, connectorID: String) async {
         for _ in 0..<300 {
+            guard !Task.isCancelled else { return }
             do {
                 let status = try await api.connectorStatus(attemptID)
                 if status.status == "complete" {
                     if !selectedConnectorIDs.contains(connectorID) { selectedConnectorIDs.append(connectorID) }
+                    connectorPollingTask = nil
+                    isBusy = false
                     browserRequest = nil
                     await persist()
                     await refreshConnectors()
                     return
                 }
                 if status.status == "error" {
+                    connectorPollingTask = nil
+                    isBusy = false
                     browserRequest = nil
                     throw ServiceError(message: status.message ?? "El proveedor rechazó la conexión.", code: "connector_error", status: 400)
                 }
             } catch {
+                guard !Task.isCancelled else { return }
+                connectorPollingTask = nil
+                isBusy = false
                 browserRequest = nil
                 report(error)
                 return
             }
-            try? await Task.sleep(for: .seconds(2))
+            do { try await Task.sleep(for: .seconds(2)) }
+            catch { return }
         }
+        connectorPollingTask = nil
+        isBusy = false
         browserRequest = nil
         report(ServiceError(message: "La conexión expiró.", code: "connector_timeout", status: 408))
     }

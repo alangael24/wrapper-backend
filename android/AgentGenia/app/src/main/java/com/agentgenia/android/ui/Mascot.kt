@@ -2,7 +2,10 @@ package com.agentgenia.android.ui
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.Image
@@ -100,15 +103,19 @@ private fun DrawScope.drawMascotBody(color: Color, shape: BotShape) {
 
 @Composable
 fun ConnectorLogo(name: String, id: String, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(13.dp)
     Box(
-        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(13.dp)),
+        modifier = modifier
+            .background(Color.White, shape)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .65f), shape)
+            .padding(9.dp),
         contentAlignment = Alignment.Center,
     ) {
         Image(
             painter = painterResource(connectorLogoResource(id)),
             contentDescription = name,
             contentScale = ContentScale.Fit,
-            modifier = Modifier.size(31.dp),
+            modifier = Modifier.fillMaxSize(),
         )
     }
 }
