@@ -1,0 +1,21 @@
+ACUERDO DE LICENCIA DE USUARIO FINAL DE AGENT GENIA
+
+Vigente desde el 12 de agosto de 2026.
+
+Agent Genia te concede una licencia personal, limitada, revocable, no exclusiva
+y no transferible para instalar y usar una copia de la aplicación en los
+dispositivos que controles. El uso también está sujeto a los Términos de
+servicio y a las reglas de la tienda desde la que obtuviste la aplicación.
+
+No puedes redistribuir, alquilar, sublicenciar, vender, descompilar, modificar
+ni eludir protecciones de la aplicación salvo que la ley lo permita
+expresamente. Las actualizaciones pueden instalarse automáticamente y quedan
+cubiertas por este acuerdo. Agent Genia conserva todos los derechos no
+concedidos.
+
+Apple, Google y Microsoft no son parte de este acuerdo ni deben prestar soporte
+de Agent Genia. La licencia termina automáticamente si incumples el acuerdo; al
+terminar debes dejar de usar y eliminar la aplicación.
+
+El texto completo aplicable se instala en la carpeta legal de la aplicación y
+se publica junto con los Términos de servicio. Contacto: support@agentgenia.com.

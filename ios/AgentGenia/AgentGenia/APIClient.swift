@@ -11,6 +11,12 @@ enum AppEnvironment {
         else { preconditionFailure("AgentGeniaAPIBaseURL debe ser HTTPS o loopback") }
         return url
     }()
+
+    #if DEBUG
+    static let externalBillingEnabled = true
+    #else
+    static let externalBillingEnabled = false
+    #endif
 }
 
 struct ServiceError: LocalizedError, Sendable {
@@ -185,6 +191,13 @@ actor APIClient {
                 canRefresh: false
             )
         }
+        session = nil
+        try? keychain.clear()
+    }
+
+    func clearLocalSessionForUITesting() {
+        refreshTask?.cancel()
+        refreshTask = nil
         session = nil
         try? keychain.clear()
     }

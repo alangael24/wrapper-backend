@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from "electron";
+import { autoUpdater } from "electron-updater";
 import {
   type AppState,
   type BotDraft,
@@ -118,6 +119,7 @@ function hasUserState(state: AppState): boolean {
 }
 
 app.setName("Agent Genia");
+app.setAppUserModelId("com.agentgenia.desktop");
 
 let mainWindow: BrowserWindow | null = null;
 let computerWindow: BrowserWindow | null = null;
@@ -724,6 +726,25 @@ function rememberComputerViewerUrl(value: string): void {
   }
 }
 
+function configureAutoUpdates(): void {
+  if (!app.isPackaged || smokeTest || process.env.AGENTGENIA_DISABLE_AUTO_UPDATE === "1") return;
+  if (process.platform === "linux" && !process.env.APPIMAGE) return;
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowDowngrade = false;
+  autoUpdater.allowPrerelease = app.getVersion().includes("-");
+
+  const check = (): void => {
+    void autoUpdater.checkForUpdatesAndNotify().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : "unknown update error";
+      console.error(`[updates] ${message}`);
+    });
+  };
+  setTimeout(check, 15_000).unref();
+  setInterval(check, 4 * 60 * 60 * 1_000).unref();
+}
+
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   const userDataPath = app.getPath("userData");
   const wrapperServiceUrl = process.env.WRAPPER_SERVICE_URL?.trim()
@@ -744,6 +765,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   registerDesktopIpc();
   configureDisplayMedia();
   createWindow();
+  configureAutoUpdates();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

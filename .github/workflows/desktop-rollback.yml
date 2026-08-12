@@ -1,0 +1,29 @@
+name: Desktop Update Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Desktop release to withdraw from automatic updates
+        required: true
+        type: string
+      confirm:
+        description: Type WITHDRAW to confirm
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  withdraw:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate explicit confirmation
+        run: test '${{ inputs.confirm }}' = WITHDRAW
+      - name: Remove release from update channel without deleting artifacts
+        run: gh release edit '${{ inputs.release_tag }}' --repo '${{ github.repository }}' --draft
+      - name: Explain recovery path
+        run: echo 'Already-updated clients remain on this version; ship the last known-good source as a higher patch version.'

@@ -1,0 +1,118 @@
+name: Android Play Release
+
+on:
+  push:
+    tags: ["android-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing android-vX.Y.Z tag to publish
+        required: true
+        type: string
+      track:
+        description: Google Play track
+        required: true
+        default: internal
+        type: choice
+        options: [internal, alpha, beta, production]
+      build_revision:
+        description: Retry revision (0-99); increment only if Play already accepted this tag
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: android-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  signed-aab:
+    environment: production-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      PLAY_TRACK: ${{ inputs.track || 'internal' }}
+      BUILD_REVISION: ${{ inputs.build_revision || '0' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+      - name: Require and install signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" && test -n "$STORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+          keystore="$RUNNER_TEMP/agentgenia-upload.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          echo "AGENTGENIA_RELEASE_STORE_FILE=$keystore" >> "$GITHUB_ENV"
+          echo "AGENTGENIA_RELEASE_STORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "AGENTGENIA_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "AGENTGENIA_RELEASE_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+      - name: Verify release tag matches versionName
+        run: |
+          version="$(awk -F '"' '/versionName =/ {print $2; exit}' android/AgentGenia/app/build.gradle.kts)"
+          test "$RELEASE_TAG" = "android-v$version" || { echo "Expected android-v$version"; exit 1; }
+          case "$BUILD_REVISION" in ''|*[!0-9]*) echo "build_revision must be 0-99"; exit 1;; esac
+          test "$BUILD_REVISION" -le 99 || { echo "build_revision must be 0-99"; exit 1; }
+          version_code="$(python3 -c 'import sys; a=[int(x) for x in sys.argv[1].split(".")]; print((a[0]*1000000+a[1]*1000+a[2])*100+int(sys.argv[2]))' "$version" "$BUILD_REVISION")"
+          test "$version_code" -le 2100000000 || { echo "Computed versionCode exceeds Google Play maximum"; exit 1; }
+          echo "AGENTGENIA_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+      - name: Test, lint, and build signed AAB
+        working-directory: android/AgentGenia
+        run: ./gradlew clean testDebugUnitTest lintDebug assembleDebug bundleRelease
+      - name: Verify AAB signature
+        run: jarsigner -verify -verbose -certs android/AgentGenia/app/build/outputs/bundle/release/app-release.aab
+      - name: Generate checksum
+        run: sha256sum android/AgentGenia/app/build/outputs/bundle/release/app-release.aab > android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt
+      - name: Stage an immutable draft GitHub Release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true || { echo "Release already published"; exit 1; }
+            gh release upload "$RELEASE_TAG" \
+              android/AgentGenia/app/build/outputs/bundle/release/app-release.aab \
+              android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              android/AgentGenia/app/build/outputs/bundle/release/app-release.aab \
+              android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt \
+              --draft --verify-tag --generate-notes --title "Agent Genia Android ${RELEASE_TAG#android-v}"
+          fi
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@935ef9c68bb393a8e6116b1575626a7f5be3a7fb
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.agentgenia.android
+          releaseFiles: android/AgentGenia/app/build/outputs/bundle/release/app-release.aab
+          track: ${{ env.PLAY_TRACK }}
+          status: completed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Agent-Genia-Android-${{ env.RELEASE_TAG }}
+          path: android/AgentGenia/app/build/outputs/bundle/release/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish the staged GitHub Release
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest=false
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: android/AgentGenia/app/build/outputs/bundle/release/app-release.aab

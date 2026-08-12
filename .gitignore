@@ -2,6 +2,7 @@
 .venv/
 node_modules/
 desktop/dist/
+release/
 __pycache__/
 *.pyc
 
@@ -17,3 +18,13 @@ secret.key
 
 # macOS
 .DS_Store
+
+# Firma y artefactos de distribución
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+*.jks
+*.keystore
+*.ipa
+*.aab

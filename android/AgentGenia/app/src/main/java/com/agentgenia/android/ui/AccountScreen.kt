@@ -76,6 +76,13 @@ fun AccountScreen(state: AppUiState, model: AppViewModel) {
             val billing = state.billing
             if (billing == null) {
                 item { Text("Consultando tu plan…", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            } else if (!BuildConfig.EXTERNAL_BILLING_ENABLED) {
+                item {
+                    Text(
+                        "Tu plan se administra en agentgenia.com. Esta versión de Google Play no ofrece compras ni enlaces externos de pago.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             } else if (!billing.configured) {
                 item { Text("Los pagos no están disponibles en este momento.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
             } else if (billing.customer) {
@@ -101,7 +108,7 @@ fun AccountScreen(state: AppUiState, model: AppViewModel) {
                 }
                 item {
                     Text(
-                        "La suscripción se completa en el sitio seguro de Agent Genia. Para una publicación en Google Play se debe validar la política de pagos aplicable antes del lanzamiento.",
+                        "La suscripción se completa en el sitio seguro de Agent Genia.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

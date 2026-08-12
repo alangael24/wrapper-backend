@@ -1,0 +1,72 @@
+name: Desktop CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/desktop.yml"
+      - "desktop/**"
+      - "electron-builder.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tests/test_desktop.mjs"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop.yml"
+      - "desktop/**"
+      - "electron-builder.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tests/test_desktop.mjs"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:desktop
+      - run: pnpm test:connectors
+
+  unsigned-package-smoke:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      WINDOWS_APPX_PUBLISHER: "CN=Agent Genia CI"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm pack:desktop
+      - name: Upload unpacked smoke package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-smoke-${{ runner.os }}
+          path: release/**
+          if-no-files-found: error
+          retention-days: 7

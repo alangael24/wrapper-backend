@@ -41,6 +41,11 @@ final class AppModel {
 
     func bootstrap() async {
         guard phase == .loading else { return }
+        if ProcessInfo.processInfo.arguments.contains("-ui-testing") {
+            await api.clearLocalSessionForUITesting()
+            phase = .signedOut
+            return
+        }
         do {
             guard let session = try await api.restoreSession() else {
                 phase = .signedOut

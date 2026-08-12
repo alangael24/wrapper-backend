@@ -1,0 +1,131 @@
+name: iOS TestFlight Release
+
+on:
+  push:
+    tags: ["ios-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing ios-vX.Y.Z tag to upload
+        required: true
+        type: string
+      build_revision:
+        description: Retry revision (0-99); increment only if App Store Connect already accepted this tag
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  archive-and-upload:
+    environment: production-release
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      BUILD_REVISION: ${{ inputs.build_revision || '0' }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      IOS_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Select newest installed Xcode
+        run: sudo xcode-select --switch "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+      - name: Require App Store signing secrets
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          IOS_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          test -n "$IOS_CERTIFICATE_BASE64" && test -n "$IOS_CERTIFICATE_PASSWORD"
+          test -n "$IOS_PROFILE_BASE64" && test -n "$IOS_PROFILE_NAME" && test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_API_KEY_BASE64" && test -n "$APPLE_API_KEY_ID" && test -n "$APPLE_API_ISSUER"
+          certificate="$RUNNER_TEMP/distribution.p12"
+          profile="$RUNNER_TEMP/profile.mobileprovision"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          printf '%s' "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          printf '%s' "$IOS_PROFILE_BASE64" | base64 --decode > "$profile"
+          security create-keychain -p runner "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p runner "$keychain"
+          security import "$certificate" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k runner "$keychain"
+          profile_uuid="$(security cms -D -i "$profile" | plutil -extract UUID raw -)"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$profile" "$HOME/Library/MobileDevice/Provisioning Profiles/$profile_uuid.mobileprovision"
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          api_key="$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$api_key"
+          chmod 600 "$api_key"
+      - name: Verify release tag matches MARKETING_VERSION
+        run: |
+          version="$(xcodebuild -project ios/AgentGenia/AgentGenia.xcodeproj -target AgentGenia -configuration Release -showBuildSettings | awk '/MARKETING_VERSION/ {print $3; exit}')"
+          test "$RELEASE_TAG" = "ios-v$version" || { echo "Expected ios-v$version"; exit 1; }
+          case "$BUILD_REVISION" in ''|*[!0-9]*) echo "build_revision must be 0-99"; exit 1;; esac
+          test "$BUILD_REVISION" -le 99 || { echo "build_revision must be 0-99"; exit 1; }
+          build_number="$(python3 -c 'import sys; a=[int(x) for x in sys.argv[1].split(".")]; print((a[0]*1000000+a[1]*1000+a[2])*100+int(sys.argv[2]))' "$version" "$BUILD_REVISION")"
+          echo "IOS_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+      - name: Run iOS tests before signing
+        run: |
+          device_id="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for runtime in reversed(list(d.values())) for x in runtime if x["name"].startswith("iPhone") and x["isAvailable"]))')"
+          xcrun simctl boot "$device_id" || true
+          xcrun simctl bootstatus "$device_id" -b
+          xcodebuild -project ios/AgentGenia/AgentGenia.xcodeproj -scheme AgentGenia -destination "platform=iOS Simulator,id=$device_id" test
+      - name: Archive signed application
+        run: |
+          xcodebuild \
+            -project ios/AgentGenia/AgentGenia.xcodeproj \
+            -scheme AgentGenia \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AgentGenia.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY='Apple Distribution' \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_NAME" \
+            CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
+            archive
+      - name: Export IPA
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>method</key><string>app-store-connect</string>
+          <key>destination</key><string>export</string>
+          <key>signingStyle</key><string>manual</string>
+          <key>teamID</key><string>$APPLE_TEAM_ID</string>
+          <key>uploadSymbols</key><true/>
+          <key>provisioningProfiles</key><dict>
+          <key>com.agentgenia.ios</key><string>$IOS_PROFILE_NAME</string>
+          </dict></dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/AgentGenia.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+      - name: Validate and upload to App Store Connect
+        run: |
+          ipa="$(find "$RUNNER_TEMP/export" -name '*.ipa' -print -quit)"
+          test -n "$ipa"
+          xcrun altool --validate-app --type ios --file "$ipa" --apiKey "$APPLE_API_KEY_ID" --apiIssuer "$APPLE_API_ISSUER"
+          xcrun altool --upload-app --type ios --file "$ipa" --apiKey "$APPLE_API_KEY_ID" --apiIssuer "$APPLE_API_ISSUER"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Agent-Genia-iOS-${{ env.RELEASE_TAG }}
+          path: |
+            ${{ runner.temp }}/export/*.ipa
+            ${{ runner.temp }}/AgentGenia.xcarchive/dSYMs/**
+          if-no-files-found: error
+          retention-days: 30

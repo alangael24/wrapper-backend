@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: agentgenia-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /readyz
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8787
+      - key: ENFORCE_LIMITS
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: WRAPPER_SECRET
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REDIRECT_URI
+        sync: false
+      - key: STRIPE_ENABLED
+        value: "0"
+      - key: STRIPE_LIVE_MODE
+        value: "1"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PLUS_PRICE_ID
+        sync: false
+      - key: STRIPE_PRO_PRICE_ID
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        sync: false
+      - key: STRIPE_CANCEL_URL
+        sync: false
+      - key: STRIPE_PORTAL_RETURN_URL
+        sync: false
+      - key: COMPOSIO_API_KEY
+        sync: false
+      - key: COMPOSIO_PUBLIC_URL
+        sync: false
+      - key: CONNECTOR_PUBLIC_URL
+        sync: false
+      - key: COMPOSIO_AUTH_CONFIGS_JSON
+        value: "{}"
+      - key: COMPOSIO_TOOLKIT_OVERRIDES_JSON
+        value: "{}"
+      - key: COMPUTERS_ENABLED
+        value: "0"
+      - key: DAYTONA_API_KEY
+        sync: false
+      - key: PI_ENABLED
+        value: "0"

@@ -10,15 +10,16 @@ val releaseStoreFile = releaseSecret("AGENTGENIA_RELEASE_STORE_FILE")
 val releaseStorePassword = releaseSecret("AGENTGENIA_RELEASE_STORE_PASSWORD")
 val releaseKeyAlias = releaseSecret("AGENTGENIA_RELEASE_KEY_ALIAS")
 val releaseKeyPassword = releaseSecret("AGENTGENIA_RELEASE_KEY_PASSWORD")
+val releaseVersionCode = releaseSecret("AGENTGENIA_VERSION_CODE")?.toIntOrNull() ?: 1
 android {
     namespace = "com.agentgenia.android"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.agentgenia.android"
         minSdk = 26
-        targetSdk = 37
-        versionCode = 1
+        targetSdk = 36
+        versionCode = releaseVersionCode
         versionName = "1.0.0"
 
         buildConfigField("String", "API_BASE_URL", "\"https://agentgenia-api.onrender.com\"")
@@ -51,10 +52,12 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            buildConfigField("boolean", "EXTERNAL_BILLING_ENABLED", "true")
         }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            buildConfigField("boolean", "EXTERNAL_BILLING_ENABLED", "false")
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

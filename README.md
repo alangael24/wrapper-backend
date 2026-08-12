@@ -130,7 +130,16 @@ hardcodeadas ni forman parte del onboarding de la aplicación.
 ```bash
 pnpm install
 pnpm desktop
+
+# paquete sin publicar para la plataforma actual
+pnpm pack:desktop
 ```
+
+La distribución usa Electron Builder: macOS genera DMG/PKG/ZIP universal,
+Windows NSIS EXE y AppX/MSIX para Store o MDM, y Linux AppImage/deb/rpm. Las
+releases firmadas nacen de tags `desktop-vX.Y.Z`, publican checksums y alimentan
+el actualizador interno. Consulta [docs/distribution.md](docs/distribution.md)
+antes de crear un tag.
 
 ## App de iOS (SwiftUI)
 
@@ -175,10 +184,10 @@ computadora de cada bot usa los endpoints
 rechaza navegación a otros orígenes.
 
 Stripe se abre fuera del contexto del agente y la app nunca incluye secret
-keys. Antes de enviar esta build al App Store se debe decidir si la compra de
-los planes se ofrece con In-App Purchase o mediante el enlace externo permitido
-para los storefronts y entitlements aplicables; el backend de Stripe sigue
-siendo válido para web y desktop.
+keys. La build Debug puede probar Checkout/Portal; la build Release para App
+Store oculta compras y enlaces externos de pago. Los usuarios conservan acceso
+al plan adquirido en web. Una venta móvil futura requiere StoreKit y validación
+server-side antes de volver a habilitar compras dentro de iOS.
 
 ## App de Android (Kotlin + Jetpack Compose)
 
@@ -215,11 +224,12 @@ HTTPS, salvo un loopback explícito para desarrollo. El WebView de la
 computadora desactiva acceso a archivos, contenido local, mixed content,
 ventanas adicionales y navegación fuera del host firmado.
 
-Antes de publicar en Google Play hay que generar un Android App Bundle firmado,
-completar Data Safety y confirmar si la venta del plan digital debe pasar por
-Google Play Billing en los países/canales de distribución elegidos. La app no
-incluye claves privadas de Stripe y presenta la administración del plan en el
-sitio seguro de Agent Genia.
+La build Release de Google Play no muestra Checkout, Portal ni enlaces externos
+de pago. Los planes comprados en web siguen funcionando al iniciar sesión. Una
+venta móvil futura requiere Google Play Billing y verificación server-side. El
+workflow de release genera y verifica el AAB firmado, lo carga al track elegido y
+conserva checksum/provenance; Data Safety se documenta en
+[docs/store-submission.md](docs/store-submission.md).
 
 Las tareas `bundleRelease` y `assembleRelease` se niegan a terminar sin una
 firma de producción. Define estas variables como secretos del entorno o como
@@ -758,6 +768,28 @@ runtime se agrupan aquí por función.
   Electron o Pi; cada ejecución recibe un grant revocable para un único bot y
   los viewers son URLs firmadas que no se persisten.
 
+## Distribución, despliegue y documentos del producto
+
+El repositorio incluye CI desde clean checkout y pipelines de publicación
+fail-closed para las tres aplicaciones:
+
+- `.github/workflows/release-config.yml`: comprueba versiones coordinadas,
+  archivos obligatorios, acciones fijadas por SHA y YAML válido;
+- `.github/workflows/desktop-release.yml`: firma/notariza Electron, genera
+  instaladores, checksums, metadata de update y GitHub Release;
+- `.github/workflows/ios-release.yml`: prueba, archiva, exporta y carga la IPA a
+  App Store Connect/TestFlight;
+- `.github/workflows/android-release.yml`: prueba, firma, verifica y publica el
+  AAB en Google Play;
+- `Dockerfile` + `render.yaml`: despliegue reproducible del backend, con secretos
+  inyectados por Render.
+
+Las credenciales y el procedimiento exacto están en
+[docs/distribution.md](docs/distribution.md). El código es propietario bajo
+[LICENSE](LICENSE). La operación pública debe enlazar
+[Privacidad](PRIVACY.md), [Términos](TERMS.md), [EULA](EULA.md) y
+[Seguridad](SECURITY.md) desde el website y las fichas de tienda.
+
 ## Tests
 
 ```bash
@@ -768,17 +800,21 @@ runtime se agrupan aquí por función.
 pnpm test:desktop
 pnpm test:connectors
 
-# iOS, sin firma
+# iOS: compila unit/UI tests sin firma y después ejecútalos en un simulador
 xcodebuild \
   -project ios/AgentGenia/AgentGenia.xcodeproj \
   -scheme AgentGenia \
-  -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
-  CODE_SIGNING_ALLOWED=NO build
+  CODE_SIGNING_ALLOWED=NO build-for-testing
 
-# Android (requiere JDK 17 y Android SDK Platform 37)
+xcodebuild \
+  -project ios/AgentGenia/AgentGenia.xcodeproj \
+  -scheme AgentGenia \
+  -destination 'platform=iOS Simulator,name=iPhone 17' test
+
+# Android (requiere JDK 17 y Android SDK Platform 36 estable)
 cd android/AgentGenia
-./gradlew testDebugUnitTest assembleDebug
+./gradlew testDebugUnitTest lintDebug assembleDebug connectedDebugAndroidTest
 ```
 
 Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del

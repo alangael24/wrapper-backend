@@ -1,0 +1,99 @@
+appId: com.agentgenia.desktop
+productName: Agent Genia
+copyright: Copyright © 2026 Agent Genia
+
+directories:
+  output: release/${version}
+  buildResources: desktop/resources
+
+files:
+  - desktop/dist/**
+  - "!desktop/dist/**/*.map"
+  - desktop/renderer/**
+  - package.json
+  - "!node_modules/**"
+
+asar: true
+npmRebuild: false
+compression: maximum
+removePackageScripts: true
+generateUpdatesFilesForAllChannels: true
+
+extraResources:
+  - from: EULA.md
+    to: legal/EULA.md
+  - from: PRIVACY.md
+    to: legal/PRIVACY.md
+  - from: TERMS.md
+    to: legal/TERMS.md
+  - from: LICENSE
+    to: legal/LICENSE
+
+publish:
+  provider: github
+  owner: alangael24
+  repo: wrapper-backend
+  releaseType: release
+
+mac:
+  appId: com.agentgenia.desktop
+  category: public.app-category.productivity
+  icon: desktop/resources/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  notarize: true
+  entitlements: desktop/resources/entitlements.mac.plist
+  entitlementsInherit: desktop/resources/entitlements.mac.plist
+  target:
+    - target: dmg
+      arch: [universal]
+    - target: zip
+      arch: [universal]
+    - target: pkg
+      arch: [universal]
+
+dmg:
+  sign: false
+  license: desktop/resources/eula.txt
+
+pkg:
+  installLocation: /Applications
+  license: desktop/resources/eula.txt
+
+win:
+  appId: com.agentgenia.desktop
+  icon: desktop/resources/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: appx
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  license: desktop/resources/eula.txt
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  deleteAppDataOnUninstall: false
+
+appx:
+  applicationId: AgentGenia
+  displayName: Agent Genia
+  publisher: ${env.WINDOWS_APPX_PUBLISHER}
+  publisherDisplayName: Agent Genia
+  languages: [es-MX, en-US]
+  minVersion: 10.0.17763.0
+  maxVersionTested: 10.0.26100.0
+  backgroundColor: "#F6F1E8"
+
+linux:
+  category: Utility
+  icon: desktop/resources/icons
+  maintainer: Agent Genia
+  target:
+    - AppImage
+    - deb
+    - rpm
+
+artifactName: Agent-Genia-${version}-${os}-${arch}.${ext}

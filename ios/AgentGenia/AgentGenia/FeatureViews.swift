@@ -221,7 +221,10 @@ struct AccountView: View {
             }
             if let billing = model.billing {
                 Section("Suscripción") {
-                    if billing.customer {
+                    if !AppEnvironment.externalBillingEnabled {
+                        Text("Tu plan se administra en agentgenia.com. Esta versión de App Store no ofrece compras ni enlaces externos de pago.")
+                            .foregroundStyle(.secondary)
+                    } else if billing.customer {
                         Button("Administrar suscripción") { Task { await model.openBillingPortal() } }
                     } else if billing.configured {
                         ForEach(["basic", "pro"], id: \.self) { tier in
