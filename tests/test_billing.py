@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -46,6 +47,8 @@ class FakeStripeClient:
     def __init__(self):
         self.checkout_calls: list[dict] = []
         self.portal_calls: list[dict] = []
+        self.retrieve_calls: list[str] = []
+        self.subscriptions: dict[str, dict] = {}
 
     def create_checkout_session(self, **kwargs):
         self.checkout_calls.append(kwargs)
@@ -54,6 +57,10 @@ class FakeStripeClient:
     def create_portal_session(self, **kwargs):
         self.portal_calls.append(kwargs)
         return {"url": "https://billing.stripe.com/p/session/example"}
+
+    def retrieve_subscription(self, subscription_id: str):
+        self.retrieve_calls.append(subscription_id)
+        return self.subscriptions[subscription_id]
 
 
 class TestBilling(unittest.TestCase):
@@ -68,10 +75,18 @@ class TestBilling(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def event(self, event_id: str, event_type: str, obj: dict) -> dict:
+    def event(
+        self,
+        event_id: str,
+        event_type: str,
+        obj: dict,
+        *,
+        created: int = 1_800_000_000,
+    ) -> dict:
         return {
             "id": event_id,
             "type": event_type,
+            "created": created,
             "livemode": True,
             "data": {"object": obj},
         }
@@ -80,7 +95,21 @@ class TestBilling(unittest.TestCase):
         payload, signature = signed(event)
         return self.service.process_webhook(payload, signature)
 
-    def activate_plus(self, event_id: str = "evt_checkout") -> dict:
+    def activate_plus(
+        self,
+        event_id: str = "evt_checkout",
+        *,
+        created: int = 1_800_000_000,
+    ) -> dict:
+        self.client.subscriptions["sub_stripe"] = {
+            "id": "sub_stripe",
+            "customer": "cus_live",
+            "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_end": 1_900_000_000,
+            "metadata": {"user_id": self.user["id"], "tier": "basic"},
+            "items": {"data": [{"price": {"id": PLUS_PRICE}}]},
+        }
         return self.process(self.event(event_id, "checkout.session.completed", {
             "id": "cs_live",
             "customer": "cus_live",
@@ -88,7 +117,7 @@ class TestBilling(unittest.TestCase):
             "client_reference_id": self.user["id"],
             "payment_status": "paid",
             "metadata": {"user_id": self.user["id"], "tier": "basic"},
-        }))
+        }, created=created))
 
     def test_checkout_uses_server_side_price_and_metadata(self):
         response = self.service.create_checkout(self.user, "basic")
@@ -131,6 +160,98 @@ class TestBilling(unittest.TestCase):
         self.assertIsNone(updated["subscription_id"])
         self.assertEqual(self.store.get_subscription("sub_pool")["status"], "available")
 
+    def test_out_of_order_paid_invoice_cannot_restore_canceled_access(self):
+        self.activate_plus(created=1_800_000_100)
+        self.process(self.event(
+            "evt_deleted_newer",
+            "customer.subscription.deleted",
+            {
+                "id": "sub_stripe",
+                "customer": "cus_live",
+                "status": "canceled",
+                "metadata": {"user_id": self.user["id"], "tier": "basic"},
+                "items": {"data": [{"price": {"id": PLUS_PRICE}}]},
+            },
+            created=1_800_000_300,
+        ))
+        self.client.subscriptions["sub_stripe"] = {
+            "id": "sub_stripe",
+            "customer": "cus_live",
+            "status": "canceled",
+            "cancel_at_period_end": False,
+            "current_period_end": 1_800_000_250,
+            "metadata": {"user_id": self.user["id"], "tier": "basic"},
+            "items": {"data": [{"price": {"id": PLUS_PRICE}}]},
+        }
+
+        result = self.process(self.event(
+            "evt_invoice_paid_older",
+            "invoice.paid",
+            {"id": "in_old", "customer": "cus_live", "subscription": "sub_stripe"},
+            created=1_800_000_200,
+        ))
+
+        self.assertTrue(result["stale"])
+        self.assertEqual(self.client.retrieve_calls[-1], "sub_stripe")
+        self.assertEqual(self.store.get_user_by_id(self.user["id"])["tier"], "free")
+        billing = self.store.get_billing_status(self.user["id"])["subscription"]
+        self.assertEqual(billing["status"], "canceled")
+        self.assertEqual(billing["last_stripe_event_created"], 1_800_000_300)
+        recorded = self.store._one(
+            "SELECT stripe_event_created FROM stripe_events WHERE event_id=?",
+            ("evt_invoice_paid_older",),
+        )
+        self.assertEqual(recorded["stripe_event_created"], 1_800_000_200)
+
+    def test_current_stripe_state_blocks_activation_even_for_newer_paid_invoice(self):
+        self.activate_plus(created=1_800_000_100)
+        self.client.subscriptions["sub_stripe"] = {
+            "id": "sub_stripe",
+            "customer": "cus_live",
+            "status": "canceled",
+            "metadata": {"user_id": self.user["id"], "tier": "basic"},
+            "items": {"data": [{"price": {"id": PLUS_PRICE}}]},
+        }
+
+        self.process(self.event(
+            "evt_invoice_paid_newer",
+            "invoice.paid",
+            {"id": "in_new", "customer": "cus_live", "subscription": "sub_stripe"},
+            created=1_800_000_400,
+        ))
+
+        self.assertEqual(self.store.get_user_by_id(self.user["id"])["tier"], "free")
+        billing = self.store.get_billing_status(self.user["id"])["subscription"]
+        self.assertEqual(billing["status"], "canceled")
+        self.assertEqual(billing["last_stripe_event_created"], 1_800_000_400)
+
+    def test_current_subscription_with_unknown_price_cannot_activate(self):
+        self.client.subscriptions["sub_stripe"] = {
+            "id": "sub_stripe",
+            "customer": "cus_live",
+            "status": "active",
+            "metadata": {"user_id": self.user["id"], "tier": "basic"},
+            "items": {"data": [{"price": {"id": "price_not_configured"}}]},
+        }
+        event = self.event(
+            "evt_unknown_price",
+            "checkout.session.completed",
+            {
+                "id": "cs_live",
+                "customer": "cus_live",
+                "subscription": "sub_stripe",
+                "client_reference_id": self.user["id"],
+                "payment_status": "paid",
+                "metadata": {"user_id": self.user["id"], "tier": "basic"},
+            },
+        )
+
+        with self.assertRaises(BillingError) as caught:
+            self.process(event)
+
+        self.assertEqual(caught.exception.code, "stripe_price_not_configured")
+        self.assertEqual(self.store.get_user_by_id(self.user["id"])["tier"], "free")
+
     def test_portal_requires_a_bound_customer(self):
         with self.assertRaises(BillingError):
             self.service.create_portal(self.user)
@@ -143,6 +264,12 @@ class TestBilling(unittest.TestCase):
         payload = b'{"id":"evt"}'
         with self.assertRaises(BillingError):
             verify_webhook_signature(payload, "t=1,v1=nope", "whsec_example", now=1)
+        missing_created = self.event("evt_missing_created", "invoice.paid", {})
+        missing_created.pop("created")
+        body, signature = signed(missing_created)
+        with self.assertRaises(BillingError) as caught:
+            self.service.process_webhook(body, signature)
+        self.assertEqual(caught.exception.code, "invalid_stripe_event")
         test_event = self.event("evt_test", "checkout.session.completed", {})
         test_event["livemode"] = False
         body, signature = signed(test_event)
@@ -175,6 +302,41 @@ class TestBilling(unittest.TestCase):
                 cancel_url="https://example.com/cancel",
                 portal_return_url="https://example.com/account",
             )
+
+    def test_existing_sqlite_billing_tables_gain_event_ordering_columns(self):
+        path = Path(self.tmp.name) / "legacy-billing.sqlite"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE billing_subscriptions (
+              stripe_subscription_id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              tier TEXT NOT NULL,
+              stripe_price_id TEXT,
+              status TEXT NOT NULL,
+              cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+              current_period_end INTEGER,
+              updated_at REAL NOT NULL
+            );
+            CREATE TABLE stripe_events (
+              event_id TEXT PRIMARY KEY,
+              event_type TEXT NOT NULL,
+              processed_at REAL NOT NULL
+            );
+            """
+        )
+        connection.close()
+
+        migrated = Store(path)
+
+        billing_columns = {
+            row["name"] for row in migrated._q("PRAGMA table_info(billing_subscriptions)")
+        }
+        event_columns = {
+            row["name"] for row in migrated._q("PRAGMA table_info(stripe_events)")
+        }
+        self.assertIn("last_stripe_event_created", billing_columns)
+        self.assertIn("stripe_event_created", event_columns)
 
 
 if __name__ == "__main__":

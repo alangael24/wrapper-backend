@@ -79,14 +79,17 @@ Electron nunca recibe la secret key, el webhook secret ni un price ID arbitrario
 El cliente solo solicita `basic` (Plus) o `pro`; el backend resuelve el price ID
 live configurado y el tier no cambia hasta recibir un evento firmado.
 
-1. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
+1. Aplica las migraciones de Supabase, incluida
+   `20260812233100_stripe_event_ordering.sql`, antes de desplegar esta versión
+   del backend.
+2. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
    del host y establece `STRIPE_ENABLED=1`.
-2. Registra `https://TU-BACKEND/v1/billing/webhook` como destino de eventos live.
-3. Suscribe al menos `checkout.session.completed`,
+3. Registra `https://TU-BACKEND/v1/billing/webhook` como destino de eventos live.
+4. Suscribe al menos `checkout.session.completed`,
    `customer.subscription.created`, `customer.subscription.updated`,
    `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` e
    `invoice.payment_action_required`.
-4. Copia el signing secret `whsec_...` al entorno privado como
+5. Copia el signing secret `whsec_...` al entorno privado como
    `STRIPE_WEBHOOK_SECRET`.
 
 Los estados `active` y `trialing` activan acceso. `past_due` conserva el acceso
@@ -704,13 +707,17 @@ runtime se agrupan aquí por función.
 - El signup público siempre crea `free`. Solo una transición autenticada tras
   comprobar el pago puede activar `basic`/`pro` y reclamar capacidad.
 - Los eventos Stripe se verifican con HMAC, tolerancia temporal y `livemode`;
-  `stripe_events.event_id` hace su procesamiento idempotente. Customer,
-  suscripción, usuario, tier y capacidad se enlazan en una sola transacción.
+  `stripe_events.event_id` hace su procesamiento idempotente y
+  `event.created` impide que un webhook antiguo sobrescriba el estado más
+  reciente de una suscripción. Antes de conceder un entitlement pagado, el
+  backend recupera la suscripción actual desde Stripe. Customer, suscripción,
+  usuario, tier y capacidad se enlazan en una sola transacción.
 - `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` solo viven en el backend. El
   arranque rechaza claves test en modo live, URLs inseguras y price IDs inválidos.
-- En SQLite, la asignación usa `BEGIN IMMEDIATE`; en PostgreSQL usa una
-  transacción normal. En ambos motores, `uniq_user_subscription` y la
-  actualización atómica impiden que dos activaciones conserven la misma key.
+- En SQLite, la asignación usa `BEGIN IMMEDIATE`; en PostgreSQL, la misma
+  sección crítica usa una transacción con advisory lock. En ambos motores,
+  `uniq_user_subscription` y la actualización atómica impiden que dos
+  activaciones conserven la misma key.
 - El servidor se niega a arrancar con `ADMIN_TOKEN=cambia-este-token`. En
   producción define un token aleatorio largo y mantenlo fuera del repositorio.
 - Los secretos viven en `data/secret.key` (0600); si usas `WRAPPER_SECRET`

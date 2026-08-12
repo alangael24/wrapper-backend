@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -90,13 +90,16 @@ CREATE TABLE IF NOT EXISTS billing_subscriptions (
   status                  TEXT NOT NULL,
   cancel_at_period_end    INTEGER NOT NULL DEFAULT 0,
   current_period_end      INTEGER,
+  last_stripe_event_created INTEGER NOT NULL DEFAULT 0
+    CHECK (last_stripe_event_created >= 0),
   updated_at              REAL NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS stripe_events (
-  event_id     TEXT PRIMARY KEY,
-  event_type   TEXT NOT NULL,
-  processed_at REAL NOT NULL
+  event_id             TEXT PRIMARY KEY,
+  event_type           TEXT NOT NULL,
+  stripe_event_created INTEGER NOT NULL DEFAULT 0 CHECK (stripe_event_created >= 0),
+  processed_at         REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS connector_credentials (
   user_id         TEXT NOT NULL,
@@ -185,6 +188,23 @@ class Store:
             )
             if str(tier_column[4]).strip("'\"").lower() != "free":
                 self._migrate_users_default_to_free()
+            billing_columns = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(billing_subscriptions)")
+            }
+            if "last_stripe_event_created" not in billing_columns:
+                self._conn.execute(
+                    "ALTER TABLE billing_subscriptions ADD COLUMN "
+                    "last_stripe_event_created INTEGER NOT NULL DEFAULT 0"
+                )
+            stripe_event_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(stripe_events)")
+            }
+            if "stripe_event_created" not in stripe_event_columns:
+                self._conn.execute(
+                    "ALTER TABLE stripe_events ADD COLUMN "
+                    "stripe_event_created INTEGER NOT NULL DEFAULT 0"
+                )
             self._conn.execute(
                 "INSERT INTO kv(k,v) VALUES('schema_version', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -710,7 +730,7 @@ class Store:
         )
         subscription = self._one(
             "SELECT stripe_subscription_id,tier,stripe_price_id,status,cancel_at_period_end,"
-            "current_period_end,updated_at FROM billing_subscriptions "
+            "current_period_end,last_stripe_event_created,updated_at FROM billing_subscriptions "
             "WHERE user_id=? ORDER BY updated_at DESC LIMIT 1",
             (user_id,),
         )
@@ -727,6 +747,13 @@ class Store:
         now = _now()
         event_id = action["event_id"]
         event_type = action["event_type"]
+        stripe_event_created = action["stripe_event_created"]
+        if (
+            not isinstance(stripe_event_created, int)
+            or isinstance(stripe_event_created, bool)
+            or stripe_event_created < 0
+        ):
+            raise ValueError("stripe_event_created debe ser un timestamp Unix válido")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -737,8 +764,10 @@ class Store:
                     return {"duplicate": True}
                 if not action.get("recognized"):
                     self._conn.execute(
-                        "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
-                        (event_id, event_type, now),
+                        "INSERT INTO stripe_events("
+                        "event_id,event_type,stripe_event_created,processed_at"
+                        ") VALUES(?,?,?,?)",
+                        (event_id, event_type, stripe_event_created, now),
                     )
                     self._conn.commit()
                     return {"ignored": True}
@@ -765,12 +794,28 @@ class Store:
                         if user_id and user_id != existing["user_id"]:
                             raise ValueError("La suscripción de Stripe ya pertenece a otro usuario")
                         user_id = existing["user_id"]
+                        last_created = int(existing["last_stripe_event_created"] or 0)
+                        if stripe_event_created < last_created:
+                            self._conn.execute(
+                                "INSERT INTO stripe_events("
+                                "event_id,event_type,stripe_event_created,processed_at"
+                                ") VALUES(?,?,?,?)",
+                                (event_id, event_type, stripe_event_created, now),
+                            )
+                            self._conn.commit()
+                            return {
+                                "ignored": True,
+                                "stale": True,
+                                "last_stripe_event_created": last_created,
+                            }
                 if not user_id or not self._conn.execute(
                     "SELECT 1 FROM users WHERE id=?", (user_id,)
                 ).fetchone():
                     self._conn.execute(
-                        "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
-                        (event_id, event_type, now),
+                        "INSERT INTO stripe_events("
+                        "event_id,event_type,stripe_event_created,processed_at"
+                        ") VALUES(?,?,?,?)",
+                        (event_id, event_type, stripe_event_created, now),
                     )
                     self._conn.commit()
                     return {"ignored": True}
@@ -796,11 +841,13 @@ class Store:
                     self._conn.execute(
                         "INSERT INTO billing_subscriptions("
                         "stripe_subscription_id,user_id,tier,stripe_price_id,status,"
-                        "cancel_at_period_end,current_period_end,updated_at"
-                        ") VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stripe_subscription_id) DO UPDATE SET "
+                        "cancel_at_period_end,current_period_end,last_stripe_event_created,updated_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(stripe_subscription_id) DO UPDATE SET "
                         "tier=excluded.tier,stripe_price_id=excluded.stripe_price_id,status=excluded.status,"
                         "cancel_at_period_end=excluded.cancel_at_period_end,"
-                        "current_period_end=excluded.current_period_end,updated_at=excluded.updated_at",
+                        "current_period_end=excluded.current_period_end,"
+                        "last_stripe_event_created=excluded.last_stripe_event_created,"
+                        "updated_at=excluded.updated_at",
                         (
                             stripe_subscription_id,
                             user_id,
@@ -809,6 +856,7 @@ class Store:
                             status,
                             int(bool(action.get("cancel_at_period_end"))),
                             action.get("current_period_end"),
+                            stripe_event_created,
                             now,
                         ),
                     )
@@ -822,8 +870,10 @@ class Store:
                     self._transition_user_tier_locked(user_id, "free", needs_subscription=False)
 
                 self._conn.execute(
-                    "INSERT INTO stripe_events(event_id,event_type,processed_at) VALUES(?,?,?)",
-                    (event_id, event_type, now),
+                    "INSERT INTO stripe_events("
+                    "event_id,event_type,stripe_event_created,processed_at"
+                    ") VALUES(?,?,?,?)",
+                    (event_id, event_type, stripe_event_created, now),
                 )
                 self._conn.commit()
                 return {"user_id": user_id, "tier": tier if tier_action == "activate" else None}

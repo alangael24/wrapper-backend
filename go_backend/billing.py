@@ -147,6 +147,27 @@ class StripeClient:
         except (OSError, TimeoutError) as exc:
             raise StripeApiError(f"No se pudo contactar Stripe: {exc}", status=502, code="stripe_unavailable") from exc
 
+    def _get(self, path: str) -> dict:
+        request = urllib.request.Request(f"{self.api_base}{path}", method="GET")
+        request.add_header("Authorization", f"Bearer {self.secret_key}")
+        request.add_header("User-Agent", "Agentgenia-Wrapper/1.0")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read())
+                message = payload.get("error", {}).get("message") or f"Stripe respondió HTTP {exc.code}"
+            except Exception:
+                message = f"Stripe respondió HTTP {exc.code}"
+            raise StripeApiError(message, status=502, code="stripe_api_error") from exc
+        except (OSError, TimeoutError) as exc:
+            raise StripeApiError(
+                f"No se pudo contactar Stripe: {exc}",
+                status=502,
+                code="stripe_unavailable",
+            ) from exc
+
     def create_checkout_session(
         self,
         *,
@@ -184,6 +205,10 @@ class StripeClient:
             ("customer", customer_id),
             ("return_url", return_url),
         ])
+
+    def retrieve_subscription(self, subscription_id: str) -> dict:
+        encoded_id = urllib.parse.quote(subscription_id, safe="")
+        return self._get(f"/subscriptions/{encoded_id}")
 
 
 def verify_webhook_signature(
@@ -334,6 +359,71 @@ class BillingService:
             raise StripeApiError("Stripe no devolvió una URL de portal válida", status=502, code="invalid_portal_url")
         return {"portal_url": url}
 
+    def _refresh_activation_from_stripe(self, action: dict[str, Any]) -> None:
+        """Revalida en Stripe antes de conceder acceso pagado."""
+        subscription_id = action.get("stripe_subscription_id")
+        if not subscription_id:
+            action["tier_action"] = "keep"
+            return
+        subscription = self.client.retrieve_subscription(subscription_id)
+        if _string(subscription.get("id")) != subscription_id:
+            raise StripeApiError(
+                "Stripe devolvió una suscripción distinta a la solicitada",
+                status=502,
+                code="invalid_stripe_subscription",
+            )
+
+        metadata = _metadata(subscription)
+        current_user_id = _string(metadata.get("user_id"))
+        current_customer_id = _string(subscription.get("customer"))
+        if action.get("user_id") and current_user_id and action["user_id"] != current_user_id:
+            raise BillingError(
+                "La suscripción de Stripe no corresponde al usuario del evento",
+                status=400,
+                code="stripe_subscription_mismatch",
+            )
+        if (
+            action.get("customer_id")
+            and current_customer_id
+            and action["customer_id"] != current_customer_id
+        ):
+            raise BillingError(
+                "La suscripción de Stripe no corresponde al customer del evento",
+                status=400,
+                code="stripe_subscription_mismatch",
+            )
+
+        price_id = _price_from_subscription(subscription)
+        status = _string(subscription.get("status")) or "unknown"
+        tier = self.config.price_tiers.get(price_id or "")
+        if status in ACTIVE_STATUSES:
+            if not tier:
+                raise BillingError(
+                    "La suscripción activa usa un price ID no configurado",
+                    status=400,
+                    code="stripe_price_not_configured",
+                )
+            tier_action = "activate"
+        elif status in TERMINAL_STATUSES:
+            tier_action = "free"
+        else:
+            tier_action = "keep"
+        action.update({
+            "user_id": current_user_id or action.get("user_id"),
+            "customer_id": current_customer_id or action.get("customer_id"),
+            "stripe_price_id": price_id or action.get("stripe_price_id"),
+            "tier": tier or action.get("tier"),
+            "status": status,
+            "cancel_at_period_end": bool(subscription.get("cancel_at_period_end")),
+            "current_period_end": (
+                subscription.get("current_period_end")
+                if isinstance(subscription.get("current_period_end"), int)
+                and not isinstance(subscription.get("current_period_end"), bool)
+                else None
+            ),
+            "tier_action": tier_action,
+        })
+
     def process_webhook(self, payload: bytes, signature_header: str) -> dict:
         self._require_enabled()
         event = verify_webhook_signature(
@@ -346,13 +436,22 @@ class BillingService:
             raise BillingError("El modo del evento Stripe no coincide", status=400, code="stripe_mode_mismatch")
         event_id = _string(event.get("id"))
         event_type = _string(event.get("type"))
+        event_created = event.get("created")
         data = event.get("data")
         obj = data.get("object") if isinstance(data, dict) else None
-        if not event_id or not event_type or not isinstance(obj, dict):
+        if (
+            not event_id
+            or not event_type
+            or not isinstance(event_created, int)
+            or isinstance(event_created, bool)
+            or event_created <= 0
+            or not isinstance(obj, dict)
+        ):
             raise BillingError("Evento Stripe incompleto", status=400, code="invalid_stripe_event")
         action: dict[str, Any] = {
             "event_id": event_id,
             "event_type": event_type,
+            "stripe_event_created": event_created,
             "recognized": event_type in SUPPORTED_EVENTS,
             "user_id": None,
             "customer_id": _string(obj.get("customer")),
@@ -394,5 +493,7 @@ class BillingService:
                 "status": "active" if event_type == "invoice.paid" else "past_due",
                 "tier_action": "activate" if event_type == "invoice.paid" else "keep",
             })
+        if action["tier_action"] == "activate":
+            self._refresh_activation_from_stripe(action)
         result = self.store.apply_billing_event(action)
         return {"received": True, **result}
