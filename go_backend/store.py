@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -98,6 +98,17 @@ CREATE TABLE IF NOT EXISTS stripe_events (
   event_type   TEXT NOT NULL,
   processed_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS connector_credentials (
+  user_id         TEXT NOT NULL,
+  connector_id    TEXT NOT NULL,
+  credentials_enc BLOB NOT NULL,
+  key_id           TEXT NOT NULL,
+  account_label    TEXT,
+  created_at       REAL NOT NULL,
+  updated_at       REAL NOT NULL,
+  PRIMARY KEY(user_id, connector_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -113,6 +124,8 @@ CREATE INDEX IF NOT EXISTS idx_account_session_account ON account_sessions(accou
 CREATE INDEX IF NOT EXISTS idx_account_session_refresh ON account_sessions(refresh_token_hash);
 CREATE INDEX IF NOT EXISTS idx_billing_subscription_user ON billing_subscriptions(user_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_billing_subscription_status ON billing_subscriptions(status);
+CREATE INDEX IF NOT EXISTS idx_connector_credentials_user
+  ON connector_credentials(user_id, updated_at);
 """
 
 
@@ -205,6 +218,52 @@ class Store:
         with self._lock:
             self._conn.execute(sql, params)
             self._conn.commit()
+
+    # ---------- credenciales privadas de conectores ----------
+    def upsert_connector_credentials(
+        self,
+        *,
+        user_id: str,
+        connector_id: str,
+        credentials_enc: bytes,
+        key_id: str,
+        account_label: str,
+    ) -> None:
+        now = _now()
+        self._exec(
+            "INSERT INTO connector_credentials("
+            "user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(user_id,connector_id) DO UPDATE SET "
+            "credentials_enc=excluded.credentials_enc,key_id=excluded.key_id,"
+            "account_label=excluded.account_label,updated_at=excluded.updated_at",
+            (
+                user_id,
+                connector_id,
+                credentials_enc,
+                key_id,
+                account_label[:160],
+                now,
+                now,
+            ),
+        )
+
+    def get_connector_credentials(self, user_id: str, connector_id: str) -> dict | None:
+        row = self._one(
+            "SELECT user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at "
+            "FROM connector_credentials WHERE user_id=? AND connector_id=?",
+            (user_id, connector_id),
+        )
+        return dict(row) if row else None
+
+    def delete_connector_credentials(self, user_id: str, connector_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM connector_credentials WHERE user_id=? AND connector_id=?",
+                (user_id, connector_id),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,

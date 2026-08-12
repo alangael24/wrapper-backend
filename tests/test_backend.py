@@ -20,6 +20,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +40,7 @@ from go_backend.connector_adapters import (  # noqa: E402
     ComposioConnectorAdapter,
     ComposioConnectorGateway,
 )
+from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.store import NoSubscriptionAvailable, Store  # noqa: E402
 
 
@@ -1361,6 +1363,67 @@ class TestBackend(unittest.TestCase):
             gateway.start("usr_alice", "github")
         self.assertEqual(error.exception.status, 429)
         self.assertEqual(error.exception.code, "connector_rate_limit")
+
+    def test_native_connector_fallback_is_encrypted_isolated_and_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "native.sqlite")
+            alice = store.create_user("alice-key", "Alice", "alice@example.com")
+            bob = store.create_user("bob-key", "Bob", "bob@example.com")
+            native = NativeConnectorGateway(
+                store=store,
+                secret_env="native-test-secret",
+                secret_path=Path(tmp) / "secret.key",
+                public_base_url="https://agentgenia-api.onrender.com",
+            )
+            gateway = ComposioConnectorGateway(
+                client=FakeComposioClient(),
+                native_gateway=native,
+            )
+
+            self.assertEqual(gateway.describe("nooks")["driver"], "native")
+            self.assertTrue(gateway.describe("nooks")["available"])
+            self.assertFalse(gateway.describe("loom")["available"])
+
+            started = gateway.start(alice["id"], "nooks")
+            self.assertTrue(started["attempt_id"].startswith("nat_"))
+            page = native.setup_html(started["attempt_id"]).decode()
+            self.assertIn("Conectar Nooks", page)
+            self.assertIn('type="password"', page)
+
+            complete_page = native.submit(
+                started["attempt_id"],
+                {"access_token": "nooks-api-super-secret", "account_label": "Ventas"},
+            ).decode()
+            self.assertIn("Cuenta conectada", complete_page)
+            row = store.get_connector_credentials(alice["id"], "nooks")
+            self.assertIsNotNone(row)
+            self.assertNotIn(b"nooks-api-super-secret", bytes(row["credentials_enc"]))
+            self.assertTrue(gateway.status(alice["id"], "nooks")["connected"])
+            self.assertFalse(gateway.status(bob["id"], "nooks")["connected"])
+            self.assertEqual(gateway.poll(alice["id"], started["attempt_id"])["status"], "complete")
+
+            with (
+                patch(
+                    "go_backend.native_connectors.socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ),
+                patch(
+                    "go_backend.native_connectors._request_json",
+                    return_value={"data": [{"id": "call-1"}]},
+                ) as request_json,
+            ):
+                result = gateway.execute(alice["id"], "nooks", "list_calls", {"page[size]": 25})
+            self.assertEqual(result["data"][0]["id"], "call-1")
+            url = request_json.call_args.args[0]
+            self.assertIn("partner-api.nooks.in/v1/calls", url)
+            self.assertIn("page%5Bsize%5D=25", url)
+            self.assertEqual(
+                request_json.call_args.kwargs["headers"]["Authorization"],
+                "Bearer nooks-api-super-secret",
+            )
+
+            gateway.disconnect(alice["id"], "nooks")
+            self.assertFalse(gateway.status(alice["id"], "nooks")["connected"])
 
     def test_connector_account_routes_are_authenticated_and_execution_is_internal_only(self):
         status, body = self.ws.req("GET", "/v1/connectors")

@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .connectors import CONNECTOR_CATALOG, ConnectorBrokerError
+from .native_connectors import NativeConnectorGateway
 
 
 ACTIVE = "ACTIVE"
@@ -106,6 +107,7 @@ class ComposioConnectorGateway:
         auth_configs: dict[str, str] | None = None,
         toolkit_overrides: dict[str, str] | None = None,
         client: Any = None,
+        native_gateway: NativeConnectorGateway | None = None,
         now=time.monotonic,
         attempt_ttl_seconds: int = AUTH_ATTEMPT_TTL_SECONDS,
     ):
@@ -120,6 +122,7 @@ class ComposioConnectorGateway:
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.RLock()
         self.client = client
+        self.native_gateway = native_gateway
         if self.client is None and self.api_key:
             try:
                 from composio import Composio
@@ -138,7 +141,7 @@ class ComposioConnectorGateway:
             1 for connector_id in CONNECTOR_CATALOG if self.describe(connector_id)["available"]
         )
         return {
-            "configured": self.configured,
+            "configured": self.configured or bool(self.native_gateway and self.native_gateway.configured),
             "available_connectors": available,
             "catalog_connectors": len(CONNECTOR_CATALOG),
         }
@@ -155,15 +158,20 @@ class ComposioConnectorGateway:
             reason = "Este conector requiere un Auth Config propio en Composio."
         else:
             reason = ""
+        if reason and self.native_gateway and self.native_gateway.supports(connector_id):
+            return self.native_gateway.describe(connector_id)
         return {
             "connector_id": connector_id,
             "toolkit": toolkit,
+            "driver": "composio",
             "available": not reason,
             "reason": reason,
         }
 
     def status(self, user_id: str, connector_id: str) -> dict[str, Any]:
         description = self.describe(connector_id)
+        if description.get("driver") == "native":
+            return self.native_gateway.status(user_id, connector_id)  # type: ignore[union-attr]
         if not description["available"]:
             return {**description, "connected": False, "account": ""}
         accounts = self.client.connected_accounts.list(
@@ -184,7 +192,12 @@ class ComposioConnectorGateway:
         """Devuelve todo el catalogo usando una sola consulta a Composio."""
         descriptions = [self.describe(connector_id) for connector_id in CONNECTOR_CATALOG]
         if not self.configured:
-            return [{**item, "connected": False, "account": ""} for item in descriptions]
+            return [
+                self.native_gateway.status(user_id, item["connector_id"])
+                if item.get("driver") == "native" and self.native_gateway
+                else {**item, "connected": False, "account": ""}
+                for item in descriptions
+            ]
         try:
             accounts_page = self.client.connected_accounts.list(
                 user_ids=[user_id],
@@ -199,14 +212,17 @@ class ComposioConnectorGateway:
             toolkit = _account_toolkit(account)
             if toolkit and toolkit not in by_toolkit:
                 by_toolkit[toolkit] = account
-        return [
-            {
-                **item,
-                "connected": item["available"] and item["toolkit"] in by_toolkit,
-                "account": _account_label(by_toolkit.get(item["toolkit"])),
-            }
-            for item in descriptions
-        ]
+        snapshot: list[dict[str, Any]] = []
+        for item in descriptions:
+            if item.get("driver") == "native":
+                snapshot.append(self.native_gateway.status(user_id, item["connector_id"]))  # type: ignore[union-attr]
+            else:
+                snapshot.append({
+                    **item,
+                    "connected": item["available"] and item["toolkit"] in by_toolkit,
+                    "account": _account_label(by_toolkit.get(item["toolkit"])),
+                })
+        return snapshot
 
     def start(self, user_id: str, connector_id: str) -> dict[str, str]:
         self._prune()
@@ -214,6 +230,8 @@ class ComposioConnectorGateway:
         description = self.describe(connector_id)
         if not description["available"]:
             raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
+        if description.get("driver") == "native":
+            return self.native_gateway.start(user_id, connector_id)  # type: ignore[union-attr]
         session = self._session(user_id, connector_id)
         callback_url = (
             f"{self.public_base_url}/connections/complete" if self.public_base_url else None
@@ -245,6 +263,8 @@ class ComposioConnectorGateway:
         return {"attempt_id": attempt_id, "authorize_url": authorize_url}
 
     def poll(self, user_id: str, attempt_id: str) -> dict[str, Any]:
+        if attempt_id.startswith("nat_") and self.native_gateway:
+            return self.native_gateway.poll(user_id, attempt_id)
         self._prune()
         with self._lock:
             attempt = self._attempts.get(attempt_id)
@@ -282,8 +302,11 @@ class ComposioConnectorGateway:
 
     def disconnect(self, user_id: str, connector_id: str) -> dict[str, bool]:
         description = self.describe(connector_id)
+        native_result = None
+        if self.native_gateway and self.native_gateway.supports(connector_id):
+            native_result = self.native_gateway.disconnect(user_id, connector_id)
         if not description["toolkit"] or not self.configured:
-            return {"disconnected": True}
+            return native_result or {"disconnected": True}
         try:
             accounts = self.client.connected_accounts.list(
                 user_ids=[user_id],
@@ -309,6 +332,8 @@ class ComposioConnectorGateway:
         description = self.describe(connector_id)
         if not description["available"]:
             raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
+        if description.get("driver") == "native":
+            return self.native_gateway.execute(user_id, connector_id, operation, arguments)  # type: ignore[union-attr]
         session = self._session(user_id, connector_id)
         try:
             search = session.search(

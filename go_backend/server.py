@@ -62,6 +62,7 @@ from .connector_adapters import (
     ComposioConnectorGateway,
     parse_config_mapping,
 )
+from .native_connectors import NativeConnectorGateway
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
 from .go_prices import estimate_cost_usd
@@ -162,6 +163,9 @@ class Config:
         self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
         self.composio_api_key = (os.environ.get("COMPOSIO_API_KEY") or "").strip()
         self.composio_public_url = (os.environ.get("COMPOSIO_PUBLIC_URL") or "").strip()
+        self.connector_public_url = (
+            os.environ.get("CONNECTOR_PUBLIC_URL") or self.composio_public_url
+        ).strip()
         self.composio_auth_configs_json = os.environ.get("COMPOSIO_AUTH_CONFIGS_JSON", "")
         self.composio_toolkit_overrides_json = os.environ.get(
             "COMPOSIO_TOOLKIT_OVERRIDES_JSON", ""
@@ -269,6 +273,24 @@ def html_response(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> 
     handler.wfile.write(body)
 
 
+def connector_html_response(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
+    """HTML hardened for the unauthenticated, one-time connector setup form."""
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Referrer-Policy", "no-referrer")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header(
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    )
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -305,6 +327,13 @@ class Backend:
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
         try:
+            self.native_connector_gateway = NativeConnectorGateway(
+                store=self.store,
+                secret_env=cfg.wrapper_secret,
+                secret_path=cfg.secret_file,
+                public_base_url=cfg.connector_public_url,
+                attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
+            )
             self.connector_gateway = ComposioConnectorGateway(
                 api_key=cfg.composio_api_key,
                 public_base_url=cfg.composio_public_url,
@@ -317,10 +346,11 @@ class Backend:
                     name="COMPOSIO_TOOLKIT_OVERRIDES_JSON",
                 ),
                 attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
+                native_gateway=self.native_connector_gateway,
             )
         except (RuntimeError, ValueError) as exc:
             raise UnsafeConfigurationError(f"Configuracion de conectores invalida: {exc}") from exc
-        for connector_id in self.connector_gateway.toolkits:
+        for connector_id in CONNECTOR_CATALOG:
             self.connectors.register_adapter(
                 connector_id,
                 ComposioConnectorAdapter(self.connector_gateway, connector_id),
@@ -475,6 +505,39 @@ class Backend:
         if not isinstance(connector_id, str):
             raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
         json_response(handler, 200, self.connector_gateway.disconnect(user["id"], connector_id))
+
+    def handle_native_connector_setup(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        connector_html_response(
+            handler,
+            200,
+            self.native_connector_gateway.setup_html(attempt_id),
+        )
+
+    def handle_native_connector_submit(
+        self, handler: BaseHTTPRequestHandler, attempt_id: str
+    ) -> None:
+        content_type = (handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/x-www-form-urlencoded":
+            raise ConnectorBrokerError(415, "Formulario no compatible", "bad_connector_credentials")
+        try:
+            length = int(handler.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ConnectorBrokerError(400, "Content-Length invalido", "bad_connector_credentials") from exc
+        if length <= 0 or length > 64 * 1024:
+            raise ConnectorBrokerError(413, "Formulario demasiado grande", "bad_connector_credentials")
+        try:
+            raw = handler.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConnectorBrokerError(400, "Formulario invalido", "bad_connector_credentials") from exc
+        parsed = parse_qs(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=20)
+        values = {key: items[-1] for key, items in parsed.items() if items}
+        connector_html_response(
+            handler,
+            200,
+            self.native_connector_gateway.submit(attempt_id, values),
+        )
 
     def handle_signup(self, handler: BaseHTTPRequestHandler) -> None:
         body = self.read_json(handler) or {}
@@ -1041,6 +1104,14 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_logout(self)
             elif self.command == "GET" and path == "/connections/complete":
                 html_response(self, 200, completion_html())
+            elif path.startswith("/v1/connectors/native/setup/"):
+                attempt_id = path.rsplit("/", 1)[-1]
+                if self.command == "GET":
+                    backend.handle_native_connector_setup(self, attempt_id)
+                elif self.command == "POST":
+                    backend.handle_native_connector_submit(self, attempt_id)
+                else:
+                    error_response(self, 405, "Metodo no permitido", "method_not_allowed")
             elif self.command == "GET" and path.startswith("/v1/connectors/status/"):
                 backend.handle_connector_auth_status(self, path.rsplit("/", 1)[-1])
             elif self.command == "POST" and path == "/v1/connectors/start":

@@ -180,11 +180,18 @@ Auth. Los proveedores que requieren una app propia se activan con
 Agent Genia y después el Connect Link oficial; los tokens administrados
 permanecen en Composio, nunca en el renderer ni en Pi.
 
-Los demás proveedores que todavía exigen credenciales propias o no tienen un
-toolkit compatible se muestran como `Próximamente`: seleccionarlos solo los
-asigna al bot y no inventa una autenticación. `COMPOSIO_API_KEY`, los Auth
-Config IDs y cualquier client secret viven exclusivamente en el entorno privado
-de `wrapper-backend`.
+Cuando Composio no ofrece Managed Auth, `wrapper-backend` usa su adaptador REST
+first-party para Nooks, Rippling, Salesloft, Tiendanube, Clay, DocuSign,
+NetSuite, Outreach, Ramp, Tableau, WooCommerce, Workday y ZoomInfo. El usuario
+abre un formulario de un solo uso y aporta la credencial de API que le entrega
+su proveedor; el backend la cifra con `WRAPPER_SECRET` en
+`connector_credentials`. Electron y Pi nunca reciben el secreto. Si hay un Auth
+Config de Composio para el mismo proveedor, se prefiere su OAuth administrado.
+
+Loom permanece explícitamente como `Próximamente`: su portal público ofrece el
+Record SDK para grabar video, pero no una API de cuenta para buscar videos o
+leer transcripciones. No se presenta como conectado porque esas operaciones no
+serían reales.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con
@@ -198,8 +205,8 @@ Además de las herramientas iniciales, incluye Trello, monday.com, Intercom,
 Zendesk, Box, Dropbox, DocuSign, Calendly, Loom, Outreach, Salesloft, Apollo,
 Clay, ZoomInfo, Nooks, Stripe, QuickBooks, NetSuite, Ramp, Workday, Rippling,
 Ashby, Greenhouse, Vercel, Tableau, Hex, Amplitude, Mixpanel, Snowflake,
-Databricks y Mailchimp. Que aparezcan en el catálogo no implica autenticación:
-sin app OAuth y adaptador registrados se muestran como `Próximamente`.
+Databricks y Mailchimp. Un conector solo se habilita si tiene un toolkit OAuth
+configurado o uno de los adaptadores first-party anteriores.
 
 La sesión de Electron y el broker efímero de Pi son límites de confianza
 distintos. Conectar una cuenta crea una conexión real en Composio; al ejecutar,
@@ -407,6 +414,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 |---|---|---|
 | `PORT` | `8787` | Puerto HTTP |
 | `WRAPPER_SECRET` | auto | Clave maestra para cifrar keys Go |
+| `CONNECTOR_PUBLIC_URL` | `COMPOSIO_PUBLIC_URL` | URL HTTPS para los formularios first-party de conexión |
 | `ADMIN_TOKEN` | auto-generado | Token de admin; el valor publicado `cambia-este-token` impide arrancar |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
