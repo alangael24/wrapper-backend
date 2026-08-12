@@ -4,7 +4,9 @@ import { Type } from "typebox";
 const BROKER_URL_ENV = "PI_CONNECTOR_BROKER_URL";
 const RUN_TOKEN_ENV = "PI_CONNECTOR_RUN_TOKEN";
 const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_COMPUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
+const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 
 const PROVIDERS = Object.freeze([
   provider("google-workspace", "Google Workspace", "Gmail, Calendar, Drive, Contacts y Sheets"),
@@ -96,9 +98,9 @@ function brokerConfig(): { baseUrl: string; token: string } {
   return { baseUrl: url.toString().replace(/\/$/, ""), token };
 }
 
-async function readLimited(response: Response): Promise<string> {
+async function readLimited(response: Response, maxBytes = MAX_RESPONSE_BYTES): Promise<string> {
   const length = Number(response.headers.get("content-length") ?? "0");
-  if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
+  if (Number.isFinite(length) && length > maxBytes) {
     throw new Error("La respuesta del conector excedio el limite permitido.");
   }
   if (!response.body) return "";
@@ -110,7 +112,7 @@ async function readLimited(response: Response): Promise<string> {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) throw new Error("La respuesta del conector excedio el limite permitido.");
+      if (total > maxBytes) throw new Error("La respuesta del conector excedio el limite permitido.");
       chunks.push(value);
     }
   } catch (error) {
@@ -135,7 +137,10 @@ async function brokerRequest(
 ): Promise<{ status: number; ok: boolean; body: unknown }> {
   const { baseUrl, token } = brokerConfig();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("Connector request timed out")), REQUEST_TIMEOUT_MS);
+  const timeoutMs = path.startsWith("/v1/internal/computers/")
+    ? COMPUTER_REQUEST_TIMEOUT_MS
+    : REQUEST_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(new Error("Broker request timed out")), timeoutMs);
   const abort = () => controller.abort(parentSignal?.reason);
   parentSignal?.addEventListener("abort", abort, { once: true });
   try {
@@ -148,7 +153,10 @@ async function brokerRequest(
         "X-Connector-Run-Token": token,
       },
     });
-    const text = await readLimited(response);
+    const text = await readLimited(
+      response,
+      path.startsWith("/v1/internal/computers/") ? MAX_COMPUTER_RESPONSE_BYTES : MAX_RESPONSE_BYTES,
+    );
     let body: unknown = {};
     if (text) {
       try {
@@ -226,8 +234,8 @@ export default function connectorExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "connector_search",
     label: "Connector Search",
-    description: "Busca y activa solamente los conectores permitidos para este bot y esta ejecucion.",
-    promptSnippet: "Busca conectores cuando una tarea necesite correo, calendario, CRM, trabajo, diseno o ecommerce",
+    description: "Busca y activa solamente los conectores o la computadora permitidos para este bot y esta ejecucion.",
+    promptSnippet: "Busca conectores o computadora cuando una tarea necesite correo, calendario, CRM, GUI, archivos, shell o ecommerce",
     parameters: Type.Object({
       query: Type.String({
         description: "Capacidad o proveedor necesario, por ejemplo Gmail, calendario, CRM o GitHub",
@@ -260,6 +268,11 @@ export default function connectorExtension(pi: ExtensionAPI): void {
         const connectors = isRecord(response.body) && Array.isArray(response.body.connectors)
           ? response.body.connectors.filter(isBrokerConnector)
           : [];
+        const computerAvailable = isRecord(response.body) && response.body.computer === true;
+        const wantsComputer = words.some((word) => [
+          "computer", "computadora", "desktop", "escritorio", "gui", "screen", "pantalla",
+          "file", "files", "archivo", "archivos", "shell", "terminal",
+        ].some((term) => term.includes(word) || word.includes(term)));
         const matches = connectors.filter((connector) => {
           const haystack = [connector.id, connector.name, connector.description, ...connector.keywords, ...connector.operations]
             .join(" ").toLocaleLowerCase();
@@ -271,6 +284,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
             return tool ? [tool] : [];
           });
         const active = pi.getActiveTools();
+        if (computerAvailable && wantsComputer && !matchedTools.includes("computer")) matchedTools.push("computer");
         const activated = matchedTools.filter((name) => !active.includes(name));
         if (activated.length) pi.setActiveTools([...active, ...activated]);
         const summary: SearchMatch[] = matches.flatMap((match): SearchMatch[] => {
@@ -283,6 +297,15 @@ export default function connectorExtension(pi: ExtensionAPI): void {
             tool,
           }] : [];
         });
+        if (computerAvailable && wantsComputer) {
+          summary.unshift({
+            id: "computer",
+            name: "Agent Computer",
+            connected: true,
+            operations: ["screenshot", "click", "type", "shell", "list_files", "read_file", "write_file"],
+            tool: "computer",
+          });
+        }
         return {
           content: [{ type: "text", text: summary.length ? JSON.stringify(summary) : "No hay conectores permitidos que coincidan." }],
           details: { matches: summary, activated, status: response.status },
@@ -297,8 +320,80 @@ export default function connectorExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "computer",
+    label: "Agent Computer",
+    description: [
+      "Controla la computadora persistente y aislada de este bot.",
+      "Operaciones: status, screenshot, click, move, drag, scroll, type, key, hotkey, shell, list_files, read_file, write_file.",
+      "Argumentos: click{x,y,button?,double?}; move{x,y}; drag{start_x,start_y,end_x,end_y,button?};",
+      "scroll{x,y,direction,amount?}; type{text,delay?}; key{key,modifiers?}; hotkey{keys};",
+      "shell{command,cwd?,timeout?}; list_files{path?,depth?}; read_file{path}; write_file{path,content}.",
+      "Usa screenshot antes de hacer clic y vuelve a capturar después de cada cambio importante.",
+    ].join(" "),
+    promptSnippet: "Usa computer cuando una tarea necesite una GUI, archivos o shell en la computadora persistente del bot",
+    parameters: Type.Object({
+      operation: Type.String({
+        description: "Una operación exacta de la lista documentada",
+        minLength: 3,
+        maxLength: 40,
+      }),
+      arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+        description: "Argumentos JSON correspondientes a la operación",
+      })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      try {
+        const response = await brokerRequest("/v1/internal/computers/execute", {
+          method: "POST",
+          body: JSON.stringify({ operation: params.operation, arguments: params.arguments ?? {} }),
+        }, signal);
+        if (!response.ok) {
+          return {
+            content: [{ type: "text", text: errorText(response.status, response.body) }],
+            details: { operation: params.operation, status: response.status },
+            isError: true,
+          };
+        }
+        const result = isRecord(response.body) && isRecord(response.body.result)
+          ? response.body.result
+          : null;
+        if (params.operation === "screenshot" && result
+          && typeof result.image_base64 === "string"
+          && typeof result.mime_type === "string") {
+          return {
+            content: [
+              { type: "text", text: "Captura actual de la computadora del bot." },
+              { type: "image", data: result.image_base64, mimeType: result.mime_type },
+            ],
+            details: { operation: params.operation, status: response.status },
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.body) }],
+          details: { operation: params.operation, status: response.status },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: error instanceof Error ? error.message : "No se pudo controlar la computadora." }],
+          details: { operation: params.operation, status: 0 },
+          isError: true,
+        };
+      }
+    },
+  });
+
   pi.on("session_start", () => {
-    const active = pi.getActiveTools().filter((name) => !providerToolNames.has(name));
+    const hasGrant = Boolean(process.env[RUN_TOKEN_ENV]);
+    const active = pi.getActiveTools().filter((name) => (
+      !providerToolNames.has(name)
+      && name !== "computer"
+      && (hasGrant || name !== "connector_search")
+    ));
+    if (!hasGrant) {
+      pi.setActiveTools(active);
+      return;
+    }
     if (!active.includes("connector_search")) active.push("connector_search");
     pi.setActiveTools(active);
   });

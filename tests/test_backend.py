@@ -171,6 +171,13 @@ class WrapperServer:
             "STRIPE_SUCCESS_URL", "STRIPE_CANCEL_URL", "STRIPE_PORTAL_RETURN_URL",
         ):
             os.environ.pop(name, None)
+        for name in (
+            "COMPUTERS_ENABLED", "DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET",
+            "DAYTONA_SNAPSHOT", "COMPUTER_AUTO_STOP_MINUTES", "COMPUTER_AUTO_ARCHIVE_MINUTES",
+            "COMPUTER_PREVIEW_TTL_SECONDS", "COMPUTER_VNC_PORT", "COMPUTER_VNC_RESOLUTION", "COMPUTER_BASIC_LIMIT",
+            "COMPUTER_PRO_LIMIT",
+        ):
+            os.environ.pop(name, None)
         self.cfg = Config()
         self.cfg.go_base_url = upstream_base + "/v1"
         self.backend = Backend(self.cfg)

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -109,6 +109,19 @@ CREATE TABLE IF NOT EXISTS connector_credentials (
   PRIMARY KEY(user_id, connector_id),
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS bot_computers (
+  user_id        TEXT NOT NULL,
+  bot_id         TEXT NOT NULL,
+  provider       TEXT NOT NULL,
+  provider_ref   TEXT,
+  state          TEXT NOT NULL DEFAULT 'pulling',
+  last_error     TEXT,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  last_active_at REAL,
+  PRIMARY KEY(user_id, bot_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -126,6 +139,10 @@ CREATE INDEX IF NOT EXISTS idx_billing_subscription_user ON billing_subscription
 CREATE INDEX IF NOT EXISTS idx_billing_subscription_status ON billing_subscriptions(status);
 CREATE INDEX IF NOT EXISTS idx_connector_credentials_user
   ON connector_credentials(user_id, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_bot_computer_provider_ref
+  ON bot_computers(provider, provider_ref) WHERE provider_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_bot_computers_user
+  ON bot_computers(user_id, updated_at);
 """
 
 
@@ -134,6 +151,10 @@ def _now() -> float:
 
 
 class NoSubscriptionAvailable(RuntimeError):
+    pass
+
+
+class ComputerLimitReached(RuntimeError):
     pass
 
 
@@ -261,6 +282,100 @@ class Store:
             cursor = self._conn.execute(
                 "DELETE FROM connector_credentials WHERE user_id=? AND connector_id=?",
                 (user_id, connector_id),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
+    # ---------- computadoras persistentes por bot ----------
+    def claim_bot_computer(
+        self,
+        user_id: str,
+        bot_id: str,
+        provider: str,
+        max_computers: int,
+    ) -> dict:
+        """Reserva de forma atómica la identidad remota de un bot."""
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+                    (user_id, bot_id),
+                ).fetchone()
+                if row is None:
+                    count_row = self._conn.execute(
+                        "SELECT COUNT(*) AS computer_count FROM bot_computers WHERE user_id=?",
+                        (user_id,),
+                    ).fetchone()
+                    count = int(count_row["computer_count"])
+                    if count >= max_computers:
+                        raise ComputerLimitReached(
+                            f"La cuenta alcanzó su límite de {max_computers} computadoras"
+                        )
+                    self._conn.execute(
+                        "INSERT INTO bot_computers("
+                        "user_id,bot_id,provider,provider_ref,state,last_error,created_at,updated_at,last_active_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?)",
+                        (user_id, bot_id, provider, None, "pulling", "", now, now, None),
+                    )
+                    row = self._conn.execute(
+                        "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+                        (user_id, bot_id),
+                    ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError("No se pudo reservar la computadora")
+        result = dict(row)
+        if result["provider"] != provider:
+            raise RuntimeError("El bot ya pertenece a otro proveedor de computadoras")
+        return result
+
+    def get_bot_computer(self, user_id: str, bot_id: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM bot_computers WHERE user_id=? AND bot_id=?",
+            (user_id, bot_id),
+        )
+        return dict(row) if row else None
+
+    def update_bot_computer(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        provider_ref: str | None = None,
+        state: str | None = None,
+        last_error: str | None = None,
+        touch: bool = False,
+    ) -> None:
+        assignments = ["updated_at=?"]
+        params: list = [_now()]
+        if provider_ref is not None:
+            assignments.append("provider_ref=?")
+            params.append(provider_ref)
+        if state is not None:
+            assignments.append("state=?")
+            params.append(state)
+        if last_error is not None:
+            assignments.append("last_error=?")
+            params.append(last_error[:500])
+        if touch:
+            assignments.append("last_active_at=?")
+            params.append(_now())
+        params.extend((user_id, bot_id))
+        self._exec(
+            f"UPDATE bot_computers SET {','.join(assignments)} WHERE user_id=? AND bot_id=?",
+            tuple(params),
+        )
+
+    def delete_bot_computer(self, user_id: str, bot_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM bot_computers WHERE user_id=? AND bot_id=?",
+                (user_id, bot_id),
             )
             self._conn.commit()
             return bool(cursor.rowcount)

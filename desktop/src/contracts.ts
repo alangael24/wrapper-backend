@@ -162,7 +162,56 @@ export interface BotProfile {
   notificationsEnabled: boolean;
   connectorIds: string[];
   messages: BotMessage[];
+  workflows: BotWorkflow[];
   createdAt: string;
+}
+
+export interface BotWorkflow {
+  id: string;
+  title: string;
+  summary: string;
+  steps: string[];
+  recordingId: string;
+  recordingMimeType: "video/webm" | "video/mp4" | "";
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt: string;
+}
+
+export interface BotWorkflowDraft {
+  title: string;
+  summary: string;
+  steps: string[];
+}
+
+export type TeachEntryPoint = "top_bar" | "composer_menu" | "screen_hover";
+export type TeachRecordingPhase = "idle" | "recording" | "processing";
+
+export interface TeachRecordingStatus {
+  phase: TeachRecordingPhase;
+  botId: string;
+  botName: string;
+  entryPoint: TeachEntryPoint | "";
+  startedAt: string;
+}
+
+export interface TeachCapture {
+  durationMs: number;
+  frames: string[];
+  mimeType: "video/webm" | "video/mp4" | "";
+  videoBytes: Uint8Array;
+}
+
+export type BotComputerState = "disabled" | "pulling" | "running" | "hibernated" | "off" | "error";
+
+export interface BotComputerSnapshot {
+  configured: boolean;
+  bot_id: string;
+  provider: string | null;
+  state: BotComputerState;
+  viewer_url: string;
+  viewer_expires_at: number;
+  reason: string;
 }
 
 export interface BotMessage {
@@ -221,10 +270,21 @@ export interface DesktopApi {
   billingSnapshot(): Promise<BillingSnapshot>;
   startCheckout(tier: "basic" | "pro"): Promise<void>;
   openBillingPortal(): Promise<void>;
+  computerStatus(botId: string): Promise<BotComputerSnapshot>;
+  ensureComputer(botId: string, botName: string): Promise<BotComputerSnapshot>;
+  handBackComputer(botId: string): Promise<BotComputerSnapshot>;
+  deleteComputer(botId: string): Promise<{ deleted: boolean }>;
+  openComputerViewer(url: string): Promise<void>;
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;
   runBotAgent(botId: string, prompt: string, initial?: boolean): Promise<AppState>;
+  getTeachRecordingStatus(): Promise<TeachRecordingStatus>;
+  startTeachRecording(botId: string, entryPoint: TeachEntryPoint): Promise<TeachRecordingStatus>;
+  stopTeachRecording(botId: string, capture: TeachCapture): Promise<AppState>;
+  discardTeachRecording(botId: string): Promise<TeachRecordingStatus>;
+  runBotWorkflow(botId: string, workflowId: string): Promise<AppState>;
+  deleteBotWorkflow(botId: string, workflowId: string): Promise<AppState>;
   setActiveBot(botId: string | null): Promise<AppState>;
   deleteBot(botId: string): Promise<AppState>;
 }
@@ -281,6 +341,7 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
     notificationsEnabled: true,
     connectorIds: normalizeConnectorIds(connectorIds),
     messages: [],
+    workflows: [],
     createdAt: now.toISOString()
   };
 }
@@ -328,11 +389,76 @@ function normalizeBot(value: unknown): BotProfile | null {
       description: cleanProfileText(value.description, 600),
       avatarDataUrl: safeAvatarDataUrl(value.avatarDataUrl),
       notificationsEnabled: value.notificationsEnabled !== false,
-      messages: normalizeBotMessages(value.messages)
+      messages: normalizeBotMessages(value.messages),
+      workflows: normalizeBotWorkflows(value.workflows)
     };
   } catch {
     return null;
   }
+}
+
+export function createBotWorkflow(
+  draft: BotWorkflowDraft,
+  id: string,
+  recordingId: string,
+  recordingMimeType: BotWorkflow["recordingMimeType"],
+  now = new Date()
+): BotWorkflow {
+  const title = cleanProfileText(draft.title, 120).replace(/\s+/g, " ");
+  const steps = normalizeWorkflowSteps(draft.steps);
+  if (!title || !steps.length) throw new Error("No pudimos extraer los pasos de la tarea.");
+  const timestamp = now.toISOString();
+  return {
+    id: id.slice(0, 100),
+    title,
+    summary: cleanProfileText(draft.summary, 500),
+    steps,
+    recordingId: recordingId.slice(0, 100),
+    recordingMimeType,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    lastRunAt: ""
+  };
+}
+
+function normalizeBotWorkflows(value: unknown): BotWorkflow[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-50).flatMap((item): BotWorkflow[] => {
+    if (!isRecord(item)) return [];
+    try {
+      const createdAt = normalizeDate(item.createdAt);
+      const workflow = createBotWorkflow({
+        title: typeof item.title === "string" ? item.title : "",
+        summary: typeof item.summary === "string" ? item.summary : "",
+        steps: Array.isArray(item.steps) ? item.steps.filter((step): step is string => typeof step === "string") : []
+      }, typeof item.id === "string" ? item.id : crypto.randomUUID(), typeof item.recordingId === "string" ? item.recordingId : "", normalizeRecordingMimeType(item.recordingMimeType), new Date(createdAt));
+      return [{
+        ...workflow,
+        updatedAt: normalizeDate(item.updatedAt, createdAt),
+        lastRunAt: item.lastRunAt ? normalizeDate(item.lastRunAt, "") : ""
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function normalizeWorkflowSteps(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 30).flatMap((step): string[] => {
+    const normalized = cleanProfileText(step, 600);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function normalizeRecordingMimeType(value: unknown): BotWorkflow["recordingMimeType"] {
+  return value === "video/webm" || value === "video/mp4" ? value : "";
+}
+
+function normalizeDate(value: unknown, fallback = new Date().toISOString()): string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value))
+    ? new Date(value).toISOString()
+    : fallback;
 }
 
 function cleanBotName(value: unknown): string {

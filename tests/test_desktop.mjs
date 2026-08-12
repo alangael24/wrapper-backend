@@ -81,11 +81,97 @@ test("normalizes connector selection and persisted bot state", () => {
   assert.equal(state.bots[0].name, "Mi bot");
   assert.deepEqual(state.bots[0].connectorIds, ["github"]);
   assert.deepEqual(state.bots[0].messages, []);
+  assert.deepEqual(state.bots[0].workflows, []);
   assert.equal(state.bots[0].title, "");
   assert.equal(state.bots[0].description, "");
   assert.equal(state.bots[0].avatarDataUrl, "");
   assert.equal(state.bots[0].notificationsEnabled, true);
   assert.equal(state.activeBotId, "bot-1");
+});
+
+test("normalizes learned workflows inside the account-scoped bot state", () => {
+  const workflow = contracts.createBotWorkflow({
+    title: "  Publicar   reporte  ",
+    summary: "Prepara y publica el reporte semanal.",
+    steps: ["Abrir el dashboard", "Exportar los datos", "Compartir el enlace"]
+  }, "workflow-1", "6d45fc31-6bc2-4dbe-a6a1-7d11850f3ad4", "video/webm", new Date("2026-08-12T00:00:00.000Z"));
+  assert.equal(workflow.title, "Publicar reporte");
+  assert.equal(workflow.steps.length, 3);
+  assert.equal(workflow.recordingMimeType, "video/webm");
+
+  const state = contracts.normalizeAppState({
+    onboardingCompleted: true,
+    bots: [{
+      id: "bot-workflow",
+      name: "Operaciones",
+      color: "#2f91f5",
+      shape: "circle",
+      workflows: [workflow, { id: "invalid", title: "", steps: [] }],
+      createdAt: "2026-08-12T00:00:00.000Z"
+    }]
+  });
+  assert.equal(state.bots[0].workflows.length, 1);
+  assert.equal(state.bots[0].workflows[0].title, "Publicar reporte");
+  assert.throws(() => contracts.createBotWorkflow({ title: "Vacío", summary: "", steps: [] }, "bad", "", ""));
+});
+
+test("teaches a task from a real display recording and replays it through Pi without changing the harness", async () => {
+  const [main, preload, oauth, renderer, styles] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/renderer/styles.css", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:start-teach-recording/);
+  assert.match(main, /desktop:stop-teach-recording/);
+  assert.match(main, /desktop:run-bot-workflow/);
+  assert.match(main, /setDisplayMediaRequestHandler/);
+  assert.match(main, /useSystemPicker:\s*true/);
+  assert.match(main, /mode:\s*0o600, flag:\s*"wx"/);
+  assert.match(main, /buildWorkflowRunPrompt\(bot, workflow\)/);
+  assert.match(main, /\{ computer: true, botId \}/);
+  assert.match(preload, /startTeachRecording/);
+  assert.match(preload, /stopTeachRecording/);
+  assert.match(oauth, /"\/v1\/responses"/);
+  assert.match(oauth, /type: "input_image"/);
+  assert.match(oauth, /parseTeachWorkflow/);
+  assert.match(renderer, /navigator\.mediaDevices\.getDisplayMedia/);
+  assert.match(renderer, /new MediaRecorder/);
+  assert.match(renderer, /Recording \$\{escapeHtml\(bot\.name\)\}'s computer/);
+  assert.match(renderer, /Stop &amp; save/);
+  assert.match(renderer, /Record yourself doing a task/);
+  assert.match(renderer, /data-composer-teach/);
+  assert.match(renderer, /data-run-workflow/);
+  assert.match(styles, /\.teach-recording-overlay/);
+  assert.match(styles, /\.workflow-panel/);
+  assert.doesNotMatch(`${main}\n${preload}\n${renderer}`, /go_backend\/pi_harness|from "\.\.\/go_backend/);
+});
+
+test("controls one persistent computer per bot through isolated Electron IPC", async () => {
+  const [main, preload, oauth, renderer, styles] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/renderer/styles.css", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:computer-status/);
+  assert.match(main, /desktop:ensure-computer/);
+  assert.match(main, /desktop:hand-back-computer/);
+  assert.match(main, /rememberComputerViewerUrl\(snapshot\.viewer_url\)/);
+  assert.match(main, /issuedComputerViewerUrls\.delete\(url\)/);
+  assert.match(main, /contextIsolation:\s*true/);
+  assert.match(main, /sandbox:\s*true/);
+  assert.match(preload, /computerStatus/);
+  assert.match(preload, /openComputerViewer/);
+  assert.match(oauth, /\/v1\/computers\/\$\{encodeURIComponent\(botId\)\}\/ensure/);
+  assert.match(oauth, /safeComputerViewerUrl/);
+  assert.match(renderer, /computer-monitor-strip/);
+  assert.match(renderer, /Crear y abrir/);
+  assert.match(renderer, /Hibernar/);
+  assert.match(styles, /\.computer-monitor-strip/);
+  assert.doesNotMatch(`${main}\n${preload}\n${renderer}`, /go_backend\/pi_harness|from "\.\.\/go_backend/);
 });
 
 test("validates the generic LLM question widget without hardcoded onboarding content", () => {

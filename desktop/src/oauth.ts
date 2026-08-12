@@ -5,6 +5,8 @@ import type { SafeStorage, Shell } from "electron";
 import type {
   AccountConnectionStatus,
   BillingSnapshot,
+  BotComputerSnapshot,
+  BotWorkflowDraft,
   ConnectorConnectionSnapshot,
   ConnectorConnectionStatus
 } from "./contracts";
@@ -167,8 +169,32 @@ export class DesktopOAuthController {
     return this.client.openBillingPortal(signal);
   }
 
-  runAgent(prompt: string, connectorIds: string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.client.runAgent(prompt, connectorIds, signal);
+  computerStatus(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.computerStatus(botId, signal);
+  }
+
+  ensureComputer(botId: string, botName: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.ensureComputer(botId, botName, signal);
+  }
+
+  handBackComputer(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return this.client.handBackComputer(botId, signal);
+  }
+
+  deleteComputer(botId: string, signal?: AbortSignal): Promise<{ deleted: boolean }> {
+    return this.client.deleteComputer(botId, signal);
+  }
+
+  runAgent(
+    prompt: string,
+    connectorIds: string[],
+    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+  ): Promise<Record<string, unknown>> {
+    return this.client.runAgent(prompt, connectorIds, options);
+  }
+
+  teachWorkflow(botName: string, frames: string[], durationMs: number, signal?: AbortSignal): Promise<BotWorkflowDraft> {
+    return this.client.teachWorkflow(botName, frames, durationMs, signal);
   }
 
   async accountId(): Promise<string | null> {
@@ -296,16 +322,89 @@ class WrapperServiceClient {
     return this.authorizedJson("/v1/connectors/disconnect", { method: "POST", body: { connector_id: connectorId }, signal });
   }
 
-  runAgent(prompt: string, connectorIds: string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
+  runAgent(
+    prompt: string,
+    connectorIds: string[],
+    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+  ): Promise<Record<string, unknown>> {
     return this.authorizedJson("/v1/agent/run", {
       method: "POST",
-      body: { prompt, browser: false, connector_ids: connectorIds },
+      body: {
+        prompt,
+        browser: options.browser === true,
+        computer: options.computer === true,
+        bot_id: options.botId ?? "",
+        connector_ids: connectorIds
+      },
+      signal: options.signal
+    });
+  }
+
+  async teachWorkflow(
+    botName: string,
+    frames: string[],
+    durationMs: number,
+    signal?: AbortSignal
+  ): Promise<BotWorkflowDraft> {
+    const response = await this.authorizedJson("/v1/responses", {
+      method: "POST",
+      body: {
+        model: "deepseek-v4-flash",
+        stream: false,
+        max_output_tokens: 3000,
+        input: [{
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                `You are extracting a reusable workflow taught to the Agent Genia bot ${botName}.`,
+                `The screenshots are chronological samples from a ${Math.max(1, Math.round(durationMs / 1000))}-second screen recording.`,
+                "Infer only steps supported by visible transitions. Never include passwords, tokens, personal data, or invented values.",
+                "Write each step as an instruction the Pi agent can execute later with browser and connector tools.",
+                "Return JSON only: {\"title\":\"short task name\",\"summary\":\"one sentence\",\"steps\":[\"ordered step\"]}. Include 2-30 steps."
+              ].join("\n")
+            },
+            ...frames.map((imageUrl) => ({ type: "input_image", image_url: imageUrl }))
+          ]
+        }]
+      },
       signal
     });
+    return parseTeachWorkflow(responseText(response));
   }
 
   billing(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.authorizedJson("/v1/billing", { signal });
+  }
+
+  async computerStatus(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}`,
+      { signal }
+    ));
+  }
+
+  async ensureComputer(botId: string, botName: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/ensure`,
+      { method: "POST", body: { bot_name: botName }, signal }
+    ));
+  }
+
+  async handBackComputer(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
+    return parseComputerSnapshot(await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/hand-back`,
+      { method: "POST", signal }
+    ));
+  }
+
+  async deleteComputer(botId: string, signal?: AbortSignal): Promise<{ deleted: boolean }> {
+    const result = await this.authorizedJson(
+      `/v1/computers/${encodeURIComponent(botId)}/delete`,
+      { method: "POST", signal }
+    );
+    return { deleted: result.deleted === true };
   }
 
   async startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
@@ -474,6 +573,47 @@ function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function responseText(payload: Record<string, unknown>): string {
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text.trim();
+  if (Array.isArray(payload.output)) {
+    for (const item of payload.output) {
+      if (!isRecord(item) || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (!isRecord(part)) continue;
+        if (typeof part.text === "string" && part.text.trim()) return part.text.trim();
+        if (typeof part.output_text === "string" && part.output_text.trim()) return part.output_text.trim();
+      }
+    }
+  }
+  if (Array.isArray(payload.choices)) {
+    const choice = payload.choices.find(isRecord);
+    const message = choice && isRecord(choice.message) ? choice.message : {};
+    if (typeof message.content === "string" && message.content.trim()) return message.content.trim();
+  }
+  throw new Error("El modelo no devolvió los pasos aprendidos.");
+}
+
+function parseTeachWorkflow(value: string): BotWorkflowDraft {
+  const candidate = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    throw new Error("El modelo devolvió un workflow inválido. Intenta grabar la tarea otra vez.");
+  }
+  if (!isRecord(parsed)) throw new Error("El modelo devolvió un workflow inválido.");
+  const title = stringValue(parsed.title).replace(/\s+/g, " ").trim().slice(0, 120);
+  const summary = stringValue(parsed.summary).replace(/\s+/g, " ").trim().slice(0, 500);
+  const steps = Array.isArray(parsed.steps)
+    ? parsed.steps.flatMap((step): string[] => {
+      const normalized = typeof step === "string" ? step.replace(/\s+/g, " ").trim().slice(0, 600) : "";
+      return normalized ? [normalized] : [];
+    }).slice(0, 30)
+    : [];
+  if (!title || steps.length < 2) throw new Error("No hubo suficientes pasos visibles para aprender la tarea.");
+  return { title, summary, steps };
+}
+
 function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
   const tier = value.tier;
   const plans = isRecord(value.plans) ? value.plans : {};
@@ -510,6 +650,33 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
     subscription,
     plans: { basic: parsePlan(basic, "Plus", 50), pro: parsePlan(pro, "Pro", 200) }
   };
+}
+
+function parseComputerSnapshot(value: Record<string, unknown>): BotComputerSnapshot {
+  const state = stringValue(value.state);
+  if (!["disabled", "pulling", "running", "hibernated", "off", "error"].includes(state)) {
+    throw new Error("El servicio devolvió un estado de computadora inválido.");
+  }
+  const viewerUrl = stringValue(value.viewer_url);
+  if (viewerUrl) safeComputerViewerUrl(viewerUrl);
+  return {
+    configured: value.configured === true,
+    bot_id: stringValue(value.bot_id),
+    provider: stringValue(value.provider) || null,
+    state: state as BotComputerSnapshot["state"],
+    viewer_url: viewerUrl,
+    viewer_expires_at: numberValue(value.viewer_expires_at),
+    reason: stringValue(value.reason)
+  };
+}
+
+export function safeComputerViewerUrl(value: string): string {
+  const url = new URL(value);
+  const loopback = url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  if ((url.protocol !== "https:" && !loopback) || url.username || url.password || url.href.length > 4096) {
+    throw new Error("El servicio devolvió una URL de computadora insegura.");
+  }
+  return url.toString();
 }
 
 function safeAuthorizationUrl(value: string): string {

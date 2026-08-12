@@ -130,6 +130,53 @@ pnpm install
 pnpm desktop
 ```
 
+## App de iOS (SwiftUI)
+
+La app nativa para iPhone y iPad vive en `ios/AgentGenia`. Usa el mismo
+`wrapper-backend` de producción y no contiene una copia del harness de Pi. El
+cliente llama a los contratos públicos de cuenta, agentes, conectores, billing
+y computadoras; por lo tanto, el modelo, las herramientas y sus límites siguen
+controlados por el servidor.
+
+```bash
+open ios/AgentGenia/AgentGenia.xcodeproj
+
+# comprobación reproducible sin firma
+xcodebuild \
+  -project ios/AgentGenia/AgentGenia.xcodeproj \
+  -scheme AgentGenia \
+  -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+La configuración Release apunta a `https://agentgenia-api.onrender.com`. Para
+desarrollo se puede definir `AGENTGENIA_API_BASE_URL` en el Scheme de Xcode; la
+app solo admite HTTPS, excepto loopback local. El bundle es
+`com.agentgenia.ios` y la configuración de firma usa el equipo de Apple
+Developer del proyecto.
+
+El login reutiliza Google Authorization Code + PKCE del backend. La app abre la
+autorización en una hoja segura y consulta el intento ligado a un UUID de
+dispositivo. Access token y refresh token se guardan en Keychain con protección
+`AfterFirstUnlockThisDeviceOnly`; los tokens OAuth de plugins nunca llegan a
+iOS. Cada cuenta guarda sus bots en un archivo distinto bajo Application
+Support, protegido por iOS, de modo que cerrar sesión no mezcla conversaciones.
+
+El chat llama realmente a `/v1/agent/run` y conserva los widgets de preguntas
+generados por el LLM, sin saludos ni opciones hardcodeadas. El marketplace
+muestra el catálogo completo, autoriza cuentas mediante el mismo gateway de
+Composio/adaptadores first-party y su pestaña `Tuyos` contiene únicamente
+conectores activos. La computadora de cada bot usa los endpoints
+`/v1/computers/*` y presenta el viewer firmado en un `WKWebView` efímero que
+rechaza navegación a otros orígenes.
+
+Stripe se abre fuera del contexto del agente y la app nunca incluye secret
+keys. Antes de enviar esta build al App Store se debe decidir si la compra de
+los planes se ofrece con In-App Purchase o mediante el enlace externo permitido
+para los storefronts y entitlements aplicables; el backend de Stripe sigue
+siendo válido para web y desktop.
+
 La app guarda preferencias y perfiles de bots en un archivo aislado por cuenta
 dentro de `userData/accounts` de Electron. Al cerrar sesión carga un estado
 vacío en memoria y no expone los bots de la cuenta anterior. Una instalación
@@ -141,6 +188,27 @@ proveedor permanecen en Composio bajo el `user_id` autenticado y nunca entran a
 Electron ni a Pi. El renderer no tiene acceso a Node.js, tokens ni red: toda
 autenticación pasa por un `preload` aislado y una lista cerrada de operaciones
 IPC.
+
+### Teach a task
+
+Cada bot ofrece `Teach a task` en el top bar y en el menú `+` del composer. La
+app abre el selector nativo de pantalla/ventana, reserva una sola grabación a la
+vez y muestra un overlay con cronómetro, `Stop & save` y `Discard`. La grabación
+no incluye audio, dura como máximo cinco minutos y se limita a 64 MB.
+
+Al guardar, Electron conserva el video con permisos `0600` dentro de
+`userData/teach-recordings/<hash-de-cuenta>` y envía hasta doce fotogramas
+cronológicos al endpoint `responses` del propio `wrapper-backend`. Luna convierte
+los fotogramas en evidencia visual y DeepSeek genera un workflow JSON con título,
+resumen y pasos. El workflow queda dentro del mismo estado local aislado por
+cuenta que el bot; eliminar el workflow o el bot elimina también su video.
+
+`Run now` vuelve a ejecutar los pasos mediante el endpoint existente de Pi con
+el navegador aislado y los conectores autorizados del bot. Esta función no
+modifica `go_backend/pi_harness.py` ni comparte el perfil original grabado: si
+la tarea necesita una sesión web, el usuario debe autorizarla en el perfil
+temporal de esa ejecución o usar un conector OAuth. La extracción requiere un
+plan con acceso a modelos y una sesión de Agent Genia iniciada.
 
 ### Login con Google
 
@@ -354,6 +422,32 @@ iniciar sesión, debe hacerlo dentro de esa ejecución y esos datos no se conser
 Las capturas que produzca `pi-chrome` pasan por Luna antes de llegar a DeepSeek,
 de modo que el agente puede observar la página y decidir su siguiente acción.
 
+## Computadora persistente por bot
+
+La computadora de un bot es distinta del Chrome efímero anterior. Con
+`COMPUTERS_ENABLED=1`, el backend crea una sandbox Daytona privada para la
+combinación exacta `(usuario, bot)` y conserva su filesystem, perfil y sesiones
+cuando se detiene. Electron permite crearla, abrir su viewer noVNC firmado e
+hibernarla; Pi controla la misma máquina mediante la herramienta `computer`
+(captura, mouse, teclado, shell y archivos), cargada por la extensión existente
+de conectores. No se modifica `go_backend/pi_harness.py`.
+
+Para habilitarla:
+
+1. Crea una API key server-side en Daytona y define `DAYTONA_API_KEY`.
+2. Define `COMPUTERS_ENABLED=1`. Opcionalmente usa `DAYTONA_SNAPSHOT` para una
+   imagen preparada con Chromium y las aplicaciones que quieras entregar.
+3. Aplica la migración `20260812233000_bot_computers.sql` en Supabase y despliega
+   el backend. `PI_CONNECTOR_EXTENSION` debe seguir apuntando a la extensión
+   first-party incluida en este repositorio.
+
+El estado normal es `off → pulling → running → hibernated`. El auto-stop de 15
+minutos conserva los datos y evita pagar cómputo ocioso; el auto-archive se
+activa tras 24 horas detenida. Un viewer nunca se guarda en la base de datos:
+se genera al abrir, expira y Electron solo acepta HTTPS (o HTTP loopback en
+desarrollo). Eliminar un bot elimina primero su sandbox remota para no dejar
+recursos facturables huérfanos.
+
 ## Endpoints
 
 Públicos (los endpoints de cuenta no requieren Bearer; los endpoints del modelo
@@ -384,7 +478,11 @@ aceptan API key o access token de una sesión Google):
 | GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
 | GET | `/v1/me` | Usuario, tier y suscripción asignada |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, connector_ids?: string[]}` y espera el resultado |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, computer?: false, bot_id?: string, connector_ids?: string[]}` y espera el resultado |
+| GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
+| POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
+| POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |
+| POST | `/v1/computers/<bot_id>/delete` | Elimina la computadora remota antes de borrar el bot |
 
 Admin (Bearer = `ADMIN_TOKEN`):
 
@@ -447,6 +545,16 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
 | `PI_CHROME_AUTO_AUTHORIZE` | `0` | Autorizar automáticamente solo el Chrome efímero de esa ejecución |
 | `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración máxima; el proceso se cierra antes si termina la tarea |
+| `COMPUTERS_ENABLED` | `0` | Habilita una sandbox Daytona persistente por `(usuario, bot)` |
+| `DAYTONA_API_KEY` | vacío | Credencial server-side; obligatoria si la función está habilitada |
+| `DAYTONA_SNAPSHOT` | vacío | Snapshot opcional preparado con apps para la computadora |
+| `COMPUTER_AUTO_STOP_MINUTES` | `15` | Inactividad antes de detener cómputo conservando el filesystem |
+| `COMPUTER_AUTO_ARCHIVE_MINUTES` | `1440` | Tiempo detenida antes de archivar |
+| `COMPUTER_PREVIEW_TTL_SECONDS` | `3600` | Vigencia del viewer firmado solicitado por Electron |
+| `COMPUTER_VNC_PORT` | `6080` | Puerto noVNC expuesto mediante preview firmado |
+| `COMPUTER_VNC_RESOLUTION` | `1440x900` | Resolución fija del escritorio al crear la sandbox |
+| `COMPUTER_BASIC_LIMIT` | `1` | Máximo de computadoras persistentes para un usuario Plus |
+| `COMPUTER_PRO_LIMIT` | `3` | Máximo de computadoras persistentes para un usuario Pro |
 
 ## Seguridad
 
@@ -481,6 +589,10 @@ Admin (Bearer = `ADMIN_TOKEN`):
   entre clientes. Pi todavía ejecuta con el usuario del sistema del backend;
   para aislamiento fuerte entre tenants usa además un contenedor o usuario del
   sistema distinto por tarea.
+- Las computadoras persistentes sí conservan cookies, pero solo dentro de la
+  sandbox privada de ese usuario y bot. El API key del proveedor nunca llega a
+  Electron o Pi; cada ejecución recibe un grant revocable para un único bot y
+  los viewers son URLs firmadas que no se persisten.
 
 ## Tests
 

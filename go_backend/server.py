@@ -23,6 +23,10 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/messages
   GET  /v1/agent/status    Estado del harness de Pi
   POST /v1/agent/run       Ejecutar una tarea con Pi
+  GET  /v1/computers/<bot_id> Estado de la computadora persistente del bot
+  POST /v1/computers/<bot_id>/ensure Crear/despertar y obtener un viewer firmado
+  POST /v1/computers/<bot_id>/hand-back Hibernar conservando el filesystem
+  POST /v1/computers/<bot_id>/delete Eliminar la computadora del bot
   GET  /v1/usage           Uso por ventanas con limites ajustados al tier
   GET  /v1/me
 
@@ -65,6 +69,7 @@ from .connector_adapters import (
 from .native_connectors import NativeConnectorGateway
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
+from .computers import ComputerConfig, ComputerError, ComputerManager
 from .go_prices import estimate_cost_usd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
@@ -238,6 +243,18 @@ class Config:
         self.pi_chrome_isolation = os.environ.get(
             "PI_CHROME_ISOLATION", CHROME_ISOLATION_PER_RUN
         ).strip().lower()
+        self.computers_enabled = os.environ.get("COMPUTERS_ENABLED", "0") == "1"
+        self.daytona_api_key = (os.environ.get("DAYTONA_API_KEY") or "").strip()
+        self.daytona_api_url = (os.environ.get("DAYTONA_API_URL") or "").strip()
+        self.daytona_target = (os.environ.get("DAYTONA_TARGET") or "").strip()
+        self.daytona_snapshot = (os.environ.get("DAYTONA_SNAPSHOT") or "").strip()
+        self.computer_auto_stop_minutes = int(os.environ.get("COMPUTER_AUTO_STOP_MINUTES", "15"))
+        self.computer_auto_archive_minutes = int(os.environ.get("COMPUTER_AUTO_ARCHIVE_MINUTES", "1440"))
+        self.computer_preview_ttl_seconds = int(os.environ.get("COMPUTER_PREVIEW_TTL_SECONDS", "3600"))
+        self.computer_vnc_port = int(os.environ.get("COMPUTER_VNC_PORT", "6080"))
+        self.computer_vnc_resolution = os.environ.get("COMPUTER_VNC_RESOLUTION", "1440x900").strip()
+        self.computer_basic_limit = int(os.environ.get("COMPUTER_BASIC_LIMIT", "1"))
+        self.computer_pro_limit = int(os.environ.get("COMPUTER_PRO_LIMIT", "3"))
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
@@ -355,6 +372,26 @@ class Backend:
                 connector_id,
                 ComposioConnectorAdapter(self.connector_gateway, connector_id),
             )
+        try:
+            self.computers = ComputerManager(
+                store=self.store,
+                config=ComputerConfig(
+                    enabled=cfg.computers_enabled,
+                    api_key=cfg.daytona_api_key,
+                    api_url=cfg.daytona_api_url,
+                    target=cfg.daytona_target,
+                    snapshot=cfg.daytona_snapshot,
+                    auto_stop_minutes=cfg.computer_auto_stop_minutes,
+                    auto_archive_minutes=cfg.computer_auto_archive_minutes,
+                    preview_ttl_seconds=cfg.computer_preview_ttl_seconds,
+                    vnc_port=cfg.computer_vnc_port,
+                    vnc_resolution=cfg.computer_vnc_resolution,
+                    basic_limit=cfg.computer_basic_limit,
+                    pro_limit=cfg.computer_pro_limit,
+                ),
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise UnsafeConfigurationError(f"Configuración de computadoras inválida: {exc}") from exc
         self.vision = VisionRouter(
             enabled=cfg.vision_enabled,
             base_url=cfg.go_base_url,
@@ -797,12 +834,20 @@ class Backend:
         body = self.read_json(handler) or {}
         prompt = body.get("prompt")
         browser = body.get("browser", False)
+        computer_requested = body.get("computer", False)
+        bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
         if not isinstance(prompt, str) or not prompt.strip():
             error_response(handler, 400, "Envia un prompt de texto no vacio", "bad_prompt")
             return
         if not isinstance(browser, bool):
             error_response(handler, 400, "browser debe ser true o false", "bad_browser")
+            return
+        if not isinstance(computer_requested, bool):
+            error_response(handler, 400, "computer debe ser true o false", "bad_computer")
+            return
+        if computer_requested and (not isinstance(bot_id, str) or not bot_id):
+            error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
             return
         try:
             connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
@@ -822,7 +867,8 @@ class Backend:
         ):
             error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
             return
-        if connector_ids and not pi_status["connectors_available"]:
+        computer_enabled = bool(computer_requested and self.computers.configured)
+        if (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
             error_response(
                 handler,
                 409,
@@ -834,8 +880,12 @@ class Backend:
         api_key = self.bearer(handler)
         assert api_key is not None
         connector_run_token = (
-            self.connectors.issue(user_id=user["id"], connector_ids=connector_ids)
-            if connector_ids
+            self.connectors.issue(
+                user_id=user["id"],
+                connector_ids=connector_ids,
+                computer_id=bot_id if computer_enabled else None,
+            )
+            if connector_ids or computer_enabled
             else None
         )
         try:
@@ -855,7 +905,43 @@ class Backend:
             self.connectors.revoke(connector_run_token)
         payload = result.as_dict()
         payload["connector_ids"] = list(connector_ids)
+        payload["computer_enabled"] = computer_enabled
         json_response(handler, 200, payload)
+
+    # ---------- computadoras persistentes por bot ----------
+    def handle_computer_status(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.status(user_id=user["id"], bot_id=bot_id))
+
+    def handle_computer_ensure(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        tier = user.get("tier") or DEFAULT_TIER
+        if not requires_subscription(tier):
+            error_response(handler, 402, "Tu plan no incluye una computadora persistente", "tier_requires_upgrade")
+            return
+        body = self.read_json(handler) or {}
+        bot_name = body.get("bot_name") if isinstance(body.get("bot_name"), str) else "Bot"
+        json_response(
+            handler,
+            200,
+            self.computers.ensure(user_id=user["id"], bot_id=bot_id, bot_name=bot_name),
+        )
+
+    def handle_computer_hand_back(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.hand_back(user_id=user["id"], bot_id=bot_id))
+
+    def handle_computer_delete(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.computers.delete(user_id=user["id"], bot_id=bot_id))
 
     # ---------- broker interno de conectores ----------
     @staticmethod
@@ -881,10 +967,11 @@ class Backend:
             return
         try:
             connectors = self.connectors.catalog(token)
+            computer = self.connectors.has_computer(token)
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
-        json_response(handler, 200, {"connectors": connectors})
+        json_response(handler, 200, {"connectors": connectors, "computer": computer})
 
     def handle_connector_execute(self, handler: BaseHTTPRequestHandler) -> None:
         token = self._connector_token(handler)
@@ -901,6 +988,20 @@ class Backend:
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
+        json_response(handler, 200, result)
+
+    def handle_computer_execute(self, handler: BaseHTTPRequestHandler) -> None:
+        token = self._connector_token(handler)
+        if not token:
+            return
+        user_id, bot_id = self.connectors.computer(token)
+        body = self.read_json(handler) or {}
+        result = self.computers.execute(
+            user_id=user_id,
+            bot_id=bot_id,
+            operation=body.get("operation"),
+            arguments=body.get("arguments", {}),
+        )
         json_response(handler, 200, result)
 
     # ---------- body helpers ----------
@@ -1146,10 +1247,26 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_status(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
+            elif path.startswith("/v1/computers/"):
+                parts = path.strip("/").split("/")
+                bot_id = parts[2] if len(parts) >= 3 else ""
+                action = parts[3] if len(parts) == 4 else ""
+                if self.command == "GET" and len(parts) == 3:
+                    backend.handle_computer_status(self, bot_id)
+                elif self.command == "POST" and action == "ensure":
+                    backend.handle_computer_ensure(self, bot_id)
+                elif self.command == "POST" and action == "hand-back":
+                    backend.handle_computer_hand_back(self, bot_id)
+                elif self.command == "POST" and action == "delete":
+                    backend.handle_computer_delete(self, bot_id)
+                else:
+                    error_response(self, 405, "Operación de computadora no permitida", "method_not_allowed")
             elif self.command == "GET" and path == "/v1/internal/connectors/catalog":
                 backend.handle_connector_catalog(self)
             elif self.command == "POST" and path == "/v1/internal/connectors/execute":
                 backend.handle_connector_execute(self)
+            elif self.command == "POST" and path == "/v1/internal/computers/execute":
+                backend.handle_computer_execute(self)
             elif self.command == "POST" and path == "/admin/subscriptions":
                 backend.handle_admin_add_subscriptions(self)
             elif self.command == "GET" and path == "/admin/subscriptions":
@@ -1170,6 +1287,7 @@ class Handler(BaseHTTPRequestHandler):
                     "stripe_configured": backend.billing.configured,
                     "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
                     "connectors": backend.connector_gateway.health(),
+                    "computers": backend.computers.health(),
                 })
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
@@ -1184,6 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
         except BillingError as e:
             error_response(self, e.status, str(e), e.code)
         except ConnectorBrokerError as e:
+            error_response(self, e.status, str(e), e.code)
+        except ComputerError as e:
             error_response(self, e.status, str(e), e.code)
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:
@@ -1212,6 +1332,7 @@ def serve(cfg: Config) -> None:
     print(f"[server] enforce_limits={cfg.enforce_limits} database={database_backend}")
     print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
     print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
+    print(f"[server] computers={backend.computers.health()}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

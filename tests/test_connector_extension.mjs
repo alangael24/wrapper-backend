@@ -21,6 +21,7 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     response.setHeader("Content-Type", "application/json");
     if (request.url === "/v1/internal/connectors/catalog") {
       response.end(JSON.stringify({
+        computer: true,
         connectors: [
           {
             id: "github",
@@ -44,6 +45,13 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     }
     if (request.url === "/v1/internal/connectors/execute") {
       response.end(JSON.stringify({ connector_id: body.connector_id, operation: body.operation, result: { repositories: ["wrapper-backend"] } }));
+      return;
+    }
+    if (request.url === "/v1/internal/computers/execute") {
+      response.end(JSON.stringify({
+        operation: body.operation,
+        result: { image_base64: "aW1hZ2U=", mime_type: "image/jpeg", size_bytes: 5 },
+      }));
       return;
     }
     response.statusCode = 404;
@@ -97,13 +105,28 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     );
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /wrapper-backend/);
-    assert.equal(requests.length, 2);
+    const computerSearch = await tools.get("connector_search").execute(
+      "computer-search", { query: "computadora pantalla" }, undefined,
+    );
+    assert.equal(computerSearch.isError, undefined);
+    assert.match(computerSearch.content[0].text, /Agent Computer/);
+    assert.deepEqual(activeTools, ["read", "connector_search", "connector_github", "computer"]);
+
+    const screenshot = await tools.get("computer").execute(
+      "computer-call", { operation: "screenshot", arguments: {} }, undefined,
+    );
+    assert.equal(screenshot.isError, undefined);
+    assert.deepEqual(screenshot.content[1], { type: "image", data: "aW1hZ2U=", mimeType: "image/jpeg" });
+
+    assert.equal(requests.length, 4);
     assert.ok(requests.every((request) => request.token === "test-run-token"));
     assert.deepEqual(requests[1].body, {
       connector_id: "github",
       operation: "search_repositories",
       arguments: { query: "wrapper" },
     });
+    assert.equal(requests[2].url, "/v1/internal/connectors/catalog");
+    assert.deepEqual(requests[3].body, { operation: "screenshot", arguments: {} });
   } finally {
     delete process.env.PI_CONNECTOR_BROKER_URL;
     delete process.env.PI_CONNECTOR_RUN_TOKEN;

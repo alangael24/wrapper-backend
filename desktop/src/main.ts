@@ -1,11 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, safeStorage, shell } from "electron";
+import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from "electron";
 import {
   type AppState,
   type BotDraft,
   type BotPatch,
+  type BotWorkflow,
+  type TeachCapture,
+  type TeachEntryPoint,
+  type TeachRecordingStatus,
+  createBotWorkflow,
   createBotProfile,
   initialAppState,
   normalizeAppState,
@@ -13,7 +18,7 @@ import {
   normalizeQuestionWidget,
   updateBotProfile
 } from "./contracts";
-import { DesktopOAuthController } from "./oauth";
+import { DesktopOAuthController, safeComputerViewerUrl } from "./oauth";
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
@@ -25,10 +30,21 @@ const CHANNELS = Object.freeze({
   billingSnapshot: "desktop:billing-snapshot",
   startCheckout: "desktop:start-checkout",
   openBillingPortal: "desktop:open-billing-portal",
+  computerStatus: "desktop:computer-status",
+  ensureComputer: "desktop:ensure-computer",
+  handBackComputer: "desktop:hand-back-computer",
+  deleteComputer: "desktop:delete-computer",
+  openComputerViewer: "desktop:open-computer-viewer",
   saveConnectors: "desktop:save-connectors",
   createBot: "desktop:create-bot",
   updateBot: "desktop:update-bot",
   runBotAgent: "desktop:run-bot-agent",
+  getTeachRecordingStatus: "desktop:get-teach-recording-status",
+  startTeachRecording: "desktop:start-teach-recording",
+  stopTeachRecording: "desktop:stop-teach-recording",
+  discardTeachRecording: "desktop:discard-teach-recording",
+  runBotWorkflow: "desktop:run-bot-workflow",
+  deleteBotWorkflow: "desktop:delete-bot-workflow",
   setActiveBot: "desktop:set-active-bot",
   deleteBot: "desktop:delete-bot"
 });
@@ -104,12 +120,34 @@ function hasUserState(state: AppState): boolean {
 app.setName("Agent Genia");
 
 let mainWindow: BrowserWindow | null = null;
+let computerWindow: BrowserWindow | null = null;
+const issuedComputerViewerUrls = new Set<string>();
 let stateStore: DesktopStateStore;
 let oauthController: DesktopOAuthController;
+let teachRecordingsDirectory = "";
+let activeTeachRecording: ActiveTeachRecording | null = null;
 const smokeTest = process.argv.includes("--smoke-test");
 const hasSingleInstanceLock = smokeTest || app.requestSingleInstanceLock();
 
 if (!hasSingleInstanceLock) app.quit();
+
+interface ActiveTeachRecording {
+  phase: "recording" | "processing";
+  botId: string;
+  botName: string;
+  entryPoint: TeachEntryPoint;
+  startedAt: string;
+  recordingId: string;
+  accountScope: string;
+}
+
+const IDLE_TEACH_STATUS: TeachRecordingStatus = Object.freeze({
+  phase: "idle",
+  botId: "",
+  botName: "",
+  entryPoint: "",
+  startedAt: ""
+});
 
 app.on("second-instance", () => {
   if (!mainWindow) return;
@@ -128,6 +166,9 @@ function registerDesktopIpc(): void {
     return connections;
   });
   ipcMain.handle(CHANNELS.signOut, async () => {
+    activeTeachRecording = null;
+    issuedComputerViewerUrls.clear();
+    computerWindow?.close();
     const connections = await oauthController.signOut();
     await stateStore.activateAccount(null);
     return connections;
@@ -146,6 +187,36 @@ function registerDesktopIpc(): void {
     return oauthController.startCheckout(tier);
   });
   ipcMain.handle(CHANNELS.openBillingPortal, () => oauthController.openBillingPortal());
+  ipcMain.handle(CHANNELS.computerStatus, (_event, botId: unknown) => {
+    if (typeof botId !== "string") throw new Error("Bot inválido.");
+    return oauthController.computerStatus(botId);
+  });
+  ipcMain.handle(CHANNELS.ensureComputer, async (_event, botId: unknown, botName: unknown) => {
+    if (typeof botId !== "string" || typeof botName !== "string") throw new Error("Bot inválido.");
+    const snapshot = await oauthController.ensureComputer(botId, botName);
+    if (snapshot.viewer_url) rememberComputerViewerUrl(snapshot.viewer_url);
+    return snapshot;
+  });
+  ipcMain.handle(CHANNELS.handBackComputer, async (_event, botId: unknown) => {
+    if (typeof botId !== "string") throw new Error("Bot inválido.");
+    const snapshot = await oauthController.handBackComputer(botId);
+    issuedComputerViewerUrls.clear();
+    computerWindow?.close();
+    return snapshot;
+  });
+  ipcMain.handle(CHANNELS.deleteComputer, async (_event, botId: unknown) => {
+    if (typeof botId !== "string") throw new Error("Bot inválido.");
+    const result = await oauthController.deleteComputer(botId);
+    issuedComputerViewerUrls.clear();
+    computerWindow?.close();
+    return result;
+  });
+  ipcMain.handle(CHANNELS.openComputerViewer, (_event, value: unknown) => {
+    if (typeof value !== "string") throw new Error("URL de computadora inválida.");
+    const url = safeComputerViewerUrl(value);
+    if (!issuedComputerViewerUrls.delete(url)) throw new Error("El viewer ya expiró o no fue emitido para esta sesión.");
+    openComputerWindow(url);
+  });
   ipcMain.handle(CHANNELS.saveConnectors, (_event, connectorIds: unknown, onboardingCompleted?: unknown) => {
     const normalized = normalizeConnectorIds(connectorIds);
     return stateStore.update((state) => ({
@@ -188,7 +259,8 @@ function registerDesktopIpc(): void {
     ]);
     const result = await oauthController.runAgent(
       buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
-      connectorIds
+      connectorIds,
+      { computer: true, botId }
     );
     const generated = parseAgentAnswer(result.answer);
     if (!generated.text) throw new Error("El agente no devolvió una respuesta.");
@@ -212,18 +284,294 @@ function registerDesktopIpc(): void {
       return { ...current, bots, activeBotId: botId };
     });
   });
+  ipcMain.handle(CHANNELS.getTeachRecordingStatus, () => teachRecordingStatus());
+  ipcMain.handle(CHANNELS.startTeachRecording, async (
+    _event,
+    botIdValue: unknown,
+    entryPointValue: unknown
+  ) => {
+    const botId = typeof botIdValue === "string" ? botIdValue : "";
+    const entryPoint = normalizeTeachEntryPoint(entryPointValue);
+    const accountId = await oauthController.accountId();
+    if (!accountId) throw new Error("Inicia sesión antes de enseñar una tarea.");
+    const bot = (await stateStore.snapshot()).bots.find((item) => item.id === botId);
+    if (!bot) throw new Error("No encontramos ese bot.");
+    if (activeTeachRecording) {
+      if (activeTeachRecording.botId === botId) return teachRecordingStatus();
+      throw new Error(`Recording another agent's computer: ${activeTeachRecording.botName}.`);
+    }
+    activeTeachRecording = {
+      phase: "recording",
+      botId,
+      botName: bot.name,
+      entryPoint,
+      startedAt: new Date().toISOString(),
+      recordingId: randomUUID(),
+      accountScope: accountScope(accountId)
+    };
+    return teachRecordingStatus();
+  });
+  ipcMain.handle(CHANNELS.discardTeachRecording, (_event, botIdValue: unknown) => {
+    const botId = typeof botIdValue === "string" ? botIdValue : "";
+    if (activeTeachRecording && activeTeachRecording.botId !== botId) {
+      throw new Error(`Recording another agent's computer: ${activeTeachRecording.botName}.`);
+    }
+    activeTeachRecording = null;
+    return teachRecordingStatus();
+  });
+  ipcMain.handle(CHANNELS.stopTeachRecording, async (
+    _event,
+    botIdValue: unknown,
+    captureValue: unknown
+  ) => {
+    const botId = typeof botIdValue === "string" ? botIdValue : "";
+    const recording = activeTeachRecording;
+    if (!recording || recording.botId !== botId || recording.phase !== "recording") {
+      throw new Error("No hay una grabación activa para este bot.");
+    }
+    const accountId = await oauthController.accountId();
+    if (!accountId || accountScope(accountId) !== recording.accountScope) {
+      activeTeachRecording = null;
+      throw new Error("La cuenta cambió durante la grabación. Vuelve a intentarlo.");
+    }
+    const capture = normalizeTeachCapture(captureValue);
+    recording.phase = "processing";
+    let storedRecording = false;
+    try {
+      const before = await stateStore.snapshot();
+      const bot = before.bots.find((item) => item.id === botId);
+      if (!bot) throw new Error("No encontramos ese bot.");
+      if (bot.workflows.length >= 50) throw new Error("Este bot ya tiene 50 tareas aprendidas. Elimina una antes de grabar otra.");
+      const extracted = await oauthController.teachWorkflow(bot.name, capture.frames, capture.durationMs);
+      const workflow = createBotWorkflow(
+        extracted,
+        randomUUID(),
+        recording.recordingId,
+        capture.videoBytes.byteLength ? capture.mimeType : ""
+      );
+      if (capture.videoBytes.byteLength && capture.mimeType) {
+        await saveTeachRecording(recording, capture);
+        storedRecording = true;
+      }
+      const now = new Date().toISOString();
+      return await stateStore.update((current) => {
+        const index = current.bots.findIndex((item) => item.id === botId);
+        if (index < 0) throw new Error("El bot se eliminó mientras aprendía.");
+        const bots = [...current.bots];
+        bots[index] = {
+          ...bots[index],
+          workflows: [...bots[index].workflows, workflow].slice(-50),
+          messages: [...bots[index].messages, {
+            id: randomUUID(),
+            role: "assistant" as const,
+            text: `Aprendí “${workflow.title}”. Ya puedo volver a ejecutar sus ${workflow.steps.length} pasos.`,
+            createdAt: now
+          }].slice(-200)
+        };
+        return { ...current, bots, activeBotId: botId };
+      });
+    } catch (error) {
+      if (storedRecording) await deleteTeachRecording(recording.accountScope, recording.recordingId, capture.mimeType);
+      throw error;
+    } finally {
+      activeTeachRecording = null;
+    }
+  });
+  ipcMain.handle(CHANNELS.runBotWorkflow, async (
+    _event,
+    botIdValue: unknown,
+    workflowIdValue: unknown
+  ) => {
+    const botId = typeof botIdValue === "string" ? botIdValue : "";
+    const workflowId = typeof workflowIdValue === "string" ? workflowIdValue : "";
+    const before = await stateStore.snapshot();
+    const bot = before.bots.find((item) => item.id === botId);
+    const workflow = bot?.workflows.find((item) => item.id === workflowId);
+    if (!bot || !workflow) throw new Error("No encontramos esa tarea aprendida.");
+    const connectorIds = normalizeConnectorIds([...before.selectedConnectorIds, ...bot.connectorIds]);
+    const result = await oauthController.runAgent(
+      buildWorkflowRunPrompt(bot, workflow),
+      connectorIds,
+      { computer: true, botId }
+    );
+    const generated = parseAgentAnswer(result.answer);
+    if (!generated.text) throw new Error("El agente no devolvió un resultado.");
+    const now = new Date().toISOString();
+    return stateStore.update((current) => {
+      const index = current.bots.findIndex((item) => item.id === botId);
+      if (index < 0) throw new Error("El bot se eliminó mientras trabajaba.");
+      const bots = [...current.bots];
+      bots[index] = {
+        ...bots[index],
+        workflows: bots[index].workflows.map((item) => item.id === workflowId
+          ? { ...item, lastRunAt: now, updatedAt: now }
+          : item),
+        messages: [
+          ...bots[index].messages,
+          { id: randomUUID(), role: "user" as const, text: `Ejecuta la tarea aprendida: ${workflow.title}`, createdAt: now },
+          { id: randomUUID(), role: "assistant" as const, text: generated.text, createdAt: now }
+        ].slice(-200)
+      };
+      return { ...current, bots, activeBotId: botId };
+    });
+  });
+  ipcMain.handle(CHANNELS.deleteBotWorkflow, async (
+    _event,
+    botIdValue: unknown,
+    workflowIdValue: unknown
+  ) => {
+    const botId = typeof botIdValue === "string" ? botIdValue : "";
+    const workflowId = typeof workflowIdValue === "string" ? workflowIdValue : "";
+    const accountId = await oauthController.accountId();
+    const before = await stateStore.snapshot();
+    const bot = before.bots.find((item) => item.id === botId);
+    const workflow = bot?.workflows.find((item) => item.id === workflowId);
+    if (!bot || !workflow) throw new Error("No encontramos esa tarea aprendida.");
+    const next = await stateStore.update((current) => ({
+      ...current,
+      bots: current.bots.map((item) => item.id === botId
+        ? { ...item, workflows: item.workflows.filter((candidate) => candidate.id !== workflowId) }
+        : item),
+      activeBotId: botId
+    }));
+    if (accountId && workflow.recordingMimeType) {
+      await deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType);
+    }
+    return next;
+  });
   ipcMain.handle(CHANNELS.setActiveBot, (_event, botId: unknown) => stateStore.update((state) => ({
     ...state,
     activeBotId: typeof botId === "string" && state.bots.some((bot) => bot.id === botId) ? botId : null
   })));
-  ipcMain.handle(CHANNELS.deleteBot, (_event, botId: unknown) => stateStore.update((state) => {
-    const bots = typeof botId === "string" ? state.bots.filter((bot) => bot.id !== botId) : state.bots;
-    return {
-      ...state,
-      bots,
-      activeBotId: state.activeBotId === botId ? bots[0]?.id ?? null : state.activeBotId
-    };
-  }));
+  ipcMain.handle(CHANNELS.deleteBot, async (_event, botId: unknown) => {
+    const before = await stateStore.snapshot();
+    const removed = typeof botId === "string" ? before.bots.find((bot) => bot.id === botId) : undefined;
+    const accountId = await oauthController.accountId();
+    if (removed && accountId) {
+      await oauthController.deleteComputer(removed.id);
+      issuedComputerViewerUrls.clear();
+      computerWindow?.close();
+    }
+    if (activeTeachRecording?.botId === botId) activeTeachRecording = null;
+    const next = await stateStore.update((state) => {
+      const bots = typeof botId === "string" ? state.bots.filter((bot) => bot.id !== botId) : state.bots;
+      return {
+        ...state,
+        bots,
+        activeBotId: state.activeBotId === botId ? bots[0]?.id ?? null : state.activeBotId
+      };
+    });
+    if (accountId && removed) {
+      await Promise.all(removed.workflows.map((workflow) => workflow.recordingMimeType
+        ? deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType)
+        : Promise.resolve()));
+    }
+    return next;
+  });
+}
+
+function teachRecordingStatus(): TeachRecordingStatus {
+  return activeTeachRecording
+    ? {
+      phase: activeTeachRecording.phase,
+      botId: activeTeachRecording.botId,
+      botName: activeTeachRecording.botName,
+      entryPoint: activeTeachRecording.entryPoint,
+      startedAt: activeTeachRecording.startedAt
+    }
+    : { ...IDLE_TEACH_STATUS };
+}
+
+function normalizeTeachEntryPoint(value: unknown): TeachEntryPoint {
+  if (value === "top_bar" || value === "composer_menu" || value === "screen_hover") return value;
+  throw new Error("Punto de entrada de grabación inválido.");
+}
+
+function accountScope(accountId: string): string {
+  return createHash("sha256").update(accountId).digest("hex");
+}
+
+function normalizeTeachCapture(value: unknown): TeachCapture {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("La grabación es inválida.");
+  const record = value as Record<string, unknown>;
+  const durationMs = typeof record.durationMs === "number" && Number.isFinite(record.durationMs)
+    ? Math.max(1_000, Math.min(300_000, Math.round(record.durationMs)))
+    : 0;
+  if (!durationMs) throw new Error("La duración de la grabación es inválida.");
+  const frames = Array.isArray(record.frames)
+    ? record.frames.slice(0, 12).flatMap((frame): string[] => {
+      if (typeof frame !== "string" || frame.length > 1_500_000) return [];
+      return /^data:image\/(?:jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(frame) ? [frame] : [];
+    })
+    : [];
+  if (frames.length < 2) throw new Error("La grabación necesita al menos dos fotogramas legibles.");
+  const mimeType = record.mimeType === "video/mp4" ? "video/mp4"
+    : record.mimeType === "video/webm" ? "video/webm"
+      : "";
+  let videoBytes: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  if (record.videoBytes instanceof Uint8Array) {
+    videoBytes = record.videoBytes;
+  } else if (record.videoBytes instanceof ArrayBuffer) {
+    videoBytes = new Uint8Array(record.videoBytes);
+  } else if (ArrayBuffer.isView(record.videoBytes)) {
+    const view = record.videoBytes;
+    videoBytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  }
+  if (videoBytes.byteLength > 64 * 1024 * 1024) throw new Error("La grabación excede el límite de 64 MB.");
+  if (videoBytes.byteLength && !mimeType) throw new Error("El formato de la grabación no es compatible.");
+  return { durationMs, frames, mimeType, videoBytes };
+}
+
+function teachRecordingExtension(mimeType: TeachCapture["mimeType"]): string {
+  return mimeType === "video/mp4" ? ".mp4" : ".webm";
+}
+
+async function saveTeachRecording(recording: ActiveTeachRecording, capture: TeachCapture): Promise<void> {
+  const directory = path.join(teachRecordingsDirectory, recording.accountScope);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const filePath = path.join(directory, `${recording.recordingId}${teachRecordingExtension(capture.mimeType)}`);
+  await writeFile(filePath, capture.videoBytes, { mode: 0o600, flag: "wx" });
+}
+
+async function deleteTeachRecording(
+  scope: string,
+  recordingId: string,
+  mimeType: BotWorkflow["recordingMimeType"]
+): Promise<void> {
+  if (!/^[0-9a-f-]{36}$/i.test(recordingId) || !mimeType) return;
+  await rm(path.join(teachRecordingsDirectory, scope, `${recordingId}${teachRecordingExtension(mimeType)}`), { force: true });
+}
+
+function configureDisplayMedia(): void {
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ["screen", "window"],
+        thumbnailSize: { width: 0, height: 0 },
+        fetchWindowIcons: false
+      });
+      const source = sources.find((item) => item.id.startsWith("screen:")) ?? sources[0];
+      callback(source ? { video: source } : {});
+    } catch {
+      callback({});
+    }
+  }, { useSystemPicker: true });
+}
+
+function buildWorkflowRunPrompt(bot: AppState["bots"][number], workflow: BotWorkflow): string {
+  return [
+    `Eres ${bot.name}, un agente de Agent Genia.`,
+    bot.title ? `Rol: ${bot.title}.` : "",
+    bot.description ? `Objetivo: ${bot.description}.` : "",
+    bot.connectorIds.length ? `Conectores autorizables: ${bot.connectorIds.join(", ")}.` : "No hay conectores seleccionados.",
+    `Ejecuta ahora la tarea aprendida “${workflow.title}”.`,
+    workflow.summary ? `Resultado esperado: ${workflow.summary}` : "",
+    "Pasos aprendidos, en orden:",
+    ...workflow.steps.map((step, index) => `${index + 1}. ${step}`),
+    "Si necesitas GUI, shell o archivos, busca primero 'computadora' con connector_search y usa la herramienta computer que active. Usa conectores cuando corresponda.",
+    "Si una autorización o dato humano bloquea un paso, detente y explica exactamente qué necesitas.",
+    "No inventes que completaste acciones. Devuelve exclusivamente JSON válido: {\"text\":\"resultado visible\",\"widget\":null}."
+  ].filter(Boolean).join("\n");
 }
 
 function buildBotPrompt(
@@ -239,6 +587,7 @@ function buildBotPrompt(
     bot.title ? `Rol: ${bot.title}.` : "",
     bot.description ? `Objetivo: ${bot.description}.` : "",
     bot.connectorIds.length ? `Conectores autorizables: ${bot.connectorIds.join(", ")}.` : "No hay conectores seleccionados.",
+    "Si la tarea necesita GUI, pantalla, shell o archivos, busca primero 'computadora' con connector_search; úsala solo si la búsqueda la ofrece para esta ejecución.",
     "Responde en el idioma del usuario, con naturalidad y sin afirmar que realizaste acciones que no ejecutaste.",
     "Devuelve exclusivamente JSON válido con esta forma: {\"text\":\"respuesta visible\",\"widget\":null}.",
     "Cuando una pregunta con opciones ayude, widget puede ser {\"prompt\":\"pregunta\",\"helpText\":\"ayuda opcional\",\"options\":[{\"label\":\"texto visible\",\"value\":\"respuesta natural enviada al agente\",\"description\":\"detalle opcional\"}],\"allowCustom\":true,\"dismissOnMoveOn\":true}. Usa entre 1 y 6 opciones. No uses Markdown alrededor del JSON.",
@@ -295,6 +644,10 @@ function createWindow(): void {
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (url !== mainWindow?.webContents.getURL()) event.preventDefault();
   });
+  mainWindow.webContents.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
+    if (isMainFrame) activeTeachRecording = null;
+  });
+  mainWindow.webContents.on("render-process-gone", () => { activeTeachRecording = null; });
   if (!smokeTest) mainWindow.once("ready-to-show", () => mainWindow?.show());
   mainWindow.webContents.once("did-finish-load", () => {
     if (!smokeTest || !mainWindow) return;
@@ -312,8 +665,63 @@ function createWindow(): void {
       }
     }, 350);
   });
-  mainWindow.on("closed", () => { mainWindow = null; });
+  mainWindow.on("closed", () => { activeTeachRecording = null; mainWindow = null; });
   void mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
+}
+
+function openComputerWindow(url: string): void {
+  computerWindow?.destroy();
+  const allowedOrigin = new URL(url).origin;
+  const viewerSession = session.fromPartition(`agentgenia-computer-${randomUUID()}`);
+  viewerSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  viewerSession.webRequest.onBeforeSendHeaders((details, callback) => {
+    let requestHeaders = details.requestHeaders;
+    try {
+      if (new URL(details.url).origin === allowedOrigin) {
+        requestHeaders = { ...requestHeaders, "X-Daytona-Skip-Preview-Warning": "true" };
+      }
+    } catch {}
+    callback({ requestHeaders });
+  });
+  computerWindow = new BrowserWindow({
+    width: 1280,
+    height: 820,
+    minWidth: 800,
+    minHeight: 600,
+    show: false,
+    title: "Agent Genia Computer",
+    backgroundColor: "#111111",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      session: viewerSession,
+      devTools: !app.isPackaged
+    }
+  });
+  computerWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  computerWindow.webContents.on("will-navigate", (event, target) => {
+    try {
+      if (new URL(target).origin !== allowedOrigin) event.preventDefault();
+    } catch {
+      event.preventDefault();
+    }
+  });
+  computerWindow.once("ready-to-show", () => computerWindow?.show());
+  computerWindow.on("closed", () => { computerWindow = null; });
+  void computerWindow.loadURL(url);
+}
+
+function rememberComputerViewerUrl(value: string): void {
+  const url = safeComputerViewerUrl(value);
+  issuedComputerViewerUrls.add(url);
+  while (issuedComputerViewerUrls.size > 8) {
+    const oldest = issuedComputerViewerUrls.values().next().value;
+    if (typeof oldest !== "string") break;
+    issuedComputerViewerUrls.delete(oldest);
+  }
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
@@ -321,6 +729,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   const wrapperServiceUrl = process.env.WRAPPER_SERVICE_URL?.trim()
     || "https://agentgenia-api.onrender.com";
   stateStore = new DesktopStateStore(path.join(userDataPath, "accounts"));
+  teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   oauthController = new DesktopOAuthController({
     baseUrl: wrapperServiceUrl,
     safeStorage,
@@ -333,6 +742,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     ...(startupAccountId ? { legacyFilePath: path.join(userDataPath, "desktop-state.json") } : {})
   });
   registerDesktopIpc();
+  configureDisplayMedia();
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
