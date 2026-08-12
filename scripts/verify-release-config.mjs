@@ -48,6 +48,11 @@ if (!gradle.includes("signingConfig = signingConfigs.getByName(\"release\")")) {
 if (!gradle.includes("compileSdk = 36") || !gradle.includes("targetSdk = 36")) {
   throw new Error("Android releases must use the stable API 36 SDK");
 }
+for (const artifact of ["lifecycle-runtime-compose", "lifecycle-viewmodel-compose"]) {
+  if (!gradle.includes(`${artifact}:2.10.0`)) {
+    throw new Error(`${artifact} must remain on the API 36-compatible release`);
+  }
+}
 for (const token of ["target: dmg", "target: pkg", "target: nsis", "target: appx", "AppImage", "deb", "rpm"]) {
   if (!builder.includes(token)) throw new Error(`Missing Electron target: ${token}`);
 }
