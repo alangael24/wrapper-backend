@@ -149,6 +149,12 @@ class WrapperServer:
         os.environ.pop("GOOGLE_OAUTH_CLIENT_ID", None)
         os.environ.pop("GOOGLE_OAUTH_CLIENT_SECRET", None)
         os.environ.pop("GOOGLE_OAUTH_REDIRECT_URI", None)
+        for name in (
+            "STRIPE_ENABLED", "STRIPE_LIVE_MODE", "STRIPE_SECRET_KEY",
+            "STRIPE_WEBHOOK_SECRET", "STRIPE_PLUS_PRICE_ID", "STRIPE_PRO_PRICE_ID",
+            "STRIPE_SUCCESS_URL", "STRIPE_CANCEL_URL", "STRIPE_PORTAL_RETURN_URL",
+        ):
+            os.environ.pop(name, None)
         self.cfg = Config()
         self.cfg.go_base_url = upstream_base + "/v1"
         self.backend = Backend(self.cfg)

@@ -7,6 +7,10 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
+  GET  /v1/billing         Consultar plan y suscripción Stripe
+  POST /v1/billing/checkout Crear Checkout para Plus/Pro
+  POST /v1/billing/portal  Abrir Customer Portal
+  POST /v1/billing/webhook Procesar eventos Stripe firmados
   POST /v1/byok            El usuario registra su propia key de Go
   GET  /v1/models          Catalogo de modelos (proxy a Go)
   POST /v1/chat/completions
@@ -47,6 +51,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from .billing import BillingConfig, BillingError, BillingService
 from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
 from .connectors import ConnectorBroker, ConnectorBrokerError
 from .go_prices import estimate_cost_usd
@@ -57,8 +62,9 @@ from .pi_harness import (
     PiHarnessBusy,
     PiHarnessError,
 )
+from .postgres_store import create_store
 from .tiers import DEFAULT_TIER, effective_limits, is_valid, requires_subscription, tier_label
-from .store import NoSubscriptionAvailable, Store, new_id
+from .store import NoSubscriptionAvailable, new_id
 from .upstream import DEFAULT_UA, proxy_request
 from .vision import VisionError, VisionRouter
 
@@ -79,6 +85,7 @@ DEFAULT_PI_CONNECTOR_EXTENSION = (
 )
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
+MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 
 # Rutas expuestas por el wrapper -> rutas relativas al upstream de Go
@@ -129,6 +136,7 @@ def validate_pi_chrome_security(chrome_isolation: str) -> None:
 class Config:
     def __init__(self):
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
+        self.database_url = (os.environ.get("DATABASE_URL") or "").strip() or None
         self.secret_file = Path(os.environ.get("SECRET_FILE", str(DEFAULT_SECRET_FILE)))
         self.go_base_url = os.environ.get("GO_BASE_URL", DEFAULT_GO_BASE).rstrip("/")
         self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -142,6 +150,20 @@ class Config:
         self.account_access_ttl_seconds = int(os.environ.get("ACCOUNT_ACCESS_TTL_SECONDS", "900"))
         self.account_refresh_ttl_seconds = int(os.environ.get("ACCOUNT_REFRESH_TTL_SECONDS", str(30 * 86400)))
         self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
+        self.stripe_enabled = os.environ.get("STRIPE_ENABLED", "0") == "1"
+        self.stripe_live_mode = os.environ.get("STRIPE_LIVE_MODE", "1") != "0"
+        self.stripe_secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip() or None
+        self.stripe_webhook_secret = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip() or None
+        self.stripe_plus_price_id = (os.environ.get("STRIPE_PLUS_PRICE_ID") or "").strip() or None
+        self.stripe_pro_price_id = (os.environ.get("STRIPE_PRO_PRICE_ID") or "").strip() or None
+        self.stripe_success_url = (os.environ.get("STRIPE_SUCCESS_URL") or "").strip() or None
+        self.stripe_cancel_url = (os.environ.get("STRIPE_CANCEL_URL") or "").strip() or None
+        self.stripe_portal_return_url = (
+            (os.environ.get("STRIPE_PORTAL_RETURN_URL") or "").strip() or None
+        )
+        self.stripe_webhook_tolerance_seconds = int(
+            os.environ.get("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300")
+        )
         self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
         self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
         self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
@@ -234,7 +256,23 @@ class Backend:
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
-        self.store = Store(cfg.db_path)
+        self.store = create_store(database_url=cfg.database_url, db_path=cfg.db_path)
+        try:
+            billing_config = BillingConfig.from_values(
+                enabled=cfg.stripe_enabled,
+                live_mode=cfg.stripe_live_mode,
+                secret_key=cfg.stripe_secret_key,
+                webhook_secret=cfg.stripe_webhook_secret,
+                basic_price_id=cfg.stripe_plus_price_id,
+                pro_price_id=cfg.stripe_pro_price_id,
+                success_url=cfg.stripe_success_url,
+                cancel_url=cfg.stripe_cancel_url,
+                portal_return_url=cfg.stripe_portal_return_url,
+                webhook_tolerance_seconds=cfg.stripe_webhook_tolerance_seconds,
+            )
+        except ValueError as exc:
+            raise UnsafeConfigurationError(f"Configuración de Stripe inválida: {exc}") from exc
+        self.billing = BillingService(self.store, billing_config)
         self.google_auth = GoogleAccountAuth(
             store=self.store,
             client_id=cfg.google_oauth_client_id,
@@ -375,6 +413,34 @@ class Backend:
                 "basic/pro se activan exclusivamente después de verificar el pago."
             ),
         })
+
+    # ---------- billing ----------
+    def handle_billing_status(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.billing.status(user))
+
+    def handle_billing_checkout(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        tier = body.get("tier")
+        if not isinstance(tier, str):
+            raise BillingError("Falta el plan solicitado", code="invalid_plan")
+        json_response(handler, 201, self.billing.create_checkout(user, tier))
+
+    def handle_billing_portal(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 201, self.billing.create_portal(user))
+
+    def handle_billing_webhook(self, handler: BaseHTTPRequestHandler) -> None:
+        signature = handler.headers.get("Stripe-Signature", "")
+        payload = self.read_body(handler, max_bytes=MAX_STRIPE_WEBHOOK_BODY)
+        json_response(handler, 200, self.billing.process_webhook(payload, signature))
 
     def handle_byok(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -688,7 +754,7 @@ class Backend:
         json_response(handler, 200, result)
 
     # ---------- body helpers ----------
-    def read_body(self, handler: BaseHTTPRequestHandler) -> bytes:
+    def read_body(self, handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_BODY) -> bytes:
         transfer_encoding = handler.headers.get("transfer-encoding", "").lower()
         if "chunked" in (part.strip() for part in transfer_encoding.split(",")):
             chunks: list[bytes] = []
@@ -714,9 +780,9 @@ class Backend:
                             raise RequestBodyError("Trailer chunked invalido")
                     break
                 total += size
-                if total > MAX_BODY:
+                if total > max_bytes:
                     handler.close_connection = True
-                    raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
+                    raise RequestBodyTooLarge(f"Body mayor a {max_bytes} bytes")
                 chunk = handler.rfile.read(size)
                 ending = handler.rfile.read(2)
                 if len(chunk) != size or ending != b"\r\n":
@@ -727,9 +793,9 @@ class Backend:
         length = handler.headers.get("content-length")
         if length and length.isdigit():
             n = int(length)
-            if n > MAX_BODY:
+            if n > max_bytes:
                 handler.close_connection = True
-                raise RequestBodyTooLarge(f"Body mayor a {MAX_BODY} bytes")
+                raise RequestBodyTooLarge(f"Body mayor a {max_bytes} bytes")
             return handler.rfile.read(n)
         return b""
 
@@ -888,6 +954,14 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_logout(self)
             elif self.command == "POST" and path == "/v1/signup":
                 backend.handle_signup(self)
+            elif self.command == "GET" and path == "/v1/billing":
+                backend.handle_billing_status(self)
+            elif self.command == "POST" and path == "/v1/billing/checkout":
+                backend.handle_billing_checkout(self)
+            elif self.command == "POST" and path == "/v1/billing/portal":
+                backend.handle_billing_portal(self)
+            elif self.command == "POST" and path == "/v1/billing/webhook":
+                backend.handle_billing_webhook(self)
             elif self.command == "POST" and path == "/v1/byok":
                 backend.handle_byok(self)
             elif path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
@@ -923,6 +997,8 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "version": __version__,
                     "google_auth_configured": backend.google_auth.configured,
+                    "stripe_configured": backend.billing.configured,
+                    "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
                 })
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
@@ -933,6 +1009,8 @@ class Handler(BaseHTTPRequestHandler):
         except RequestBodyError as e:
             error_response(self, 400, str(e), "bad_body")
         except GoogleAuthError as e:
+            error_response(self, e.status, str(e), e.code)
+        except BillingError as e:
             error_response(self, e.status, str(e), e.code)
         except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
             try:
@@ -957,7 +1035,8 @@ def serve(cfg: Config) -> None:
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     print(f"[server] wrapper backend v{__version__} escuchando en http://{cfg.host}:{cfg.port}")
     print(f"[server] upstream Go: {cfg.go_base_url}")
-    print(f"[server] enforce_limits={cfg.enforce_limits} db={cfg.db_path}")
+    database_backend = "postgres" if cfg.database_url else f"sqlite:{cfg.db_path}"
+    print(f"[server] enforce_limits={cfg.enforce_limits} database={database_backend}")
     print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
     print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
     try:
@@ -998,7 +1077,8 @@ def cli() -> None:
 
     backend = Backend(cfg)
     if args.cmd == "init-db":
-        print(f"[ok] base de datos en {cfg.db_path}")
+        location = "Supabase/Postgres" if cfg.database_url else str(cfg.db_path)
+        print(f"[ok] base de datos en {location}")
     elif args.cmd == "users":
         for u in backend.store.list_users():
             print(u["id"], "|", u.get("name") or "-", "|", u.get("email") or "-",

@@ -196,6 +196,26 @@ test("keeps Electron renderer isolated from Node and external network", async ()
   assert.match(html, /connect-src 'none'/);
 });
 
+test("opens Stripe Checkout and the customer portal only through isolated IPC", async () => {
+  const [main, preload, oauth, renderer] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:start-checkout/);
+  assert.match(main, /tier !== "basic" && tier !== "pro"/);
+  assert.match(preload, /startCheckout/);
+  assert.match(preload, /openBillingPortal/);
+  assert.doesNotMatch(preload, /STRIPE_SECRET_KEY|sk_live_|whsec_/);
+  assert.match(oauth, /safeStripeUrl/);
+  assert.match(oauth, /checkout\.stripe\.com/);
+  assert.match(oauth, /billing\.stripe\.com/);
+  assert.match(renderer, /function renderBilling\(\)/);
+  assert.match(renderer, /data-select-plan/);
+  assert.match(renderer, /data-open-billing-portal/);
+});
+
 test("stores real OAuth sessions outside the renderer and binds them to one signed-in account", async () => {
   const [oauth, main, preload, renderer] = await Promise.all([
     readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),

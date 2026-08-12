@@ -39,6 +39,7 @@ import {
   CONNECTOR_CATALOG,
   HOSTED_CONNECTOR_IDS,
   type AppState,
+  type BillingSnapshot,
   type BotDraft,
   type BotPatch,
   type BotProfile,
@@ -59,7 +60,7 @@ declare global {
   }
 }
 
-type View = "connectors" | "plugins" | "bot-builder" | "bot-detail";
+type View = "connectors" | "plugins" | "billing" | "bot-builder" | "bot-detail";
 
 const CONNECTOR_CATEGORIES = Object.freeze([
   "Trabajo", "Ventas", "Soporte", "Desarrollo", "Diseño",
@@ -118,6 +119,10 @@ let avatarEditorTab: "bot" | "generate" | "upload" = "bot";
 let connections: ConnectorConnectionSnapshot = emptyConnectionSnapshot();
 let authBusyConnectorId = "";
 let accountAuthBusy = false;
+let billing = emptyBillingSnapshot();
+let billingLoaded = false;
+let billingBusy = false;
+let billingNotice = "";
 const settingsSaveTimers = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
@@ -163,6 +168,7 @@ async function initialize(): Promise<void> {
 function render(): void {
   if (activeView === "connectors") renderConnectors();
   else if (activeView === "plugins") renderPluginMarketplace();
+  else if (activeView === "billing") renderBilling();
   else if (activeView === "bot-builder") renderBotBuilder();
   else renderBotDetail();
 }
@@ -478,6 +484,141 @@ async function leaveConnectors(nextView: View): Promise<void> {
     activeView = nextView;
   } catch (error) {
     transientError = errorMessage(error);
+  }
+  render();
+}
+
+function renderBilling(): void {
+  const tier = billing.tier;
+  const subscription = billing.subscription;
+  const currentLabel = tier === "basic" ? "Plus" : tier === "pro" ? "Pro" : "Free";
+  appRoot.innerHTML = renderDesktopShell(`
+    <section class="billing-view">
+      <header class="workspace-topbar">
+        <span class="billing-mark">$</span>
+        <strong>Plan y facturación</strong>
+        <button class="topbar-link" type="button" data-refresh-billing ${billingBusy ? "disabled" : ""}>Actualizar</button>
+      </header>
+      <div class="billing-scroll">
+        <div class="billing-heading">
+          <span class="eyebrow">AGENTGENIA</span>
+          <h1>Elige el plan que acompaña tu trabajo</h1>
+          <p>Los cobros y datos de tarjeta se procesan directamente en Stripe. Agentgenia activa el acceso únicamente después de recibir un webhook firmado.</p>
+        </div>
+        ${!connections.account.connected ? `
+          <section class="billing-signin-card">
+            <strong>Inicia sesión para administrar tu plan</strong>
+            <p>Tu suscripción se vincula a tu cuenta verificada de Agentgenia.</p>
+            <button class="primary-action compact" type="button" data-billing-sign-in>Iniciar sesión</button>
+          </section>` : !billingLoaded ? `
+          <section class="billing-signin-card"><strong>Cargando tus planes…</strong></section>` : `
+          <div class="billing-current">
+            <span><small>Plan actual</small><strong>${currentLabel}</strong></span>
+            ${subscription ? `<span><small>Estado</small><strong>${escapeHtml(subscription.status)}</strong></span>` : ""}
+            ${subscription?.cancel_at_period_end ? '<em>Se cancelará al finalizar el periodo actual.</em>' : ""}
+            ${billing.customer ? '<button type="button" class="secondary-action" data-open-billing-portal>Administrar en Stripe</button>' : ""}
+          </div>
+          <div class="billing-plans">
+            ${renderBillingPlan("free", "Free", 0, "Para explorar Agentgenia", ["Crea y personaliza bots", "Conecta tus herramientas", "Sin acceso al modelo incluido"], tier)}
+            ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", ["Acceso al modelo incluido", "50% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
+            ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", ["Acceso al modelo incluido", "100% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
+          </div>`}
+        ${billingNotice ? `<p class="billing-notice">${escapeHtml(billingNotice)}</p>` : ""}
+        ${!billing.configured && billingLoaded && connections.account.connected ? '<p class="inline-error">El servicio de pagos todavía no está habilitado en producción.</p>' : renderError()}
+      </div>
+    </section>
+  `, "billing");
+  bindSidebar();
+  document.querySelector("[data-refresh-billing]")?.addEventListener("click", () => void refreshBilling());
+  document.querySelector("[data-billing-sign-in]")?.addEventListener("click", async () => {
+    await signInAccount();
+    if (connections.account.connected) await refreshBilling();
+  });
+  document.querySelector("[data-open-billing-portal]")?.addEventListener("click", () => void openBillingPortal());
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-plan]")) {
+    button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro"));
+  }
+}
+
+function renderBillingPlan(
+  id: "free" | "basic" | "pro",
+  name: string,
+  amount: number,
+  subtitle: string,
+  features: string[],
+  currentTier: string
+): string {
+  const current = id === currentTier;
+  const paid = id === "basic" || id === "pro";
+  return `
+    <article class="billing-plan${id === "pro" ? " featured" : ""}${current ? " current" : ""}">
+      <span class="plan-kicker">${id === "pro" ? "MÁS CAPACIDAD" : current ? "TU PLAN" : "MENSUAL"}</span>
+      <h2>${escapeHtml(name)}</h2>
+      <p>${escapeHtml(subtitle)}</p>
+      <div class="plan-price"><strong>$${amount}</strong><span>${amount ? "USD / mes" : "para siempre"}</span></div>
+      <ul>${features.map((feature) => `<li>✓ ${escapeHtml(feature)}</li>`).join("")}</ul>
+      ${current
+        ? '<button type="button" disabled>Plan actual</button>'
+        : paid
+          ? `<button type="button" data-select-plan="${id}" ${!billing.configured || billingBusy ? "disabled" : ""}>Elegir ${escapeHtml(name)}</button>`
+          : '<button type="button" disabled>Incluido</button>'}
+    </article>`;
+}
+
+async function openBillingView(): Promise<void> {
+  closeBotSettings();
+  activeView = "billing";
+  transientError = "";
+  billingNotice = "";
+  render();
+  if (connections.account.connected) await refreshBilling();
+}
+
+async function refreshBilling(): Promise<void> {
+  if (!connections.account.connected || billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  render();
+  try {
+    billing = await desktopApi.billingSnapshot();
+    billingLoaded = true;
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
+  }
+  render();
+}
+
+async function startCheckout(tier: "basic" | "pro"): Promise<void> {
+  if (billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  billingNotice = "";
+  render();
+  try {
+    await desktopApi.startCheckout(tier);
+    billingNotice = "Abrimos el Checkout seguro de Stripe en tu navegador. Al terminar, vuelve aquí y presiona Actualizar.";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
+  }
+  render();
+}
+
+async function openBillingPortal(): Promise<void> {
+  if (billingBusy) return;
+  billingBusy = true;
+  transientError = "";
+  render();
+  try {
+    await desktopApi.openBillingPortal();
+    billingNotice = "Abrimos tu portal de Stripe para actualizar el método de pago, cambiar o cancelar el plan.";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    billingBusy = false;
   }
   render();
 }
@@ -840,7 +981,7 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
         ${normalizedSidebarQuery && !visibleBots.length ? '<div class="sidebar-empty">No encontramos ese bot</div>' : ""}
         <div class="sidebar-footer">
           <button class="sidebar-footer-row" type="button" data-open-connectors><span class="sidebar-connector-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3v5M16 3v5M5 8h14v2a7 7 0 0 1-7 7 7 7 0 0 1-7-7V8Zm7 9v4"></path></svg></span><strong>Plugins</strong><small>${selectedConnectorIds.size ? `${selectedConnectorIds.size} instalados` : ""}</small></button>
-          <div class="sidebar-user"><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong></div>
+          <button class="sidebar-user" type="button" data-open-billing><span>${escapeHtml((connections.account.name || connections.account.email || "A").slice(0, 1).toUpperCase())}</span><strong>${escapeHtml(connections.account.connected ? connections.account.name || connections.account.email : "Sin sesión")}</strong><small>${connections.account.connected ? "Plan y facturación" : "Iniciar sesión"}</small></button>
         </div>
       </aside>
       <div class="desktop-content">${content}</div>
@@ -1044,6 +1185,7 @@ async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<voi
 function bindSidebar(): void {
   document.querySelector("[data-new-bot]")?.addEventListener("click", () => void createDefaultBot());
   document.querySelector("[data-open-connectors]")?.addEventListener("click", () => { closeBotSettings(); activeView = "plugins"; render(); });
+  document.querySelector("[data-open-billing]")?.addEventListener("click", () => void openBillingView());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-bot]")) {
     button.addEventListener("click", () => void selectBot(button.dataset.selectBot ?? ""));
   }
@@ -1163,9 +1305,23 @@ function emptyConnectionSnapshot(): ConnectorConnectionSnapshot {
   };
 }
 
+function emptyBillingSnapshot(): BillingSnapshot {
+  return {
+    configured: false,
+    tier: "free",
+    customer: false,
+    subscription: null,
+    plans: {
+      basic: { name: "Plus", amount: 50, currency: "usd", interval: "month" },
+      pro: { name: "Pro", amount: 200, currency: "usd", interval: "month" }
+    }
+  };
+}
+
 function createPreviewApi(): DesktopApi {
   let previewState = initialAppState();
   let previewConnections = emptyConnectionSnapshot();
+  let previewBilling = { ...emptyBillingSnapshot(), configured: true };
   return {
     async bootstrap() { return structuredClone(previewState); },
     async connectionSnapshot() { return structuredClone(previewConnections); },
@@ -1196,6 +1352,11 @@ function createPreviewApi(): DesktopApi {
       };
       return structuredClone(previewConnections);
     },
+    async billingSnapshot() { return structuredClone(previewBilling); },
+    async startCheckout(tier) {
+      previewBilling = { ...previewBilling, tier };
+    },
+    async openBillingPortal() {},
     async saveConnectors(connectorIds, onboardingCompleted) {
       previewState = {
         ...previewState,

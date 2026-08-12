@@ -154,6 +154,26 @@ export interface ConnectorConnectionSnapshot {
   connectors: ConnectorConnectionStatus[];
 }
 
+export interface BillingSubscriptionStatus {
+  stripe_subscription_id: string;
+  tier: "basic" | "pro";
+  stripe_price_id: string;
+  status: string;
+  cancel_at_period_end: boolean;
+  current_period_end: number | null;
+}
+
+export interface BillingSnapshot {
+  configured: boolean;
+  tier: "free" | "basic" | "pro";
+  customer: boolean;
+  subscription: BillingSubscriptionStatus | null;
+  plans: {
+    basic: { name: string; amount: number; currency: string; interval: string };
+    pro: { name: string; amount: number; currency: string; interval: string };
+  };
+}
+
 export interface BotSetupState {
   step: BotSetupStep;
   purpose: string;
@@ -213,6 +233,9 @@ export interface DesktopApi {
   signOut(): Promise<ConnectorConnectionSnapshot>;
   connectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   disconnectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
+  billingSnapshot(): Promise<BillingSnapshot>;
+  startCheckout(tier: "basic" | "pro"): Promise<void>;
+  openBillingPortal(): Promise<void>;
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;

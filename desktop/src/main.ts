@@ -23,6 +23,9 @@ const CHANNELS = Object.freeze({
   signOut: "desktop:sign-out",
   connectConnector: "desktop:connect-connector",
   disconnectConnector: "desktop:disconnect-connector",
+  billingSnapshot: "desktop:billing-snapshot",
+  startCheckout: "desktop:start-checkout",
+  openBillingPortal: "desktop:open-billing-portal",
   saveConnectors: "desktop:save-connectors",
   createBot: "desktop:create-bot",
   updateBot: "desktop:update-bot",
@@ -100,6 +103,12 @@ function registerDesktopIpc(): void {
     if (typeof connectorId !== "string") throw new Error("Conector inválido.");
     return oauthController.disconnect(connectorId);
   });
+  ipcMain.handle(CHANNELS.billingSnapshot, () => oauthController.billingStatus());
+  ipcMain.handle(CHANNELS.startCheckout, (_event, tier: unknown) => {
+    if (tier !== "basic" && tier !== "pro") throw new Error("Plan inválido.");
+    return oauthController.startCheckout(tier);
+  });
+  ipcMain.handle(CHANNELS.openBillingPortal, () => oauthController.openBillingPortal());
   ipcMain.handle(CHANNELS.saveConnectors, (_event, connectorIds: unknown, onboardingCompleted?: unknown) => {
     const normalized = normalizeConnectorIds(connectorIds);
     return stateStore.update((state) => ({

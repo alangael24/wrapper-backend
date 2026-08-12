@@ -10,8 +10,9 @@ tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
 **GPT-5.6 Luna**, con MiMo como fallback.
 
-El backend base solo requiere Python y `cryptography`; Pi es una dependencia
-opcional de Node.js y viene desactivado por defecto.
+El backend base requiere Python, `cryptography` y `psycopg` cuando usa
+Supabase/Postgres; Pi es una dependencia opcional de Node.js y viene
+desactivado por defecto.
 
 ## Tiers de usuario
 
@@ -46,27 +47,63 @@ funciona con un **pool de suscripciones**:
 
 1. El operador carga las keys de Go compradas al pool (una por usuario final).
 2. Cada registro público (`POST /v1/signup`) crea un usuario `free` sin key.
-3. Un webhook de Stripe con firma verificada —o, mientras se implementa, un
-   administrador que ya comprobó el pago— activa `basic`/`pro`.
+3. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
+   con firma verificada activa `basic`/`pro` después del pago.
 4. La transición pagada reclama una sola key del pool de forma atómica.
 5. El usuario también puede traer su propia key (`POST /v1/byok`), pero el
    acceso sigue dependiendo del tier guardado por el servidor.
 6. El backend proxya `chat/completions`, `responses` y `messages` al upstream
    con la key asignada, y registra el uso por ventanas.
 
-El repositorio todavía no incluye el webhook de Stripe. No publiques un
-checkout que prometa activación automática hasta añadir y verificar ese flujo;
-el endpoint admin es la ruta segura provisional.
+### Persistencia gratuita con Supabase
+
+Producción usa el esquema privado `agentgenia` del proyecto Supabase
+`agent-genia-prod`. Las tablas no se exponen al Data API, no otorgan permisos a
+`anon`/`authenticated` y tienen RLS habilitado como defensa adicional. El
+backend se conecta exclusivamente con `DATABASE_URL` guardada como secreto del
+host. Desarrollo y las pruebas conservan SQLite cuando esa variable está vacía.
+
+La migración versionada vive en `supabase/migrations/`. En Postgres, las
+transiciones de tier, el procesamiento idempotente de webhooks y la reclamación
+de keys mantienen una transacción de escritura serializada; los índices únicos
+parciales siguen impidiendo compartir una suscripción entre usuarios.
+
+Para Render Free define al menos `DATABASE_URL`, `WRAPPER_SECRET` y
+`ADMIN_TOKEN` como secretos. No uses `DB_PATH` ni `secret.key` como estado
+persistente: el filesystem gratuito es efímero. El harness y sus directorios de
+ejecución siguen siendo temporales y no forman parte de la base de datos.
+
+### Stripe Checkout en producción
+
+La integración usa Checkout alojado, el Customer Portal y webhooks idempotentes.
+Electron nunca recibe la secret key, el webhook secret ni un price ID arbitrario.
+El cliente solo solicita `basic` (Plus) o `pro`; el backend resuelve el price ID
+live configurado y el tier no cambia hasta recibir un evento firmado.
+
+1. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
+   del host y establece `STRIPE_ENABLED=1`.
+2. Registra `https://TU-BACKEND/v1/billing/webhook` como destino de eventos live.
+3. Suscribe al menos `checkout.session.completed`,
+   `customer.subscription.created`, `customer.subscription.updated`,
+   `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` e
+   `invoice.payment_action_required`.
+4. Copia el signing secret `whsec_...` al entorno privado como
+   `STRIPE_WEBHOOK_SECRET`.
+
+Los estados `active` y `trialing` activan acceso. `past_due` conserva el acceso
+durante los reintentos de Stripe; `unpaid`, `canceled`, `paused` e
+`incomplete_expired` vuelven a `free` y liberan la capacidad. Si el pool no tiene
+una key disponible, la transacción se revierte y Stripe reintenta el webhook.
 
 ## Requisitos
 
 - Python 3.12 (`python3.12` o el que tengas; si no, instálalo).
-- `cryptography` (solo para cifrado AES; sin él usa el Keychain de macOS).
+- `cryptography` para cifrado AES y `psycopg[binary]` para Supabase/Postgres.
 - Node.js y `pnpm` para habilitar el harness de Pi.
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install cryptography
+.venv/bin/pip install -r requirements.txt
 pnpm install                  # instala Pi 0.84.1 y pi-chrome 0.15.46
 ```
 
@@ -326,6 +363,10 @@ aceptan API key o access token de una sesión Google):
 | POST | `/v1/account-auth/refresh` | Rota access y refresh token ligados al dispositivo |
 | POST | `/v1/account-auth/logout` | Revoca la sesión actual |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
+| GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
+| POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
+| POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
+| POST | `/v1/billing/webhook` | Webhook público que exige una firma `Stripe-Signature` válida |
 | POST | `/v1/byok` | El usuario registra su propia key de Go `{apiKey}` |
 | GET | `/v1/models` | Catálogo de modelos (proxy a Go) |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
@@ -405,6 +446,11 @@ Admin (Bearer = `ADMIN_TOKEN`):
   solo se muestran una vez en el signup.
 - El signup público siempre crea `free`. Solo una transición autenticada tras
   comprobar el pago puede activar `basic`/`pro` y reclamar capacidad.
+- Los eventos Stripe se verifican con HMAC, tolerancia temporal y `livemode`;
+  `stripe_events.event_id` hace su procesamiento idempotente. Customer,
+  suscripción, usuario, tier y capacidad se enlazan en una sola transacción.
+- `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` solo viven en el backend. El
+  arranque rechaza claves test en modo live, URLs inseguras y price IDs inválidos.
 - La asignación de suscripciones usa `BEGIN IMMEDIATE` y el índice único
   `uniq_user_subscription`; dos activaciones concurrentes no pueden compartir
   una key.
@@ -429,14 +475,15 @@ Admin (Bearer = `ADMIN_TOKEN`):
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_backend.py
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Corren contra un upstream mock (sin llamadas reales a OpenCode Go) y cubren:
+Corren contra un upstream mock (sin llamadas reales a OpenCode Go ni Stripe) y cubren:
 signup siempre-free, activación admin, carrera de asignación, rechazo del token
 inseguro, proxy de modelos, chat/responses/messages, streaming,
 registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
-cifrado en reposo. También validan el flujo Pi RPC completo con un ejecutable
+cifrado en reposo, Checkout con price IDs allowlisted, firma e idempotencia de
+webhooks y cancelación. También validan el flujo Pi RPC completo con un ejecutable
 falso, el puente Luna/MiMo, los grants efímeros del broker, la carga dinámica de
 herramientas y el aislamiento de proceso, perfil y bridge de pi-chrome, sin
 consumir saldo real.

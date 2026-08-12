@@ -4,6 +4,7 @@ import path from "node:path";
 import type { SafeStorage, Shell } from "electron";
 import type {
   AccountConnectionStatus,
+  BillingSnapshot,
   ConnectorConnectionSnapshot,
   ConnectorConnectionStatus,
   OAuthProviderId
@@ -244,6 +245,18 @@ export class DesktopOAuthController {
     return this.snapshot();
   }
 
+  async billingStatus(signal?: AbortSignal): Promise<BillingSnapshot> {
+    return parseBillingSnapshot(await this.accountClient.billing(signal));
+  }
+
+  startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+    return this.accountClient.startCheckout(tier, signal);
+  }
+
+  openBillingPortal(signal?: AbortSignal): Promise<void> {
+    return this.accountClient.openBillingPortal(signal);
+  }
+
   private async accountStatus(): Promise<AccountConnectionStatus> {
     const stored = await this.accountStore.get();
     return stored
@@ -481,6 +494,24 @@ class OutcomeOAuthClient {
     return this.authorizedJson("/v1/connectors/disconnect", { method: "POST", body: { connector_id: connectorId }, signal });
   }
 
+  billing(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.authorizedJson("/v1/billing", { signal });
+  }
+
+  async startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+    const result = await this.authorizedJson("/v1/billing/checkout", {
+      method: "POST",
+      body: { tier },
+      signal
+    });
+    await this.options.openExternal(safeStripeUrl(stringValue(result.checkout_url), "checkout.stripe.com"));
+  }
+
+  async openBillingPortal(signal?: AbortSignal): Promise<void> {
+    const result = await this.authorizedJson("/v1/billing/portal", { method: "POST", signal });
+    await this.options.openExternal(safeStripeUrl(stringValue(result.portal_url), "billing.stripe.com"));
+  }
+
   private async authorizedJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
     const session = await this.getSession(request.signal);
     return this.publicJson(route, {
@@ -655,9 +686,55 @@ function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
+  const tier = value.tier;
+  const plans = isRecord(value.plans) ? value.plans : {};
+  const basic = isRecord(plans.basic) ? plans.basic : {};
+  const pro = isRecord(plans.pro) ? plans.pro : {};
+  if (tier !== "free" && tier !== "basic" && tier !== "pro") {
+    throw new Error("El servicio devolvió un plan inválido.");
+  }
+  const parsePlan = (plan: Record<string, unknown>, fallbackName: string, fallbackAmount: number) => ({
+    name: stringValue(plan.name) || fallbackName,
+    amount: numberValue(plan.amount) || fallbackAmount,
+    currency: stringValue(plan.currency) || "usd",
+    interval: stringValue(plan.interval) || "month"
+  });
+  let subscription: BillingSnapshot["subscription"] = null;
+  if (isRecord(value.subscription)) {
+    const item = value.subscription;
+    const itemTier = item.tier;
+    if (itemTier === "basic" || itemTier === "pro") {
+      subscription = {
+        stripe_subscription_id: stringValue(item.stripe_subscription_id),
+        tier: itemTier,
+        stripe_price_id: stringValue(item.stripe_price_id),
+        status: stringValue(item.status),
+        cancel_at_period_end: item.cancel_at_period_end === true,
+        current_period_end: typeof item.current_period_end === "number" ? item.current_period_end : null
+      };
+    }
+  }
+  return {
+    configured: value.configured === true,
+    tier,
+    customer: value.customer === true,
+    subscription,
+    plans: { basic: parsePlan(basic, "Plus", 50), pro: parsePlan(pro, "Pro", 200) }
+  };
+}
+
 function safeAuthorizationUrl(value: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" || url.username || url.password) throw new Error("El servicio devolvió una URL OAuth insegura.");
+  return url.toString();
+}
+
+function safeStripeUrl(value: string, expectedHost: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.hostname !== expectedHost || url.username || url.password) {
+    throw new Error("El servicio devolvió una URL de Stripe insegura.");
+  }
   return url.toString();
 }
 

@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 if [ ! -x .venv/bin/python ]; then
   echo "[error] no hay .venv. Crea el entorno:" >&2
-  echo "  python3.12 -m venv .venv && .venv/bin/pip install cryptography" >&2
+  echo "  python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
   exit 1
 fi
 if [ -f .env ]; then

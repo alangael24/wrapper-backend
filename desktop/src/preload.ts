@@ -8,6 +8,9 @@ const api: DesktopApi = Object.freeze({
   signOut: () => ipcRenderer.invoke("desktop:sign-out"),
   connectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:connect-connector", connectorId),
   disconnectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:disconnect-connector", connectorId),
+  billingSnapshot: () => ipcRenderer.invoke("desktop:billing-snapshot"),
+  startCheckout: (tier: "basic" | "pro") => ipcRenderer.invoke("desktop:start-checkout", tier),
+  openBillingPortal: () => ipcRenderer.invoke("desktop:open-billing-portal"),
   saveConnectors: (connectorIds: string[], onboardingCompleted?: boolean) => (
     ipcRenderer.invoke("desktop:save-connectors", connectorIds, onboardingCompleted)
   ),
