@@ -72,8 +72,12 @@ class AgentGeniaApi(
     }
 
     suspend fun authStatus(attemptId: String): AuthStatus {
-        val path = "/v1/account-auth/status/${path(attemptId)}?device_id=${query(secureStore.deviceId())}"
-        val json = requestJson(path, authorized = false)
+        val json = requestJson(
+            "/v1/account-auth/status",
+            "POST",
+            JSONObject().put("attempt_id", attemptId).put("device_id", secureStore.deviceId()),
+            authorized = false,
+        )
         return AuthStatus(
             status = json.optString("status"),
             message = json.optNullableString("message"),
@@ -136,7 +140,9 @@ class AgentGeniaApi(
     }
 
     suspend fun connectorStatus(attemptId: String): ConnectorPoll {
-        val json = requestJson("/v1/connectors/status/${path(attemptId)}")
+        val json = requestJson(
+            "/v1/connectors/status", "POST", JSONObject().put("attempt_id", attemptId),
+        )
         return ConnectorPoll(json.optString("status"), json.optNullableString("message"))
     }
 

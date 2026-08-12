@@ -485,6 +485,18 @@ class ComputerManager:
         self.store.delete_bot_computer(user_id, bot_id)
         return {"deleted": True}
 
+    def delete_all(self, *, user_id: str) -> dict[str, Any]:
+        """Elimina toda computadora persistente conocida durante una revocación."""
+        deleted = 0
+        errors: list[str] = []
+        for row in self.store.list_bot_computers(user_id):
+            try:
+                self.delete(user_id=user_id, bot_id=row["bot_id"])
+                deleted += 1
+            except ComputerError as exc:
+                errors.append(str(exc))
+        return {"deleted": deleted, "errors": errors}
+
     def execute(self, *, user_id: str, bot_id: str, operation: Any, arguments: Any) -> dict[str, Any]:
         if not self.configured:
             raise ComputerError(503, "Las computadoras no están configuradas", "computers_disabled")

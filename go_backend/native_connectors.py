@@ -15,7 +15,6 @@ import json
 import secrets
 import socket
 import ssl
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,15 +204,6 @@ NATIVE_CONNECTORS: dict[str, NativeDefinition] = {
 }
 
 
-@dataclass
-class _NativeAttempt:
-    user_id: str
-    connector_id: str
-    expires_at: float
-    complete: bool = False
-    account_label: str = ""
-
-
 class NativeConnectorGateway:
     def __init__(
         self,
@@ -222,17 +212,21 @@ class NativeConnectorGateway:
         secret_env: str | None,
         secret_path: Path,
         public_base_url: str,
-        now=time.monotonic,
+        key_version: int = 1,
+        secret_versions: dict[int, str] | None = None,
+        allow_secret_file: bool = True,
+        now=time.time,
         attempt_ttl_seconds: int = AUTH_ATTEMPT_TTL_SECONDS,
     ):
         self.store = store
         self.secret_env = secret_env
         self.secret_path = secret_path
         self.public_base_url = public_base_url.rstrip("/")
+        self.key_version = key_version
+        self.secret_versions = secret_versions or {}
+        self.allow_secret_file = allow_secret_file
         self._now = now
         self._ttl = max(60, min(int(attempt_ttl_seconds), 1800))
-        self._attempts: dict[str, _NativeAttempt] = {}
-        self._lock = threading.RLock()
 
     @property
     def configured(self) -> bool:
@@ -262,14 +256,16 @@ class NativeConnectorGateway:
     def start(self, user_id: str, connector_id: str) -> dict[str, str]:
         if not self.supports(connector_id):
             raise ConnectorBrokerError(409, "Conector first-party no configurado", "connector_not_configured")
-        self._prune()
+        self.store.prune_auth_attempts()
         attempt_id = "nat_" + secrets.token_urlsafe(32)
-        with self._lock:
-            self._attempts[attempt_id] = _NativeAttempt(
-                user_id=user_id,
-                connector_id=connector_id,
-                expires_at=self._now() + self._ttl,
-            )
+        self.store.create_connector_auth_attempt(
+            attempt_id=attempt_id,
+            user_id=user_id,
+            connector_id=connector_id,
+            driver="native",
+            connected_account_id=f"native:{connector_id}",
+            expires_at=self._now() + self._ttl,
+        )
         return {
             "attempt_id": attempt_id,
             "authorize_url": f"{self.public_base_url}/v1/connectors/native/setup/{attempt_id}",
@@ -277,9 +273,9 @@ class NativeConnectorGateway:
 
     def setup_html(self, attempt_id: str, *, error: str = "", saved: bool = False) -> bytes:
         attempt = self._attempt(attempt_id)
-        saved = saved or attempt.complete
-        definition = NATIVE_CONNECTORS[attempt.connector_id]
-        name = CONNECTOR_CATALOG[attempt.connector_id]["name"]
+        saved = saved or attempt["status"] == "complete"
+        definition = NATIVE_CONNECTORS[attempt["connector_id"]]
+        name = CONNECTOR_CATALOG[attempt["connector_id"]]["name"]
         if saved:
             content = (
                 "<h1>Cuenta conectada</h1><p>Ya puedes cerrar esta ventana y volver a Agent Genia.</p>"
@@ -312,9 +308,9 @@ class NativeConnectorGateway:
 
     def submit(self, attempt_id: str, values: dict[str, str]) -> bytes:
         attempt = self._attempt(attempt_id)
-        if attempt.complete:
+        if attempt["status"] == "complete":
             return self.setup_html(attempt_id, saved=True)
-        definition = NATIVE_CONNECTORS[attempt.connector_id]
+        definition = NATIVE_CONNECTORS[attempt["connector_id"]]
         allowed = {field.name for field in definition.fields}
         credentials: dict[str, str] = {}
         for field in definition.fields:
@@ -330,42 +326,49 @@ class NativeConnectorGateway:
             raise ConnectorBrokerError(400, "Campos de conexion invalidos", "bad_connector_credentials")
         try:
             _build_base_url(definition, credentials, resolve=False)
-            key_id = f"connector:{attempt.user_id}:{attempt.connector_id}"
+            key_id = f"connector:{attempt['user_id']}:{attempt['connector_id']}"
             encrypted = encrypt_api_key(
                 json.dumps(credentials, separators=(",", ":"), ensure_ascii=False),
                 key_id,
                 self.secret_env,
                 self.secret_path,
+                key_version=self.key_version,
+                secret_versions=self.secret_versions,
+                allow_secret_file=self.allow_secret_file,
             )
         except (ValueError, CryptoError) as exc:
             return self.setup_html(attempt_id, error=str(exc))
-        label = credentials.get("account_label") or CONNECTOR_CATALOG[attempt.connector_id]["name"]
+        label = credentials.get("account_label") or CONNECTOR_CATALOG[attempt["connector_id"]]["name"]
         self.store.upsert_connector_credentials(
-            user_id=attempt.user_id,
-            connector_id=attempt.connector_id,
+            user_id=attempt["user_id"],
+            connector_id=attempt["connector_id"],
             credentials_enc=encrypted,
             key_id=key_id,
+            key_version=self.key_version,
             account_label=label,
         )
-        with self._lock:
-            attempt.complete = True
-            attempt.account_label = label[:160]
+        self.store.finish_connector_auth_attempt(
+            attempt_id=attempt_id,
+            status="complete",
+            account_label=label,
+        )
         return self.setup_html(attempt_id, saved=True)
 
     def poll(self, user_id: str, attempt_id: str) -> dict[str, Any]:
-        attempt = self._attempt(attempt_id)
-        if attempt.user_id != user_id:
+        attempt = self._attempt(attempt_id, user_id=user_id)
+        if attempt is None:
             raise ConnectorBrokerError(404, "Conexion desconocida o expirada", "connector_auth_not_found")
-        if not attempt.complete:
+        if attempt["status"] != "complete":
             return {"status": "pending"}
-        with self._lock:
-            self._attempts.pop(attempt_id, None)
+        attempt = self.store.consume_connector_auth_attempt(attempt_id, user_id)
+        if attempt is None:
+            raise ConnectorBrokerError(404, "Conexion desconocida o ya consumida", "connector_auth_not_found")
         return {
             "status": "complete",
             "session": {
-                "managed_connection_id": f"native:{attempt.connector_id}",
-                "connector_id": attempt.connector_id,
-                "account_label": attempt.account_label,
+                "managed_connection_id": f"native:{attempt['connector_id']}",
+                "connector_id": attempt["connector_id"],
+                "account_label": attempt.get("account_label") or "",
             },
         }
 
@@ -419,28 +422,35 @@ class NativeConnectorGateway:
                 str(row["key_id"]),
                 self.secret_env,
                 self.secret_path,
+                key_version=int(row.get("key_version") or 1),
+                secret_versions=self.secret_versions,
+                allow_secret_file=self.allow_secret_file,
             )
             value = json.loads(raw)
         except (CryptoError, ValueError, TypeError) as exc:
             raise ConnectorBrokerError(500, "Credenciales cifradas invalidas", "connector_credentials_invalid") from exc
         if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
             raise ConnectorBrokerError(500, "Credenciales cifradas invalidas", "connector_credentials_invalid")
+        if int(row.get("key_version") or 1) != self.key_version:
+            rotated = encrypt_api_key(
+                raw,
+                str(row["key_id"]),
+                self.secret_env,
+                self.secret_path,
+                key_version=self.key_version,
+                secret_versions=self.secret_versions,
+                allow_secret_file=self.allow_secret_file,
+            )
+            self.store.update_connector_encryption(
+                user_id, connector_id, rotated, self.key_version
+            )
         return value
 
-    def _attempt(self, attempt_id: str) -> _NativeAttempt:
-        self._prune()
-        with self._lock:
-            attempt = self._attempts.get(attempt_id)
+    def _attempt(self, attempt_id: str, *, user_id: str | None = None) -> dict:
+        attempt = self.store.get_connector_auth_attempt(attempt_id, user_id)
         if attempt is None:
             raise ConnectorBrokerError(404, "Conexion desconocida o expirada", "connector_auth_not_found")
         return attempt
-
-    def _prune(self) -> None:
-        now = self._now()
-        with self._lock:
-            for attempt_id, attempt in list(self._attempts.items()):
-                if attempt.expires_at <= now:
-                    self._attempts.pop(attempt_id, None)
 
 
 def _path_markers(value: str) -> tuple[str, ...]:

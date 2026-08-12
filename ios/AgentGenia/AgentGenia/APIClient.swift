@@ -62,6 +62,17 @@ private struct RefreshRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey { case deviceID = "device_id" }
 }
 
+private struct AuthStatusRequest: Encodable, Sendable {
+    let attemptID: String
+    let deviceID: String
+    enum CodingKeys: String, CodingKey { case attemptID = "attempt_id"; case deviceID = "device_id" }
+}
+
+private struct AttemptStatusRequest: Encodable, Sendable {
+    let attemptID: String
+    enum CodingKeys: String, CodingKey { case attemptID = "attempt_id" }
+}
+
 private struct ConnectorStartRequest: Encodable, Sendable {
     let connectorID: String
     enum CodingKeys: String, CodingKey { case connectorID = "connector_id" }
@@ -133,11 +144,10 @@ actor APIClient {
     }
 
     func authStatus(attemptID: String) async throws -> AuthStatusResponse {
-        let encodedAttempt = pathComponent(attemptID)
-        let encodedDevice = deviceID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? deviceID
         return try await request(
-            "/v1/account-auth/status/\(encodedAttempt)?device_id=\(encodedDevice)",
-            body: Optional<EmptyBody>.none,
+            "/v1/account-auth/status",
+            method: "POST",
+            body: AuthStatusRequest(attemptID: attemptID, deviceID: deviceID),
             authorized: false
         )
     }
@@ -186,8 +196,9 @@ actor APIClient {
 
     func connectorStatus(_ attemptID: String) async throws -> ConnectorPollResponse {
         try await request(
-            "/v1/connectors/status/\(pathComponent(attemptID))",
-            body: Optional<EmptyBody>.none
+            "/v1/connectors/status",
+            method: "POST",
+            body: AttemptStatusRequest(attemptID: attemptID)
         )
     }
 

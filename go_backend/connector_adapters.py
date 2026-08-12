@@ -14,7 +14,6 @@ import secrets
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -86,16 +85,6 @@ CUSTOM_AUTH_REQUIRED = frozenset({
 })
 
 
-@dataclass
-class _AuthAttempt:
-    user_id: str
-    connector_id: str
-    connected_account_id: str
-    expires_at: float
-    session: Any
-    next_upstream_poll_at: float = 0.0
-
-
 class ComposioConnectorGateway:
     """Administra Connect Links y ejecuciones, siempre aisladas por user_id."""
 
@@ -108,7 +97,8 @@ class ComposioConnectorGateway:
         toolkit_overrides: dict[str, str] | None = None,
         client: Any = None,
         native_gateway: NativeConnectorGateway | None = None,
-        now=time.monotonic,
+        store: Any = None,
+        now=time.time,
         attempt_ttl_seconds: int = AUTH_ATTEMPT_TTL_SECONDS,
     ):
         self.api_key = api_key.strip()
@@ -118,7 +108,7 @@ class ComposioConnectorGateway:
         self.toolkits.update(_validated_toolkit_overrides(toolkit_overrides or {}))
         self._now = now
         self._attempt_ttl_seconds = max(60, min(int(attempt_ttl_seconds), 1800))
-        self._attempts: dict[str, _AuthAttempt] = {}
+        self.store = store
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.RLock()
         self.client = client
@@ -131,6 +121,8 @@ class ComposioConnectorGateway:
                     "COMPOSIO_API_KEY requiere instalar composio desde requirements.txt"
                 ) from exc
             self.client = Composio(api_key=self.api_key)
+        if (self.client is not None or native_gateway is not None) and self.store is None:
+            raise ValueError("El gateway de conectores requiere un Store persistente")
 
     @property
     def configured(self) -> bool:
@@ -225,11 +217,11 @@ class ComposioConnectorGateway:
         return snapshot
 
     def start(self, user_id: str, connector_id: str) -> dict[str, str]:
-        self._prune()
         self._check_start_rate(user_id)
         description = self.describe(connector_id)
         if not description["available"]:
             raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
+        self.store.prune_auth_attempts()
         if description.get("driver") == "native":
             return self.native_gateway.start(user_id, connector_id)  # type: ignore[union-attr]
         session = self._session(user_id, connector_id)
@@ -252,53 +244,71 @@ class ComposioConnectorGateway:
             _delete_session(session)
             raise _upstream_error(exc, "No se pudo crear el enlace de autorizacion") from exc
         attempt_id = secrets.token_urlsafe(24)
-        with self._lock:
-            self._attempts[attempt_id] = _AuthAttempt(
-                user_id=user_id,
-                connector_id=connector_id,
-                connected_account_id=account_id,
-                expires_at=self._now() + self._attempt_ttl_seconds,
-                session=session,
-            )
+        _delete_session(session)
+        self.store.create_connector_auth_attempt(
+            attempt_id=attempt_id,
+            user_id=user_id,
+            connector_id=connector_id,
+            driver="composio",
+            connected_account_id=account_id,
+            expires_at=self._now() + self._attempt_ttl_seconds,
+        )
         return {"attempt_id": attempt_id, "authorize_url": authorize_url}
 
     def poll(self, user_id: str, attempt_id: str) -> dict[str, Any]:
         if attempt_id.startswith("nat_") and self.native_gateway:
             return self.native_gateway.poll(user_id, attempt_id)
-        self._prune()
-        with self._lock:
-            attempt = self._attempts.get(attempt_id)
-        if attempt is None or attempt.user_id != user_id:
+        attempt, should_poll = self.store.claim_connector_poll(
+            attempt_id,
+            user_id,
+            UPSTREAM_POLL_INTERVAL_SECONDS,
+            now=self._now(),
+        )
+        if attempt is None:
             raise ConnectorBrokerError(
                 404, "Conexion desconocida o expirada", "connector_auth_not_found"
             )
-        now = self._now()
-        with self._lock:
-            if attempt.next_upstream_poll_at > now:
-                return {"status": "pending"}
-            attempt.next_upstream_poll_at = now + UPSTREAM_POLL_INTERVAL_SECONDS
+        if attempt["status"] in {"complete", "error"}:
+            return self._consume_terminal_attempt(user_id, attempt_id)
+        if not should_poll:
+            return {"status": "pending"}
         try:
-            account = self.client.connected_accounts.get(attempt.connected_account_id)
+            account = self.client.connected_accounts.get(attempt["connected_account_id"])
             state = str(getattr(account, "status", "") or "").upper()
         except Exception as exc:
             raise _upstream_error(exc, "No se pudo consultar la autorizacion") from exc
         if state == ACTIVE:
-            self._finish_attempt(attempt_id)
-            return {
-                "status": "complete",
-                "session": {
-                    "managed_connection_id": attempt.connected_account_id,
-                    "connector_id": attempt.connector_id,
-                    "account_label": _account_label(account) or attempt.connected_account_id,
-                },
-            }
+            self.store.finish_connector_auth_attempt(
+                attempt_id=attempt_id,
+                status="complete",
+                account_label=_account_label(account) or attempt["connected_account_id"],
+            )
+            return self._consume_terminal_attempt(user_id, attempt_id)
         if state in TERMINAL_CONNECTION_STATES:
-            self._finish_attempt(attempt_id)
-            return {
-                "status": "error",
-                "message": str(getattr(account, "status_reason", "") or "El proveedor rechazo la conexion"),
-            }
+            self.store.finish_connector_auth_attempt(
+                attempt_id=attempt_id,
+                status="error",
+                message=str(getattr(account, "status_reason", "") or "El proveedor rechazo la conexion"),
+            )
+            return self._consume_terminal_attempt(user_id, attempt_id)
         return {"status": "pending"}
+
+    def _consume_terminal_attempt(self, user_id: str, attempt_id: str) -> dict[str, Any]:
+        attempt = self.store.consume_connector_auth_attempt(attempt_id, user_id)
+        if attempt is None:
+            raise ConnectorBrokerError(
+                404, "Conexion desconocida o ya consumida", "connector_auth_not_found"
+            )
+        if attempt["status"] == "error":
+            return {"status": "error", "message": attempt.get("message") or "El proveedor rechazó la conexión"}
+        return {
+            "status": "complete",
+            "session": {
+                "managed_connection_id": attempt["connected_account_id"],
+                "connector_id": attempt["connector_id"],
+                "account_label": attempt.get("account_label") or attempt["connected_account_id"],
+            },
+        }
 
     def disconnect(self, user_id: str, connector_id: str) -> dict[str, bool]:
         description = self.describe(connector_id)
@@ -321,6 +331,24 @@ class ComposioConnectorGateway:
         except Exception as exc:
             raise _upstream_error(exc, "No se pudo desconectar la cuenta") from exc
         return {"disconnected": True}
+
+    def disconnect_all(self, user_id: str) -> int:
+        """Revoca las cuentas administradas del usuario durante incident response."""
+        if not self.configured:
+            return 0
+        try:
+            accounts = self.client.connected_accounts.list(
+                user_ids=[user_id], statuses=[ACTIVE], limit=100
+            )
+            deleted = 0
+            for account in list(getattr(accounts, "items", []) or []):
+                account_id = str(getattr(account, "id", "") or "")
+                if account_id:
+                    self.client.connected_accounts.delete(account_id)
+                    deleted += 1
+            return deleted
+        except Exception as exc:
+            raise _upstream_error(exc, "No se pudieron revocar las cuentas conectadas") from exc
 
     def execute(
         self,
@@ -380,27 +408,6 @@ class ComposioConnectorGateway:
 
     def _auth_config(self, connector_id: str, toolkit: str) -> str:
         return self.auth_configs.get(connector_id) or self.auth_configs.get(toolkit, "")
-
-    def _finish_attempt(self, attempt_id: str) -> None:
-        with self._lock:
-            attempt = self._attempts.pop(attempt_id, None)
-        if attempt is not None:
-            _delete_session(attempt.session)
-
-    def _prune(self) -> None:
-        expired: list[_AuthAttempt] = []
-        now = self._now()
-        with self._lock:
-            for attempt_id, attempt in list(self._attempts.items()):
-                if attempt.expires_at <= now:
-                    expired.append(self._attempts.pop(attempt_id))
-            for user_id, bucket in list(self._start_rate.items()):
-                while bucket and bucket[0] <= now - 60:
-                    bucket.popleft()
-                if not bucket:
-                    self._start_rate.pop(user_id, None)
-        for attempt in expired:
-            _delete_session(attempt.session)
 
     def _check_start_rate(self, user_id: str) -> None:
         now = self._now()

@@ -7,6 +7,7 @@ respuestas para registrar consumo.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from urllib.parse import urljoin
@@ -132,9 +133,10 @@ def proxy_request(
         err_body = e.read()
         usage = parse_usage_from_body(err_body) if not is_stream(headers) else (None, Usage())
         return e.code, dict(e.headers), err_body, usage[1]
-    except urllib.error.URLError as e:
+    except urllib.error.URLError:
+        logging.warning("Upstream no disponible", exc_info=True)
         return 502, {"content-type": "application/json"}, json.dumps(
-            {"error": {"message": f"upstream unreachable: {e.reason}", "type": "upstream_error"}}
+            {"error": {"message": "Upstream unavailable", "type": "upstream_error"}}
         ).encode(), Usage()
 
     status = resp.status

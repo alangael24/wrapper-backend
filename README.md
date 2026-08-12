@@ -10,7 +10,7 @@ tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
 **GPT-5.6 Luna**, con MiMo como fallback.
 
-El backend base requiere Python, `cryptography` y `psycopg` cuando usa
+El backend base requiere Python, `cryptography` y `psycopg` con su pool cuando usa
 Supabase/Postgres; Pi es una dependencia opcional de Node.js y viene
 desactivado por defecto.
 
@@ -100,7 +100,7 @@ una key disponible, la transacción se revierte y Stripe reintenta el webhook.
 ## Requisitos
 
 - Python 3.12 (`python3.12` o el que tengas; si no, instálalo).
-- `cryptography` para cifrado AES y `psycopg[binary]` para Supabase/Postgres.
+- `cryptography` para cifrado AES y `psycopg[binary,pool]` para Supabase/Postgres.
 - Node.js y `pnpm` para habilitar el harness de Pi.
 
 ```bash
@@ -516,14 +516,15 @@ recursos facturables huérfanos.
 | Método | Ruta | Descripción |
 |---|---|---|
 | POST | `/v1/account-auth/start` | Inicia Google OAuth para un `device_id` UUID |
-| GET | `/v1/account-auth/status/<attempt_id>` | Entrega la sesión al dispositivo que inició el flujo |
+| POST | `/v1/account-auth/status` | Consume una sola vez el intento enviado en el body y entrega la sesión al dispositivo original |
 | GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
 | GET | `/v1/account-auth/complete` | Página final del login |
 | GET | `/connections/complete` | Página final de autorización de conectores |
 | GET/POST | `/v1/connectors/native/setup/<attempt_id>` | Formulario de un solo uso para un adaptador first-party |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
 | POST | `/v1/billing/webhook` | Webhook que exige una firma `Stripe-Signature` válida |
-| GET | `/healthz` | Salud y disponibilidad de Google, Stripe, conectores y computadoras |
+| GET | `/healthz` | Liveness del proceso y estado resumido de dependencias |
+| GET | `/readyz` | Readiness real; responde 503 si PostgreSQL/esquema no están listos |
 
 Los formularios nativos usan un `attempt_id` aleatorio, de corta vida y ligado
 al usuario que inició la conexión.
@@ -542,7 +543,7 @@ proviene del flujo de signup.
 | GET | `/v1/connectors` | Catálogo y conexiones del usuario |
 | GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
 | POST | `/v1/connectors/start` | Crea un Connect Link o formulario first-party |
-| GET | `/v1/connectors/status/<attempt_id>` | Consulta el consentimiento sin exponer credenciales |
+| POST | `/v1/connectors/status` | Consulta y consume el consentimiento con `attempt_id` en el body |
 | POST | `/v1/connectors/disconnect` | Revoca las cuentas del toolkit para el usuario |
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
 | POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
@@ -581,7 +582,7 @@ Bearer = `ADMIN_TOKEN`:
 | POST | `/admin/subscriptions` | Agregar credenciales de proveedor al pool `{keys:[...]}` |
 | GET | `/admin/subscriptions` | Listar pool (keys cifradas, enmascaradas) |
 | GET | `/admin/users` | Listar usuarios y asignaciones |
-| POST | `/admin/users/<id>/revoke` | Devolver la suscripción al pool |
+| POST | `/admin/users/<id>/revoke` | Deshabilitar la cuenta y revocar API key, sesiones, conectores y computadoras |
 | POST | `/admin/users/<id>/tier` | Cambiar tier `{tier: "free"|"basic"|"pro"}` |
 | GET | `/admin/usage` | Eventos de uso recientes |
 
@@ -607,10 +608,13 @@ runtime se agrupan aquí por función.
 |---|---|---|
 | `HOST` | `127.0.0.1` | Interfaz de escucha; usa `0.0.0.0` detrás de un proxy |
 | `PORT` | `8787` | Puerto HTTP |
-| `WRAPPER_SECRET` | auto | Clave maestra para cifrar credenciales del proveedor |
+| `ENVIRONMENT` | `development` | Solo admite `development` o `production` |
+| `WRAPPER_SECRET` | archivo local en desarrollo | Obligatoria en producción; clave maestra para cifrar credenciales |
+| `WRAPPER_SECRET_VERSION` | `1` | Versión activa; los nuevos secretos se cifran con ella |
+| `WRAPPER_SECRET_PREVIOUS_JSON` | `{}` | Versiones anteriores para rotación dual-read/new-write |
 | `SECRET_FILE` | `data/secret.key` | Clave local cuando no se define `WRAPPER_SECRET` |
-| `ADMIN_TOKEN` | auto-generado | Token de admin; el valor publicado `cambia-este-token` impide arrancar |
-| `DATABASE_URL` | vacío | PostgreSQL/Supabase; si está vacío se usa SQLite |
+| `ADMIN_TOKEN` | efímero solo en desarrollo | Obligatorio en producción; nunca se imprime |
+| `DATABASE_URL` | SQLite solo en desarrollo | PostgreSQL/Supabase y obligatorio en producción |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `GO_BASE_URL` | valor de `.env.example` | Upstream OpenAI-compatible; el nombre se conserva por compatibilidad histórica |
 | `ENFORCE_LIMITS` | `1` | Rechazar al superar los presupuestos de uso |
@@ -719,9 +723,17 @@ runtime se agrupan aquí por función.
   `uniq_user_subscription` y la actualización atómica impiden que dos
   activaciones conserven la misma key.
 - El servidor se niega a arrancar con `ADMIN_TOKEN=cambia-este-token`. En
-  producción define un token aleatorio largo y mantenlo fuera del repositorio.
-- Los secretos viven en `data/secret.key` (0600); si usas `WRAPPER_SECRET`
-  en producción, bórralo y apóyalo en tu gestor de secretos.
+  `ENVIRONMENT=production` también exige `DATABASE_URL`, `WRAPPER_SECRET` y
+  `ADMIN_TOKEN`; no genera ni imprime ningún token.
+- `data/secret.key` (0600) existe únicamente para desarrollo. Producción usa
+  una clave de entorno versionada: los secretos nuevos usan
+  `WRAPPER_SECRET_VERSION` y las versiones anteriores permanecen temporalmente
+  en `WRAPPER_SECRET_PREVIOUS_JSON` para descifrado y rotación perezosa.
+- OAuth y consentimientos se persisten con identificadores hasheados. Los
+  resultados se consultan por POST y se consumen atómicamente una sola vez.
+- Toda respuesta JSON usa `Cache-Control: no-store`; los errores 500 exponen
+  solo `Internal server error` y un `request_id`, mientras la excepción completa
+  permanece en los logs privados.
 - Pi puede ejecutar comandos y manipular archivos con los permisos del proceso
   del backend. El endpoint viene desactivado; en producción debe correr en un
   contenedor o sandbox por tarea, sin montar secretos ni el código del servidor.

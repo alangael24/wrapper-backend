@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -22,12 +22,15 @@ CREATE TABLE IF NOT EXISTS users (
   api_key_hash    TEXT UNIQUE NOT NULL,
   subscription_id TEXT,
   tier            TEXT NOT NULL DEFAULT 'free',
+  account_status  TEXT NOT NULL DEFAULT 'active',
+  disabled_at     REAL,
   created_at      REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS go_subscriptions (
   id               TEXT PRIMARY KEY,
   api_key_enc      BLOB NOT NULL,
   key_id           TEXT NOT NULL,          -- id usado en el Keychain (si aplica)
+  key_version      INTEGER NOT NULL DEFAULT 1,
   label            TEXT,
   source           TEXT NOT NULL DEFAULT 'pool',   -- pool | byok
   status           TEXT NOT NULL DEFAULT 'available', -- available | assigned | revoked
@@ -106,6 +109,7 @@ CREATE TABLE IF NOT EXISTS connector_credentials (
   connector_id    TEXT NOT NULL,
   credentials_enc BLOB NOT NULL,
   key_id           TEXT NOT NULL,
+  key_version      INTEGER NOT NULL DEFAULT 1,
   account_label    TEXT,
   created_at       REAL NOT NULL,
   updated_at       REAL NOT NULL,
@@ -123,6 +127,36 @@ CREATE TABLE IF NOT EXISTS bot_computers (
   updated_at     REAL NOT NULL,
   last_active_at REAL,
   PRIMARY KEY(user_id, bot_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_auth_attempts (
+  id_hash                TEXT PRIMARY KEY,
+  state_hash             TEXT UNIQUE NOT NULL,
+  device_id_hash         TEXT NOT NULL,
+  verifier_enc           BLOB NOT NULL,
+  result_enc             BLOB,
+  key_version            INTEGER NOT NULL DEFAULT 1,
+  status                 TEXT NOT NULL DEFAULT 'pending',
+  message                TEXT NOT NULL DEFAULT '',
+  expires_at             REAL NOT NULL,
+  consumed_at            REAL,
+  created_at             REAL NOT NULL,
+  updated_at             REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connector_auth_attempts (
+  id_hash                TEXT PRIMARY KEY,
+  user_id                TEXT NOT NULL,
+  connector_id           TEXT NOT NULL,
+  driver                 TEXT NOT NULL,
+  connected_account_id   TEXT,
+  status                 TEXT NOT NULL DEFAULT 'pending',
+  account_label          TEXT NOT NULL DEFAULT '',
+  message                TEXT NOT NULL DEFAULT '',
+  expires_at             REAL NOT NULL,
+  next_poll_at           REAL NOT NULL DEFAULT 0,
+  consumed_at            REAL,
+  created_at             REAL NOT NULL,
+  updated_at             REAL NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -146,6 +180,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_bot_computer_provider_ref
   ON bot_computers(provider, provider_ref) WHERE provider_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_bot_computers_user
   ON bot_computers(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_account_auth_attempts_expires
+  ON account_auth_attempts(expires_at);
+CREATE INDEX IF NOT EXISTS idx_connector_auth_attempts_user
+  ON connector_auth_attempts(user_id, expires_at);
 """
 
 
@@ -169,6 +207,10 @@ def _hash_account_token(kind: str, token: str) -> str:
     return hashlib.sha256(f"account-{kind}|{token}".encode()).hexdigest()
 
 
+def _hash_ephemeral(kind: str, value: str) -> str:
+    return hashlib.sha256(f"agentgenia-{kind}|{value}".encode()).hexdigest()
+
+
 class Store:
     def __init__(self, db_path: str | Path):
         self._path = str(db_path)
@@ -183,6 +225,12 @@ class Store:
             if "tier" not in cols:
                 self._conn.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
                 self._conn.commit()
+            if "account_status" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN account_status TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "disabled_at" not in cols:
+                self._conn.execute("ALTER TABLE users ADD COLUMN disabled_at REAL")
             tier_column = next(
                 row for row in self._conn.execute("PRAGMA table_info(users)") if row[1] == "tier"
             )
@@ -205,6 +253,20 @@ class Store:
                     "ALTER TABLE stripe_events ADD COLUMN "
                     "stripe_event_created INTEGER NOT NULL DEFAULT 0"
                 )
+            subscription_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(go_subscriptions)")
+            }
+            if "key_version" not in subscription_columns:
+                self._conn.execute(
+                    "ALTER TABLE go_subscriptions ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
+                )
+            connector_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(connector_credentials)")
+            }
+            if "key_version" not in connector_columns:
+                self._conn.execute(
+                    "ALTER TABLE connector_credentials ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
+                )
             self._conn.execute(
                 "INSERT INTO kv(k,v) VALUES('schema_version', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -225,12 +287,14 @@ class Store:
                   api_key_hash    TEXT UNIQUE NOT NULL,
                   subscription_id TEXT,
                   tier            TEXT NOT NULL DEFAULT 'free',
+                  account_status  TEXT NOT NULL DEFAULT 'active',
+                  disabled_at     REAL,
                   created_at      REAL NOT NULL
                 )"""
             )
             self._conn.execute(
-                "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier, created_at) "
-                "SELECT id, name, email, api_key_hash, subscription_id, tier, created_at "
+                "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,created_at) "
+                "SELECT id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,created_at "
                 "FROM users_legacy_default_basic"
             )
             self._conn.execute("DROP TABLE users_legacy_default_basic")
@@ -260,6 +324,251 @@ class Store:
             self._conn.execute(sql, params)
             self._conn.commit()
 
+    def health(self) -> dict:
+        row = self._one("SELECT v FROM kv WHERE k='schema_version'")
+        return {
+            "ready": bool(row and int(row["v"]) == SCHEMA_VERSION),
+            "schema_version": int(row["v"]) if row else None,
+            "backend": "sqlite",
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # ---------- intentos efímeros persistentes ----------
+    def prune_auth_attempts(self) -> None:
+        cutoff = _now() - 60
+        self._exec(
+            "DELETE FROM account_auth_attempts WHERE expires_at<? OR "
+            "(consumed_at IS NOT NULL AND consumed_at<?)",
+            (cutoff, cutoff),
+        )
+        self._exec(
+            "DELETE FROM connector_auth_attempts WHERE expires_at<? OR "
+            "(consumed_at IS NOT NULL AND consumed_at<?)",
+            (cutoff, cutoff),
+        )
+
+    def create_account_auth_attempt(
+        self,
+        *,
+        attempt_id: str,
+        state: str,
+        device_id: str,
+        verifier_enc: bytes,
+        key_version: int,
+        expires_at: float,
+    ) -> None:
+        now = _now()
+        self._exec(
+            "INSERT INTO account_auth_attempts("
+            "id_hash,state_hash,device_id_hash,verifier_enc,key_version,status,message,"
+            "expires_at,created_at,updated_at) VALUES(?,?,?,?,?,'pending','',?,?,?)",
+            (
+                _hash_ephemeral("oauth-attempt", attempt_id),
+                _hash_ephemeral("oauth-state", state),
+                _hash_ephemeral("oauth-device", device_id),
+                verifier_enc,
+                key_version,
+                expires_at,
+                now,
+                now,
+            ),
+        )
+
+    def claim_account_auth_callback(self, state: str) -> dict | None:
+        now = _now()
+        state_hash = _hash_ephemeral("oauth-state", state)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM account_auth_attempts WHERE state_hash=?",
+                    (state_hash,),
+                ).fetchone()
+                if row is None or row["status"] != "pending" or row["expires_at"] <= now:
+                    self._conn.rollback()
+                    return None
+                changed = self._conn.execute(
+                    "UPDATE account_auth_attempts SET status='exchanging',updated_at=? "
+                    "WHERE id_hash=? AND status='pending'",
+                    (now, row["id_hash"]),
+                )
+                if changed.rowcount != 1:
+                    self._conn.rollback()
+                    return None
+                self._conn.commit()
+                return dict(row)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def complete_account_auth_attempt(
+        self, *, id_hash: str, result_enc: bytes, key_version: int
+    ) -> None:
+        self._exec(
+            "UPDATE account_auth_attempts SET status='complete',result_enc=?,verifier_enc=?,"
+            "key_version=?,message='',updated_at=? WHERE id_hash=? AND status='exchanging'",
+            (result_enc, b"", key_version, _now(), id_hash),
+        )
+
+    def fail_account_auth_attempt(self, *, id_hash: str, message: str) -> None:
+        self._exec(
+            "UPDATE account_auth_attempts SET status='error',message=?,verifier_enc=?,updated_at=? "
+            "WHERE id_hash=? AND consumed_at IS NULL",
+            (message[:500], b"", _now(), id_hash),
+        )
+
+    def consume_account_auth_attempt(self, attempt_id: str, device_id: str) -> dict | None:
+        now = _now()
+        attempt_hash = _hash_ephemeral("oauth-attempt", attempt_id)
+        device_hash = _hash_ephemeral("oauth-device", device_id)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM account_auth_attempts WHERE id_hash=? AND device_id_hash=?",
+                    (attempt_hash, device_hash),
+                ).fetchone()
+                if row is None or row["consumed_at"] is not None:
+                    self._conn.rollback()
+                    return None
+                if row["expires_at"] <= now and row["status"] not in {"complete", "error"}:
+                    self._conn.execute(
+                        "UPDATE account_auth_attempts SET status='error',message=?,updated_at=? WHERE id_hash=?",
+                        ("El inicio de sesión expiró. Inténtalo de nuevo.", now, attempt_hash),
+                    )
+                    row = self._conn.execute(
+                        "SELECT * FROM account_auth_attempts WHERE id_hash=?", (attempt_hash,)
+                    ).fetchone()
+                if row["status"] in {"complete", "error"}:
+                    changed = self._conn.execute(
+                        "UPDATE account_auth_attempts SET consumed_at=?,updated_at=? "
+                        "WHERE id_hash=? AND consumed_at IS NULL",
+                        (now, now, attempt_hash),
+                    )
+                    if changed.rowcount != 1:
+                        self._conn.rollback()
+                        return None
+                self._conn.commit()
+                return dict(row)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def create_connector_auth_attempt(
+        self,
+        *,
+        attempt_id: str,
+        user_id: str,
+        connector_id: str,
+        driver: str,
+        connected_account_id: str | None,
+        expires_at: float,
+    ) -> None:
+        now = _now()
+        self._exec(
+            "INSERT INTO connector_auth_attempts("
+            "id_hash,user_id,connector_id,driver,connected_account_id,status,expires_at,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,'pending',?,?,?)",
+            (
+                _hash_ephemeral("connector-attempt", attempt_id),
+                user_id,
+                connector_id,
+                driver,
+                connected_account_id,
+                expires_at,
+                now,
+                now,
+            ),
+        )
+
+    def get_connector_auth_attempt(self, attempt_id: str, user_id: str | None = None) -> dict | None:
+        params: tuple = (_hash_ephemeral("connector-attempt", attempt_id),)
+        sql = "SELECT * FROM connector_auth_attempts WHERE id_hash=?"
+        if user_id is not None:
+            sql += " AND user_id=?"
+            params += (user_id,)
+        row = self._one(sql, params)
+        if row is None or row["expires_at"] <= _now() or row["consumed_at"] is not None:
+            return None
+        return dict(row)
+
+    def claim_connector_poll(
+        self, attempt_id: str, user_id: str, interval: float, *, now: float | None = None
+    ) -> tuple[dict | None, bool]:
+        now = _now() if now is None else now
+        attempt_hash = _hash_ephemeral("connector-attempt", attempt_id)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM connector_auth_attempts WHERE id_hash=? AND user_id=? "
+                    "AND consumed_at IS NULL AND expires_at>?",
+                    (attempt_hash, user_id, now),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return None, False
+                should_poll = row["status"] == "pending" and float(row["next_poll_at"] or 0) <= now
+                if should_poll:
+                    self._conn.execute(
+                        "UPDATE connector_auth_attempts SET next_poll_at=?,updated_at=? WHERE id_hash=?",
+                        (now + interval, now, attempt_hash),
+                    )
+                self._conn.commit()
+                return dict(row), should_poll
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finish_connector_auth_attempt(
+        self, *, attempt_id: str, status: str, account_label: str = "", message: str = ""
+    ) -> None:
+        if status not in {"complete", "error"}:
+            raise ValueError("Estado terminal inválido")
+        self._exec(
+            "UPDATE connector_auth_attempts SET status=?,account_label=?,message=?,updated_at=? "
+            "WHERE id_hash=? AND consumed_at IS NULL",
+            (
+                status,
+                account_label[:160],
+                message[:500],
+                _now(),
+                _hash_ephemeral("connector-attempt", attempt_id),
+            ),
+        )
+
+    def consume_connector_auth_attempt(self, attempt_id: str, user_id: str) -> dict | None:
+        now = _now()
+        attempt_hash = _hash_ephemeral("connector-attempt", attempt_id)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM connector_auth_attempts WHERE id_hash=? AND user_id=? "
+                    "AND consumed_at IS NULL AND expires_at>?",
+                    (attempt_hash, user_id, now),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return None
+                if row["status"] in {"complete", "error"}:
+                    changed = self._conn.execute(
+                        "UPDATE connector_auth_attempts SET consumed_at=?,updated_at=? "
+                        "WHERE id_hash=? AND consumed_at IS NULL",
+                        (now, now, attempt_hash),
+                    )
+                    if changed.rowcount != 1:
+                        self._conn.rollback()
+                        return None
+                self._conn.commit()
+                return dict(row)
+            except Exception:
+                self._conn.rollback()
+                raise
+
     # ---------- credenciales privadas de conectores ----------
     def upsert_connector_credentials(
         self,
@@ -268,21 +577,24 @@ class Store:
         connector_id: str,
         credentials_enc: bytes,
         key_id: str,
+        key_version: int = 1,
         account_label: str,
     ) -> None:
         now = _now()
         self._exec(
             "INSERT INTO connector_credentials("
-            "user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,?) "
+            "user_id,connector_id,credentials_enc,key_id,key_version,account_label,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(user_id,connector_id) DO UPDATE SET "
             "credentials_enc=excluded.credentials_enc,key_id=excluded.key_id,"
+            "key_version=excluded.key_version,"
             "account_label=excluded.account_label,updated_at=excluded.updated_at",
             (
                 user_id,
                 connector_id,
                 credentials_enc,
                 key_id,
+                key_version,
                 account_label[:160],
                 now,
                 now,
@@ -291,7 +603,7 @@ class Store:
 
     def get_connector_credentials(self, user_id: str, connector_id: str) -> dict | None:
         row = self._one(
-            "SELECT user_id,connector_id,credentials_enc,key_id,account_label,created_at,updated_at "
+            "SELECT user_id,connector_id,credentials_enc,key_id,key_version,account_label,created_at,updated_at "
             "FROM connector_credentials WHERE user_id=? AND connector_id=?",
             (user_id, connector_id),
         )
@@ -305,6 +617,15 @@ class Store:
             )
             self._conn.commit()
             return bool(cursor.rowcount)
+
+    def update_connector_encryption(
+        self, user_id: str, connector_id: str, credentials_enc: bytes, key_version: int
+    ) -> None:
+        self._exec(
+            "UPDATE connector_credentials SET credentials_enc=?,key_version=?,updated_at=? "
+            "WHERE user_id=? AND connector_id=?",
+            (credentials_enc, key_version, _now(), user_id, connector_id),
+        )
 
     # ---------- computadoras persistentes por bot ----------
     def claim_bot_computer(
@@ -360,6 +681,14 @@ class Store:
             (user_id, bot_id),
         )
         return dict(row) if row else None
+
+    def list_bot_computers(self, user_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self._q(
+                "SELECT * FROM bot_computers WHERE user_id=? ORDER BY created_at", (user_id,)
+            )
+        ]
 
     def update_bot_computer(
         self,
@@ -420,7 +749,10 @@ class Store:
         return self.get_user_by_id(user_id)  # type: ignore[return-value]
 
     def get_user_by_api_key(self, api_key: str) -> dict | None:
-        row = self._one("SELECT * FROM users WHERE api_key_hash=?", (hash_wrapper_key(api_key),))
+        row = self._one(
+            "SELECT * FROM users WHERE api_key_hash=? AND account_status='active'",
+            (hash_wrapper_key(api_key),),
+        )
         return dict(row) if row else None
 
     def get_user_by_id(self, user_id: str) -> dict | None:
@@ -446,7 +778,9 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 existing = self._conn.execute(
-                    "SELECT * FROM account_identities WHERE provider='google' AND subject=?",
+                    "SELECT a.*,u.account_status FROM account_identities a "
+                    "JOIN users u ON u.id=a.user_id "
+                    "WHERE a.provider='google' AND a.subject=?",
                     (subject,),
                 ).fetchone()
                 if existing is None:
@@ -465,6 +799,8 @@ class Store:
                         (account_id, user_id, "google", subject, email, name, picture, now, now),
                     )
                 else:
+                    if existing["account_status"] != "active":
+                        raise PermissionError("La cuenta está deshabilitada")
                     account_id = existing["id"]
                     user_id = existing["user_id"]
                     self._conn.execute(
@@ -487,7 +823,7 @@ class Store:
 
     def get_account_identity(self, account_id: str) -> dict | None:
         row = self._one(
-            "SELECT a.*, u.tier, u.subscription_id FROM account_identities a "
+            "SELECT a.*, u.tier, u.subscription_id,u.account_status,u.disabled_at FROM account_identities a "
             "JOIN users u ON u.id=a.user_id WHERE a.id=?",
             (account_id,),
         )
@@ -528,7 +864,8 @@ class Store:
             "SELECT u.* FROM account_sessions s "
             "JOIN account_identities a ON a.id=s.account_id "
             "JOIN users u ON u.id=a.user_id "
-            "WHERE s.access_token_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>?",
+            "WHERE s.access_token_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>? "
+            "AND u.account_status='active'",
             (_hash_account_token("access", access_token), _now()),
         )
         return dict(row) if row else None
@@ -550,8 +887,11 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 session = self._conn.execute(
-                    "SELECT * FROM account_sessions WHERE refresh_token_hash=? "
-                    "AND device_id=? AND revoked_at IS NULL AND refresh_expires_at>?",
+                    "SELECT s.* FROM account_sessions s "
+                    "JOIN account_identities a ON a.id=s.account_id "
+                    "JOIN users u ON u.id=a.user_id "
+                    "WHERE s.refresh_token_hash=? AND s.device_id=? AND s.revoked_at IS NULL "
+                    "AND s.refresh_expires_at>? AND u.account_status='active'",
                     (refresh_hash, device_id, now),
                 ).fetchone()
                 if session is None:
@@ -593,6 +933,51 @@ class Store:
             self._conn.commit()
             return cursor.rowcount > 0
 
+    def revoke_user_account(self, user_id: str) -> dict:
+        """Deshabilita la cuenta e invalida credenciales locales atómicamente."""
+        now = _now()
+        revoked_hash = hash_wrapper_key("revoked|" + secrets.token_urlsafe(48))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._conn.execute(
+                    "SELECT * FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                if user is None:
+                    raise KeyError(user_id)
+                if user["subscription_id"]:
+                    self._conn.execute(
+                        "UPDATE go_subscriptions SET status='available',assigned_user_id=NULL "
+                        "WHERE id=?",
+                        (user["subscription_id"],),
+                    )
+                sessions = self._conn.execute(
+                    "UPDATE account_sessions SET revoked_at=? WHERE revoked_at IS NULL AND account_id IN ("
+                    "SELECT id FROM account_identities WHERE user_id=?)",
+                    (now, user_id),
+                ).rowcount
+                connectors = self._conn.execute(
+                    "DELETE FROM connector_credentials WHERE user_id=?", (user_id,)
+                ).rowcount
+                self._conn.execute(
+                    "DELETE FROM connector_auth_attempts WHERE user_id=?", (user_id,)
+                )
+                self._conn.execute(
+                    "UPDATE users SET tier='free',subscription_id=NULL,account_status='disabled',"
+                    "disabled_at=?,api_key_hash=? WHERE id=?",
+                    (now, revoked_hash, user_id),
+                )
+                self._conn.commit()
+                return {
+                    "user_id": user_id,
+                    "sessions_revoked": int(sessions),
+                    "connector_credentials_deleted": int(connectors),
+                    "disabled_at": now,
+                }
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def list_users(self) -> list[dict]:
         return [dict(r) for r in self._q("SELECT * FROM users ORDER BY created_at")]
 
@@ -613,15 +998,15 @@ class Store:
             self._conn.commit()
 
     # ---------- suscripciones Go ----------
-    def add_subscription(self, api_key_enc: bytes, key_id: str, label: str | None, source: str = "pool", user_id: str | None = None, sub_id: str | None = None) -> dict:
+    def add_subscription(self, api_key_enc: bytes, key_id: str, label: str | None, source: str = "pool", user_id: str | None = None, sub_id: str | None = None, key_version: int = 1) -> dict:
         sub_id = sub_id or new_id("sub")
         created = _now()
         status = "assigned" if user_id else "available"
         with self._lock:
             self._conn.execute(
-                "INSERT INTO go_subscriptions(id, api_key_enc, key_id, label, source, status, assigned_user_id, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (sub_id, api_key_enc, key_id, label, source, status, user_id, created),
+                "INSERT INTO go_subscriptions(id, api_key_enc, key_id,key_version,label,source,status,assigned_user_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (sub_id, api_key_enc, key_id, key_version, label, source, status, user_id, created),
             )
             if user_id:
                 self._conn.execute("UPDATE users SET subscription_id=? WHERE id=?", (sub_id, user_id))
@@ -631,6 +1016,14 @@ class Store:
     def get_subscription(self, sub_id: str) -> dict | None:
         row = self._one("SELECT * FROM go_subscriptions WHERE id=?", (sub_id,))
         return dict(row) if row else None
+
+    def update_subscription_encryption(
+        self, sub_id: str, api_key_enc: bytes, key_version: int
+    ) -> None:
+        self._exec(
+            "UPDATE go_subscriptions SET api_key_enc=?,key_version=? WHERE id=?",
+            (api_key_enc, key_version, sub_id),
+        )
 
     def available_count(self) -> int:
         row = self._one("SELECT COUNT(*) AS n FROM go_subscriptions WHERE status='available'")

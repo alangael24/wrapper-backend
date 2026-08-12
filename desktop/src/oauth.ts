@@ -272,7 +272,11 @@ class WrapperServiceClient {
     await this.options.openExternal(authorizeUrl);
     const attemptId = stringValue(started.attempt_id);
     for (let attempt = 0; attempt < ACCOUNT_AUTH_ATTEMPTS; attempt += 1) {
-      const result = await this.publicJson(`/v1/account-auth/status/${encodeURIComponent(attemptId)}?device_id=${encodeURIComponent(deviceId)}`, { signal });
+      const result = await this.publicJson("/v1/account-auth/status", {
+        method: "POST",
+        body: { attempt_id: attemptId, device_id: deviceId },
+        signal
+      });
       if (result.status === "complete" && isAccountIdentity(result.account)) {
         const session: AccountSession = {
           token: stringValue(result.token),
@@ -315,7 +319,11 @@ class WrapperServiceClient {
   }
 
   connectorStatus(attemptId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.authorizedJson(`/v1/connectors/status/${encodeURIComponent(attemptId)}`, { signal });
+    return this.authorizedJson("/v1/connectors/status", {
+      method: "POST",
+      body: { attempt_id: attemptId },
+      signal
+    });
   }
 
   disconnectConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {

@@ -382,6 +382,16 @@ class ConnectorBroker:
         with self._lock:
             self._grants.pop(token, None)
 
+    def revoke_user(self, user_id: str) -> int:
+        """Revoca grants de conectores/computadora que sigan vivos para una cuenta."""
+        with self._lock:
+            tokens = [
+                token for token, grant in self._grants.items() if grant.user_id == user_id
+            ]
+            for token in tokens:
+                self._grants.pop(token, None)
+            return len(tokens)
+
     def catalog(self, token: str) -> list[dict[str, Any]]:
         grant = self._require_grant(token)
         with self._lock:

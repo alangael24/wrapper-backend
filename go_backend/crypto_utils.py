@@ -13,6 +13,7 @@ Nunca se guardan keys Go en claro.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import subprocess
@@ -41,11 +42,58 @@ def _load_or_create_secret(secret_path: Path) -> bytes:
     return raw
 
 
-def _master_key(secret_env: str | None, secret_path: Path) -> bytes:
+def _master_key(secret_env: str | None, secret_path: Path, *, allow_create: bool = True) -> bytes:
     if secret_env:
         salt = b"wrapper-backend"
         return hashlib.pbkdf2_hmac("sha256", secret_env.encode(), salt, _PBKDF2_ITERATIONS, dklen=32)
+    if not allow_create:
+        raise CryptoError("WRAPPER_SECRET es obligatorio en producción")
     return _load_or_create_secret(secret_path)
+
+
+def parse_secret_versions(raw: str, *, current_version: int, current_secret: str | None) -> dict[int, str]:
+    """Parsea secretos anteriores para rotación dual-read/new-write.
+
+    ``WRAPPER_SECRET_PREVIOUS_JSON`` usa el formato ``{"1":"secret-anterior"}``.
+    La versión actual siempre viene de ``WRAPPER_SECRET`` y no puede repetirse.
+    """
+    if current_version < 1:
+        raise CryptoError("WRAPPER_SECRET_VERSION debe ser un entero positivo")
+    versions: dict[int, str] = {}
+    if raw.strip():
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            raise CryptoError("WRAPPER_SECRET_PREVIOUS_JSON debe ser JSON válido") from exc
+        if not isinstance(value, dict):
+            raise CryptoError("WRAPPER_SECRET_PREVIOUS_JSON debe ser un objeto")
+        for raw_version, secret in value.items():
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError) as exc:
+                raise CryptoError("Las versiones de cifrado deben ser enteros positivos") from exc
+            if version < 1 or not isinstance(secret, str) or len(secret) < 24:
+                raise CryptoError("Cada secreto anterior debe tener al menos 24 caracteres")
+            versions[version] = secret
+    if current_secret:
+        if current_version in versions:
+            raise CryptoError("La versión actual no debe repetirse entre los secretos anteriores")
+        versions[current_version] = current_secret
+    return versions
+
+
+def _secret_for_version(
+    *,
+    key_version: int,
+    current_secret: str | None,
+    secret_versions: dict[int, str] | None,
+) -> str | None:
+    if secret_versions:
+        secret = secret_versions.get(key_version)
+        if not secret:
+            raise CryptoError(f"No existe WRAPPER_SECRET para la versión {key_version}")
+        return secret
+    return current_secret
 
 
 def _aesgcm():
@@ -57,31 +105,62 @@ def _aesgcm():
         return None
 
 
-def encrypt_api_key(plaintext: str, key_id: str, secret_env: str | None, secret_path: Path) -> bytes:
+def encrypt_api_key(
+    plaintext: str,
+    key_id: str,
+    secret_env: str | None,
+    secret_path: Path,
+    *,
+    key_version: int = 1,
+    secret_versions: dict[int, str] | None = None,
+    allow_secret_file: bool = True,
+) -> bytes:
     """Cifra una key Go y devuelve el blob para guardar en la BD."""
+    selected_secret = _secret_for_version(
+        key_version=key_version,
+        current_secret=secret_env,
+        secret_versions=secret_versions,
+    )
+    if not allow_secret_file and not selected_secret:
+        raise CryptoError("WRAPPER_SECRET es obligatorio en producción")
     aesgcm = _aesgcm()
     if aesgcm is not None:
-        master = _master_key(secret_env, secret_path)
+        master = _master_key(selected_secret, secret_path, allow_create=allow_secret_file)
         salt = secrets.token_bytes(_SALT_LEN)
         key = hashlib.pbkdf2_hmac("sha256", master, salt, _PBKDF2_ITERATIONS, dklen=32)
         nonce = secrets.token_bytes(_NONCE_LEN)
         ct = aesgcm(key).encrypt(nonce, plaintext.encode(), None)
-        return b"aes:" + salt + nonce + ct
+        return f"aesv{key_version}:".encode() + salt + nonce + ct
     # Fallback: Keychain de macOS
     keychain_put(key_id, plaintext)
     return b"kc:" + key_id.encode()
 
 
-def decrypt_api_key(blob: bytes, key_id: str, secret_env: str | None, secret_path: Path) -> str:
+def decrypt_api_key(
+    blob: bytes,
+    key_id: str,
+    secret_env: str | None,
+    secret_path: Path,
+    *,
+    key_version: int = 1,
+    secret_versions: dict[int, str] | None = None,
+    allow_secret_file: bool = True,
+) -> str:
     aesgcm = _aesgcm()
-    if blob.startswith(b"aes:"):
+    prefix = f"aesv{key_version}:".encode()
+    if blob.startswith(prefix) or (key_version == 1 and blob.startswith(b"aes:")):
         if aesgcm is None:
             raise CryptoError("blob AES pero cryptography no esta instalado")
-        raw = blob[4:]
+        raw = blob[len(prefix):] if blob.startswith(prefix) else blob[4:]
         if len(raw) < _SALT_LEN + _NONCE_LEN:
             raise CryptoError("blob cifrado invalido")
         salt, nonce, ct = raw[:_SALT_LEN], raw[_SALT_LEN:_SALT_LEN + _NONCE_LEN], raw[_SALT_LEN + _NONCE_LEN:]
-        master = _master_key(secret_env, secret_path)
+        selected_secret = _secret_for_version(
+            key_version=key_version,
+            current_secret=secret_env,
+            secret_versions=secret_versions,
+        )
+        master = _master_key(selected_secret, secret_path, allow_create=allow_secret_file)
         key = hashlib.pbkdf2_hmac("sha256", master, salt, _PBKDF2_ITERATIONS, dklen=32)
         return aesgcm(key).decrypt(nonce, ct, None).decode()
     if blob.startswith(b"kc:"):

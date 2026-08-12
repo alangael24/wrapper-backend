@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -30,6 +31,7 @@ from go_backend.server import (  # noqa: E402
     Handler,
     UnsafeConfigurationError,
     serve,
+    validate_runtime_security,
 )
 from go_backend.connectors import (  # noqa: E402
     CONNECTOR_CATALOG,
@@ -41,7 +43,8 @@ from go_backend.connector_adapters import (  # noqa: E402
     ComposioConnectorGateway,
 )
 from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
-from go_backend.store import NoSubscriptionAvailable, Store  # noqa: E402
+from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
+from go_backend.store import NoSubscriptionAvailable, Store, new_id  # noqa: E402
 
 
 class MockUpstream(BaseHTTPRequestHandler):
@@ -470,15 +473,34 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(replayed["error"]["type"], "invalid_state")
 
+        self.ws.backend.google_auth = GoogleAccountAuth(
+            store=self.ws.backend.store,
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri=self.ws.base + "/v1/account-auth/google/callback",
+            secret_env=self.ws.cfg.wrapper_secret,
+            secret_path=self.ws.cfg.secret_file,
+            key_version=self.ws.cfg.wrapper_secret_version,
+            secret_versions=self.ws.cfg.wrapper_secret_versions,
+        )
+
         status, completed = self.ws.req(
-            "GET",
-            f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}",
+            "POST",
+            "/v1/account-auth/status",
+            {"attempt_id": started["attempt_id"], "device_id": device_id},
         )
         self.assertEqual(status, 200)
         self.assertEqual(completed["status"], "complete")
         self.assertTrue(completed["token"].startswith("aga_"))
         self.assertTrue(completed["refresh_token"].startswith("agr_"))
         self.assertTrue(completed["account"]["id"].startswith("acct_"))
+        status, replayed_result = self.ws.req(
+            "POST",
+            "/v1/account-auth/status",
+            {"attempt_id": started["attempt_id"], "device_id": device_id},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(replayed_result["error"]["type"], "not_found")
 
         status, me = self.ws.req(
             "GET", "/v1/me", headers={"Authorization": f"Bearer {completed['token']}"}
@@ -542,7 +564,8 @@ class TestBackend(unittest.TestCase):
             raw=True,
         )
         _, completed = self.ws.req(
-            "GET", f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}"
+            "POST", "/v1/account-auth/status",
+            {"attempt_id": started["attempt_id"], "device_id": device_id},
         )
         google_user = self.ws.backend.store.get_user_by_access_token(completed["token"])
         self.assertNotEqual(google_user["id"], signup["user_id"])
@@ -569,10 +592,17 @@ class TestBackend(unittest.TestCase):
             raw=True,
         )
         _, result = self.ws.req(
-            "GET", f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}"
+            "POST", "/v1/account-auth/status",
+            {"attempt_id": started["attempt_id"], "device_id": device_id},
         )
         self.assertEqual(result["status"], "error")
         self.assertIn("verificada", result["message"])
+        status, replayed = self.ws.req(
+            "POST", "/v1/account-auth/status",
+            {"attempt_id": started["attempt_id"], "device_id": device_id},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(replayed["error"]["type"], "not_found")
 
     def test_public_signup_always_free_and_never_consumes_pool(self):
         ws = self.ws
@@ -599,7 +629,7 @@ class TestBackend(unittest.TestCase):
         store = self.ws.backend.store
         for sub in store.list_subscriptions():
             blob = sub["api_key_enc"]
-            self.assertTrue(blob.startswith((b"aes:", b"kc:")))
+            self.assertTrue(blob.startswith((b"aesv1:", b"aes:", b"kc:")))
             self.assertNotIn(b"sk-go-", blob)
 
     def test_admin_auth_required(self):
@@ -941,6 +971,35 @@ class TestBackend(unittest.TestCase):
         status, _ = self.ws.req("GET", "/v1/usage", headers={"Authorization": "Bearer wrong"})
         self.assertEqual(status, 401)
 
+    def test_json_responses_are_never_cacheable(self):
+        status, body, headers = self.ws.req(
+            "POST", "/v1/signup", {}, include_headers=True
+        )
+        self.assertEqual(status, 201)
+        self.assertIn("no-store", headers["Cache-Control"])
+        self.assertEqual(headers["Pragma"], "no-cache")
+        self.assertTrue(headers["X-Request-Id"].startswith("req_"))
+        self.assertIn("api_key", body)
+
+    def test_unhandled_errors_are_private_and_have_request_id(self):
+        with patch.object(self.ws.backend.store, "health", side_effect=RuntimeError("secret SQL table")):
+            status, body = self.ws.req("GET", "/readyz")
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"]["message"], "Internal server error")
+        self.assertNotIn("secret SQL table", json.dumps(body))
+        self.assertTrue(body["error"]["request_id"].startswith("req_"))
+
+    def test_production_requires_database_master_secret_and_admin_token(self):
+        cfg = self.ws.cfg
+        cfg.environment = "production"
+        cfg.database_url = None
+        cfg.wrapper_secret = None
+        cfg.admin_token = None
+        with self.assertRaisesRegex(
+            UnsafeConfigurationError, "DATABASE_URL, WRAPPER_SECRET, ADMIN_TOKEN"
+        ):
+            validate_runtime_security(cfg)
+
     def test_byok(self):
         ws = self.ws
         signup = self.new_user("byok-user")
@@ -968,11 +1027,57 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         user = ws.backend.store.get_user_by_api_key(signup["api_key"])
+        account_id = new_id("acct")
+        now = time.time()
+        ws.backend.store._exec(
+            "INSERT INTO account_identities("
+            "id,user_id,provider,subject,email,email_verified,name,picture,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,1,?,?,?,?)",
+            (account_id, user["id"], "google", "revoked-subject", "revoked@example.com", "Revoked", "", now, now),
+        )
+        revoked_device_id = str(uuid.uuid4())
+        ws.backend.store.create_account_session(
+            account_id=account_id,
+            device_id=revoked_device_id,
+            access_token="aga_" + "a" * 50,
+            refresh_token="agr_" + "r" * 70,
+            access_expires_at=now + 3600,
+            refresh_expires_at=now + 7200,
+        )
+        connector_blob = ws.backend.encrypt_secret("{\"token\":\"private\"}", "connector-test")
+        ws.backend.store.upsert_connector_credentials(
+            user_id=user["id"],
+            connector_id="github",
+            credentials_enc=connector_blob,
+            key_id="connector-test",
+            key_version=ws.cfg.wrapper_secret_version,
+            account_label="test",
+        )
+        ws.backend.store.claim_bot_computer(user["id"], "revoked-bot", "daytona", 2)
+        grant = ws.backend.connectors.issue(
+            user_id=user["id"], connector_ids=("github",), computer_id="revoked-bot"
+        )
         status, body = ws.req("POST", f"/admin/users/{user['id']}/revoke", headers=ws.admin_headers)
         self.assertEqual(status, 200)
+        self.assertTrue(body["revoked"])
+        self.assertEqual(body["ephemeral_grants_revoked"], 1)
         sub = ws.backend.store.get_subscription(user["subscription_id"])
         self.assertEqual(sub["status"], "available")
         self.assertEqual(ws.backend.store.available_count(), 1)
+        self.assertEqual(ws.backend.store.get_user_by_id(user["id"])["account_status"], "disabled")
+        self.assertIsNone(ws.backend.store.get_user_by_api_key(signup["api_key"]))
+        self.assertIsNone(ws.backend.store.get_user_by_access_token("aga_" + "a" * 50))
+        refresh_status, _ = ws.req(
+            "POST",
+            "/v1/account-auth/refresh",
+            {"device_id": revoked_device_id},
+            headers={"Authorization": "Bearer " + "agr_" + "r" * 70},
+        )
+        self.assertEqual(refresh_status, 401)
+        self.assertIsNone(ws.backend.store.get_connector_credentials(user["id"], "github"))
+        self.assertIsNone(ws.backend.store.get_bot_computer(user["id"], "revoked-bot"))
+        with self.assertRaises(ConnectorBrokerError):
+            ws.backend.connectors.catalog(grant)
 
 
 
@@ -1286,11 +1391,11 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(body["error"]["type"], "connector_token_invalid")
 
     def test_connector_grant_expires_without_server_restart(self):
-        clock = [100.0]
+        clock = [time.time()]
         broker = ConnectorBroker(default_ttl_seconds=5, now=lambda: clock[0])
         token = broker.issue(user_id="user-a", connector_ids=("github",))
         self.assertEqual(broker.catalog(token)[0]["id"], "github")
-        clock[0] = 106.0
+        clock[0] += 6.0
         with self.assertRaises(ConnectorBrokerError) as error:
             broker.catalog(token)
         self.assertEqual(error.exception.status, 401)
@@ -1298,36 +1403,49 @@ class TestBackend(unittest.TestCase):
 
     def test_composio_gateway_owns_auth_status_and_execution_by_wrapper_user(self):
         client = FakeComposioClient()
-        clock = [100.0]
+        clock = [time.time()]
+        alice_id = self.new_user("composio-alice")["user_id"]
+        bob_id = self.new_user("composio-bob")["user_id"]
         gateway = ComposioConnectorGateway(
             client=client,
             public_base_url="https://agentgenia-api.onrender.com",
             auth_configs={"salesforce": "ac_agentgenia_salesforce"},
             now=lambda: clock[0],
+            store=self.ws.backend.store,
         )
         self.assertTrue(gateway.describe("github")["available"])
         self.assertTrue(gateway.describe("salesforce")["available"])
-        self.assertFalse(gateway.status("usr_alice", "github")["connected"])
+        self.assertFalse(gateway.status(alice_id, "github")["connected"])
 
-        started = gateway.start("usr_alice", "github")
+        started = gateway.start(alice_id, "github")
         self.assertRegex(started["attempt_id"], r"^[A-Za-z0-9_-]+$")
         self.assertEqual(
             started["authorize_url"],
             "https://connect.composio.dev/link/ca_1",
         )
-        self.assertEqual(gateway.poll("usr_alice", started["attempt_id"]), {"status": "pending"})
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+            now=lambda: clock[0],
+            store=self.ws.backend.store,
+        )
+        self.assertEqual(gateway.poll(alice_id, started["attempt_id"]), {"status": "pending"})
         client.connected_accounts.items["ca_1"].status = "ACTIVE"
-        self.assertEqual(gateway.poll("usr_alice", started["attempt_id"]), {"status": "pending"})
+        self.assertEqual(gateway.poll(alice_id, started["attempt_id"]), {"status": "pending"})
         self.assertEqual(client.connected_accounts.get_calls, ["ca_1"])
         clock[0] += 2.1
-        completed = gateway.poll("usr_alice", started["attempt_id"])
+        completed = gateway.poll(alice_id, started["attempt_id"])
         self.assertEqual(completed["status"], "complete")
         self.assertEqual(completed["session"]["connector_id"], "github")
-        self.assertTrue(gateway.status("usr_alice", "github")["connected"])
-        self.assertFalse(gateway.status("usr_bob", "github")["connected"])
+        with self.assertRaises(ConnectorBrokerError) as replay:
+            gateway.poll(alice_id, started["attempt_id"])
+        self.assertEqual(replay.exception.code, "connector_auth_not_found")
+        self.assertTrue(gateway.status(alice_id, "github")["connected"])
+        self.assertFalse(gateway.status(bob_id, "github")["connected"])
 
         client.connected_accounts.list_calls.clear()
-        snapshot = gateway.snapshot("usr_alice")
+        snapshot = gateway.snapshot(alice_id)
         github = next(item for item in snapshot if item["connector_id"] == "github")
         slack = next(item for item in snapshot if item["connector_id"] == "slack")
         self.assertTrue(github["connected"])
@@ -1336,25 +1454,27 @@ class TestBackend(unittest.TestCase):
         self.assertIsNone(client.connected_accounts.list_calls[0]["toolkit_slugs"])
 
         adapter = ComposioConnectorAdapter(gateway, "github")
-        self.assertTrue(adapter.is_connected("usr_alice"))
+        self.assertTrue(adapter.is_connected(alice_id))
         result = adapter.execute(
-            "usr_alice", "search_repositories", {"query": "wrapper"}
+            alice_id, "search_repositories", {"query": "wrapper"}
         )
         self.assertEqual(result["items"][0]["name"], "wrapper-backend")
         self.assertEqual(
             client.executions,
             [("GITHUB_SEARCH", {"query": "wrapper"})],
         )
-        self.assertEqual(client.session_options[-1]["user_id"], "usr_alice")
+        self.assertEqual(client.session_options[-1]["user_id"], alice_id)
         self.assertEqual(client.session_options[-1]["toolkits"], ["github"])
         self.assertFalse(client.session_options[-1]["manage_connections"])
         self.assertEqual(client.session_options[-1]["workbench"], {"enable": False})
 
-        gateway.disconnect("usr_alice", "github")
-        self.assertFalse(gateway.status("usr_alice", "github")["connected"])
+        gateway.disconnect(alice_id, "github")
+        self.assertFalse(gateway.status(alice_id, "github")["connected"])
 
     def test_composio_gateway_fails_closed_without_private_auth_config(self):
-        gateway = ComposioConnectorGateway(client=FakeComposioClient())
+        gateway = ComposioConnectorGateway(
+            client=FakeComposioClient(), store=self.ws.backend.store
+        )
         salesforce = gateway.describe("salesforce")
         self.assertFalse(salesforce["available"])
         self.assertIn("Auth Config", salesforce["reason"])
@@ -1363,11 +1483,14 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(error.exception.code, "connector_not_configured")
 
     def test_composio_gateway_rate_limits_new_links_per_user(self):
-        gateway = ComposioConnectorGateway(client=FakeComposioClient(), now=lambda: 100.0)
+        user_id = self.new_user("rate-user")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=FakeComposioClient(), now=time.time, store=self.ws.backend.store
+        )
         for _ in range(12):
-            gateway.start("usr_alice", "github")
+            gateway.start(user_id, "github")
         with self.assertRaises(ConnectorBrokerError) as error:
-            gateway.start("usr_alice", "github")
+            gateway.start(user_id, "github")
         self.assertEqual(error.exception.status, 429)
         self.assertEqual(error.exception.code, "connector_rate_limit")
 
@@ -1385,6 +1508,7 @@ class TestBackend(unittest.TestCase):
             gateway = ComposioConnectorGateway(
                 client=FakeComposioClient(),
                 native_gateway=native,
+                store=store,
             )
 
             self.assertEqual(gateway.describe("nooks")["driver"], "native")

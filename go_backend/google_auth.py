@@ -19,8 +19,10 @@ import urllib.request
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from .crypto_utils import CryptoError, decrypt_api_key, encrypt_api_key
 from .store import Store, new_id
 
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -34,18 +36,6 @@ class GoogleAuthError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.code = code
-
-
-@dataclass
-class _Attempt:
-    id: str
-    state: str
-    device_id: str
-    verifier: str
-    expires_at: float
-    status: str = "pending"
-    message: str = ""
-    result: dict[str, Any] | None = None
 
 
 @dataclass
@@ -64,6 +54,11 @@ class GoogleAccountAuth:
         access_ttl_seconds: int = 900,
         refresh_ttl_seconds: int = 30 * 86400,
         attempt_ttl_seconds: int = 600,
+        secret_env: str | None = None,
+        secret_path: Path = Path("secret.key"),
+        key_version: int = 1,
+        secret_versions: dict[int, str] | None = None,
+        allow_secret_file: bool = True,
     ):
         self.store = store
         self.client_id = (client_id or "").strip()
@@ -72,8 +67,11 @@ class GoogleAccountAuth:
         self.access_ttl_seconds = max(300, min(int(access_ttl_seconds), 3600))
         self.refresh_ttl_seconds = max(3600, min(int(refresh_ttl_seconds), 90 * 86400))
         self.attempt_ttl_seconds = max(120, min(int(attempt_ttl_seconds), 900))
-        self._attempts: dict[str, _Attempt] = {}
-        self._attempt_by_state: dict[str, str] = {}
+        self.secret_env = secret_env
+        self.secret_path = secret_path
+        self.key_version = key_version
+        self.secret_versions = secret_versions or {}
+        self.allow_secret_file = allow_secret_file
         self._rate: dict[str, _RateBucket] = defaultdict(_RateBucket)
         self._lock = threading.RLock()
         self._validate_configuration()
@@ -111,24 +109,30 @@ class GoogleAccountAuth:
         # del mismo proxy corporativo.
         self._check_rate(f"start-device:{device_id}", limit=5, window_seconds=60)
         self._check_rate(f"start-origin:{remote_key}", limit=120, window_seconds=60)
-        self._cleanup()
-
+        self.store.prune_auth_attempts()
         attempt_id = new_id("auth")
         state = secrets.token_urlsafe(32)
         verifier = secrets.token_urlsafe(64)
         challenge = base64.urlsafe_b64encode(
             hashlib.sha256(verifier.encode()).digest()
         ).rstrip(b"=").decode()
-        attempt = _Attempt(
-            id=attempt_id,
+        verifier_enc = encrypt_api_key(
+            verifier,
+            state,
+            self.secret_env,
+            self.secret_path,
+            key_version=self.key_version,
+            secret_versions=self.secret_versions,
+            allow_secret_file=self.allow_secret_file,
+        )
+        self.store.create_account_auth_attempt(
+            attempt_id=attempt_id,
             state=state,
             device_id=device_id,
-            verifier=verifier,
+            verifier_enc=verifier_enc,
+            key_version=self.key_version,
             expires_at=time.time() + self.attempt_ttl_seconds,
         )
-        with self._lock:
-            self._attempts[attempt_id] = attempt
-            self._attempt_by_state[state] = attempt_id
 
         query = urllib.parse.urlencode(
             {
@@ -151,48 +155,69 @@ class GoogleAccountAuth:
 
     def status(self, *, attempt_id: str, device_id: str) -> dict:
         self._validate_device_id(device_id)
-        self._cleanup()
-        with self._lock:
-            attempt = self._attempts.get(attempt_id)
-            if attempt is None or not secrets.compare_digest(attempt.device_id, device_id):
-                raise GoogleAuthError("Intento de acceso no encontrado", status=404, code="not_found")
-            if attempt.expires_at <= time.time() and attempt.status != "complete":
-                attempt.status = "error"
-                attempt.message = "El inicio de sesión expiró. Inténtalo de nuevo."
-            if attempt.status == "complete" and attempt.result:
-                return {"status": "complete", **attempt.result}
-            if attempt.status == "error":
-                return {"status": "error", "message": attempt.message}
-            return {"status": "pending"}
+        attempt = self.store.consume_account_auth_attempt(attempt_id, device_id)
+        if attempt is None:
+            raise GoogleAuthError("Intento de acceso no encontrado", status=404, code="not_found")
+        if attempt["status"] == "complete" and attempt.get("result_enc"):
+            try:
+                raw = decrypt_api_key(
+                    bytes(attempt["result_enc"]),
+                    str(attempt["id_hash"]),
+                    self.secret_env,
+                    self.secret_path,
+                    key_version=int(attempt.get("key_version") or 1),
+                    secret_versions=self.secret_versions,
+                    allow_secret_file=self.allow_secret_file,
+                )
+                result = json.loads(raw)
+                account = self.store.get_account_identity(str(result["account_id"]))
+            except (CryptoError, ValueError, KeyError, TypeError) as exc:
+                raise GoogleAuthError(
+                    "El resultado del inicio de sesión no es válido",
+                    status=500,
+                    code="auth_result_invalid",
+                ) from exc
+            if not account or account.get("account_status") != "active":
+                raise GoogleAuthError("La cuenta está deshabilitada", status=403, code="account_disabled")
+            return {"status": "complete", **self._create_session(account=account, device_id=device_id)}
+        if attempt["status"] == "error":
+            return {"status": "error", "message": attempt.get("message") or "No fue posible iniciar sesión."}
+        return {"status": "pending"}
 
     def callback(self, params: dict[str, list[str]]) -> None:
         state = self._first(params, "state")
         if not state:
             raise GoogleAuthError("Google no devolvió state", code="invalid_state")
-        with self._lock:
-            attempt_id = self._attempt_by_state.pop(state, None)
-            attempt = self._attempts.get(attempt_id or "")
-            if attempt is None or not secrets.compare_digest(attempt.state, state):
-                raise GoogleAuthError("El state de Google no es válido o ya fue usado", code="invalid_state")
-            if attempt.expires_at <= time.time():
-                attempt.status = "error"
-                attempt.message = "El inicio de sesión expiró. Inténtalo de nuevo."
-                raise GoogleAuthError(attempt.message, code="expired_attempt")
-            if attempt.status != "pending":
-                raise GoogleAuthError("Este inicio de sesión ya fue procesado", code="replayed_callback")
-            attempt.status = "exchanging"
+        attempt = self.store.claim_account_auth_callback(state)
+        if attempt is None:
+            raise GoogleAuthError("El state de Google no es válido, expiró o ya fue usado", code="invalid_state")
+        try:
+            verifier = decrypt_api_key(
+                bytes(attempt["verifier_enc"]),
+                state,
+                self.secret_env,
+                self.secret_path,
+                key_version=int(attempt.get("key_version") or 1),
+                secret_versions=self.secret_versions,
+                allow_secret_file=self.allow_secret_file,
+            )
+        except CryptoError as exc:
+            self.store.fail_account_auth_attempt(
+                id_hash=attempt["id_hash"], message="No fue posible validar el inicio de sesión."
+            )
+            raise GoogleAuthError("No fue posible validar el inicio de sesión") from exc
 
         provider_error = self._first(params, "error")
         if provider_error:
-            self._fail(attempt, "Google canceló o rechazó el inicio de sesión.")
+            self._fail(attempt["id_hash"], "Google canceló o rechazó el inicio de sesión.")
             return
         code = self._first(params, "code")
         if not code:
-            self._fail(attempt, "Google no devolvió un código de autorización.")
+            self._fail(attempt["id_hash"], "Google no devolvió un código de autorización.")
             return
 
         try:
-            google_tokens = self._exchange_code(code=code, verifier=attempt.verifier)
+            google_tokens = self._exchange_code(code=code, verifier=verifier)
             access_token = google_tokens.get("access_token")
             if not isinstance(access_token, str) or len(access_token) < 10:
                 raise GoogleAuthError("Google no devolvió un access token válido")
@@ -211,15 +236,24 @@ class GoogleAccountAuth:
                 name=name,
                 picture=picture,
             )
-            token_result = self._create_session(account=account, device_id=attempt.device_id)
-            with self._lock:
-                attempt.result = token_result
-                attempt.status = "complete"
-                attempt.verifier = ""
+            result_enc = encrypt_api_key(
+                json.dumps({"account_id": account["id"]}, separators=(",", ":")),
+                str(attempt["id_hash"]),
+                self.secret_env,
+                self.secret_path,
+                key_version=self.key_version,
+                secret_versions=self.secret_versions,
+                allow_secret_file=self.allow_secret_file,
+            )
+            self.store.complete_account_auth_attempt(
+                id_hash=attempt["id_hash"],
+                result_enc=result_enc,
+                key_version=self.key_version,
+            )
         except GoogleAuthError as exc:
-            self._fail(attempt, str(exc))
+            self._fail(attempt["id_hash"], str(exc))
         except Exception:
-            self._fail(attempt, "No fue posible verificar tu cuenta con Google.")
+            self._fail(attempt["id_hash"], "No fue posible verificar tu cuenta con Google.")
 
     def refresh(self, *, refresh_token: str, device_id: str, remote_key: str) -> dict:
         self._validate_device_id(device_id)
@@ -374,23 +408,8 @@ class GoogleAccountAuth:
                 )
             bucket.append(now)
 
-    def _cleanup(self) -> None:
-        cutoff = time.time() - 60
-        with self._lock:
-            expired = [
-                attempt_id
-                for attempt_id, attempt in self._attempts.items()
-                if attempt.expires_at < cutoff
-            ]
-            for attempt_id in expired:
-                attempt = self._attempts.pop(attempt_id)
-                self._attempt_by_state.pop(attempt.state, None)
-
-    def _fail(self, attempt: _Attempt, message: str) -> None:
-        with self._lock:
-            attempt.status = "error"
-            attempt.message = message
-            attempt.verifier = ""
+    def _fail(self, id_hash: str, message: str) -> None:
+        self.store.fail_account_auth_attempt(id_hash=id_hash, message=message)
 
     @staticmethod
     def _first(params: dict[str, list[str]], key: str) -> str:

@@ -2,14 +2,14 @@
 
 Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/account-auth/start    Iniciar login con Google
-  GET  /v1/account-auth/status  Consultar login desde Electron
+  POST /v1/account-auth/status  Consumir login desde el dispositivo original
   GET  /v1/account-auth/google/callback
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
   GET  /v1/connectors            Catalogo y conexiones del usuario
   GET  /v1/connectors/<id>       Estado de una cuenta conectada
   POST /v1/connectors/start      Crear un Connect Link de Composio
-  GET  /v1/connectors/status/<id> Consultar el consentimiento
+  POST /v1/connectors/status     Consultar/consumir el consentimiento
   POST /v1/connectors/disconnect Revocar la cuenta del usuario
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
   GET  /v1/billing         Consultar plan y suscripción Stripe
@@ -51,6 +51,7 @@ import argparse
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import sys
@@ -67,7 +68,13 @@ from .connector_adapters import (
     parse_config_mapping,
 )
 from .native_connectors import NativeConnectorGateway
-from .crypto_utils import decrypt_api_key, encrypt_api_key, hash_wrapper_key
+from .crypto_utils import (
+    CryptoError,
+    decrypt_api_key,
+    encrypt_api_key,
+    hash_wrapper_key,
+    parse_secret_versions,
+)
 from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
 from .computers import ComputerConfig, ComputerError, ComputerManager
 from .go_prices import estimate_cost_usd
@@ -151,6 +158,11 @@ def validate_pi_chrome_security(chrome_isolation: str) -> None:
 
 class Config:
     def __init__(self):
+        self.environment = (os.environ.get("ENVIRONMENT") or "development").strip().lower()
+        if self.environment not in {"development", "production"}:
+            raise UnsafeConfigurationError(
+                "ENVIRONMENT debe ser 'development' o 'production'"
+            )
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
         self.database_url = (os.environ.get("DATABASE_URL") or "").strip() or None
         self.secret_file = Path(os.environ.get("SECRET_FILE", str(DEFAULT_SECRET_FILE)))
@@ -159,6 +171,15 @@ class Config:
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
+        self.wrapper_secret_version = int(os.environ.get("WRAPPER_SECRET_VERSION", "1"))
+        try:
+            self.wrapper_secret_versions = parse_secret_versions(
+                os.environ.get("WRAPPER_SECRET_PREVIOUS_JSON", ""),
+                current_version=self.wrapper_secret_version,
+                current_secret=self.wrapper_secret,
+            )
+        except CryptoError as exc:
+            raise UnsafeConfigurationError(str(exc)) from exc
         self.admin_token = (os.environ.get("ADMIN_TOKEN") or "").strip() or None
         self.google_oauth_client_id = (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
         self.google_oauth_client_secret = (os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
@@ -257,17 +278,50 @@ class Config:
         self.computer_pro_limit = int(os.environ.get("COMPUTER_PRO_LIMIT", "3"))
 
 
+def validate_runtime_security(cfg: Config) -> None:
+    validate_admin_token(cfg.admin_token)
+    if cfg.environment == "production":
+        missing = [
+            name
+            for name, value in (
+                ("DATABASE_URL", cfg.database_url),
+                ("WRAPPER_SECRET", cfg.wrapper_secret),
+                ("ADMIN_TOKEN", cfg.admin_token),
+            )
+            if not value
+        ]
+        if missing:
+            raise UnsafeConfigurationError(
+                "Faltan variables obligatorias en producción: " + ", ".join(missing)
+            )
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
     body = json.dumps(obj).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    request_id = getattr(handler, "request_id", "")
+    if request_id:
+        handler.send_header("X-Request-Id", request_id)
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def error_response(handler: BaseHTTPRequestHandler, status: int, message: str, code: str | None = None) -> None:
-    json_response(handler, status, {"error": {"message": message, "type": code or "error"}})
+def error_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    message: str,
+    code: str | None = None,
+    *,
+    include_request_id: bool = False,
+) -> None:
+    error = {"message": message, "type": code or "error"}
+    if include_request_id:
+        error["request_id"] = getattr(handler, "request_id", "")
+    json_response(handler, status, {"error": error})
 
 
 def empty_redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
@@ -311,6 +365,7 @@ def connector_html_response(handler: BaseHTTPRequestHandler, status: int, body: 
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +394,11 @@ class Backend:
             access_ttl_seconds=cfg.account_access_ttl_seconds,
             refresh_ttl_seconds=cfg.account_refresh_ttl_seconds,
             attempt_ttl_seconds=cfg.account_auth_attempt_ttl_seconds,
+            secret_env=cfg.wrapper_secret,
+            secret_path=cfg.secret_file,
+            key_version=cfg.wrapper_secret_version,
+            secret_versions=cfg.wrapper_secret_versions,
+            allow_secret_file=cfg.environment != "production",
         )
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
@@ -349,6 +409,9 @@ class Backend:
                 secret_env=cfg.wrapper_secret,
                 secret_path=cfg.secret_file,
                 public_base_url=cfg.connector_public_url,
+                key_version=cfg.wrapper_secret_version,
+                secret_versions=cfg.wrapper_secret_versions,
+                allow_secret_file=cfg.environment != "production",
                 attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
             )
             self.connector_gateway = ComposioConnectorGateway(
@@ -364,6 +427,7 @@ class Backend:
                 ),
                 attempt_ttl_seconds=cfg.composio_auth_attempt_ttl_seconds,
                 native_gateway=self.native_connector_gateway,
+                store=self.store,
             )
         except (RuntimeError, ValueError) as exc:
             raise UnsafeConfigurationError(f"Configuracion de conectores invalida: {exc}") from exc
@@ -428,6 +492,38 @@ class Backend:
         )
 
     # ---------- auth helpers ----------
+    def encrypt_secret(self, plaintext: str, key_id: str) -> bytes:
+        return encrypt_api_key(
+            plaintext,
+            key_id,
+            self.cfg.wrapper_secret,
+            self.cfg.secret_file,
+            key_version=self.cfg.wrapper_secret_version,
+            secret_versions=self.cfg.wrapper_secret_versions,
+            allow_secret_file=self.cfg.environment != "production",
+        )
+
+    def decrypt_secret(self, blob: bytes, key_id: str, key_version: int) -> str:
+        return decrypt_api_key(
+            blob,
+            key_id,
+            self.cfg.wrapper_secret,
+            self.cfg.secret_file,
+            key_version=key_version,
+            secret_versions=self.cfg.wrapper_secret_versions,
+            allow_secret_file=self.cfg.environment != "production",
+        )
+
+    def subscription_key(self, sub: dict) -> str:
+        version = int(sub.get("key_version") or 1)
+        plaintext = self.decrypt_secret(bytes(sub["api_key_enc"]), sub["key_id"], version)
+        if version != self.cfg.wrapper_secret_version:
+            rotated = self.encrypt_secret(plaintext, sub["key_id"])
+            self.store.update_subscription_encryption(
+                sub["id"], rotated, self.cfg.wrapper_secret_version
+            )
+        return plaintext
+
     def bearer(self, handler: BaseHTTPRequestHandler) -> str | None:
         auth = handler.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
@@ -463,10 +559,10 @@ class Backend:
         )
         json_response(handler, 201, result)
 
-    def handle_account_auth_status(
-        self, handler: BaseHTTPRequestHandler, attempt_id: str, query: dict[str, list[str]]
-    ) -> None:
-        device_id = (query.get("device_id") or [""])[0]
+    def handle_account_auth_status(self, handler: BaseHTTPRequestHandler) -> None:
+        body = self.read_json(handler) or {}
+        attempt_id = body.get("attempt_id") if isinstance(body.get("attempt_id"), str) else ""
+        device_id = body.get("device_id") if isinstance(body.get("device_id"), str) else ""
         json_response(
             handler,
             200,
@@ -525,12 +621,14 @@ class Backend:
             raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
         json_response(handler, 201, self.connector_gateway.start(user["id"], connector_id))
 
-    def handle_connector_auth_status(
-        self, handler: BaseHTTPRequestHandler, attempt_id: str
-    ) -> None:
+    def handle_connector_auth_status(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
         if not user:
             return
+        body = self.read_json(handler) or {}
+        attempt_id = body.get("attempt_id") if isinstance(body.get("attempt_id"), str) else ""
+        if not attempt_id:
+            raise ConnectorBrokerError(400, "Falta attempt_id", "bad_connector")
         json_response(handler, 200, self.connector_gateway.poll(user["id"], attempt_id))
 
     def handle_connector_disconnect(self, handler: BaseHTTPRequestHandler) -> None:
@@ -644,8 +742,15 @@ class Backend:
             error_response(handler, 400, f"Key de Go rechazada por el upstream: {message}", "invalid_go_key")
             return
         sub_id = new_id("sub")
-        blob = encrypt_api_key(go_key, sub_id, self.cfg.wrapper_secret, self.cfg.secret_file)
-        self.store.add_subscription(blob, sub_id, label=f"byok-{user['id']}", source="byok", sub_id=sub_id)
+        blob = self.encrypt_secret(go_key, sub_id)
+        self.store.add_subscription(
+            blob,
+            sub_id,
+            label=f"byok-{user['id']}",
+            source="byok",
+            sub_id=sub_id,
+            key_version=self.cfg.wrapper_secret_version,
+        )
         self.store.update_user_subscription(user["id"], sub_id)
         json_response(handler, 201, {
             "subscription_id": sub_id,
@@ -701,9 +806,16 @@ class Backend:
                 )
                 return
         try:
-            go_key = decrypt_api_key(sub["api_key_enc"], sub["key_id"], self.cfg.wrapper_secret, self.cfg.secret_file)
-        except Exception as e:
-            error_response(handler, 500, f"No se pudo descifrar la key de Go: {e}", "crypto_error")
+            go_key = self.subscription_key(sub)
+        except Exception:
+            logging.exception("No se pudo descifrar una key Go")
+            error_response(
+                handler,
+                500,
+                "Internal server error",
+                "internal_error",
+                include_request_id=True,
+            )
             return
 
         body = self.read_body(handler)
@@ -749,9 +861,12 @@ class Backend:
             try:
                 handler.send_response(status)
                 for k, v in out_headers.items():
-                    if k.lower() in ("content-length", "transfer-encoding"):
+                    if k.lower() in ("content-length", "transfer-encoding", "cache-control", "pragma"):
                         continue
                     handler.send_header(k, v)
+                handler.send_header("Cache-Control", "no-store, max-age=0")
+                handler.send_header("Pragma", "no-cache")
+                handler.send_header("X-Request-Id", handler.request_id)
                 if vision_models:
                     handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
                 handler.end_headers()
@@ -780,9 +895,12 @@ class Backend:
         try:
             handler.send_response(status)
             for k, v in out_headers.items():
-                if k.lower() in ("content-length", "transfer-encoding"):
+                if k.lower() in ("content-length", "transfer-encoding", "cache-control", "pragma"):
                     continue
                 handler.send_header(k, v)
+            handler.send_header("Cache-Control", "no-store, max-age=0")
+            handler.send_header("Pragma", "no-cache")
+            handler.send_header("X-Request-Id", handler.request_id)
             if vision_models:
                 handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
             handler.send_header("Content-Length", str(len(raw)))
@@ -1074,8 +1192,14 @@ class Backend:
             if not k:
                 continue
             sub_id = new_id("sub")
-            blob = encrypt_api_key(k, sub_id, self.cfg.wrapper_secret, self.cfg.secret_file)
-            sub = self.store.add_subscription(blob, sub_id, label=body.get("label"), sub_id=sub_id)
+            blob = self.encrypt_secret(k, sub_id)
+            sub = self.store.add_subscription(
+                blob,
+                sub_id,
+                label=body.get("label"),
+                sub_id=sub_id,
+                key_version=self.cfg.wrapper_secret_version,
+            )
             created.append({"id": sub["id"], "status": sub["status"], "key_masked": masked(k)})
         json_response(handler, 201, {"created": created, "available_left": self.store.available_count()})
 
@@ -1099,6 +1223,8 @@ class Backend:
             users.append({
                 "id": u["id"], "name": u["name"], "email": u["email"],
                 "tier": u.get("tier") or DEFAULT_TIER,
+                "account_status": u.get("account_status") or "active",
+                "disabled_at": u.get("disabled_at"),
                 "subscription_id": u["subscription_id"], "created_at": u["created_at"],
             })
         json_response(handler, 200, {"users": users})
@@ -1110,8 +1236,38 @@ class Backend:
         if not user:
             error_response(handler, 404, "Usuario no encontrado", "not_found")
             return
-        self.store.transition_user_tier(user_id, "free", needs_subscription=False)
-        json_response(handler, 200, {"revoked": True, "user_id": user_id})
+        if user.get("account_status") != "active":
+            error_response(handler, 409, "La cuenta esta deshabilitada", "account_disabled")
+            return
+        result = self.store.revoke_user_account(user_id)
+        ephemeral_grants_revoked = self.connectors.revoke_user(user_id)
+        cleanup_errors: list[str] = []
+        managed_deleted = 0
+        try:
+            managed_deleted = self.connector_gateway.disconnect_all(user_id)
+        except Exception:
+            cleanup_errors.append("managed_connectors")
+            logging.exception("Falló la limpieza remota de conectores para %s", user_id)
+        computer_cleanup = self.computers.delete_all(user_id=user_id)
+        if computer_cleanup["errors"]:
+            cleanup_errors.append("computers")
+            logging.error(
+                "Falló la limpieza de computadoras para %s: %s",
+                user_id,
+                computer_cleanup["errors"],
+            )
+        json_response(
+            handler,
+            200,
+            {
+                "revoked": True,
+                **result,
+                "managed_connectors_deleted": managed_deleted,
+                "ephemeral_grants_revoked": ephemeral_grants_revoked,
+                "computers_deleted": computer_cleanup["deleted"],
+                "cleanup_pending": cleanup_errors,
+            },
+        )
 
     def handle_admin_set_tier(self, handler: BaseHTTPRequestHandler, user_id: str) -> None:
         if not self.require_admin(handler):
@@ -1119,6 +1275,9 @@ class Backend:
         user = self.store.get_user_by_id(user_id)
         if not user:
             error_response(handler, 404, "Usuario no encontrado", "not_found")
+            return
+        if user.get("account_status") != "active":
+            error_response(handler, 409, "La cuenta esta deshabilitada", "account_disabled")
             return
         body = self.read_json(handler) or {}
         tier = str(body.get("tier") or "").lower()
@@ -1183,9 +1342,16 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        status = args[1] if len(args) > 1 else "unknown"
+        logging.info(
+            "http request_id=%s method=%s status=%s",
+            getattr(self, "request_id", ""),
+            self.command,
+            status,
+        )
 
     def _dispatch(self):
+        self.request_id = "req_" + secrets.token_hex(12)
         parsed = urlparse(self.path)
         path = parsed.path
         backend = self.backend
@@ -1193,8 +1359,8 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query, keep_blank_values=True)
             if self.command == "POST" and path == "/v1/account-auth/start":
                 backend.handle_account_auth_start(self)
-            elif self.command == "GET" and path.startswith("/v1/account-auth/status/"):
-                backend.handle_account_auth_status(self, path.rsplit("/", 1)[-1], query)
+            elif self.command == "POST" and path == "/v1/account-auth/status":
+                backend.handle_account_auth_status(self)
             elif self.command == "GET" and path == "/v1/account-auth/google/callback":
                 backend.handle_account_auth_callback(self, query)
             elif self.command == "GET" and path == "/v1/account-auth/complete":
@@ -1213,8 +1379,8 @@ class Handler(BaseHTTPRequestHandler):
                     backend.handle_native_connector_submit(self, attempt_id)
                 else:
                     error_response(self, 405, "Metodo no permitido", "method_not_allowed")
-            elif self.command == "GET" and path.startswith("/v1/connectors/status/"):
-                backend.handle_connector_auth_status(self, path.rsplit("/", 1)[-1])
+            elif self.command == "POST" and path == "/v1/connectors/status":
+                backend.handle_connector_auth_status(self)
             elif self.command == "POST" and path == "/v1/connectors/start":
                 backend.handle_connector_start(self)
             elif self.command == "POST" and path == "/v1/connectors/disconnect":
@@ -1279,10 +1445,15 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_admin_set_tier(self, path.split("/")[3])
             elif self.command == "GET" and path == "/admin/usage":
                 backend.handle_admin_usage(self)
-            elif path == "/healthz":
-                json_response(self, 200, {
-                    "ok": True,
+            elif path in {"/healthz", "/readyz"}:
+                database_health = backend.store.health()
+                response_status = 200 if path == "/healthz" or database_health["ready"] else 503
+                json_response(self, response_status, {
+                    "ok": path == "/healthz" or database_health["ready"],
+                    "ready": database_health["ready"],
                     "version": __version__,
+                    "environment": backend.cfg.environment,
+                    "database": database_health,
                     "google_auth_configured": backend.google_auth.configured,
                     "stripe_configured": backend.billing.configured,
                     "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
@@ -1305,9 +1476,20 @@ class Handler(BaseHTTPRequestHandler):
             error_response(self, e.status, str(e), e.code)
         except ComputerError as e:
             error_response(self, e.status, str(e), e.code)
-        except Exception as e:  # noqa: BLE001 - nunca dejar colgar al cliente
+        except Exception:  # noqa: BLE001 - nunca dejar colgar al cliente
+            logging.exception(
+                "Unhandled request error request_id=%s method=%s",
+                self.request_id,
+                self.command,
+            )
             try:
-                error_response(self, 500, f"Error interno: {e}", "internal_error")
+                error_response(
+                    self,
+                    500,
+                    "Internal server error",
+                    "internal_error",
+                    include_request_id=True,
+                )
             except Exception:
                 self.close_connection = True
 
@@ -1319,10 +1501,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(cfg: Config) -> None:
-    validate_admin_token(cfg.admin_token)
+    validate_runtime_security(cfg)
     if not cfg.admin_token:
-        cfg.admin_token = secrets.token_hex(16)
-        print(f"[config] ADMIN_TOKEN no definido; generado: {cfg.admin_token}", file=sys.stderr)
+        cfg.admin_token = secrets.token_hex(32)
+        logging.warning("ADMIN_TOKEN efímero generado para desarrollo; no se imprimirá")
     backend = Backend(cfg)
     Handler.backend = backend
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
@@ -1337,6 +1519,9 @@ def serve(cfg: Config) -> None:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[server] deteniendo...")
+    finally:
+        httpd.server_close()
+        backend.store.close()
 
 
 def cli() -> None:
@@ -1411,8 +1596,14 @@ def cli() -> None:
         created = []
         for k in keys:
             sub_id = new_id("sub")
-            blob = encrypt_api_key(k, sub_id, cfg.wrapper_secret, cfg.secret_file)
-            sub = backend.store.add_subscription(blob, sub_id, label=args.label, sub_id=sub_id)
+            blob = backend.encrypt_secret(k, sub_id)
+            sub = backend.store.add_subscription(
+                blob,
+                sub_id,
+                label=args.label,
+                sub_id=sub_id,
+                key_version=cfg.wrapper_secret_version,
+            )
             created.append(sub)
         print(f"[ok] {len(created)} key(s) agregadas al pool. Disponibles: {backend.store.available_count()}")
     else:
