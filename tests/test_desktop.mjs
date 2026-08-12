@@ -377,6 +377,12 @@ test("desktop layer does not import or rewrite the Pi harness", async () => {
   for (const source of files) assert.doesNotMatch(source, /pi_harness|go_backend/);
 });
 
+test("resolves Electron build inputs as native paths on Windows", async () => {
+  const buildScript = await readFile(new URL("../desktop/build.mjs", import.meta.url), "utf8");
+  assert.match(buildScript, /fileURLToPath/);
+  assert.doesNotMatch(buildScript, /new URL\([^\n]+\)\.pathname/);
+});
+
 test("keeps one normal Electron main process so renderer and IPC handlers cannot drift", async () => {
   const main = await readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8");
   assert.match(main, /smokeTest \|\| app\.requestSingleInstanceLock\(\)/);
