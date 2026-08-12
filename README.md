@@ -218,6 +218,21 @@ Google Play Billing en los países/canales de distribución elegidos. La app no
 incluye claves privadas de Stripe y presenta la administración del plan en el
 sitio seguro de Agent Genia.
 
+Las tareas `bundleRelease` y `assembleRelease` se niegan a terminar sin una
+firma de producción. Define estas variables como secretos del entorno o como
+propiedades privadas de Gradle; nunca las agregues al repositorio:
+
+```bash
+export AGENTGENIA_RELEASE_STORE_FILE=/ruta/privada/agentgenia-upload.jks
+export AGENTGENIA_RELEASE_STORE_PASSWORD='...'
+export AGENTGENIA_RELEASE_KEY_ALIAS='agentgenia-upload'
+export AGENTGENIA_RELEASE_KEY_PASSWORD='...'
+
+cd android/AgentGenia
+./gradlew clean testDebugUnitTest lintDebug assembleDebug bundleRelease
+# AAB firmado: app/build/outputs/bundle/release/app-release.aab
+```
+
 ### Estado local y seguridad de Electron
 
 Electron guarda preferencias y perfiles de bots en un archivo aislado por cuenta

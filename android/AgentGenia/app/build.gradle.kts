@@ -3,6 +3,13 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+fun releaseSecret(name: String): String? = providers.gradleProperty(name).orNull
+    ?: providers.environmentVariable(name).orNull
+
+val releaseStoreFile = releaseSecret("AGENTGENIA_RELEASE_STORE_FILE")
+val releaseStorePassword = releaseSecret("AGENTGENIA_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = releaseSecret("AGENTGENIA_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = releaseSecret("AGENTGENIA_RELEASE_KEY_PASSWORD")
 android {
     namespace = "com.agentgenia.android"
     compileSdk = 37
@@ -29,6 +36,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        create("release") {
+            // A deliberately missing path makes Android's validateSigningRelease
+            // fail closed when CI has not supplied the four private values.
+            storeFile = rootProject.file(releaseStoreFile ?: ".missing-agentgenia-release-keystore")
+            storePassword = releaseStorePassword ?: ""
+            keyAlias = releaseKeyAlias ?: ""
+            keyPassword = releaseKeyPassword ?: ""
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
@@ -37,6 +55,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
