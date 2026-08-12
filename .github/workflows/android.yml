@@ -30,12 +30,8 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Install Android SDK
         run: |
-          if command -v android >/dev/null 2>&1; then
-            android sdk install platforms/android-37.0 build-tools/36.0.0 platform-tools
-          else
-            yes | sdkmanager --licenses >/dev/null
-            sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "platform-tools"
-          fi
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-37" "build-tools;36.0.0" "platform-tools"
       - name: Test, lint, and assemble from clean checkout
         working-directory: android/AgentGenia
         run: ./gradlew clean testDebugUnitTest lintDebug assembleDebug
