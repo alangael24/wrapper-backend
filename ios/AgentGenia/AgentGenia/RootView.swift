@@ -193,7 +193,6 @@ private struct BotView: View {
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         Button {
                             showingComputer = true
-                            Task { await model.loadComputer(botID: botID) }
                         } label: {
                             Image(systemName: "desktopcomputer")
                         }

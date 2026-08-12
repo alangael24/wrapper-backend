@@ -27,6 +27,13 @@ final class AppModel {
     private let api: APIClient
     private let stateStore = AccountStateStore()
     private var connectorPollingTask: Task<Void, Never>?
+    private var connectorRefreshTask: Task<ConnectorSnapshot, Error>?
+    private var billingRefreshTask: Task<BillingSnapshot, Error>?
+    private var lastConnectorRefresh = Date.distantPast
+    private var lastBillingRefresh = Date.distantPast
+    private var browserPurpose: BrowserRequest.Purpose?
+
+    private static let refreshFreshness: TimeInterval = 15
 
     init(api: APIClient? = nil) {
         self.api = api ?? APIClient(baseURL: AppEnvironment.baseURL)
@@ -54,7 +61,7 @@ final class AppModel {
         do {
             let started = try await api.beginSignIn()
             let url = try trustedHTTPSURL(started.authorizeURL, allowedHosts: ["accounts.google.com"])
-            browserRequest = BrowserRequest(url: url, purpose: .account)
+            presentBrowser(url: url, purpose: .account)
             Task { await pollSignIn(attemptID: started.attemptID) }
         } catch { report(error) }
     }
@@ -62,6 +69,12 @@ final class AppModel {
     func signOut() async {
         connectorPollingTask?.cancel()
         connectorPollingTask = nil
+        connectorRefreshTask?.cancel()
+        connectorRefreshTask = nil
+        billingRefreshTask?.cancel()
+        billingRefreshTask = nil
+        lastConnectorRefresh = .distantPast
+        lastBillingRefresh = .distantPast
         isBusy = false
         await api.signOut()
         account = nil
@@ -72,6 +85,7 @@ final class AppModel {
         billing = nil
         destination = nil
         browserRequest = nil
+        browserPurpose = nil
         computer = nil
         phase = .signedOut
     }
@@ -127,9 +141,20 @@ final class AppModel {
         await runAgent(botID: botID, userText: value, initial: false)
     }
 
-    func refreshConnectors() async {
+    func refreshConnectors(force: Bool = false) async {
+        if !force, Date().timeIntervalSince(lastConnectorRefresh) < Self.refreshFreshness { return }
+        if let existing = connectorRefreshTask {
+            _ = try? await existing.value
+            return
+        }
+        let accountID = account?.id
+        let task = Task { try await api.connectors() }
+        connectorRefreshTask = task
+        defer { connectorRefreshTask = nil }
         do {
-            let snapshot = try await api.connectors()
+            let snapshot = try await task.value
+            guard phase == .ready, account?.id == accountID else { return }
+            lastConnectorRefresh = Date()
             connectorStatuses = Dictionary(uniqueKeysWithValues: snapshot.connectors.map { ($0.connectorID, $0) })
             let knownIDs = Set(ConnectorDefinition.catalog.map(\.id))
             let connectedIDs = snapshot.connectors
@@ -144,7 +169,12 @@ final class AppModel {
                 bots[index].connectorIDs = bots[index].connectorIDs.filter(connectedSet.contains)
             }
             if changed { await persist() }
-        } catch { report(error) }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard phase == .ready else { return }
+            report(error)
+        }
     }
 
     func connect(_ connectorID: String) async {
@@ -153,7 +183,7 @@ final class AppModel {
         do {
             let started = try await api.startConnector(connectorID)
             let url = try trustedHTTPSURL(started.authorizeURL)
-            browserRequest = BrowserRequest(url: url, purpose: .connector(connectorID))
+            presentBrowser(url: url, purpose: .connector(connectorID))
             connectorPollingTask = Task { [weak self] in
                 await self?.pollConnector(attemptID: started.attemptID, connectorID: connectorID)
             }
@@ -169,26 +199,44 @@ final class AppModel {
             selectedConnectorIDs.removeAll { $0 == connectorID }
             for index in bots.indices { bots[index].connectorIDs.removeAll { $0 == connectorID } }
             await persist()
-            await refreshConnectors()
+            await refreshConnectors(force: true)
         } catch { report(error) }
     }
 
-    func refreshBilling() async {
-        do { billing = try await api.billing() }
-        catch { report(error) }
+    func refreshBilling(force: Bool = false) async {
+        if !force, Date().timeIntervalSince(lastBillingRefresh) < Self.refreshFreshness { return }
+        if let existing = billingRefreshTask {
+            _ = try? await existing.value
+            return
+        }
+        let accountID = account?.id
+        let task = Task { try await api.billing() }
+        billingRefreshTask = task
+        defer { billingRefreshTask = nil }
+        do {
+            let snapshot = try await task.value
+            guard phase == .ready, account?.id == accountID else { return }
+            billing = snapshot
+            lastBillingRefresh = Date()
+        } catch is CancellationError {
+            return
+        } catch {
+            guard phase == .ready else { return }
+            report(error)
+        }
     }
 
     func startCheckout(tier: String) async {
         do {
             let url = try await api.checkoutURL(tier: tier)
-            browserRequest = BrowserRequest(url: url, purpose: .billing)
+            presentBrowser(url: url, purpose: .billing)
         } catch { report(error) }
     }
 
     func openBillingPortal() async {
         do {
             let url = try await api.portalURL()
-            browserRequest = BrowserRequest(url: url, purpose: .billing)
+            presentBrowser(url: url, purpose: .billing)
         } catch { report(error) }
     }
 
@@ -206,7 +254,7 @@ final class AppModel {
             let snapshot = try await api.ensureComputer(botID: botID, botName: bot.name)
             computer = snapshot
             if snapshot.state == .running, let url = URL(string: snapshot.viewerURL), url.scheme == "https" {
-                browserRequest = BrowserRequest(url: url, purpose: .computer)
+                presentBrowser(url: url, purpose: .computer)
             }
         } catch { report(error) }
     }
@@ -217,7 +265,7 @@ final class AppModel {
               let url = URL(string: snapshot.viewerURL),
               url.scheme == "https"
         else { return }
-        browserRequest = BrowserRequest(url: url, purpose: .computer)
+        presentBrowser(url: url, purpose: .computer)
     }
 
     func handBackComputer(botID: UUID) async {
@@ -229,13 +277,16 @@ final class AppModel {
     }
 
     func dismissBrowser() {
-        connectorPollingTask?.cancel()
-        connectorPollingTask = nil
-        isBusy = false
+        let dismissedPurpose = browserPurpose
+        browserPurpose = nil
         browserRequest = nil
-        Task {
-            await refreshConnectors()
-            await refreshBilling()
+        if case .connector = dismissedPurpose, connectorPollingTask != nil {
+            connectorPollingTask?.cancel()
+            connectorPollingTask = nil
+            isBusy = false
+        }
+        if dismissedPurpose == .billing {
+            Task { await refreshBilling(force: true) }
         }
     }
 
@@ -275,7 +326,7 @@ final class AppModel {
                     isBusy = false
                     browserRequest = nil
                     await persist()
-                    await refreshConnectors()
+                    await refreshConnectors(force: true)
                     return
                 }
                 if status.status == "error" {
@@ -303,7 +354,7 @@ final class AppModel {
 
     private func activate(session: AccountSession) async throws {
         account = session.account
-        profile = try await api.me()
+        profile = nil
         let state = try await stateStore.load(accountID: session.account.id)
         bots = state.bots
         selectedConnectorIDs = state.selectedConnectorIDs
@@ -315,9 +366,28 @@ final class AppModel {
             destination = .plugins
         }
         phase = .ready
-        async let connectorRefresh: Void = refreshConnectors()
-        async let billingRefresh: Void = refreshBilling()
-        _ = await (connectorRefresh, billingRefresh)
+        Task { [weak self] in
+            guard let self else { return }
+            async let profileRefresh: Void = self.refreshProfile(accountID: session.account.id)
+            async let connectorRefresh: Void = self.refreshConnectors()
+            async let billingRefresh: Void = self.refreshBilling()
+            _ = await (profileRefresh, connectorRefresh, billingRefresh)
+        }
+    }
+
+    private func refreshProfile(accountID: String) async {
+        do {
+            let nextProfile = try await api.me()
+            guard phase == .ready, account?.id == accountID else { return }
+            profile = nextProfile
+        } catch {
+            guard phase == .ready, account?.id == accountID else { return }
+            if let serviceError = error as? ServiceError, serviceError.status == 401 {
+                await signOut()
+            } else {
+                report(error)
+            }
+        }
     }
 
     private func runAgent(botID: UUID, userText: String, initial: Bool) async {
@@ -332,8 +402,15 @@ final class AppModel {
             await persist()
         }
         do {
-            let connectorIDs = Array(Set(selectedConnectorIDs + source.connectorIDs)).sorted()
-            let response = try await api.runAgent(prompt: prompt, botID: botID, connectorIDs: connectorIDs)
+            let connectorIDs = initial
+                ? []
+                : Array(Set(selectedConnectorIDs + source.connectorIDs)).sorted()
+            let response = try await api.runAgent(
+                prompt: prompt,
+                botID: botID,
+                connectorIDs: connectorIDs,
+                computer: !initial
+            )
             let generated = parseAgentAnswer(response.answer)
             guard !generated.text.isEmpty, let index = bots.firstIndex(where: { $0.id == botID }) else {
                 throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
@@ -365,6 +442,11 @@ final class AppModel {
     private func report(_ error: Error) {
         alertMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
+
+    private func presentBrowser(url: URL, purpose: BrowserRequest.Purpose) {
+        browserPurpose = purpose
+        browserRequest = BrowserRequest(url: url, purpose: purpose)
+    }
 }
 
 private actor AccountStateStore {
@@ -383,7 +465,14 @@ private actor AccountStateStore {
     func load(accountID: String) throws -> PersistedAccountState {
         let url = try fileURL(accountID: accountID)
         guard FileManager.default.fileExists(atPath: url.path) else { return PersistedAccountState() }
-        return try decoder.decode(PersistedAccountState.self, from: Data(contentsOf: url))
+        var state = try decoder.decode(
+            PersistedAccountState.self,
+            from: Data(contentsOf: url, options: [.mappedIfSafe])
+        )
+        for index in state.bots.indices where state.bots[index].messages.count > 200 {
+            state.bots[index].messages = Array(state.bots[index].messages.suffix(200))
+        }
+        return state
     }
 
     func save(_ state: PersistedAccountState, accountID: String) throws {

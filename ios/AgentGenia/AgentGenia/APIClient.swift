@@ -120,13 +120,22 @@ private struct PortalResponse: Decodable, Sendable {
 
 actor APIClient {
     private let baseURL: URL
+    private let urlSession: URLSession
     private let keychain = KeychainSessionStore()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var session: AccountSession?
+    private var refreshTask: Task<AccountSession, Error>?
 
     init(baseURL: URL) {
         self.baseURL = baseURL
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 1_800
+        self.urlSession = URLSession(configuration: configuration)
     }
 
     func restoreSession() throws -> AccountSession? {
@@ -165,6 +174,8 @@ actor APIClient {
     }
 
     func signOut() async {
+        refreshTask?.cancel()
+        refreshTask = nil
         if let current = session ?? (try? keychain.read()) {
             _ = try? await rawRequest(
                 "/v1/account-auth/logout",
@@ -210,14 +221,19 @@ actor APIClient {
         )
     }
 
-    func runAgent(prompt: String, botID: UUID, connectorIDs: [String]) async throws -> AgentRunResponse {
+    func runAgent(
+        prompt: String,
+        botID: UUID,
+        connectorIDs: [String],
+        computer: Bool = true
+    ) async throws -> AgentRunResponse {
         try await request(
             "/v1/agent/run",
             method: "POST",
             body: AgentRunRequest(
                 prompt: prompt,
                 browser: false,
-                computer: true,
+                computer: computer,
                 botID: botID.uuidString.lowercased(),
                 connectorIDs: connectorIDs
             )
@@ -300,14 +316,15 @@ actor APIClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 60
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = path == "/v1/agent/run" ? 1_800 : 60
         request.httpBody = bodyData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if bodyData != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let authorization { request.setValue("Bearer \(authorization)", forHTTPHeaderField: "Authorization") }
 
         let (data, rawResponse): (Data, URLResponse)
-        do { (data, rawResponse) = try await URLSession.shared.data(for: request) }
+        do { (data, rawResponse) = try await urlSession.data(for: request) }
         catch { throw ServiceError(message: "No fue posible conectar con Agent Genia.", code: "network_error", status: 0) }
         guard let response = rawResponse as? HTTPURLResponse else {
             throw ServiceError(message: "Respuesta de red inválida.", code: "network_error", status: 0)
@@ -345,6 +362,14 @@ actor APIClient {
     }
 
     private func refreshSession() async throws -> AccountSession {
+        if let refreshTask { return try await refreshTask.value }
+        let task = Task { try await performSessionRefresh() }
+        refreshTask = task
+        defer { refreshTask = nil }
+        return try await task.value
+    }
+
+    private func performSessionRefresh() async throws -> AccountSession {
         let stored: AccountSession?
         if let session { stored = session } else { stored = try keychain.read() }
         guard let current = stored else {

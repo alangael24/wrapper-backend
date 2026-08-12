@@ -151,7 +151,7 @@ struct PluginsView: View {
         }
         .navigationTitle("Plugins")
         .searchable(text: $model.searchText, prompt: "Buscar plugins")
-        .refreshable { await model.refreshConnectors() }
+        .refreshable { await model.refreshConnectors(force: true) }
         .task { await model.refreshConnectors() }
     }
 }
@@ -260,7 +260,7 @@ struct AccountView: View {
             }
         }
         .navigationTitle("Cuenta")
-        .refreshable { await model.refreshBilling() }
+        .refreshable { await model.refreshBilling(force: true) }
         .task { await model.refreshBilling() }
     }
 }
