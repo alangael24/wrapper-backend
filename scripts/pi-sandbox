@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""PI_BIN-compatible executable that applies the sandbox before starting Pi."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from go_backend.pi_sandbox import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

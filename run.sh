@@ -15,10 +15,14 @@ if [ -f .env ]; then
   set +a
 fi
 if [ "${PI_ENABLED:-0}" = "1" ]; then
-  pi_runtime="${PI_BIN:-./node_modules/.bin/pi}"
+  # Default seguro: PiHarness sigue invocando un PI_BIN normal, pero el launcher
+  # crea la frontera Bubblewrap antes de ejecutar el binario real de Pi.
+  pi_runtime="${PI_BIN:-./scripts/pi-sandbox}"
+  PI_BIN=$pi_runtime
+  export PI_BIN
   case "$pi_runtime" in
     */*) [ -x "$pi_runtime" ] || {
-      echo "[error] Pi no esta instalado en $pi_runtime. Ejecuta: pnpm install" >&2
+      echo "[error] Pi no esta instalado o el launcher no es ejecutable: $pi_runtime" >&2
       exit 1
     } ;;
     *) command -v "$pi_runtime" >/dev/null 2>&1 || {
@@ -35,5 +39,13 @@ if [ "${PI_ENABLED:-0}" = "1" ]; then
     echo "[error] Pi necesita node en PATH o PI_NODE_BIN_DIR" >&2
     exit 1
   fi
+  case "$pi_runtime" in
+    ./scripts/pi-sandbox|*/scripts/pi-sandbox)
+      "$pi_runtime" --check >/dev/null || {
+        echo "[error] el sandbox de Pi no supero el preflight" >&2
+        exit 1
+      }
+      ;;
+  esac
 fi
 exec .venv/bin/python -m go_backend.server serve "$@"

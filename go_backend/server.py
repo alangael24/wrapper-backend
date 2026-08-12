@@ -94,7 +94,7 @@ from .vision import VisionError, VisionRouter
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "secret.key"
 DEFAULT_PI_RUNS = Path(__file__).resolve().parent.parent / "data" / "pi-runs"
-DEFAULT_PI_BIN = Path(__file__).resolve().parent.parent / "node_modules" / ".bin" / "pi"
+DEFAULT_PI_BIN = Path(__file__).resolve().parent.parent / "scripts" / "pi-sandbox"
 DEFAULT_PI_CHROME_EXTENSION = (
     Path(__file__).resolve().parent.parent
     / "node_modules"

@@ -391,6 +391,12 @@ Por eso las llamadas que hace Pi usan la capacidad asignada al
 usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
 propios bajo `PI_RUNS_DIR`.
 
+En producción Pi se ejecuta únicamente en Linux mediante el launcher
+Bubblewrap fail-closed. Instala `bubblewrap`, `socat` y `util-linux`, ejecuta
+`./scripts/setup-pi-sandbox.sh` y consulta el threat model y las pruebas
+negativas en [docs/pi-sandbox.md](docs/pi-sandbox.md). No existe fallback al
+binario de Pi sin aislamiento.
+
 ## Conectores nativos de Pi
 
 Pi carga `extensions/connectors/index.ts` como una extensión first-party. Para
@@ -668,7 +674,7 @@ runtime se agrupan aquí por función.
 | `VISION_MAX_GROUPS` | `6` | Máximo de grupos visuales por request |
 | `VISION_MAX_IMAGES` | `12` | Máximo de imágenes únicas por request |
 | `PI_ENABLED` | `0` | Habilitar el endpoint de tareas de Pi |
-| `PI_BIN` | `./node_modules/.bin/pi` | Ejecutable de Pi |
+| `PI_BIN` | `./scripts/pi-sandbox` | Launcher Bubblewrap fail-closed; ejecuta el Pi real dentro del sandbox Linux |
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
 | `PI_BACKEND_URL` | `http://127.0.0.1:$PORT` | URL que Pi usa para volver al wrapper |
 | `PI_RUNS_DIR` | `data/pi-runs` | Workspaces y logs por ejecución |

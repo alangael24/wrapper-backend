@@ -648,6 +648,12 @@ class TestBackend(unittest.TestCase):
         with self.assertRaisesRegex(UnsafeConfigurationError, "per_run"):
             Backend(cfg)
 
+    def test_pi_defaults_to_fail_closed_sandbox_launcher(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = Config()
+        self.assertEqual(Path(cfg.pi_bin).name, "pi-sandbox")
+        self.assertEqual(Path(cfg.pi_bin).parent.name, "scripts")
+
     def test_models_proxy(self):
         ws = self.ws
         signup = self.new_user()
