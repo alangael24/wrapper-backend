@@ -1,11 +1,11 @@
-# Wrapper Backend — OpenCode Go por usuario
+# Agent Genia — backend y runtime de agentes
 
-Backend para tu wrapper: **cada usuario nuevo empieza en `free`, sin capacidad
-de pago asignada**. Una suscripción de OpenCode Go solo se reclama después de
-que un webhook de pago verificado o un administrador autenticado activa
-`basic`/`pro`. El backend proxya las requests de LLM al upstream de Go con la
-key asignada a ese usuario, registra uso y vigila los límites de la
-suscripción. También puede ejecutar
+Backend de Agent Genia: **cada usuario nuevo empieza en `free`, sin capacidad
+de pago asignada**. La capacidad administrada solo se reclama después de que un
+webhook de pago verificado o un administrador autenticado activa `basic`/`pro`.
+El backend envía las requests de LLM al proveedor configurado con la credencial
+asignada a ese usuario, registra uso y vigila los límites de la suscripción.
+También puede ejecutar
 tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
 Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
 **GPT-5.6 Luna**, con MiMo como fallback.
@@ -16,10 +16,10 @@ desactivado por defecto.
 
 ## Tiers de usuario
 
-Hay 3 tiers; cada uno aplica un porcentaje de los límites de una suscripción
-de OpenCode Go ($12 / 5h, $30 / semana, $60 / mes):
+Hay 3 tiers; cada uno aplica un porcentaje de los presupuestos internos de uso
+($12 / 5h, $30 / semana, $60 / mes):
 
-| Tier | Suscripción Go | Límites (5h / semana / mes) | Acceso a modelos |
+| Tier | Capacidad administrada | Límites (5h / semana / mes) | Acceso a modelos |
 |---|---|---|---|
 | `free` | No se asigna | $0 / $0 / $0 | ❌ (402 `tier_requires_upgrade`) |
 | `basic` | 50% | $6 / $15 / $30 | ✅ |
@@ -38,14 +38,12 @@ de OpenCode Go ($12 / 5h, $30 / semana, $60 / mes):
 - Los límites se reescalan según el tier: un usuario `basic` recibe 429 al
   llegar a $6 en 5h; uno `pro` al llegar a $12.
 
-## Cómo funciona el modelo de suscripciones
+## Cómo funciona el modelo de capacidad
 
-OpenCode Go NO tiene una API pública para crear cuentas/suscripciones
-programáticamente (la key se genera en `https://opencode.ai/auth` tras pagar;
-solo un miembro por workspace puede suscribirse a Go). Por eso el backend
-funciona con un **pool de suscripciones**:
+Las credenciales del proveedor de modelos se administran exclusivamente en el
+servidor mediante un **pool de capacidad**:
 
-1. El operador carga las keys de Go compradas al pool (una por usuario final).
+1. El operador carga las credenciales del proveedor al pool.
 2. Cada registro público (`POST /v1/signup`) crea un usuario `free` sin key.
 3. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
    con firma verificada activa `basic`/`pro` después del pago.
@@ -55,23 +53,24 @@ funciona con un **pool de suscripciones**:
 6. El backend proxya `chat/completions`, `responses` y `messages` al upstream
    con la key asignada, y registra el uso por ventanas.
 
-### Persistencia gratuita con Supabase
+### Persistencia con PostgreSQL/Supabase
 
-Producción usa el esquema privado `agentgenia` del proyecto Supabase
-`agent-genia-prod`. Las tablas no se exponen al Data API, no otorgan permisos a
-`anon`/`authenticated` y tienen RLS habilitado como defensa adicional. El
-backend se conecta exclusivamente con `DATABASE_URL` guardada como secreto del
-host. Desarrollo y las pruebas conservan SQLite cuando esa variable está vacía.
+La migración incluida crea el esquema privado `agentgenia`. Las tablas no se
+exponen al Data API, no otorgan permisos a `anon`/`authenticated` y tienen RLS
+habilitado como defensa adicional. El backend se conecta exclusivamente con
+`DATABASE_URL`, que debe guardarse como secreto del host. Desarrollo y pruebas
+usan SQLite cuando esa variable está vacía.
 
-La migración versionada vive en `supabase/migrations/`. En Postgres, las
-transiciones de tier, el procesamiento idempotente de webhooks y la reclamación
-de keys mantienen una transacción de escritura serializada; los índices únicos
-parciales siguen impidiendo compartir una suscripción entre usuarios.
+Las migraciones versionadas viven en `supabase/migrations/`. Las transiciones de
+tier, el procesamiento idempotente de webhooks y la reclamación de capacidad se
+ejecutan dentro de transacciones. Los índices únicos parciales son la defensa
+final que impide asignar una misma suscripción a dos usuarios, incluso ante una
+carrera.
 
-Para Render Free define al menos `DATABASE_URL`, `WRAPPER_SECRET` y
-`ADMIN_TOKEN` como secretos. No uses `DB_PATH` ni `secret.key` como estado
-persistente: el filesystem gratuito es efímero. El harness y sus directorios de
-ejecución siguen siendo temporales y no forman parte de la base de datos.
+En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
+`WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de
+`secret.key` como estado persistente. Los directorios de ejecución del harness
+son temporales y no forman parte de la base de datos.
 
 ### Stripe Checkout en producción
 
@@ -166,8 +165,9 @@ Support, protegido por iOS, de modo que cerrar sesión no mezcla conversaciones.
 El chat llama realmente a `/v1/agent/run` y conserva los widgets de preguntas
 generados por el LLM, sin saludos ni opciones hardcodeadas. El marketplace
 muestra el catálogo completo, autoriza cuentas mediante el mismo gateway de
-Composio/adaptadores first-party y su pestaña `Tuyos` contiene únicamente
-conectores activos. La computadora de cada bot usa los endpoints
+Composio/adaptadores first-party y su pestaña `Tuyos` contiene los plugins que
+el usuario instaló, estén conectados o todavía pendientes de autorización. La
+computadora de cada bot usa los endpoints
 `/v1/computers/*` y presenta el viewer firmado en un `WKWebView` efímero que
 rechaza navegación a otros orígenes.
 
@@ -218,7 +218,9 @@ Google Play Billing en los países/canales de distribución elegidos. La app no
 incluye claves privadas de Stripe y presenta la administración del plan en el
 sitio seguro de Agent Genia.
 
-La app guarda preferencias y perfiles de bots en un archivo aislado por cuenta
+### Estado local y seguridad de Electron
+
+Electron guarda preferencias y perfiles de bots en un archivo aislado por cuenta
 dentro de `userData/accounts` de Electron. Al cerrar sesión carga un estado
 vacío en memoria y no expone los bots de la cuenta anterior. Una instalación
 existente migra una sola vez su antiguo `desktop-state.json` a la cuenta que ya
@@ -263,9 +265,9 @@ instancia propia del wrapper nunca enlaza automáticamente por email con un
 usuario del signup antiguo porque esos correos no fueron verificados.
 
 El backend no persiste tokens de Google. Emite tokens opacos propios, guarda
-solo sus hashes en SQLite, liga cada refresh token al `device_id`, lo rota al
-usarlo y revoca el access token al cerrar sesión. Electron cifra access,
-refresh e identidad con `safeStorage`/Keychain.
+solo sus hashes en la base de datos configurada, liga cada refresh token al
+`device_id`, lo rota al usarlo y revoca el access token al cerrar sesión.
+Electron cifra access, refresh e identidad con `safeStorage`/Keychain.
 
 Para reemplazar el broker actual por una instancia propia:
 
@@ -297,10 +299,10 @@ su proveedor; el backend la cifra con `WRAPPER_SECRET` en
 `connector_credentials`. Electron y Pi nunca reciben el secreto. Si hay un Auth
 Config de Composio para el mismo proveedor, se prefiere su OAuth administrado.
 
-Loom permanece explícitamente como `Próximamente`: su portal público ofrece el
-Record SDK para grabar video, pero no una API de cuenta para buscar videos o
-leer transcripciones. No se presenta como conectado porque esas operaciones no
-serían reales.
+Loom permanece explícitamente como `Próximamente`: está en el catálogo visual,
+pero esta versión no registra un toolkit ni un adaptador first-party para sus
+operaciones. Por eso el backend lo devuelve como no disponible y la interfaz no
+permite presentarlo como una conexión real.
 
 El selector grande de herramientas aparece únicamente durante el onboarding
 inicial. Después, el acceso `Plugins` abre un marketplace independiente con
@@ -325,16 +327,16 @@ tokens, API keys de Composio ni client secrets. Electron consulta todas sus
 conexiones con un único `GET /v1/connectors`; el backend es la fuente de verdad
 y no persiste estados OAuth de proveedores en el dispositivo.
 
-Cargar keys de Go al pool:
+Cargar credenciales del proveedor al pool:
 
 ```bash
 # key(s) a mano
-.venv/bin/python -m go_backend.server add-key sk-go-xxx sk-go-yyy
+.venv/bin/python -m go_backend.server add-key MODEL_KEY_1 MODEL_KEY_2
 
 # desde stdin
-echo "sk-go-xxx" | .venv/bin/python -m go_backend.server add-key -
+echo "MODEL_KEY_1" | .venv/bin/python -m go_backend.server add-key -
 
-# desde tu Keychain de macOS (el item que ya usa codex-opencode)
+# desde tu Keychain de macOS
 .venv/bin/python -m go_backend.server add-key --from-keychain
 ```
 
@@ -366,8 +368,8 @@ curl -X POST http://127.0.0.1:8787/v1/agent/run \
   -d '{"prompt":"Revisa mis issues urgentes", "connector_ids":["github","linear"]}'
 ```
 
-El recorrido es `cliente → agent/run → Pi RPC → chat/completions → OpenCode Go`.
-Por eso las llamadas que hace Pi usan la suscripción asignada al
+El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
+Por eso las llamadas que hace Pi usan la capacidad asignada al
 usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
 propios bajo `PI_RUNS_DIR`.
 
@@ -414,7 +416,7 @@ imagen → Luna → reporte visual no confiable → DeepSeek V4 → respuesta/ac
                   ↘ MiMo-V2.5 si Luna falla
 ```
 
-- Luna recibe las imágenes con la misma suscripción Go asignada al usuario.
+- Luna recibe las imágenes con la misma capacidad de modelos asignada al usuario.
 - DeepSeek recibe texto/OCR, estado de UI, defectos y evidencia relevante; no
   recibe los bytes de la imagen que no sabe interpretar.
 - El consumo de Luna/MiMo y el de DeepSeek se registran como eventos separados.
@@ -491,28 +493,44 @@ recursos facturables huérfanos.
 
 ## Endpoints
 
-Públicos (los endpoints de cuenta no requieren Bearer; los endpoints del modelo
-aceptan API key o access token de una sesión Google):
+### Públicos o de intercambio de sesión
 
 | Método | Ruta | Descripción |
 |---|---|---|
 | POST | `/v1/account-auth/start` | Inicia Google OAuth para un `device_id` UUID |
 | GET | `/v1/account-auth/status/<attempt_id>` | Entrega la sesión al dispositivo que inició el flujo |
 | GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
-| POST | `/v1/account-auth/refresh` | Rota access y refresh token ligados al dispositivo |
-| POST | `/v1/account-auth/logout` | Revoca la sesión actual |
-| GET | `/v1/connectors` | Catálogo y conexiones reales del usuario en una sola consulta |
-| GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
-| POST | `/v1/connectors/start` | Crea un Connect Link de Composio con límite por usuario |
-| GET | `/v1/connectors/status/<attempt_id>` | Consulta un consentimiento sin exponer credenciales |
-| POST | `/v1/connectors/disconnect` | Revoca las cuentas activas de ese toolkit para el usuario |
+| GET | `/v1/account-auth/complete` | Página final del login |
+| GET | `/connections/complete` | Página final de autorización de conectores |
+| GET/POST | `/v1/connectors/native/setup/<attempt_id>` | Formulario de un solo uso para un adaptador first-party |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
+| POST | `/v1/billing/webhook` | Webhook que exige una firma `Stripe-Signature` válida |
+| GET | `/healthz` | Salud y disponibilidad de Google, Stripe, conectores y computadoras |
+
+Los formularios nativos usan un `attempt_id` aleatorio, de corta vida y ligado
+al usuario que inició la conexión.
+
+### Autenticados o ligados a una sesión
+
+Las rutas de producto aceptan `Authorization: Bearer <api_key|access_token>`.
+`refresh` recibe específicamente el refresh token como Bearer y el `device_id`
+en el body. Los tokens de sesión pertenecen a un dispositivo; la API key
+proviene del flujo de signup.
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/v1/account-auth/refresh` | Rota un refresh token enviado como Bearer y ligado al `device_id` |
+| POST | `/v1/account-auth/logout` | Revoca la sesión actual |
+| GET | `/v1/connectors` | Catálogo y conexiones del usuario |
+| GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
+| POST | `/v1/connectors/start` | Crea un Connect Link o formulario first-party |
+| GET | `/v1/connectors/status/<attempt_id>` | Consulta el consentimiento sin exponer credenciales |
+| POST | `/v1/connectors/disconnect` | Revoca las cuentas del toolkit para el usuario |
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
 | POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
 | POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
-| POST | `/v1/billing/webhook` | Webhook público que exige una firma `Stripe-Signature` válida |
-| POST | `/v1/byok` | El usuario registra su propia key de Go `{apiKey}` |
-| GET | `/v1/models` | Catálogo de modelos (proxy a Go) |
+| POST | `/v1/byok` | El usuario registra su propia credencial de proveedor `{apiKey}` |
+| GET | `/v1/models` | Catálogo de modelos del proveedor configurado |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
 | POST | `/v1/responses` | Proxy Responses API (stream y no-stream) |
 | POST | `/v1/messages` | Proxy estilo Anthropic |
@@ -525,11 +543,24 @@ aceptan API key o access token de una sesión Google):
 | POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |
 | POST | `/v1/computers/<bot_id>/delete` | Elimina la computadora remota antes de borrar el bot |
 
-Admin (Bearer = `ADMIN_TOKEN`):
+### Internos del runtime
+
+Estas rutas solo aceptan loopback y un grant efímero emitido para una ejecución
+de Pi. No son una API para clientes:
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| POST | `/admin/subscriptions` | Agregar keys de Go al pool `{keys:[...]}` |
+| GET | `/v1/internal/connectors/catalog` | Catálogo limitado a los conectores concedidos |
+| POST | `/v1/internal/connectors/execute` | Ejecuta una operación autorizada del broker |
+| POST | `/v1/internal/computers/execute` | Controla la computadora ligada al grant |
+
+### Administración
+
+Bearer = `ADMIN_TOKEN`:
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/admin/subscriptions` | Agregar credenciales de proveedor al pool `{keys:[...]}` |
 | GET | `/admin/subscriptions` | Listar pool (keys cifradas, enmascaradas) |
 | GET | `/admin/users` | Listar usuarios y asignaciones |
 | POST | `/admin/users/<id>/revoke` | Devolver la suscripción al pool |
@@ -538,7 +569,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 
 ## Uso y límites
 
-- Los límites de Go son **$12 por 5 horas, $30 por semana, $60 por mes**.
+- Los presupuestos internos son **$12 por 5 horas, $30 por semana, $60 por mes**.
 - El tier del usuario escala esos límites (`basic` = 50%, `pro` = 100%).
 - El backend estima el costo por request con la tabla de precios de
   `go_backend/go_prices.py` y responde `429 usage_limit` cuando el usuario
@@ -549,15 +580,60 @@ Admin (Bearer = `ADMIN_TOKEN`):
 
 ## Configuración (env)
 
+`.env.example` es la plantilla de despliegue. Las variables que reconoce el
+runtime se agrupan aquí por función.
+
+### Servidor, persistencia y cuenta
+
 | Variable | Default | Descripción |
 |---|---|---|
+| `HOST` | `127.0.0.1` | Interfaz de escucha; usa `0.0.0.0` detrás de un proxy |
 | `PORT` | `8787` | Puerto HTTP |
-| `WRAPPER_SECRET` | auto | Clave maestra para cifrar keys Go |
-| `CONNECTOR_PUBLIC_URL` | `COMPOSIO_PUBLIC_URL` | URL HTTPS para los formularios first-party de conexión |
+| `WRAPPER_SECRET` | auto | Clave maestra para cifrar credenciales del proveedor |
+| `SECRET_FILE` | `data/secret.key` | Clave local cuando no se define `WRAPPER_SECRET` |
 | `ADMIN_TOKEN` | auto-generado | Token de admin; el valor publicado `cambia-este-token` impide arrancar |
+| `DATABASE_URL` | vacío | PostgreSQL/Supabase; si está vacío se usa SQLite |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
-| `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | Upstream |
-| `ENFORCE_LIMITS` | `1` | Rechazar al superar límites de Go |
+| `GO_BASE_URL` | valor de `.env.example` | Upstream OpenAI-compatible; el nombre se conserva por compatibilidad histórica |
+| `ENFORCE_LIMITS` | `1` | Rechazar al superar los presupuestos de uso |
+| `GOOGLE_OAUTH_CLIENT_ID` | vacío | Cliente OAuth web de Google |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | vacío | Secreto OAuth, solo servidor |
+| `GOOGLE_OAUTH_REDIRECT_URI` | vacío | Callback `/v1/account-auth/google/callback` registrado en Google |
+| `ACCOUNT_ACCESS_TTL_SECONDS` | `900` | Vida del access token de Agent Genia |
+| `ACCOUNT_REFRESH_TTL_SECONDS` | `2592000` | Vida del refresh token |
+| `ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS` | `600` | Vida del intento OAuth |
+| `WRAPPER_SERVICE_URL` | producción | Backend utilizado por Electron |
+
+### Stripe
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `STRIPE_ENABLED` | `0` | Habilita Checkout, Portal y webhook |
+| `STRIPE_LIVE_MODE` | `1` | Exige recursos live; usa `0` únicamente en pruebas |
+| `STRIPE_SECRET_KEY` | vacío | Secret key server-side |
+| `STRIPE_WEBHOOK_SECRET` | vacío | Signing secret `whsec_...` |
+| `STRIPE_PLUS_PRICE_ID` | vacío | Price allowlisted para `basic`/Plus |
+| `STRIPE_PRO_PRICE_ID` | vacío | Price allowlisted para `pro` |
+| `STRIPE_SUCCESS_URL` | vacío | Retorno exitoso de Checkout |
+| `STRIPE_CANCEL_URL` | vacío | Retorno cancelado de Checkout |
+| `STRIPE_PORTAL_RETURN_URL` | vacío | Retorno del Customer Portal |
+| `STRIPE_WEBHOOK_TOLERANCE_SECONDS` | `300` | Tolerancia de firma del webhook |
+
+### Conectores
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `COMPOSIO_API_KEY` | vacío | Credencial server-side del gateway |
+| `COMPOSIO_PUBLIC_URL` | vacío | URL pública para callbacks de Composio |
+| `CONNECTOR_PUBLIC_URL` | `COMPOSIO_PUBLIC_URL` | URL HTTPS para formularios first-party |
+| `COMPOSIO_AUTH_CONFIGS_JSON` | `{}` | Mapa privado de connector ID a Auth Config |
+| `COMPOSIO_TOOLKIT_OVERRIDES_JSON` | `{}` | Overrides de toolkit por connector ID |
+| `COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS` | `600` | Vida de un intento de conexión |
+
+### Visión y Pi
+
+| Variable | Default | Descripción |
+|---|---|---|
 | `VISION_ENABLED` | `1` | Añadir visión a los modelos objetivo de solo texto |
 | `VISION_MODEL` | `gpt-5.6-luna` | Modelo primario de percepción visual |
 | `VISION_FALLBACK_MODEL` | `mimo-v2.5` | Fallback visual; vacío lo desactiva |
@@ -586,8 +662,15 @@ Admin (Bearer = `ADMIN_TOKEN`):
 | `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
 | `PI_CHROME_AUTO_AUTHORIZE` | `0` | Autorizar automáticamente solo el Chrome efímero de esa ejecución |
 | `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración máxima; el proceso se cierra antes si termina la tarea |
+
+### Computadoras persistentes
+
+| Variable | Default | Descripción |
+|---|---|---|
 | `COMPUTERS_ENABLED` | `0` | Habilita una sandbox Daytona persistente por `(usuario, bot)` |
 | `DAYTONA_API_KEY` | vacío | Credencial server-side; obligatoria si la función está habilitada |
+| `DAYTONA_API_URL` | vacío | Endpoint alternativo de Daytona |
+| `DAYTONA_TARGET` | vacío | Target o región opcional |
 | `DAYTONA_SNAPSHOT` | vacío | Snapshot opcional preparado con apps para la computadora |
 | `COMPUTER_AUTO_STOP_MINUTES` | `15` | Inactividad antes de detener cómputo conservando el filesystem |
 | `COMPUTER_AUTO_ARCHIVE_MINUTES` | `1440` | Tiempo detenida antes de archivar |
@@ -599,7 +682,7 @@ Admin (Bearer = `ADMIN_TOKEN`):
 
 ## Seguridad
 
-- Las keys de Go se cifran con AES-256-GCM (`cryptography`) o se guardan en
+- Las credenciales del proveedor se cifran con AES-256-GCM (`cryptography`) o se guardan en
   el Keychain de macOS (fallback). Nunca se persisten en claro.
 - Las api keys de los usuarios del wrapper se guardan hasheadas (SHA-256);
   solo se muestran una vez en el signup.
@@ -610,9 +693,9 @@ Admin (Bearer = `ADMIN_TOKEN`):
   suscripción, usuario, tier y capacidad se enlazan en una sola transacción.
 - `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` solo viven en el backend. El
   arranque rechaza claves test en modo live, URLs inseguras y price IDs inválidos.
-- La asignación de suscripciones usa `BEGIN IMMEDIATE` y el índice único
-  `uniq_user_subscription`; dos activaciones concurrentes no pueden compartir
-  una key.
+- En SQLite, la asignación usa `BEGIN IMMEDIATE`; en PostgreSQL usa una
+  transacción normal. En ambos motores, `uniq_user_subscription` y la
+  actualización atómica impiden que dos activaciones conserven la misma key.
 - El servidor se niega a arrancar con `ADMIN_TOKEN=cambia-este-token`. En
   producción define un token aleatorio largo y mantenlo fuera del repositorio.
 - Los secretos viven en `data/secret.key` (0600); si usas `WRAPPER_SECRET`
@@ -638,15 +721,29 @@ Admin (Bearer = `ADMIN_TOKEN`):
 ## Tests
 
 ```bash
+# Backend, billing, persistencia, visión, conectores y computadoras
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+
+# Electron y extensión dinámica de conectores
+pnpm test:desktop
+pnpm test:connectors
+
+# iOS, sin firma
+xcodebuild \
+  -project ios/AgentGenia/AgentGenia.xcodeproj \
+  -scheme AgentGenia \
+  -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO build
+
+# Android (requiere JDK 17 y Android SDK Platform 37)
+cd android/AgentGenia
+./gradlew testDebugUnitTest assembleDebug
 ```
 
-Corren contra un upstream mock (sin llamadas reales a OpenCode Go ni Stripe) y cubren:
-signup siempre-free, activación admin, carrera de asignación, rechazo del token
-inseguro, proxy de modelos, chat/responses/messages, streaming,
-registro de uso, límite 429, tiers (free/basic/pro), BYOK, revocación y
-cifrado en reposo, Checkout con price IDs allowlisted, firma e idempotencia de
-webhooks y cancelación. También validan el flujo Pi RPC completo con un ejecutable
-falso, el puente Luna/MiMo, los grants efímeros del broker, la carga dinámica de
-herramientas y el aislamiento de proceso, perfil y bridge de pi-chrome, sin
-consumir saldo real.
+Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del
+proveedor ni realizan cobros. Cubren signup siempre-free, activación, carrera de
+asignación, proxy y streaming, uso, tiers, BYOK, Stripe, cifrado, Google OAuth,
+Pi RPC, visión, grants efímeros, conectores, computadoras, aislamiento por
+cuenta, widgets del LLM y contratos de Electron. Las compilaciones móviles
+validan además que los proyectos nativos y sus catálogos de assets sean válidos.
