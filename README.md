@@ -177,6 +177,47 @@ los planes se ofrece con In-App Purchase o mediante el enlace externo permitido
 para los storefronts y entitlements aplicables; el backend de Stripe sigue
 siendo válido para web y desktop.
 
+## App de Android (Kotlin + Jetpack Compose)
+
+La app nativa para teléfonos y tablets Android vive en `android/AgentGenia`.
+Comparte directamente los contratos públicos de `wrapper-backend` con Electron
+y iOS; no copia ni modifica el harness de Pi. Incluye login Google ligado al
+dispositivo, chat real con widgets generados por el LLM, marketplace y pestaña
+`Tuyos`, estado de billing y el viewer firmado de la computadora persistente de
+cada bot.
+
+```bash
+cd android/AgentGenia
+./gradlew testDebugUnitTest assembleDebug
+
+# APK de desarrollo
+open app/build/outputs/apk/debug
+```
+
+Para compilar se necesita JDK 17 y Android SDK Platform 37 con Build Tools
+36.0.0; Android Studio instala y administra esas dependencias. El Gradle
+Wrapper 9.5 queda incluido en el repositorio para que CI y Windows usen la
+misma versión.
+
+La build usa Kotlin, Jetpack Compose y `minSdk 26`. Los access/refresh tokens y
+los archivos de bots se cifran con AES-GCM usando una clave no exportable de
+Android Keystore; el estado se guarda por hash de cuenta en `noBackupFilesDir`
+y se excluye de cloud backup y device transfer. Los secretos OAuth de cada
+proveedor permanecen en el backend/Composio y nunca llegan al teléfono.
+
+La configuración predeterminada apunta a
+`https://agentgenia-api.onrender.com`. Para una variante interna se puede
+reemplazar `API_BASE_URL` en `app/build.gradle.kts`; el cliente solo admite
+HTTPS, salvo un loopback explícito para desarrollo. El WebView de la
+computadora desactiva acceso a archivos, contenido local, mixed content,
+ventanas adicionales y navegación fuera del host firmado.
+
+Antes de publicar en Google Play hay que generar un Android App Bundle firmado,
+completar Data Safety y confirmar si la venta del plan digital debe pasar por
+Google Play Billing en los países/canales de distribución elegidos. La app no
+incluye claves privadas de Stripe y presenta la administración del plan en el
+sitio seguro de Agent Genia.
+
 La app guarda preferencias y perfiles de bots en un archivo aislado por cuenta
 dentro de `userData/accounts` de Electron. Al cerrar sesión carga un estado
 vacío en memoria y no expone los bots de la cuenta anterior. Una instalación
