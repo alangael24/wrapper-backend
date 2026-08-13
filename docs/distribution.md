@@ -13,9 +13,9 @@ Actualiza de forma coordinada `package.json`, `MARKETING_VERSION` de iOS y
 accidente:
 
 ```text
-desktop-v1.0.1   → GitHub Release + canal electron-updater
+desktop-v1.0.1   → GitHub Release + canal electron-updater (macOS/Linux; Windows al añadir firma)
 ios-v1.0.1       → App Store Connect / TestFlight
-android-v1.0.1   → Google Play + GitHub Release del AAB
+android-v1.0.1   → GitHub Release del AAB firmado; promoción posterior a Google Play
 ```
 
 Los build numbers móviles se derivan determinísticamente de SemVer y una revisión
@@ -34,6 +34,14 @@ Las Actions también admiten `workflow_dispatch` pero exigen que el tag ya exist
 - Windows x64: NSIS EXE y AppX/MSIX-compatible, con Authenticode;
 - Linux x64: AppImage, deb y rpm;
 - metadatos de actualización, blockmaps y `SHA256SUMS.txt`.
+
+Un tag nuevo construye por defecto las plataformas que hoy tienen una cadena de
+confianza completa: macOS y Linux. El dispatch manual acepta
+`platforms=windows` para anexar Windows al mismo release únicamente cuando
+existan el PFX y el publisher. El job de Windows conserva
+`forceCodeSigning=true` y rechaza cualquier artefacto sin Authenticode; nunca se
+publica un instalador unsigned. Al anexar una plataforma se recalcula
+`SHA256SUMS.txt` incluyendo los artefactos previos.
 
 La build usa Electron 43.4.0 fijado en el lockfile. Los artefactos objetivo son
 macOS 12 o posterior (Intel y Apple Silicon), Windows 10/11 x64 y Linux x64.
@@ -97,18 +105,23 @@ está declarado en `NO` porque la app solo usa el cifrado estándar del sistema.
 ## Android
 
 `Android` ejecuta unit tests, lint, APK Debug y pruebas instrumentadas de inicio,
-Compose y Android Keystore. `Android Play Release` exige:
+Compose y Android Keystore. El release firmado de Android siempre exige:
 
 - `ANDROID_RELEASE_KEYSTORE_BASE64`;
 - `ANDROID_RELEASE_STORE_PASSWORD`;
 - `ANDROID_RELEASE_KEY_ALIAS`;
-- `ANDROID_RELEASE_KEY_PASSWORD`;
-- `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`.
+- `ANDROID_RELEASE_KEY_PASSWORD`.
+
+La publicación posterior a Google Play (`publish_to_play=true`) exige además
+`GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`.
 
 El servicio de Google debe tener permiso de release sobre
-`com.agentgenia.android`. El workflow verifica `jarsigner`, publica primero al
-track solicitado (`internal` por defecto), conserva el AAB/checksum en GitHub y
-emite provenance. La build distribuible usa Android 16/API 36 estable (no el SDK
+`com.agentgenia.android`. Un tag genera, verifica con `jarsigner`, publica el
+AAB/checksum inmutable en GitHub y emite provenance sin depender de Play. Cuando
+la cuenta de servicio esté disponible, un dispatch del mismo tag con
+`publish_to_play=true` recompila el binario firmado y lo envía al track
+seleccionado (`internal` por defecto) sin reemplazar el artefacto público. La
+build distribuible usa Android 16/API 36 estable (no el SDK
 preview de Android 17), que cumple el requisito de Google Play vigente desde el
 31 de agosto de 2026. La build Release oculta Stripe; para venta móvil futura se
 debe integrar Google Play Billing y validación server-side.
@@ -134,24 +147,27 @@ actualizarlo, cambia `requirements.in` y regenera `requirements.txt` con
 `uv pip compile --universal --generate-hashes`. CI audita los locks de Python y
 Node antes de construir. `render.yaml` exige que producción reciba `DATABASE_URL`,
 `WRAPPER_SECRET`, `ADMIN_TOKEN` y los secretos de proveedores desde Render. El
-blueprint de producción activa Stripe, las computadoras y Pi. El proceso falla
-cerrado si falta cualquier secreto obligatorio y `/readyz` solo responde 200
-cuando la base de datos, capacidad de modelo, OAuth Google/Apple, Stripe,
-Composio, Daytona, Pi y pi-chrome están disponibles. `/healthz` es liveness puro
+blueprint de producción activa Stripe y Pi; las computadoras se activan solo al
+configurar su proveedor. El proceso falla cerrado si falta cualquier secreto
+obligatorio y `/readyz` solo responde 200 cuando la base de datos, capacidad de
+modelo, OAuth Google/Apple, Stripe, el gateway de conectores, Pi y pi-chrome
+están disponibles. Si `COMPUTERS_ENABLED=1`, también exige Daytona; deshabilitar
+la capability no bloquea las funciones principales. `/healthz` es liveness puro
 y no consulta dependencias; `/readyz` expone su estado sin revelar secretos. El signup público heredado
 permanece deshabilitado en producción.
 
 `COMPOSIO_AUTH_CONFIGS_JSON` es un secreto obligatorio del servicio, no un `{}`
-de ejemplo. La readiness compara `available_connectors` con el catálogo completo:
-si una integración publicada carece de toolkit, Auth Config privado o adaptador
-first-party, ninguna app puede distribuirse hasta configurarla o retirarla del
-catálogo. Esto evita que Marketplace prometa conectores que solo funcionan en la
-interfaz.
+de ejemplo. Readiness exige que el gateway privado esté configurado y que exista
+al menos un conector ejecutable. Una integración individual sin toolkit o Auth
+Config se muestra como no disponible sin tumbar el resto del catálogo. La
+completitud permanece visible en el health detallado para que Marketplace no
+presente como instalable algo que aún no tiene adaptador real.
 
 Render espera a que los checks de GitHub terminen correctamente antes de hacer
 auto-deploy. Su health check usa `/platformz`, que comprueba proceso y base de
 datos sin reiniciar el servicio por una caída transitoria de Stripe, Composio o
-Daytona. `/readyz` conserva el chequeo integral, y los tres workflows de release
+Daytona. `/readyz` conserva el chequeo integral de las capabilities habilitadas,
+y los tres workflows de release
 lo consultan antes de firmar o publicar cualquier binario; si producción no está
 realmente operativa, la distribución se detiene.
 

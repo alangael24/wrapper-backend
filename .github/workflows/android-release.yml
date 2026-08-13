@@ -20,6 +20,11 @@ on:
         required: true
         default: "0"
         type: string
+      publish_to_play:
+        description: Upload this signed build to the selected Google Play track
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -38,6 +43,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       PLAY_TRACK: ${{ inputs.track || 'internal' }}
       BUILD_REVISION: ${{ inputs.build_revision || '0' }}
+      PUBLISH_TO_PLAY: ${{ inputs.publish_to_play || false }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -88,6 +94,7 @@ jobs:
       - name: Require a production-ready backend
         run: python scripts/verify-live-readiness.py
       - name: Require a valid Google Play service account
+        if: inputs.publish_to_play == true
         env:
           GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -101,12 +108,11 @@ jobs:
       - name: Generate checksum
         run: sha256sum android/AgentGenia/app/build/outputs/bundle/release/app-release.aab > android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt
       - name: Stage an immutable draft GitHub Release
+        if: inputs.publish_to_play != true
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true || { echo "Release already published"; exit 1; }
-            gh release upload "$RELEASE_TAG" \
-              android/AgentGenia/app/build/outputs/bundle/release/app-release.aab \
-              android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt --clobber
+            echo "Release $RELEASE_TAG already exists; refusing to replace its immutable AAB"
+            exit 1
           else
             gh release create "$RELEASE_TAG" \
               android/AgentGenia/app/build/outputs/bundle/release/app-release.aab \
@@ -114,6 +120,7 @@ jobs:
               --draft --verify-tag --generate-notes --title "Agent Genia Android ${RELEASE_TAG#android-v}"
           fi
       - name: Upload to Google Play
+        if: inputs.publish_to_play == true
         uses: r0adkll/upload-google-play@935ef9c68bb393a8e6116b1575626a7f5be3a7fb
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
@@ -128,6 +135,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Publish the staged GitHub Release
+        if: inputs.publish_to_play != true
         run: gh release edit "$RELEASE_TAG" --draft=false --latest=false
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:

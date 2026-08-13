@@ -9,6 +9,12 @@ on:
         description: Existing desktop-vX.Y.Z tag to release
         required: true
         type: string
+      platforms:
+        description: Platforms to build; Windows remains fail-closed until signing is configured
+        required: true
+        default: available
+        type: choice
+        options: [available, windows, all]
 
 permissions:
   contents: write
@@ -23,20 +29,13 @@ jobs:
     environment: production-release
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            command: dist:mac
-            target: mac
-            artifact: macos
-          - os: windows-2025
-            command: dist:win
-            target: win
-            artifact: windows
-          - os: ubuntu-24.04
-            command: dist:linux
-            target: linux
-            artifact: linux
+      matrix: ${{ fromJSON(
+          inputs.platforms == 'windows'
+          && '{"include":[{"os":"windows-2025","target":"win","artifact":"windows"}]}'
+          || inputs.platforms == 'all'
+          && '{"include":[{"os":"macos-14","target":"mac","artifact":"macos"},{"os":"windows-2025","target":"win","artifact":"windows"},{"os":"ubuntu-24.04","target":"linux","artifact":"linux"}]}'
+          || '{"include":[{"os":"macos-14","target":"mac","artifact":"macos"},{"os":"ubuntu-24.04","target":"linux","artifact":"linux"}]}'
+        ) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -202,12 +201,20 @@ jobs:
         with:
           pattern: desktop-release-*
           path: artifacts
-      - run: node scripts/checksums.mjs artifacts
+      - name: Include existing platform assets in the combined checksum
+        run: |
+          roots=(artifacts)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            mkdir -p existing-artifacts
+            gh release download "$RELEASE_TAG" --dir existing-artifacts
+            rm -f existing-artifacts/SHA256SUMS.txt
+            roots+=(existing-artifacts)
+          fi
+          node scripts/checksums.mjs "${roots[@]}"
       - name: Stage and atomically publish the GitHub release
         run: |
           mapfile -d '' files < <(find artifacts -type f -print0)
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true || { echo "Release already published"; exit 1; }
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           else
             gh release create "$RELEASE_TAG" "${files[@]}" --draft --verify-tag --generate-notes --title "Agent Genia ${RELEASE_TAG#desktop-v}"

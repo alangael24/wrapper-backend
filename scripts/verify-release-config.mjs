@@ -33,6 +33,8 @@ const gradle = await readFile("android/AgentGenia/app/build.gradle.kts", "utf8")
 const builder = await readFile("electron-builder.yml", "utf8");
 const render = await readFile("render.yaml", "utf8");
 const backendWorkflow = await readFile(".github/workflows/backend.yml", "utf8");
+const desktopReleaseWorkflow = await readFile(".github/workflows/desktop-release.yml", "utf8");
+const androidReleaseWorkflow = await readFile(".github/workflows/android-release.yml", "utf8");
 const dockerfile = await readFile("Dockerfile", "utf8");
 const pythonLock = await readFile("requirements.txt", "utf8");
 const entitlements = await readFile("ios/AgentGenia/AgentGenia/AgentGenia.entitlements", "utf8");
@@ -106,6 +108,16 @@ if (!dockerfile.includes("pip install --no-cache-dir --require-hashes -r require
 }
 if (!pythonLock.includes("--hash=sha256:")) {
   throw new Error("requirements.txt must be a hashed dependency lockfile");
+}
+if (!desktopReleaseWorkflow.includes("inputs.platforms == 'windows'")
+  || !desktopReleaseWorkflow.includes("forceCodeSigning=${{ runner.os != 'Linux' }}")
+  || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")) {
+  throw new Error("Desktop release must append Windows only through its signed, checksum-preserving path");
+}
+if (!androidReleaseWorkflow.includes("if: inputs.publish_to_play == true")
+  || !androidReleaseWorkflow.includes("if: inputs.publish_to_play != true")
+  || !androidReleaseWorkflow.includes("refusing to replace its immutable AAB")) {
+  throw new Error("Android release must separate immutable signed AAB publication from Google Play promotion");
 }
 for (const key of [
   "DATABASE_URL", "WRAPPER_SECRET", "ADMIN_TOKEN",
