@@ -158,4 +158,13 @@ for (const file of [
     throw new Error(`${file} must refuse tags that are not reachable from main`);
   }
 }
+for (const file of [".github/workflows/desktop.yml", ".github/workflows/desktop-release.yml"]) {
+  const workflow = await readFile(file, "utf8");
+  if (!workflow.includes("sudo chmod 4755 \"$sandbox\"")) {
+    throw new Error(`${file} must launch Linux Electron with its sandbox configured`);
+  }
+  if (workflow.includes("--no-sandbox")) {
+    throw new Error(`${file} must not disable the Electron sandbox`);
+  }
+}
 console.log(`Release configuration verified for Agent Genia ${packageJson.version}.`);

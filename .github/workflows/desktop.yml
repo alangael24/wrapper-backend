@@ -87,6 +87,10 @@ jobs:
           sudo apt-get install -y xvfb
           executable="$(find release -type f -path '*/linux-*/agent-genia' -perm -111 -print -quit)"
           test -n "$executable"
+          sandbox="$(dirname "$executable")/chrome-sandbox"
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
           AGENTGENIA_DISABLE_AUTO_UPDATE=1 xvfb-run -a "$executable" --smoke-test
       - name: Upload unpacked smoke package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

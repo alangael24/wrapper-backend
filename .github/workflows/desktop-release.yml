@@ -137,6 +137,10 @@ jobs:
           sudo apt-get install -y xvfb
           executable="$(find release -type f -path '*/linux-*/agent-genia' -perm -111 -print -quit)"
           test -n "$executable"
+          sandbox="$(dirname "$executable")/chrome-sandbox"
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
           AGENTGENIA_DISABLE_AUTO_UPDATE=1 xvfb-run -a "$executable" --smoke-test
       - name: Notarize and verify final macOS containers
         if: runner.os == 'macOS'
