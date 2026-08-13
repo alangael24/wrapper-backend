@@ -166,13 +166,32 @@ private struct PortalResponse: Decodable, Sendable {
     enum CodingKeys: String, CodingKey { case portalURL = "portal_url" }
 }
 
+private struct AccountStateSaveRequest: Encodable, Sendable {
+    let baseRevision: Int
+    let deviceID: String
+    let state: PersistedAccountState
+    enum CodingKeys: String, CodingKey {
+        case baseRevision = "base_revision"
+        case deviceID = "device_id"
+        case state
+    }
+}
+
 actor APIClient {
     private static let deviceIDKey = "agentgenia.device-id"
     private let baseURL: URL
     private let urlSession: URLSession
     private let keychain = KeychainSessionStore()
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    private let encoder: JSONEncoder = {
+        let value = JSONEncoder()
+        value.dateEncodingStrategy = .iso8601
+        return value
+    }()
+    private let decoder: JSONDecoder = {
+        let value = JSONDecoder()
+        value.dateDecodingStrategy = .iso8601
+        return value
+    }()
     private var session: AccountSession?
     private var refreshTask: Task<AccountSession, Error>?
     private let logger = Logger(subsystem: "com.agentgenia.ios", category: "network")
@@ -294,6 +313,18 @@ actor APIClient {
 
     func connectors() async throws -> ConnectorSnapshot {
         try await request("/v1/connectors", body: Optional<EmptyBody>.none)
+    }
+
+    func accountState() async throws -> AccountStateSnapshot {
+        try await request("/v1/account-state", body: Optional<EmptyBody>.none)
+    }
+
+    func saveAccountState(_ state: PersistedAccountState, baseRevision: Int) async throws -> AccountStateSnapshot {
+        try await request(
+            "/v1/account-state",
+            method: "POST",
+            body: AccountStateSaveRequest(baseRevision: baseRevision, deviceID: deviceID, state: state)
+        )
     }
 
     func startConnector(_ connectorID: String) async throws -> ConnectorStartResponse {

@@ -163,6 +163,7 @@ async function initialize(): Promise<void> {
       desktopApi.connectionSnapshot(),
       desktopApi.getTeachRecordingStatus()
     ]);
+    if (connections.account.connected) state = await desktopApi.bootstrap();
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
     const preview = new URLSearchParams(window.location.search).get("preview");
@@ -410,6 +411,8 @@ async function disconnectConnector(connectorId: string): Promise<void> {
   render();
   try {
     connections = await desktopApi.disconnectConnector(connectorId);
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
   } catch (error) {
     transientError = errorMessage(error);
   } finally {

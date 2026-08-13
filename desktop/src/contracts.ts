@@ -256,6 +256,12 @@ export interface AppState {
   activeBotId: string | null;
 }
 
+export interface AccountStateSnapshot {
+  revision: number;
+  state: AppState;
+  updatedAt: number | null;
+}
+
 export interface BotDraft {
   name: string;
   color: string;

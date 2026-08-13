@@ -71,14 +71,83 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
     var description: String
     var color: String
     var shape: BotShape
+    var avatarDataURL: String = ""
     var notificationsEnabled: Bool
     var connectorIDs: [String]
     var messages: [BotMessage]
+    var workflows: [BotWorkflow] = []
     var createdAt: Date
 
     enum CodingKeys: String, CodingKey {
-        case id, name, title, description, color, shape, notificationsEnabled, messages, createdAt
+        case id, name, title, description, color, shape, notificationsEnabled, messages, workflows, createdAt
+        case avatarDataURL = "avatarDataUrl"
         case connectorIDs = "connectorIds"
+    }
+
+    init(
+        id: UUID,
+        name: String,
+        title: String,
+        description: String,
+        color: String,
+        shape: BotShape,
+        avatarDataURL: String = "",
+        notificationsEnabled: Bool,
+        connectorIDs: [String],
+        messages: [BotMessage],
+        workflows: [BotWorkflow] = [],
+        createdAt: Date
+    ) {
+        self.id = id; self.name = name; self.title = title; self.description = description
+        self.color = color; self.shape = shape; self.avatarDataURL = avatarDataURL
+        self.notificationsEnabled = notificationsEnabled; self.connectorIDs = connectorIDs
+        self.messages = messages; self.workflows = workflows; self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        title = try values.decodeIfPresent(String.self, forKey: .title) ?? ""
+        description = try values.decodeIfPresent(String.self, forKey: .description) ?? ""
+        color = try values.decodeIfPresent(String.self, forKey: .color) ?? "#2f91f5"
+        shape = try values.decodeIfPresent(BotShape.self, forKey: .shape) ?? .circle
+        avatarDataURL = try values.decodeIfPresent(String.self, forKey: .avatarDataURL) ?? ""
+        notificationsEnabled = try values.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? true
+        connectorIDs = try values.decodeIfPresent([String].self, forKey: .connectorIDs) ?? []
+        messages = try values.decodeIfPresent([BotMessage].self, forKey: .messages) ?? []
+        workflows = try values.decodeIfPresent([BotWorkflow].self, forKey: .workflows) ?? []
+        createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    }
+}
+
+struct BotWorkflow: Codable, Identifiable, Equatable, Sendable {
+    var id: String
+    var title: String
+    var summary: String
+    var steps: [String]
+    var recordingID: String
+    var recordingMimeType: String
+    var createdAt: Date
+    var updatedAt: Date
+    var lastRunAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, summary, steps, recordingMimeType, createdAt, updatedAt, lastRunAt
+        case recordingID = "recordingId"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        summary = try values.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        steps = try values.decodeIfPresent([String].self, forKey: .steps) ?? []
+        recordingID = try values.decodeIfPresent(String.self, forKey: .recordingID) ?? ""
+        recordingMimeType = try values.decodeIfPresent(String.self, forKey: .recordingMimeType) ?? ""
+        createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try values.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        lastRunAt = try? values.decode(Date.self, forKey: .lastRunAt)
     }
 }
 
@@ -87,9 +156,65 @@ enum BotShape: String, Codable, CaseIterable, Sendable {
 }
 
 struct PersistedAccountState: Codable, Equatable, Sendable {
+    var version: Int = 1
+    var onboardingCompleted: Bool = true
     var bots: [BotProfile] = []
     var selectedConnectorIDs: [String] = []
     var activeBotID: UUID?
+
+    enum CodingKeys: String, CodingKey {
+        case version, onboardingCompleted, bots
+        case selectedConnectorIDs = "selectedConnectorIds"
+        case activeBotID = "activeBotId"
+        case legacySelectedConnectorIDs = "selectedConnectorIDs"
+        case legacyActiveBotID = "activeBotID"
+    }
+
+    init(
+        version: Int = 1,
+        onboardingCompleted: Bool = true,
+        bots: [BotProfile] = [],
+        selectedConnectorIDs: [String] = [],
+        activeBotID: UUID? = nil
+    ) {
+        self.version = version
+        self.onboardingCompleted = onboardingCompleted
+        self.bots = bots
+        self.selectedConnectorIDs = selectedConnectorIDs
+        self.activeBotID = activeBotID
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        onboardingCompleted = try values.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
+        bots = try values.decodeIfPresent([BotProfile].self, forKey: .bots) ?? []
+        selectedConnectorIDs = try values.decodeIfPresent([String].self, forKey: .selectedConnectorIDs)
+            ?? values.decodeIfPresent([String].self, forKey: .legacySelectedConnectorIDs)
+            ?? []
+        activeBotID = try values.decodeIfPresent(UUID.self, forKey: .activeBotID)
+            ?? values.decodeIfPresent(UUID.self, forKey: .legacyActiveBotID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(1, forKey: .version)
+        try values.encode(onboardingCompleted, forKey: .onboardingCompleted)
+        try values.encode(bots, forKey: .bots)
+        try values.encode(selectedConnectorIDs, forKey: .selectedConnectorIDs)
+        try values.encodeIfPresent(activeBotID, forKey: .activeBotID)
+    }
+}
+
+struct AccountStateSnapshot: Codable, Equatable, Sendable {
+    let revision: Int
+    let state: PersistedAccountState
+    let updatedAt: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case revision, state
+        case updatedAt = "updated_at"
+    }
 }
 
 struct ConnectorDefinition: Identifiable, Hashable, Sendable {

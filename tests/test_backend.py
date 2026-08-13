@@ -391,6 +391,71 @@ class TestBackend(unittest.TestCase):
         return auth
 
     # ---------- pool / signup ----------
+    def test_account_state_sync_is_account_scoped_versioned_and_validated(self):
+        first = self.new_user(tier="free")
+        second = self.new_user(tier="free")
+        first_headers = {"Authorization": f"Bearer {first['api_key']}"}
+        second_headers = {"Authorization": f"Bearer {second['api_key']}"}
+
+        status, empty = self.ws.req("GET", "/v1/account-state", headers=first_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(empty["revision"], 0)
+        self.assertEqual(empty["state"]["bots"], [])
+
+        device_id = str(uuid.uuid4())
+        state = {
+            "version": 99,
+            "onboardingCompleted": True,
+            "selectedConnectorIds": ["github", "not-real", "github"],
+            "activeBotId": "bot-one",
+            "bots": [{
+                "id": "bot-one",
+                "name": "  Research   bot ",
+                "color": "#2F91F5",
+                "shape": "bean",
+                "connectorIds": ["github", "not-real"],
+                "messages": [{
+                    "id": "message-one",
+                    "role": "assistant",
+                    "text": "Listo",
+                    "createdAt": "2026-08-13T20:00:00Z",
+                }],
+                "createdAt": "2026-08-13T19:00:00Z",
+            }],
+        }
+        status, saved = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": 0, "device_id": device_id, "state": state},
+            headers=first_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["revision"], 1)
+        self.assertEqual(saved["state"]["version"], 1)
+        self.assertEqual(saved["state"]["selectedConnectorIds"], ["github"])
+        self.assertEqual(saved["state"]["bots"][0]["name"], "Research bot")
+
+        status, other = self.ws.req("GET", "/v1/account-state", headers=second_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(other["revision"], 0)
+
+        stale_state = {**saved["state"], "activeBotId": None}
+        status, conflict = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": 0, "device_id": device_id, "state": stale_state},
+            headers=first_headers,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["error"]["type"], "account_state_conflict")
+        self.assertEqual(conflict["current"]["revision"], 1)
+
+        status, invalid = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": 1, "device_id": "not-a-device", "state": state},
+            headers=first_headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"]["type"], "invalid_account_state")
+
     def test_google_account_auth_flow_issues_rotates_and_revokes_session(self):
         self.configure_fake_google()
         device_id = str(uuid.uuid4())
@@ -1199,7 +1264,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 12)
+        self.assertEqual(migrated.health()["schema_version"], 13)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)

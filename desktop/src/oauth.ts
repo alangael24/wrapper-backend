@@ -3,6 +3,8 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path";
 import type { SafeStorage, Shell } from "electron";
 import type {
+  AccountStateSnapshot,
+  AppState,
   AccountConnectionStatus,
   BillingSnapshot,
   BotComputerSnapshot,
@@ -10,7 +12,7 @@ import type {
   ConnectorConnectionSnapshot,
   ConnectorConnectionStatus
 } from "./contracts";
-import { CONNECTOR_CATALOG } from "./contracts";
+import { CONNECTOR_CATALOG, normalizeAppState } from "./contracts";
 
 const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
@@ -42,6 +44,24 @@ interface JsonRequestOptions {
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
   signal?: AbortSignal;
+}
+
+class WrapperHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly payload: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = "WrapperHttpError";
+  }
+}
+
+export class AccountStateConflictError extends Error {
+  constructor(readonly current: AccountStateSnapshot) {
+    super("La cuenta cambió en otro dispositivo.");
+    this.name = "AccountStateConflictError";
+  }
 }
 
 export const COMPOSIO_CONNECTOR_IDS: ReadonlySet<string> = new Set(
@@ -206,6 +226,18 @@ export class DesktopOAuthController {
     return (await this.accountStore.get())?.account.id ?? null;
   }
 
+  loadAccountState(signal?: AbortSignal): Promise<AccountStateSnapshot> {
+    return this.client.loadAccountState(signal);
+  }
+
+  saveAccountState(
+    state: AppState,
+    baseRevision: number,
+    signal?: AbortSignal
+  ): Promise<AccountStateSnapshot> {
+    return this.client.saveAccountState(state, baseRevision, signal);
+  }
+
   private async accountStatus(): Promise<AccountConnectionStatus> {
     const stored = await this.accountStore.get();
     return stored
@@ -327,6 +359,33 @@ class WrapperServiceClient {
 
   connectors(signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.authorizedJson("/v1/connectors", { signal });
+  }
+
+  async loadAccountState(signal?: AbortSignal): Promise<AccountStateSnapshot> {
+    return parseAccountStateSnapshot(await this.authorizedJson("/v1/account-state", { signal }));
+  }
+
+  async saveAccountState(
+    state: AppState,
+    baseRevision: number,
+    signal?: AbortSignal
+  ): Promise<AccountStateSnapshot> {
+    try {
+      return parseAccountStateSnapshot(await this.authorizedJson("/v1/account-state", {
+        method: "POST",
+        body: {
+          base_revision: baseRevision,
+          device_id: await this.options.deviceStore.getOrCreate(),
+          state: normalizeAppState(state)
+        },
+        signal
+      }));
+    } catch (error) {
+      if (error instanceof WrapperHttpError && error.status === 409 && isRecord(error.payload.current)) {
+        throw new AccountStateConflictError(parseAccountStateSnapshot(error.payload.current));
+      }
+      throw error;
+    }
   }
 
   startConnector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -478,7 +537,7 @@ class WrapperServiceClient {
     if (!response.ok) {
       const nested = isRecord(payload.error) ? payload.error : {};
       const message = typeof nested.message === "string" ? nested.message : `El servicio OAuth respondió HTTP ${response.status}.`;
-      throw new Error(message);
+      throw new WrapperHttpError(message, response.status, payload);
     }
     return payload;
   }
@@ -644,6 +703,20 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
       pro: parsePlan(pro, "pro"),
       business: parsePlan(business, "business")
     }
+  };
+}
+
+function parseAccountStateSnapshot(value: Record<string, unknown>): AccountStateSnapshot {
+  const revision = numberValue(value.revision);
+  if (!Number.isSafeInteger(revision) || revision < 0 || !isRecord(value.state)) {
+    throw new Error("El servicio devolvió un estado de cuenta inválido.");
+  }
+  return {
+    revision,
+    state: normalizeAppState(value.state),
+    updatedAt: typeof value.updated_at === "number" && Number.isFinite(value.updated_at)
+      ? value.updated_at
+      : null
   };
 }
 

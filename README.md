@@ -62,7 +62,10 @@ usan SQLite cuando esa variable está vacía.
 Las migraciones versionadas viven en `supabase/migrations/`. Las transiciones de
 tier, los grants, las reservas y el procesamiento idempotente y cronológico de
 webhooks se ejecutan dentro de transacciones. La versión 11 añade el ledger de
-créditos, runs, allocations, tokens efímeros y costo entero en microUSD.
+créditos, runs, allocations, tokens efímeros y costo entero en microUSD. La
+versión 13 añade el estado versionado por cuenta para sincronizar bots,
+conversaciones, personalización, workflows y selección de conectores entre
+Electron e iOS sin compartir archivos locales entre usuarios.
 
 En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
 `WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de
@@ -79,7 +82,8 @@ evento firmado.
 
 1. Aplica las migraciones de Supabase, incluida
    `20260813143000_deepseek_direct.sql` y
-   `20260813190000_credit_ledger.sql`, antes de desplegar esta versión
+   `20260813190000_credit_ledger.sql`, además de
+   `20260813224341_account_state_sync.sql`, antes de desplegar esta versión
    del backend.
 2. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
    del host y establece `STRIPE_ENABLED=1`.
@@ -549,6 +553,8 @@ proviene del flujo de signup.
 |---|---|---|
 | POST | `/v1/account-auth/refresh` | Rota un refresh token enviado como Bearer y ligado al `device_id` |
 | POST | `/v1/account-auth/logout` | Revoca la sesión actual |
+| GET | `/v1/account-state` | Lee el estado canónico de bots y preferencias de la cuenta |
+| POST | `/v1/account-state` | Guarda el estado con `base_revision` optimista y `device_id` |
 | GET | `/v1/connectors` | Catálogo y conexiones del usuario |
 | GET | `/v1/connectors/<id>` | Estado y disponibilidad de un conector |
 | POST | `/v1/connectors/start` | Crea un Connect Link o formulario first-party |

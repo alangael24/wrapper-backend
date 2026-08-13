@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -131,6 +131,15 @@ CREATE TABLE IF NOT EXISTS bot_computers (
   updated_at     REAL NOT NULL,
   last_active_at REAL,
   PRIMARY KEY(user_id, bot_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_states (
+  user_id                TEXT PRIMARY KEY,
+  revision               INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+  state_json             TEXT NOT NULL,
+  updated_by_device_hash TEXT NOT NULL,
+  created_at             REAL NOT NULL,
+  updated_at             REAL NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS account_auth_attempts (
@@ -289,6 +298,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_bot_computer_provider_ref
   ON bot_computers(provider, provider_ref) WHERE provider_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_bot_computers_user
   ON bot_computers(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_account_states_updated
+  ON account_states(updated_at);
 CREATE INDEX IF NOT EXISTS idx_account_auth_attempts_expires
   ON account_auth_attempts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_connector_auth_attempts_user
@@ -311,6 +322,12 @@ def _now() -> float:
 
 class ComputerLimitReached(RuntimeError):
     pass
+
+
+class AccountStateConflict(RuntimeError):
+    def __init__(self, current: dict):
+        super().__init__("La cuenta cambió en otro dispositivo")
+        self.current = current
 
 
 def new_id(prefix: str) -> str:
@@ -931,6 +948,70 @@ class Store:
             )
             self._conn.commit()
             return bool(cursor.rowcount)
+
+    # ---------- estado de producto sincronizado por cuenta ----------
+    def get_account_state(self, user_id: str) -> dict | None:
+        row = self._one(
+            "SELECT user_id,revision,state_json,created_at,updated_at "
+            "FROM account_states WHERE user_id=?",
+            (user_id,),
+        )
+        return dict(row) if row else None
+
+    def save_account_state(
+        self,
+        *,
+        user_id: str,
+        base_revision: int,
+        state_json: str,
+        device_hash: str,
+    ) -> dict:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT user_id,revision,state_json,created_at,updated_at "
+                    "FROM account_states WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()
+                current_revision = int(row["revision"]) if row else 0
+                if current_revision != base_revision:
+                    self._conn.rollback()
+                    current = dict(row) if row else None
+                    raise AccountStateConflict(current or {
+                        "user_id": user_id,
+                        "revision": 0,
+                        "state_json": "",
+                        "created_at": now,
+                        "updated_at": now,
+                    })
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO account_states(user_id,revision,state_json,updated_by_device_hash,created_at,updated_at) "
+                        "VALUES(?,1,?,?,?,?)",
+                        (user_id, state_json, device_hash, now, now),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE account_states SET revision=revision+1,state_json=?,"
+                        "updated_by_device_hash=?,updated_at=? WHERE user_id=? AND revision=?",
+                        (state_json, device_hash, now, user_id, base_revision),
+                    )
+                saved = self._conn.execute(
+                    "SELECT user_id,revision,state_json,created_at,updated_at "
+                    "FROM account_states WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()
+                self._conn.commit()
+            except AccountStateConflict:
+                raise
+            except Exception:
+                self._conn.rollback()
+                raise
+        if saved is None:
+            raise RuntimeError("No se pudo guardar el estado de la cuenta")
+        return dict(saved)
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,

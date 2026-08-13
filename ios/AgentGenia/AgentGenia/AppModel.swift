@@ -35,6 +35,7 @@ final class AppModel {
     private var lastConnectorRefresh = Date.distantPast
     private var lastBillingRefresh = Date.distantPast
     private var browserPurpose: BrowserRequest.Purpose?
+    private var accountStateRevision = 0
 
     private static let refreshFreshness: TimeInterval = 15
 
@@ -248,13 +249,9 @@ final class AppModel {
                 .filter { $0.connected && knownIDs.contains($0.connectorID) }
                 .map(\.connectorID)
                 .sorted()
-            let connectedSet = Set(connectedIDs)
-            let changed = selectedConnectorIDs != connectedIDs
-                || bots.contains { !Set($0.connectorIDs).isSubset(of: connectedSet) }
-            selectedConnectorIDs = connectedIDs
-            for index in bots.indices {
-                bots[index].connectorIDs = bots[index].connectorIDs.filter(connectedSet.contains)
-            }
+            let installedIDs = Array(Set(selectedConnectorIDs).union(connectedIDs)).sorted()
+            let changed = selectedConnectorIDs != installedIDs
+            selectedConnectorIDs = installedIDs
             if changed { await persist() }
         } catch is CancellationError {
             return
@@ -444,7 +441,30 @@ final class AppModel {
     private func activate(session: AccountSession) async throws {
         account = session.account
         profile = nil
-        let state = try await stateStore.load(accountID: session.account.id)
+        let cache = try await stateStore.load(accountID: session.account.id)
+        var state = cache.state
+        accountStateRevision = cache.serverRevision
+        do {
+            let remote = try await api.accountState()
+            let shouldMigrateLocal = cache.dirty || (cache.serverRevision == 0 && hasUserState(cache.state))
+            state = shouldMigrateLocal ? mergeAccountStates(remote.state, cache.state) : remote.state
+            accountStateRevision = remote.revision
+            if shouldMigrateLocal {
+                let saved = try await api.saveAccountState(state, baseRevision: remote.revision)
+                state = saved.state
+                accountStateRevision = saved.revision
+            }
+            try await stateStore.save(
+                state, accountID: session.account.id,
+                serverRevision: accountStateRevision, dirty: false
+            )
+        } catch {
+            try await stateStore.save(
+                state, accountID: session.account.id,
+                serverRevision: accountStateRevision,
+                dirty: cache.dirty
+            )
+        }
         bots = state.bots
         selectedConnectorIDs = state.selectedConnectorIDs
         if let active = state.activeBotID, bots.contains(where: { $0.id == active }) {
@@ -555,15 +575,49 @@ final class AppModel {
         let activeBotID: UUID?
         if case let .bot(id) = destination { activeBotID = id } else { activeBotID = nil }
         do {
+            let local = PersistedAccountState(
+                    bots: bots,
+                    selectedConnectorIDs: selectedConnectorIDs,
+                    activeBotID: activeBotID
+            )
+            try await stateStore.save(
+                local, accountID: account.id,
+                serverRevision: accountStateRevision, dirty: true
+            )
+            do {
+                let saved = try await api.saveAccountState(local, baseRevision: accountStateRevision)
+                applyRemoteState(saved.state)
+                accountStateRevision = saved.revision
+            } catch let service as ServiceError where service.status == 409 {
+                let remote = try await api.accountState()
+                let merged = mergeAccountStates(remote.state, local)
+                let saved = try await api.saveAccountState(merged, baseRevision: remote.revision)
+                applyRemoteState(saved.state)
+                accountStateRevision = saved.revision
+            }
             try await stateStore.save(
                 PersistedAccountState(
                     bots: bots,
                     selectedConnectorIDs: selectedConnectorIDs,
                     activeBotID: activeBotID
                 ),
-                accountID: account.id
+                accountID: account.id,
+                serverRevision: accountStateRevision,
+                dirty: false
             )
         } catch { report(error) }
+    }
+
+    private func applyRemoteState(_ state: PersistedAccountState) {
+        bots = state.bots
+        selectedConnectorIDs = state.selectedConnectorIDs
+        if let active = state.activeBotID, bots.contains(where: { $0.id == active }) {
+            destination = .bot(active)
+        } else if case let .bot(current) = destination, bots.contains(where: { $0.id == current }) {
+            destination = .bot(current)
+        } else if let first = bots.first {
+            destination = .bot(first.id)
+        }
     }
 
     private func report(_ error: Error) {
@@ -574,6 +628,12 @@ final class AppModel {
         browserPurpose = purpose
         browserRequest = BrowserRequest(url: url, purpose: purpose)
     }
+}
+
+private struct CachedAccountState: Codable, Sendable {
+    let state: PersistedAccountState
+    let serverRevision: Int
+    let dirty: Bool
 }
 
 private actor AccountStateStore {
@@ -589,23 +649,46 @@ private actor AccountStateStore {
         return value
     }()
 
-    func load(accountID: String) throws -> PersistedAccountState {
+    func load(accountID: String) throws -> CachedAccountState {
         let url = try fileURL(accountID: accountID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return PersistedAccountState() }
-        var state = try decoder.decode(
-            PersistedAccountState.self,
-            from: Data(contentsOf: url, options: [.mappedIfSafe])
-        )
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return CachedAccountState(state: PersistedAccountState(), serverRevision: 0, dirty: false)
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        var cache: CachedAccountState
+        if let envelope = try? decoder.decode(CachedAccountState.self, from: data) {
+            cache = envelope
+        } else {
+            cache = CachedAccountState(
+                state: try decoder.decode(PersistedAccountState.self, from: data),
+                serverRevision: 0,
+                dirty: true
+            )
+        }
+        var state = cache.state
         for index in state.bots.indices where state.bots[index].messages.count > 200 {
             state.bots[index].messages = Array(state.bots[index].messages.suffix(200))
         }
-        return state
+        return CachedAccountState(
+            state: state,
+            serverRevision: max(0, cache.serverRevision),
+            dirty: cache.dirty
+        )
     }
 
-    func save(_ state: PersistedAccountState, accountID: String) throws {
+    func save(
+        _ state: PersistedAccountState,
+        accountID: String,
+        serverRevision: Int,
+        dirty: Bool
+    ) throws {
         let url = try fileURL(accountID: accountID)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try encoder.encode(state).write(to: url, options: [.atomic, .completeFileProtection])
+        try encoder.encode(CachedAccountState(
+            state: state,
+            serverRevision: max(0, serverRevision),
+            dirty: dirty
+        )).write(to: url, options: [.atomic, .completeFileProtection])
     }
 
     func delete(accountID: String) throws {
@@ -625,6 +708,49 @@ private actor AccountStateStore {
         let digest = SHA256.hash(data: Data(accountID.utf8)).map { String(format: "%02x", $0) }.joined()
         return root.appending(path: "AgentGenia/accounts/\(digest).json")
     }
+}
+
+private func hasUserState(_ state: PersistedAccountState) -> Bool {
+    state.onboardingCompleted || !state.bots.isEmpty || !state.selectedConnectorIDs.isEmpty
+}
+
+private func mergeAccountStates(
+    _ server: PersistedAccountState,
+    _ local: PersistedAccountState
+) -> PersistedAccountState {
+    var bots = Dictionary(uniqueKeysWithValues: server.bots.map { ($0.id, $0) })
+    for localBot in local.bots {
+        guard let serverBot = bots[localBot.id] else {
+            bots[localBot.id] = localBot
+            continue
+        }
+        var messages = Dictionary(uniqueKeysWithValues: serverBot.messages.map { ($0.id, $0) })
+        localBot.messages.forEach { messages[$0.id] = $0 }
+        var workflows = Dictionary(uniqueKeysWithValues: serverBot.workflows.map { ($0.id, $0) })
+        for workflow in localBot.workflows {
+            if workflows[workflow.id] == nil || workflow.updatedAt >= workflows[workflow.id]!.updatedAt {
+                workflows[workflow.id] = workflow
+            }
+        }
+        var merged = localBot
+        merged.connectorIDs = Array(Set(serverBot.connectorIDs + localBot.connectorIDs)).sorted()
+        merged.messages = Array(messages.values.sorted { $0.createdAt < $1.createdAt }.suffix(200))
+        merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
+        bots[localBot.id] = merged
+    }
+    let mergedBots = Array(bots.values.sorted { $0.createdAt < $1.createdAt }.prefix(100))
+    let availableIDs = Set(mergedBots.map(\.id))
+    let active = local.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
+        ?? server.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
+        ?? mergedBots.first?.id
+    return PersistedAccountState(
+        onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
+        bots: mergedBots,
+        selectedConnectorIDs: Array(Set(
+            server.selectedConnectorIDs + local.selectedConnectorIDs
+        )).sorted(),
+        activeBotID: active
+    )
 }
 
 private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) -> String {

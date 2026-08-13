@@ -21,7 +21,7 @@ import {
   normalizeQuestionWidget,
   updateBotProfile
 } from "./contracts";
-import { DesktopOAuthController, safeComputerViewerUrl } from "./oauth";
+import { AccountStateConflictError, DesktopOAuthController, safeComputerViewerUrl } from "./oauth";
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
@@ -57,8 +57,13 @@ class DesktopStateStore {
   private state: AppState = initialAppState();
   private filePath: string | null = null;
   private writes: Promise<void> = Promise.resolve();
+  private revision = 0;
+  private dirty = false;
 
-  constructor(private readonly accountsDirectory: string) {}
+  constructor(
+    private readonly accountsDirectory: string,
+    private readonly remote: DesktopOAuthController
+  ) {}
 
   async activateAccount(
     accountId: string | null,
@@ -69,14 +74,30 @@ class DesktopStateStore {
     if (!accountId) {
       this.filePath = null;
       this.state = initialAppState();
+      this.revision = 0;
+      this.dirty = false;
       return structuredClone(this.state);
     }
     const scope = createHash("sha256").update(accountId).digest("hex");
     const nextFilePath = path.join(this.accountsDirectory, `${scope}.json`);
     let loaded: AppState | null = null;
+    let loadedRevision = 0;
+    let loadedDirty = false;
     let migratedLegacyFilePath = "";
     try {
-      loaded = normalizeAppState(JSON.parse(await readFile(nextFilePath, "utf8")));
+      const parsed: unknown = JSON.parse(await readFile(nextFilePath, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "state" in parsed) {
+        const envelope = parsed as Record<string, unknown>;
+        loaded = normalizeAppState(envelope.state);
+        loadedRevision = typeof envelope.serverRevision === "number"
+          && Number.isSafeInteger(envelope.serverRevision)
+          && envelope.serverRevision >= 0
+          ? envelope.serverRevision
+          : 0;
+        loadedDirty = envelope.dirty === true;
+      } else {
+        loaded = normalizeAppState(parsed);
+      }
     } catch {}
     if (!loaded && options.legacyFilePath) {
       try {
@@ -87,7 +108,20 @@ class DesktopStateStore {
     if (!loaded && options.claimGuest && hasUserState(guestState)) loaded = guestState;
     this.filePath = nextFilePath;
     this.state = loaded ?? initialAppState();
-    if (loaded) {
+    this.revision = loadedRevision;
+    this.dirty = loadedDirty;
+    try {
+      const server = await this.remote.loadAccountState();
+      const shouldMergeLocal = Boolean(loaded && hasUserState(loaded) && (loadedRevision === 0 || loadedDirty));
+      this.state = shouldMergeLocal ? mergeAppStates(server.state, loaded!) : server.state;
+      this.revision = server.revision;
+      this.dirty = shouldMergeLocal;
+      if (shouldMergeLocal) await this.syncRemote();
+    } catch (error) {
+      this.dirty = this.dirty || (this.revision === 0 && hasUserState(this.state));
+      console.error(`[account-state] No fue posible cargar el estado remoto: ${errorMessage(error)}`);
+    }
+    if (loaded || hasUserState(this.state)) {
       await this.persist(this.state);
       if (migratedLegacyFilePath) {
         await rename(migratedLegacyFilePath, `${migratedLegacyFilePath}.migrated`).catch(() => undefined);
@@ -101,11 +135,33 @@ class DesktopStateStore {
   }
 
   async update(mutator: (current: AppState) => AppState): Promise<AppState> {
-    this.state = normalizeAppState(mutator(structuredClone(this.state)));
-    const snapshot = structuredClone(this.state);
-    this.writes = this.writes.then(() => this.persist(snapshot));
+    let result = structuredClone(this.state);
+    this.writes = this.writes.then(async () => {
+      this.state = normalizeAppState(mutator(structuredClone(this.state)));
+      this.dirty = true;
+      await this.persist(this.state);
+      try {
+        await this.syncRemote();
+      } catch (error) {
+        console.error(`[account-state] No fue posible sincronizar el cambio: ${errorMessage(error)}`);
+      }
+      result = structuredClone(this.state);
+    });
     await this.writes;
-    return structuredClone(snapshot);
+    return result;
+  }
+
+  async reconcileConnections(connections: Awaited<ReturnType<DesktopOAuthController["snapshot"]>>): Promise<AppState> {
+    if (!connections.account.connected) return this.snapshot();
+    const connected = normalizeConnectorIds(
+      connections.connectors.filter((item) => item.connected).map((item) => item.connectorId)
+    ).sort();
+    const current = await this.snapshot();
+    const next = normalizeAppState({
+      ...current,
+      selectedConnectorIds: normalizeConnectorIds([...current.selectedConnectorIds, ...connected]).sort()
+    });
+    return JSON.stringify(current) === JSON.stringify(next) ? current : this.update(() => next);
   }
 
   async deleteActiveAccount(): Promise<AppState> {
@@ -113,6 +169,8 @@ class DesktopStateStore {
     const accountFilePath = this.filePath;
     this.filePath = null;
     this.state = initialAppState();
+    this.revision = 0;
+    this.dirty = false;
     if (accountFilePath) await rm(accountFilePath, { force: true });
     return structuredClone(this.state);
   }
@@ -121,13 +179,84 @@ class DesktopStateStore {
     if (!this.filePath) return;
     await mkdir(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporaryPath, `${JSON.stringify({
+      state: snapshot,
+      serverRevision: this.revision,
+      dirty: this.dirty
+    }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(temporaryPath, this.filePath);
+  }
+
+  private async syncRemote(): Promise<void> {
+    if (!this.filePath || !this.dirty) return;
+    try {
+      const saved = await this.remote.saveAccountState(this.state, this.revision);
+      this.state = saved.state;
+      this.revision = saved.revision;
+      this.dirty = false;
+      await this.persist(this.state);
+    } catch (error) {
+      if (!(error instanceof AccountStateConflictError)) throw error;
+      this.state = mergeAppStates(error.current.state, this.state);
+      this.revision = error.current.revision;
+      const saved = await this.remote.saveAccountState(this.state, this.revision);
+      this.state = saved.state;
+      this.revision = saved.revision;
+      this.dirty = false;
+      await this.persist(this.state);
+    }
   }
 }
 
 function hasUserState(state: AppState): boolean {
   return state.onboardingCompleted || state.bots.length > 0 || state.selectedConnectorIds.length > 0;
+}
+
+function mergeAppStates(server: AppState, local: AppState): AppState {
+  const bots = new Map(server.bots.map((bot) => [bot.id, bot]));
+  for (const localBot of local.bots) {
+    const serverBot = bots.get(localBot.id);
+    if (!serverBot) {
+      bots.set(localBot.id, localBot);
+      continue;
+    }
+    const messages = new Map(serverBot.messages.map((message) => [message.id, message]));
+    for (const message of localBot.messages) messages.set(message.id, message);
+    const workflows = new Map(serverBot.workflows.map((workflow) => [workflow.id, workflow]));
+    for (const workflow of localBot.workflows) {
+      const existing = workflows.get(workflow.id);
+      if (!existing || Date.parse(workflow.updatedAt) >= Date.parse(existing.updatedAt)) {
+        workflows.set(workflow.id, workflow);
+      }
+    }
+    bots.set(localBot.id, {
+      ...serverBot,
+      ...localBot,
+      connectorIds: normalizeConnectorIds([...serverBot.connectorIds, ...localBot.connectorIds]),
+      messages: [...messages.values()]
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+        .slice(-200),
+      workflows: [...workflows.values()].slice(-50)
+    });
+  }
+  const mergedBots = [...bots.values()].slice(0, 100);
+  const activeBotId = local.activeBotId && mergedBots.some((bot) => bot.id === local.activeBotId)
+    ? local.activeBotId
+    : server.activeBotId;
+  return normalizeAppState({
+    version: 1,
+    onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
+    selectedConnectorIds: normalizeConnectorIds([
+      ...server.selectedConnectorIds,
+      ...local.selectedConnectorIds
+    ]),
+    bots: mergedBots,
+    activeBotId
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 app.setName("Agent Genia");
@@ -176,11 +305,16 @@ app.on("second-instance", () => {
 
 function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.bootstrap, () => stateStore.snapshot());
-  ipcMain.handle(CHANNELS.connectionSnapshot, () => oauthController.snapshot());
+  ipcMain.handle(CHANNELS.connectionSnapshot, async () => {
+    const connections = await oauthController.snapshot();
+    await stateStore.reconcileConnections(connections);
+    return connections;
+  });
   ipcMain.handle(CHANNELS.signIn, async () => {
     const wasSignedOut = !(await oauthController.accountId());
     const connections = await oauthController.signIn();
     await stateStore.activateAccount(await oauthController.accountId(), { claimGuest: wasSignedOut });
+    await stateStore.reconcileConnections(connections);
     return connections;
   });
   ipcMain.handle(CHANNELS.signOut, async () => {
@@ -211,13 +345,17 @@ function registerDesktopIpc(): void {
     }
     return connections;
   });
-  ipcMain.handle(CHANNELS.connectConnector, (_event, connectorId: unknown) => {
+  ipcMain.handle(CHANNELS.connectConnector, async (_event, connectorId: unknown) => {
     if (typeof connectorId !== "string") throw new Error("Conector inválido.");
-    return oauthController.connect(connectorId);
+    const connections = await oauthController.connect(connectorId);
+    await stateStore.reconcileConnections(connections);
+    return connections;
   });
-  ipcMain.handle(CHANNELS.disconnectConnector, (_event, connectorId: unknown) => {
+  ipcMain.handle(CHANNELS.disconnectConnector, async (_event, connectorId: unknown) => {
     if (typeof connectorId !== "string") throw new Error("Conector inválido.");
-    return oauthController.disconnect(connectorId);
+    const connections = await oauthController.disconnect(connectorId);
+    await stateStore.reconcileConnections(connections);
+    return connections;
   });
   ipcMain.handle(CHANNELS.billingSnapshot, () => oauthController.billingStatus());
   ipcMain.handle(CHANNELS.startCheckout, (_event, tier: unknown) => {
@@ -785,8 +923,6 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   const userDataPath = app.getPath("userData");
   const wrapperServiceUrl = process.env.WRAPPER_SERVICE_URL?.trim()
     || "https://agentgenia-api.onrender.com";
-  stateStore = new DesktopStateStore(path.join(userDataPath, "accounts"));
-  teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   oauthController = new DesktopOAuthController({
     baseUrl: wrapperServiceUrl,
     safeStorage,
@@ -794,10 +930,16 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     shell,
     appVersion: app.getVersion()
   });
+  stateStore = new DesktopStateStore(path.join(userDataPath, "accounts"), oauthController);
+  teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   const startupAccountId = await oauthController.accountId();
   await stateStore.activateAccount(startupAccountId, {
     ...(startupAccountId ? { legacyFilePath: path.join(userDataPath, "desktop-state.json") } : {})
   });
+  if (startupAccountId) {
+    const connections = await oauthController.snapshot().catch(() => null);
+    if (connections) await stateStore.reconcileConnections(connections);
+  }
   registerDesktopIpc();
   configureDisplayMedia();
   createWindow();

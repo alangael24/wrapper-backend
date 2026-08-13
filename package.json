@@ -1,7 +1,7 @@
 {
   "name": "wrapper-backend-pi-runtime",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Agent Genia desktop client and Pi harness runtime",
   "author": "Agent Genia",
   "license": "UNLICENSED",

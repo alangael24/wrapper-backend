@@ -9,6 +9,8 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/account-auth/logout   Revocar la sesión actual
   POST /v1/account-auth/apple    Verificar Sign in with Apple nativo
   POST /v1/account/delete        Eliminar definitivamente la cuenta autenticada
+  GET  /v1/account-state         Leer bots y preferencias sincronizados
+  POST /v1/account-state         Guardar estado con control de revisión
   GET  /v1/connectors            Catalogo y conexiones del usuario
   GET  /v1/connectors/<id>       Estado de una cuenta conectada
   POST /v1/connectors/start      Crear un Connect Link de Composio
@@ -46,6 +48,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -64,6 +67,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .apple_auth import AppleAccountAuth, AppleAuthError
+from .account_state import AccountStateError, empty_account_state, normalize_account_state
 from .billing import BillingConfig, BillingError, BillingService
 from .connector_adapters import (
     ComposioConnectorAdapter,
@@ -92,7 +96,7 @@ from .pi_harness import (
     PiHarnessUsageError,
 )
 from .postgres_store import create_store
-from .store import hash_agent_run_token
+from .store import AccountStateConflict, hash_agent_run_token
 from .tiers import (
     DEFAULT_TIER,
     effective_limits,
@@ -1056,6 +1060,75 @@ class Backend:
                 "pi_sessions_deleted": pi_sessions_deleted,
             },
         )
+
+    # ---------- estado sincronizado de la aplicación ----------
+    @staticmethod
+    def _account_state_payload(row: dict | None) -> dict:
+        if not row:
+            return {
+                "revision": 0,
+                "state": empty_account_state(),
+                "updated_at": None,
+            }
+        try:
+            state = normalize_account_state(json.loads(row.get("state_json") or "{}"))
+        except (json.JSONDecodeError, AccountStateError):
+            logging.exception("Estado de cuenta inválido almacenado para %s", row.get("user_id"))
+            state = empty_account_state()
+        return {
+            "revision": int(row.get("revision") or 0),
+            "state": state,
+            "updated_at": row.get("updated_at"),
+        }
+
+    def handle_account_state_get(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self._account_state_payload(
+            self.store.get_account_state(user["id"])
+        ))
+
+    def handle_account_state_save(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        base_revision = body.get("base_revision")
+        device_id = body.get("device_id")
+        if not isinstance(base_revision, int) or isinstance(base_revision, bool) or base_revision < 0:
+            error_response(handler, 400, "base_revision inválida", "invalid_account_state")
+            return
+        if not isinstance(device_id, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            device_id,
+        ):
+            error_response(handler, 400, "device_id inválido", "invalid_account_state")
+            return
+        try:
+            state = normalize_account_state(body.get("state"))
+            state_json = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+            row = self.store.save_account_state(
+                user_id=user["id"],
+                base_revision=base_revision,
+                state_json=state_json,
+                device_hash=hashlib.sha256(
+                    f"account-state-device|{device_id}".encode()
+                ).hexdigest(),
+            )
+        except AccountStateError as exc:
+            error_response(handler, 400, str(exc), "invalid_account_state")
+            return
+        except AccountStateConflict as exc:
+            json_response(handler, 409, {
+                "error": {
+                    "message": "La cuenta cambió en otro dispositivo.",
+                    "type": "account_state_conflict",
+                },
+                "current": self._account_state_payload(exc.current),
+            })
+            return
+        json_response(handler, 200, self._account_state_payload(row))
 
     # ---------- connector accounts ----------
     def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:
@@ -2198,6 +2271,10 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_apple(self)
             elif self.command == "POST" and path == "/v1/account/delete":
                 backend.handle_account_delete(self)
+            elif self.command == "GET" and path == "/v1/account-state":
+                backend.handle_account_state_get(self)
+            elif self.command == "POST" and path == "/v1/account-state":
+                backend.handle_account_state_save(self)
             elif self.command == "GET" and path == "/connections/complete":
                 html_response(self, 200, completion_html())
             elif path.startswith("/v1/connectors/native/setup/"):
