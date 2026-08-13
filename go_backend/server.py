@@ -3,6 +3,7 @@
 Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/account-auth/start    Iniciar login con Google
   POST /v1/account-auth/status  Consumir login desde el dispositivo original
+  GET  /v1/account-auth/status/<attempt_id>  Consultar login desde Electron
   GET  /v1/account-auth/google/callback
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
@@ -959,6 +960,19 @@ class Backend:
         body = self.read_json(handler) or {}
         attempt_id = body.get("attempt_id") if isinstance(body.get("attempt_id"), str) else ""
         device_id = body.get("device_id") if isinstance(body.get("device_id"), str) else ""
+        json_response(
+            handler,
+            200,
+            self.google_auth.status(attempt_id=attempt_id, device_id=device_id),
+        )
+
+    def handle_account_auth_status_get(
+        self,
+        handler: BaseHTTPRequestHandler,
+        attempt_id: str,
+        query: dict[str, list[str]],
+    ) -> None:
+        device_id = (query.get("device_id") or [""])[0]
         json_response(
             handler,
             200,
@@ -2166,6 +2180,8 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query, keep_blank_values=True)
             if self.command == "POST" and path == "/v1/account-auth/start":
                 backend.handle_account_auth_start(self)
+            elif self.command == "GET" and path.startswith("/v1/account-auth/status/"):
+                backend.handle_account_auth_status_get(self, path.rsplit("/", 1)[-1], query)
             elif self.command == "POST" and path == "/v1/account-auth/status":
                 backend.handle_account_auth_status(self)
             elif self.command == "GET" and path == "/v1/account-auth/google/callback":

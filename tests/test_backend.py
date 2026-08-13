@@ -491,6 +491,28 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 401)
 
+    def test_google_account_auth_status_supports_electron_get_endpoint(self):
+        self.configure_fake_google()
+        device_id = str(uuid.uuid4())
+        _, started = self.ws.req(
+            "POST", "/v1/account-auth/start", {"device_id": device_id, "app_version": "0.1.0"}
+        )
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(started["authorize_url"]).query)
+        self.ws.req(
+            "GET",
+            "/v1/account-auth/google/callback?" + urllib.parse.urlencode({
+                "state": params["state"][0], "code": "ok"
+            }),
+            raw=True,
+        )
+        status, completed = self.ws.req(
+            "GET",
+            f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(completed["status"], "complete")
+        self.assertTrue(completed["token"].startswith("aga_"))
+
     def test_google_login_does_not_link_unverified_signup_email(self):
         status, signup = self.ws.req("POST", "/v1/signup", {"email": "alan@example.com"})
         self.assertEqual(status, 201)
