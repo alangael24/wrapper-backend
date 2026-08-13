@@ -9,6 +9,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     VIRTUAL_ENV=/opt/venv \
     PNPM_HOME=/opt/pnpm \
+    HOME=/app/data \
+    XDG_CACHE_HOME=/app/data/.cache \
+    COMPOSIO_CACHE_DIR=/app/data/.composio \
     PATH=/opt/venv/bin:/opt/pnpm:/usr/local/bin:/usr/bin:/bin \
     HOST=0.0.0.0 \
     PORT=8787 \
@@ -40,7 +43,7 @@ COPY run.sh README.md ./
 
 RUN set -eux; \
     chmod 0755 run.sh scripts/pi-sandbox scripts/setup-pi-sandbox.sh; \
-    mkdir -p /app/data/pi-runs; \
+    mkdir -p /app/data/pi-runs /app/data/.cache /app/data/.composio; \
     chown -R 10001:10001 /app/data
 
 USER 10001:10001
