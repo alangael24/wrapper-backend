@@ -525,7 +525,7 @@ recursos facturables huérfanos.
 |---|---|---|
 | POST | `/v1/account-auth/start` | Inicia Google OAuth para un `device_id` UUID |
 | POST | `/v1/account-auth/status` | Consume una sola vez el intento enviado en el body y entrega la sesión al dispositivo original |
-| GET | `/v1/account-auth/status/<attempt_id>` | Consulta el estado del intento; `device_id` se envía por query para Electron |
+| GET | `/v1/account-auth/status/<attempt_id>` | Compatibilidad temporal con builds Electron antiguas; las builds actuales usan el POST para no incluir identificadores en la URL |
 | GET | `/v1/account-auth/google/callback` | Callback exacto registrado en Google Cloud |
 | GET | `/v1/account-auth/complete` | Página final del login |
 | GET | `/connections/complete` | Página final de autorización de conectores |

@@ -372,6 +372,8 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
   assert.match(oauth, /agent-genia-account\.bin/);
   assert.doesNotMatch(oauth, /agent-genia-connectors-account\.bin/);
   assert.match(oauth, /WrapperServiceClient/);
+  assert.match(oauth, /this\.publicJson\("\/v1\/account-auth\/status",\s*\{\s*method: "POST",\s*body: \{ attempt_id: attemptId, device_id: deviceId \}/);
+  assert.doesNotMatch(oauth, /account-auth\/status\/\$\{encodeURIComponent\(attemptId\)\}/);
   assert.match(main, /WRAPPER_SERVICE_URL\?\.trim\(\)/);
   assert.match(main, /https:\/\/agentgenia-api\.onrender\.com/);
   assert.match(oauth, /managed_connection_id/);

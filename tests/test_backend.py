@@ -505,6 +505,12 @@ class TestBackend(unittest.TestCase):
             }),
             raw=True,
         )
+        status, rejected = self.ws.req(
+            "GET",
+            f"/v1/account-auth/status/{started['attempt_id']}?device_id={uuid.uuid4()}",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(rejected["error"]["type"], "not_found")
         status, completed = self.ws.req(
             "GET",
             f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}",
@@ -512,6 +518,12 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(completed["status"], "complete")
         self.assertTrue(completed["token"].startswith("aga_"))
+        status, replayed = self.ws.req(
+            "GET",
+            f"/v1/account-auth/status/{started['attempt_id']}?device_id={device_id}",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(replayed["error"]["type"], "not_found")
 
     def test_google_login_does_not_link_unverified_signup_email(self):
         status, signup = self.ws.req("POST", "/v1/signup", {"email": "alan@example.com"})
