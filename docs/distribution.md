@@ -121,6 +121,9 @@ AAB/checksum inmutable en GitHub y emite provenance sin depender de Play. Cuando
 la cuenta de servicio esté disponible, un dispatch del mismo tag con
 `publish_to_play=true` recompila el binario firmado y lo envía al track
 seleccionado (`internal` por defecto) sin reemplazar el artefacto público. La
+opción de mantenimiento `attest_existing_release=true` descarga el AAB público,
+verifica su checksum y firma, y repara únicamente su provenance sin recompilarlo
+ni reemplazarlo. No puede combinarse con la publicación a Play. La
 build distribuible usa Android 16/API 36 estable (no el SDK
 preview de Android 17), que cumple el requisito de Google Play vigente desde el
 31 de agosto de 2026. La build Release oculta Stripe; para venta móvil futura se

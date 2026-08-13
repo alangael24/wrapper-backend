@@ -25,10 +25,16 @@ on:
         required: true
         default: false
         type: boolean
+      attest_existing_release:
+        description: Attest the immutable AAB already attached to this GitHub Release
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   id-token: write
+  attestations: write
 
 concurrency:
   group: android-release-${{ inputs.tag || github.ref }}
@@ -44,6 +50,7 @@ jobs:
       PLAY_TRACK: ${{ inputs.track || 'internal' }}
       BUILD_REVISION: ${{ inputs.build_revision || '0' }}
       PUBLISH_TO_PLAY: ${{ inputs.publish_to_play || false }}
+      ATTEST_EXISTING_RELEASE: ${{ inputs.attest_existing_release || false }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -68,6 +75,7 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - name: Require and install signing key
+        if: inputs.attest_existing_release != true
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
@@ -90,25 +98,44 @@ jobs:
           test "$BUILD_REVISION" -le 99 || { echo "build_revision must be 0-99"; exit 1; }
           version_code="$(python3 -c 'import sys; a=[int(x) for x in sys.argv[1].split(".")]; print((a[0]*1000000+a[1]*1000+a[2])*100+int(sys.argv[2]))' "$version" "$BUILD_REVISION")"
           test "$version_code" -le 2100000000 || { echo "Computed versionCode exceeds Google Play maximum"; exit 1; }
+          if [ "$PUBLISH_TO_PLAY" = true ] && [ "$ATTEST_EXISTING_RELEASE" = true ]; then
+            echo "publish_to_play and attest_existing_release are mutually exclusive"
+            exit 1
+          fi
           echo "AGENTGENIA_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
       - name: Require a production-ready backend
         run: python scripts/verify-live-readiness.py
       - name: Require a valid Google Play service account
-        if: inputs.publish_to_play == true
+        if: inputs.publish_to_play == true && inputs.attest_existing_release != true
         env:
           GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
           python -c 'import json,os; value=json.loads(os.environ["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"]); assert value.get("type") == "service_account" and value.get("client_email") and value.get("private_key")'
       - name: Test, lint, and build signed AAB
+        if: inputs.attest_existing_release != true
         working-directory: android/AgentGenia
         run: ./gradlew clean testDebugUnitTest lintDebug assembleDebug bundleRelease
+      - name: Download and verify the immutable release AAB
+        if: inputs.attest_existing_release == true
+        run: |
+          source_dir="$RUNNER_TEMP/existing-android-release"
+          output_dir="android/AgentGenia/app/build/outputs/bundle/release"
+          mkdir -p "$source_dir" "$output_dir"
+          gh release download "$RELEASE_TAG" \
+            --pattern app-release.aab \
+            --pattern SHA256SUMS.txt \
+            --dir "$source_dir"
+          (cd "$source_dir" && sha256sum --check SHA256SUMS.txt)
+          cp "$source_dir/app-release.aab" "$output_dir/app-release.aab"
+          cp "$source_dir/SHA256SUMS.txt" "$output_dir/SHA256SUMS.txt"
       - name: Verify AAB signature
         run: jarsigner -verify -verbose -certs android/AgentGenia/app/build/outputs/bundle/release/app-release.aab
       - name: Generate checksum
+        if: inputs.attest_existing_release != true
         run: sha256sum android/AgentGenia/app/build/outputs/bundle/release/app-release.aab > android/AgentGenia/app/build/outputs/bundle/release/SHA256SUMS.txt
       - name: Stage an immutable draft GitHub Release
-        if: inputs.publish_to_play != true
+        if: inputs.publish_to_play != true && inputs.attest_existing_release != true
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; refusing to replace its immutable AAB"
@@ -120,7 +147,7 @@ jobs:
               --draft --verify-tag --generate-notes --title "Agent Genia Android ${RELEASE_TAG#android-v}"
           fi
       - name: Upload to Google Play
-        if: inputs.publish_to_play == true
+        if: inputs.publish_to_play == true && inputs.attest_existing_release != true
         uses: r0adkll/upload-google-play@935ef9c68bb393a8e6116b1575626a7f5be3a7fb
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
@@ -135,7 +162,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Publish the staged GitHub Release
-        if: inputs.publish_to_play != true
+        if: inputs.publish_to_play != true && inputs.attest_existing_release != true
         run: gh release edit "$RELEASE_TAG" --draft=false --latest=false
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:

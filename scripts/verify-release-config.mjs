@@ -111,12 +111,15 @@ if (!pythonLock.includes("--hash=sha256:")) {
 }
 if (!desktopReleaseWorkflow.includes("inputs.platforms == 'windows'")
   || !desktopReleaseWorkflow.includes("forceCodeSigning=${{ runner.os != 'Linux' }}")
-  || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")) {
+  || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")
+  || !desktopReleaseWorkflow.includes("attestations: write")) {
   throw new Error("Desktop release must append Windows only through its signed, checksum-preserving path");
 }
 if (!androidReleaseWorkflow.includes("if: inputs.publish_to_play == true")
   || !androidReleaseWorkflow.includes("if: inputs.publish_to_play != true")
-  || !androidReleaseWorkflow.includes("refusing to replace its immutable AAB")) {
+  || !androidReleaseWorkflow.includes("refusing to replace its immutable AAB")
+  || !androidReleaseWorkflow.includes("attest_existing_release")
+  || !androidReleaseWorkflow.includes("attestations: write")) {
   throw new Error("Android release must separate immutable signed AAB publication from Google Play promotion");
 }
 for (const key of [
