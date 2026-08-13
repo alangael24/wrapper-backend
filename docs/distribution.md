@@ -13,9 +13,9 @@ Actualiza de forma coordinada `package.json`, `MARKETING_VERSION` de iOS y
 accidente:
 
 ```text
-desktop-v1.0.0   → GitHub Release + canal electron-updater
-ios-v1.0.0       → App Store Connect / TestFlight
-android-v1.0.0   → Google Play + GitHub Release del AAB
+desktop-v1.0.1   → GitHub Release + canal electron-updater
+ios-v1.0.1       → App Store Connect / TestFlight
+android-v1.0.1   → Google Play + GitHub Release del AAB
 ```
 
 Los build numbers móviles se derivan determinísticamente de SemVer y una revisión
@@ -87,6 +87,13 @@ un plan comprado fuera de la app, pero no existe CTA de compra dentro de iOS.
 Si se quiere vender dentro de la app, primero hay que implementar StoreKit y
 mapear recibos a entitlements del backend.
 
+La app ofrece Google y Sign in with Apple. El App ID, provisioning profile y
+entitlements deben incluir la capability de Sign in with Apple. El backend debe
+tener `APPLE_CLIENT_ID`, `APPLE_TEAM_ID`, `APPLE_KEY_ID` y
+`APPLE_PRIVATE_KEY_BASE64`; conserva cifrado el refresh token únicamente para
+revocarlo cuando el usuario elimina su cuenta. `ITSAppUsesNonExemptEncryption`
+está declarado en `NO` porque la app solo usa el cifrado estándar del sistema.
+
 ## Android
 
 `Android` ejecuta unit tests, lint, APK Debug y pruebas instrumentadas de inicio,
@@ -121,13 +128,45 @@ debe compararse con los proveedores y datos realmente habilitados al enviar.
 
 ## Backend reproducible
 
-`Dockerfile` fija Python, Node y pnpm, instala Bubblewrap/Chromium y usa un usuario
-sin privilegios. `render.yaml` exige que producción reciba `DATABASE_URL`,
-`WRAPPER_SECRET`, `ADMIN_TOKEN` y los secretos de proveedores desde Render. Las
-funciones costosas (`PI_ENABLED`, `COMPUTERS_ENABLED`, `STRIPE_ENABLED`) empiezan
-apagadas y se activan solo después de configurar sus secretos y verificar
-`/readyz`.
+`Dockerfile` fija Python, Node y pnpm, instala el lock universal de Python con
+hashes, instala Bubblewrap/Chromium y usa un usuario sin privilegios. Para
+actualizarlo, cambia `requirements.in` y regenera `requirements.txt` con
+`uv pip compile --universal --generate-hashes`. CI audita los locks de Python y
+Node antes de construir. `render.yaml` exige que producción reciba `DATABASE_URL`,
+`WRAPPER_SECRET`, `ADMIN_TOKEN` y los secretos de proveedores desde Render. El
+blueprint de producción activa Stripe, las computadoras y Pi. El proceso falla
+cerrado si falta cualquier secreto obligatorio y `/readyz` solo responde 200
+cuando la base de datos, capacidad de modelo, OAuth Google/Apple, Stripe,
+Composio, Daytona, Pi y pi-chrome están disponibles. `/healthz` es liveness puro
+y no consulta dependencias; `/readyz` expone su estado sin revelar secretos. El signup público heredado
+permanece deshabilitado en producción.
+
+`COMPOSIO_AUTH_CONFIGS_JSON` es un secreto obligatorio del servicio, no un `{}`
+de ejemplo. La readiness compara `available_connectors` con el catálogo completo:
+si una integración publicada carece de toolkit, Auth Config privado o adaptador
+first-party, ninguna app puede distribuirse hasta configurarla o retirarla del
+catálogo. Esto evita que Marketplace prometa conectores que solo funcionan en la
+interfaz.
+
+Render espera a que los checks de GitHub terminen correctamente antes de hacer
+auto-deploy. Su health check usa `/platformz`, que comprueba proceso y base de
+datos sin reiniciar el servicio por una caída transitoria de Stripe, Composio o
+Daytona. `/readyz` conserva el chequeo integral, y los tres workflows de release
+lo consultan antes de firmar o publicar cualquier binario; si producción no está
+realmente operativa, la distribución se detiene.
+
+La migración `20260813032540_apple_identity_tokens.sql` lleva el esquema a la
+versión 9. Debe aplicarse antes de desplegar el binario; el verificador de release
+impide publicar si el historial local deja de coincidir con el historial remoto.
 
 El sandbox Bubblewrap requiere un host Linux con user namespaces habilitados. Si
 el runtime de contenedores los bloquea, `/v1/agent/status` debe permanecer
 deshabilitado; nunca cambies `PI_BIN` al ejecutable sin sandbox.
+
+## Eliminación de cuenta
+
+iOS, Android y Electron permiten borrar la cuenta dentro de la app. El backend cancela
+primero la suscripción Stripe, revoca Sign in with Apple y desconecta conectores
+y computadoras; después elimina sesiones, bots, credenciales y datos personales.
+La URL pública `/account-deletion` ofrece instrucciones y un canal alternativo
+verificado para las fichas de ambas tiendas.

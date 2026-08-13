@@ -30,7 +30,7 @@ RUN set -eux; \
 
 WORKDIR /app
 COPY requirements.txt package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
     && pnpm install --prod --frozen-lockfile
 
 COPY go_backend ./go_backend

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -159,6 +159,23 @@ CREATE TABLE IF NOT EXISTS connector_auth_attempts (
   updated_at             REAL NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS account_identity_tokens (
+  token_hash TEXT PRIMARY KEY,
+  provider   TEXT NOT NULL,
+  expires_at REAL NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_provider_credentials (
+  account_id     TEXT NOT NULL,
+  provider       TEXT NOT NULL,
+  credential_enc BLOB NOT NULL,
+  key_id         TEXT NOT NULL,
+  key_version    INTEGER NOT NULL DEFAULT 1,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  PRIMARY KEY(account_id, provider),
+  FOREIGN KEY(account_id) REFERENCES account_identities(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -184,6 +201,10 @@ CREATE INDEX IF NOT EXISTS idx_account_auth_attempts_expires
   ON account_auth_attempts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_connector_auth_attempts_user
   ON connector_auth_attempts(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_account_identity_tokens_expires
+  ON account_identity_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_account_provider_credentials_account
+  ON account_provider_credentials(account_id);
 """
 
 
@@ -821,6 +842,117 @@ class Store:
             raise RuntimeError("No se pudo leer la identidad Google recién guardada")
         return account
 
+    def get_or_create_federated_account(
+        self,
+        *,
+        provider: str,
+        subject: str,
+        email: str | None,
+        name: str | None,
+        picture: str | None,
+        identity_token_hash: str,
+        token_expires_at: float,
+    ) -> dict:
+        """Consume un token firmado una sola vez y crea/actualiza su identidad.
+
+        No enlaza identidades por email. El identificador estable es siempre el
+        ``(provider, subject)`` firmado por el proveedor.
+        """
+        if provider not in {"apple"}:
+            raise ValueError("Proveedor de identidad no permitido")
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "DELETE FROM account_identity_tokens WHERE expires_at<=?", (now,)
+                )
+                consumed = self._conn.execute(
+                    "INSERT INTO account_identity_tokens(token_hash,provider,expires_at,created_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(token_hash) DO NOTHING",
+                    (identity_token_hash, provider, token_expires_at, now),
+                )
+                if consumed.rowcount != 1:
+                    raise PermissionError("El token de identidad ya fue utilizado")
+                existing = self._conn.execute(
+                    "SELECT a.*,u.account_status FROM account_identities a "
+                    "JOIN users u ON u.id=a.user_id WHERE a.provider=? AND a.subject=?",
+                    (provider, subject),
+                ).fetchone()
+                if existing is None:
+                    if not email or "@" not in email:
+                        raise ValueError(
+                            "Apple no devolvió el email inicial. Revoca Agent Genia en "
+                            "Ajustes de Apple ID e intenta nuevamente."
+                        )
+                    user_id = new_id("usr")
+                    account_id = new_id("acct")
+                    internal_api_key = secrets.token_urlsafe(48)
+                    self._conn.execute(
+                        "INSERT INTO users(id,name,email,api_key_hash,subscription_id,tier,created_at) "
+                        "VALUES(?,?,?,?,NULL,'free',?)",
+                        (user_id, name, email, hash_wrapper_key(internal_api_key), now),
+                    )
+                    self._conn.execute(
+                        "INSERT INTO account_identities("
+                        "id,user_id,provider,subject,email,email_verified,name,picture,created_at,updated_at"
+                        ") VALUES(?,?,?,?,?,1,?,?,?,?)",
+                        (account_id, user_id, provider, subject, email, name, picture, now, now),
+                    )
+                else:
+                    if existing["account_status"] != "active":
+                        raise PermissionError("La cuenta está deshabilitada")
+                    account_id = existing["id"]
+                    user_id = existing["user_id"]
+                    next_email = email or existing["email"]
+                    next_name = name or existing["name"]
+                    next_picture = picture or existing["picture"]
+                    self._conn.execute(
+                        "UPDATE account_identities SET email=?,email_verified=1,name=?,picture=?,updated_at=? "
+                        "WHERE id=?",
+                        (next_email, next_name, next_picture, now, account_id),
+                    )
+                    self._conn.execute(
+                        "UPDATE users SET name=?,email=? WHERE id=?",
+                        (next_name, next_email, user_id),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        account = self.get_account_identity(account_id)
+        if account is None:  # pragma: no cover - defensa ante corrupción externa
+            raise RuntimeError("No se pudo leer la identidad recién guardada")
+        return account
+
+    def put_account_provider_credential(
+        self,
+        *,
+        account_id: str,
+        provider: str,
+        credential_enc: bytes,
+        key_id: str,
+        key_version: int,
+    ) -> None:
+        now = _now()
+        self._exec(
+            "INSERT INTO account_provider_credentials("
+            "account_id,provider,credential_enc,key_id,key_version,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,provider) DO UPDATE SET "
+            "credential_enc=excluded.credential_enc,key_id=excluded.key_id,"
+            "key_version=excluded.key_version,updated_at=excluded.updated_at",
+            (account_id, provider, credential_enc, key_id, key_version, now, now),
+        )
+
+    def get_account_provider_credential(self, user_id: str, provider: str) -> dict | None:
+        row = self._one(
+            "SELECT c.*,a.user_id FROM account_provider_credentials c "
+            "JOIN account_identities a ON a.id=c.account_id "
+            "WHERE a.user_id=? AND c.provider=?",
+            (user_id, provider),
+        )
+        return dict(row) if row else None
+
     def get_account_identity(self, account_id: str) -> dict | None:
         row = self._one(
             "SELECT a.*, u.tier, u.subscription_id,u.account_status,u.disabled_at FROM account_identities a "
@@ -974,6 +1106,60 @@ class Store:
                     "connector_credentials_deleted": int(connectors),
                     "disabled_at": now,
                 }
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def delete_user_account(self, user_id: str) -> dict:
+        """Elimina definitivamente una cuenta y todos sus datos locales."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._conn.execute(
+                    "SELECT * FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                if user is None:
+                    raise KeyError(user_id)
+                subscription_id = user["subscription_id"]
+                subscription_source = None
+                if subscription_id:
+                    subscription = self._conn.execute(
+                        "SELECT source FROM go_subscriptions WHERE id=?", (subscription_id,)
+                    ).fetchone()
+                    subscription_source = subscription["source"] if subscription else None
+
+                usage = self._conn.execute(
+                    "DELETE FROM usage_events WHERE user_id=?", (user_id,)
+                ).rowcount
+                self._conn.execute(
+                    "DELETE FROM account_provider_credentials WHERE account_id IN "
+                    "(SELECT id FROM account_identities WHERE user_id=?)",
+                    (user_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM account_sessions WHERE account_id IN "
+                    "(SELECT id FROM account_identities WHERE user_id=?)",
+                    (user_id,),
+                )
+                self._conn.execute("DELETE FROM connector_credentials WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM connector_auth_attempts WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM bot_computers WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM billing_subscriptions WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM billing_customers WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM account_identities WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+                if subscription_id and subscription_source == "byok":
+                    self._conn.execute(
+                        "DELETE FROM go_subscriptions WHERE id=?", (subscription_id,)
+                    )
+                elif subscription_id:
+                    self._conn.execute(
+                        "UPDATE go_subscriptions SET status='available',assigned_user_id=NULL "
+                        "WHERE id=?",
+                        (subscription_id,),
+                    )
+                self._conn.commit()
+                return {"user_id": user_id, "usage_events_deleted": int(usage)}
             except Exception:
                 self._conn.rollback()
                 raise

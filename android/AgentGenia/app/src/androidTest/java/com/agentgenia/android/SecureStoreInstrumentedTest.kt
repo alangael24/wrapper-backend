@@ -29,8 +29,12 @@ class SecureStoreInstrumentedTest {
         val state = PersistedAccountState(listOf(bot), emptyList(), bot.id)
         store.writeAccountState(account.id, state)
         assertEquals(state, store.readAccountState(account.id))
+        store.deleteAccountState(account.id)
+        assertEquals(PersistedAccountState(), store.readAccountState(account.id))
 
-        store.clearSession()
+        val previousDeviceID = store.deviceId()
+        store.clearAfterAccountDeletion()
         assertNull(store.readSession())
+        org.junit.Assert.assertNotEquals(previousDeviceID, store.deviceId())
     }
 }

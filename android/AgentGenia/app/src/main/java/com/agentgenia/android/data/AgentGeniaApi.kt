@@ -109,6 +109,21 @@ class AgentGeniaApi(
         secureStore.clearSession()
     }
 
+    suspend fun deleteAccount() {
+        val response = requestJson(
+            "/v1/account/delete",
+            "POST",
+            JSONObject().put("confirmation", "DELETE"),
+        )
+        if (!response.optBoolean("deleted")) {
+            throw ServiceException(
+                "El servidor no confirmó la eliminación.", "deletion_unconfirmed", 502
+            )
+        }
+        session = null
+        secureStore.clearAfterAccountDeletion()
+    }
+
     suspend fun me(): AccountProfile {
         val json = requestJson("/v1/me")
         return AccountProfile(

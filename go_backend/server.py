@@ -6,6 +6,8 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/account-auth/google/callback
   POST /v1/account-auth/refresh  Rotar la sesión del dispositivo
   POST /v1/account-auth/logout   Revocar la sesión actual
+  POST /v1/account-auth/apple    Verificar Sign in with Apple nativo
+  POST /v1/account/delete        Eliminar definitivamente la cuenta autenticada
   GET  /v1/connectors            Catalogo y conexiones del usuario
   GET  /v1/connectors/<id>       Estado de una cuenta conectada
   POST /v1/connectors/start      Crear un Connect Link de Composio
@@ -56,11 +58,14 @@ import os
 import secrets
 import sys
 import threading
+import time
+from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from .apple_auth import AppleAccountAuth, AppleAuthError
 from .billing import BillingConfig, BillingError, BillingService
 from .connector_adapters import (
     ComposioConnectorAdapter,
@@ -108,6 +113,7 @@ DEFAULT_PI_CONNECTOR_EXTENSION = (
 )
 DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
+MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 
@@ -184,6 +190,12 @@ class Config:
         self.google_oauth_client_id = (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
         self.google_oauth_client_secret = (os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
         self.google_oauth_redirect_uri = (os.environ.get("GOOGLE_OAUTH_REDIRECT_URI") or "").strip() or None
+        self.apple_client_id = (os.environ.get("APPLE_CLIENT_ID") or "").strip() or None
+        self.apple_team_id = (os.environ.get("APPLE_TEAM_ID") or "").strip() or None
+        self.apple_key_id = (os.environ.get("APPLE_KEY_ID") or "").strip() or None
+        self.apple_private_key_base64 = (
+            (os.environ.get("APPLE_PRIVATE_KEY_BASE64") or "").strip() or None
+        )
         self.account_access_ttl_seconds = int(os.environ.get("ACCOUNT_ACCESS_TTL_SECONDS", "900"))
         self.account_refresh_ttl_seconds = int(os.environ.get("ACCOUNT_REFRESH_TTL_SECONDS", str(30 * 86400)))
         self.account_auth_attempt_ttl_seconds = int(os.environ.get("ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS", "600"))
@@ -276,6 +288,10 @@ class Config:
         self.computer_vnc_resolution = os.environ.get("COMPUTER_VNC_RESOLUTION", "1440x900").strip()
         self.computer_basic_limit = int(os.environ.get("COMPUTER_BASIC_LIMIT", "1"))
         self.computer_pro_limit = int(os.environ.get("COMPUTER_PRO_LIMIT", "3"))
+        signup_default = "0" if self.environment == "production" else "1"
+        self.public_legacy_signup_enabled = (
+            os.environ.get("PUBLIC_LEGACY_SIGNUP_ENABLED", signup_default) == "1"
+        )
 
 
 def validate_runtime_security(cfg: Config) -> None:
@@ -287,6 +303,13 @@ def validate_runtime_security(cfg: Config) -> None:
                 ("DATABASE_URL", cfg.database_url),
                 ("WRAPPER_SECRET", cfg.wrapper_secret),
                 ("ADMIN_TOKEN", cfg.admin_token),
+                ("GOOGLE_OAUTH_CLIENT_ID", cfg.google_oauth_client_id),
+                ("GOOGLE_OAUTH_CLIENT_SECRET", cfg.google_oauth_client_secret),
+                ("GOOGLE_OAUTH_REDIRECT_URI", cfg.google_oauth_redirect_uri),
+                ("APPLE_CLIENT_ID", cfg.apple_client_id),
+                ("APPLE_TEAM_ID", cfg.apple_team_id),
+                ("APPLE_KEY_ID", cfg.apple_key_id),
+                ("APPLE_PRIVATE_KEY_BASE64", cfg.apple_private_key_base64),
             )
             if not value
         ]
@@ -362,6 +385,20 @@ def connector_html_response(handler: BaseHTTPRequestHandler, status: int, body: 
     handler.wfile.write(body)
 
 
+def account_deletion_html() -> bytes:
+    return """<!doctype html><html lang='es'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta name='robots' content='index,follow'><title>Eliminar cuenta | Agent Genia</title>
+<style>body{font:16px system-ui;background:#f6f6f4;color:#171717;margin:0}main{max-width:680px;margin:8vh auto;padding:32px}
+section{background:white;border:1px solid #ddd;border-radius:22px;padding:28px}h1{font-size:32px;margin-top:0}p,li{line-height:1.55;color:#555}
+a{display:inline-block;background:#171717;color:white;padding:13px 18px;border-radius:12px;text-decoration:none;font-weight:650}</style></head>
+<body><main><section><h1>Eliminar tu cuenta de Agent Genia</h1>
+<p>En la app de escritorio, iOS o Android abre <strong>Cuenta → Eliminar cuenta y datos</strong>. Esa opción cancela una suscripción activa y elimina bots, sesiones, conectores y computadoras asociadas.</p>
+<p>Si ya no tienes acceso a la app, solicita la eliminación desde el email usado en tu cuenta. Verificaremos que seas su titular antes de procesarla.</p>
+<a href='mailto:privacy@agentgenia.com?subject=Eliminar%20mi%20cuenta%20de%20Agent%20Genia'>Solicitar eliminación</a>
+<p>Solo conservaremos información cuando una obligación legal, fiscal o antifraude lo requiera.</p></section></main></body></html>""".encode("utf-8")
+
+
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -400,6 +437,21 @@ class Backend:
             secret_versions=cfg.wrapper_secret_versions,
             allow_secret_file=cfg.environment != "production",
         )
+        self.apple_auth = AppleAccountAuth(
+            store=self.store,
+            session_issuer=self.google_auth,
+            client_id=cfg.apple_client_id,
+            team_id=cfg.apple_team_id,
+            key_id=cfg.apple_key_id,
+            private_key_base64=cfg.apple_private_key_base64,
+            secret_env=cfg.wrapper_secret,
+            secret_path=cfg.secret_file,
+            key_version=cfg.wrapper_secret_version,
+            secret_versions=cfg.wrapper_secret_versions,
+            allow_secret_file=cfg.environment != "production",
+        )
+        self._signup_rate: dict[str, deque[float]] = defaultdict(deque)
+        self._signup_rate_lock = threading.RLock()
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
@@ -592,6 +644,59 @@ class Backend:
             return
         json_response(handler, 200, {"revoked": True})
 
+    def handle_account_auth_apple(self, handler: BaseHTTPRequestHandler) -> None:
+        body = self.read_json(handler) or {}
+        required = {
+            key: body.get(key) if isinstance(body.get(key), str) else ""
+            for key in ("identity_token", "authorization_code", "nonce", "device_id")
+        }
+        result = self.apple_auth.login(
+            **required,
+            name=body.get("name") if isinstance(body.get("name"), str) else None,
+            remote_key=handler.client_address[0],
+        )
+        json_response(handler, 200, result)
+
+    def handle_account_delete(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        if body.get("confirmation") != "DELETE":
+            error_response(
+                handler,
+                400,
+                "Confirma la eliminación definitiva enviando confirmation=DELETE",
+                "deletion_confirmation_required",
+            )
+            return
+
+        subscription_canceled = self.billing.cancel_for_account_deletion(user)
+        apple_revoked = self.apple_auth.revoke_user(user["id"])
+        managed_deleted = self.connector_gateway.disconnect_all(user["id"])
+        computer_cleanup = self.computers.delete_all(user_id=user["id"])
+        if computer_cleanup["errors"]:
+            raise ComputerError(
+                502,
+                "No fue posible eliminar todas las computadoras. Intenta nuevamente.",
+                "computer_cleanup_failed",
+            )
+        ephemeral_grants = self.connectors.revoke_user(user["id"])
+        result = self.store.delete_user_account(user["id"])
+        json_response(
+            handler,
+            200,
+            {
+                "deleted": True,
+                **result,
+                "stripe_subscription_canceled": subscription_canceled,
+                "apple_revoked": apple_revoked,
+                "managed_connectors_deleted": managed_deleted,
+                "ephemeral_grants_revoked": ephemeral_grants,
+                "computers_deleted": computer_cleanup["deleted"],
+            },
+        )
+
     # ---------- connector accounts ----------
     def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -675,6 +780,10 @@ class Backend:
         )
 
     def handle_signup(self, handler: BaseHTTPRequestHandler) -> None:
+        if not self.cfg.public_legacy_signup_enabled:
+            error_response(handler, 404, "Endpoint no disponible", "not_found")
+            return
+        self._check_signup_rate(handler.client_address[0])
         body = self.read_json(handler) or {}
         name = body.get("name")
         email = body.get("email")
@@ -698,6 +807,57 @@ class Backend:
                 "basic/pro se activan exclusivamente después de verificar el pago."
             ),
         })
+
+    def _check_signup_rate(self, remote_key: str) -> None:
+        now = time.monotonic()
+        with self._signup_rate_lock:
+            bucket = self._signup_rate[remote_key]
+            while bucket and bucket[0] <= now - 60:
+                bucket.popleft()
+            if len(bucket) >= 20:
+                raise GoogleAuthError(
+                    "Demasiadas altas. Espera un minuto.", status=429, code="rate_limit"
+                )
+            bucket.append(now)
+
+    def readiness(self) -> dict:
+        database = self.store.health()
+        pi = self.pi.status()
+        pi.pop("binary", None)
+        connectors = self.connector_gateway.health()
+        computers = self.computers.health()
+        capacity = sum(
+            1 for item in self.store.list_subscriptions() if item.get("status") != "revoked"
+        )
+        checks = {
+            "database": bool(database.get("ready")),
+            "google_auth": self.google_auth.configured,
+            "apple_auth": self.apple_auth.configured,
+            "stripe": self.billing.configured,
+            "connectors": bool(connectors.get("configured"))
+            and bool(connectors.get("all_connectors_available"))
+            and int(connectors.get("available_connectors") or 0)
+            == int(connectors.get("catalog_connectors") or -1),
+            "computers": bool(computers.get("configured")),
+            "pi": bool(pi.get("enabled"))
+            and bool(pi.get("available"))
+            and bool(pi.get("node_available"))
+            and bool(pi.get("connectors_available")),
+            "pi_chrome": bool(pi.get("browser_available"))
+            and bool(pi.get("browser_auto_authorize"))
+            and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN,
+            "model_capacity": capacity > 0,
+        }
+        ready = all(checks.values()) if self.cfg.environment == "production" else checks["database"]
+        return {
+            "ready": ready,
+            "checks": checks,
+            "database": database,
+            "pi": pi,
+            "connectors": connectors,
+            "computers": computers,
+            "model_capacity": capacity,
+        }
 
     # ---------- billing ----------
     def handle_billing_status(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1168,14 +1328,22 @@ class Backend:
             return handler.rfile.read(n)
         return b""
 
-    def read_json(self, handler: BaseHTTPRequestHandler) -> dict | None:
-        body = self.read_body(handler)
+    def read_json(
+        self,
+        handler: BaseHTTPRequestHandler,
+        *,
+        max_bytes: int = MAX_JSON_BODY,
+    ) -> dict | None:
+        body = self.read_body(handler, max_bytes=max_bytes)
         if not body:
             return None
         try:
-            return json.loads(body)
-        except Exception:
-            return None
+            value = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestBodyError("JSON inválido") from exc
+        if not isinstance(value, dict):
+            raise RequestBodyError("El body JSON debe ser un objeto")
+        return value
 
     # ---------- admin ----------
     def handle_admin_add_subscriptions(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1365,10 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_auth_callback(self, query)
             elif self.command == "GET" and path == "/v1/account-auth/complete":
                 html_response(self, 200, completion_html())
+            elif self.command == "GET" and path == "/account-deletion":
+                html_response(self, 200, account_deletion_html())
             elif self.command == "POST" and path == "/v1/account-auth/refresh":
                 backend.handle_account_auth_refresh(self)
             elif self.command == "POST" and path == "/v1/account-auth/logout":
                 backend.handle_account_auth_logout(self)
+            elif self.command == "POST" and path == "/v1/account-auth/apple":
+                backend.handle_account_auth_apple(self)
+            elif self.command == "POST" and path == "/v1/account/delete":
+                backend.handle_account_delete(self)
             elif self.command == "GET" and path == "/connections/complete":
                 html_response(self, 200, completion_html())
             elif path.startswith("/v1/connectors/native/setup/"):
@@ -1445,21 +1619,38 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_admin_set_tier(self, path.split("/")[3])
             elif self.command == "GET" and path == "/admin/usage":
                 backend.handle_admin_usage(self)
-            elif path in {"/healthz", "/readyz"}:
-                database_health = backend.store.health()
-                response_status = 200 if path == "/healthz" or database_health["ready"] else 503
-                json_response(self, response_status, {
-                    "ok": path == "/healthz" or database_health["ready"],
-                    "ready": database_health["ready"],
+            elif self.command == "GET" and path == "/healthz":
+                json_response(self, 200, {
+                    "ok": True,
                     "version": __version__,
                     "environment": backend.cfg.environment,
-                    "database": database_health,
-                    "google_auth_configured": backend.google_auth.configured,
-                    "stripe_configured": backend.billing.configured,
-                    "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
-                    "connectors": backend.connector_gateway.health(),
-                    "computers": backend.computers.health(),
+                    "liveness": True,
                 })
+            elif self.command == "GET" and path == "/platformz":
+                database = backend.store.health()
+                platform_ready = bool(database.get("ready"))
+                json_response(self, 200 if platform_ready else 503, {
+                    "ok": platform_ready,
+                    "version": __version__,
+                    "environment": backend.cfg.environment,
+                    "database_ready": platform_ready,
+                })
+            elif self.command == "GET" and path == "/readyz":
+                readiness = backend.readiness()
+                response = {
+                    "ok": readiness["ready"],
+                    "version": __version__,
+                    "environment": backend.cfg.environment,
+                    "ready": readiness["ready"],
+                    "checks": readiness["checks"],
+                    "stripe_live_mode": backend.billing.config.live_mode if backend.billing.configured else None,
+                }
+                if backend.cfg.environment != "production":
+                    response.update({
+                        key: value for key, value in readiness.items()
+                        if key not in {"ready", "checks"}
+                    })
+                json_response(self, 200 if readiness["ready"] else 503, response)
             else:
                 error_response(self, 404, f"No existe {self.command} {path}", "not_found")
         except (BrokenPipeError, ConnectionResetError):
@@ -1469,6 +1660,8 @@ class Handler(BaseHTTPRequestHandler):
         except RequestBodyError as e:
             error_response(self, 400, str(e), "bad_body")
         except GoogleAuthError as e:
+            error_response(self, e.status, str(e), e.code)
+        except AppleAuthError as e:
             error_response(self, e.status, str(e), e.code)
         except BillingError as e:
             error_response(self, e.status, str(e), e.code)

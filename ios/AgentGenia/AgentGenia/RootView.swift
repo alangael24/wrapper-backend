@@ -1,3 +1,6 @@
+import AuthenticationServices
+import CryptoKit
+import Security
 import SwiftUI
 
 struct RootView: View {
@@ -50,6 +53,7 @@ struct RootView: View {
 
 private struct LoginView: View {
     @Environment(AppModel.self) private var model
+    @State private var appleNonce = ""
 
     var body: some View {
         VStack(spacing: 26) {
@@ -78,6 +82,49 @@ private struct LoginView: View {
             .controlSize(.large)
             .disabled(model.isBusy)
             .overlay { if model.isBusy { ProgressView().tint(.white) } }
+            SignInWithAppleButton(.signIn) { request in
+                let nonce = secureNonce()
+                appleNonce = nonce
+                request.requestedScopes = [.fullName, .email]
+                request.nonce = SHA256.hash(data: Data(nonce.utf8))
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+            } onCompletion: { result in
+                switch result {
+                case .success(let authorization):
+                    guard
+                        let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
+                        let identityData = credential.identityToken,
+                        let codeData = credential.authorizationCode,
+                        let identityToken = String(data: identityData, encoding: .utf8),
+                        let authorizationCode = String(data: codeData, encoding: .utf8),
+                        !appleNonce.isEmpty
+                    else {
+                        model.alertMessage = "Apple devolvió una autorización incompleta."
+                        return
+                    }
+                    let name = credential.fullName.flatMap {
+                        PersonNameComponentsFormatter().string(from: $0).nilIfBlank
+                    }
+                    Task {
+                        await model.completeAppleSignIn(
+                            identityToken: identityToken,
+                            authorizationCode: authorizationCode,
+                            nonce: appleNonce,
+                            name: name
+                        )
+                        appleNonce = ""
+                    }
+                case .failure(let error):
+                    appleNonce = ""
+                    if (error as? ASAuthorizationError)?.code != .canceled {
+                        model.alertMessage = "No fue posible iniciar sesión con Apple."
+                    }
+                }
+            }
+            .signInWithAppleButtonStyle(.black)
+            .frame(height: 50)
+            .disabled(model.isBusy)
             Text("Tus bots, conectores y computadora se mantienen separados por cuenta.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -89,6 +136,19 @@ private struct LoginView: View {
         .frame(maxWidth: .infinity)
         .background(Color(uiColor: .systemGroupedBackground))
     }
+}
+
+private func secureNonce(length: Int = 32) -> String {
+    let alphabet = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")
+    var bytes = [UInt8](repeating: 0, count: length)
+    if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess {
+        return String(bytes.map { alphabet[Int($0) % alphabet.count] })
+    }
+    return UUID().uuidString.replacingOccurrences(of: "-", with: "")
+}
+
+private extension String {
+    var nilIfBlank: String? { trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : self }
 }
 
 private struct MainView: View {

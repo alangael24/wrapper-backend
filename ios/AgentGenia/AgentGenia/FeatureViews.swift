@@ -209,6 +209,7 @@ private struct ConnectorRow: View {
 
 struct AccountView: View {
     @Environment(AppModel.self) private var model
+    @State private var confirmsDeletion = false
 
     var body: some View {
         List {
@@ -257,6 +258,14 @@ struct AccountView: View {
             Section {
                 Button("Cerrar sesión", role: .destructive) { Task { await model.signOut() } }
             }
+            Section("Privacidad") {
+                Button("Eliminar cuenta y datos", role: .destructive) {
+                    confirmsDeletion = true
+                }
+                Text("Elimina bots, sesiones, conectores y computadoras. Si existe una suscripción activa, se cancela primero.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Servicio") {
                 LabeledContent("API", value: AppEnvironment.baseURL.host ?? "Agent Genia")
                 LabeledContent("Versión", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")
@@ -265,6 +274,18 @@ struct AccountView: View {
         .navigationTitle("Cuenta")
         .refreshable { await model.refreshBilling(force: true) }
         .task { await model.refreshBilling() }
+        .confirmationDialog(
+            "¿Eliminar tu cuenta definitivamente?",
+            isPresented: $confirmsDeletion,
+            titleVisibility: .visible
+        ) {
+            Button("Eliminar cuenta", role: .destructive) {
+                Task { await model.deleteAccount() }
+            }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Esta acción no se puede deshacer.")
+        }
     }
 }
 

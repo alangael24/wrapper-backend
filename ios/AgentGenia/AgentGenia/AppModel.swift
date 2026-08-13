@@ -26,6 +26,7 @@ final class AppModel {
 
     private let api: APIClient
     private let stateStore = AccountStateStore()
+    private var accountPollingTask: Task<Void, Never>?
     private var connectorPollingTask: Task<Void, Never>?
     private var connectorRefreshTask: Task<ConnectorSnapshot, Error>?
     private var billingRefreshTask: Task<BillingSnapshot, Error>?
@@ -67,11 +68,34 @@ final class AppModel {
             let started = try await api.beginSignIn()
             let url = try trustedHTTPSURL(started.authorizeURL, allowedHosts: ["accounts.google.com"])
             presentBrowser(url: url, purpose: .account)
-            Task { await pollSignIn(attemptID: started.attemptID) }
+            accountPollingTask?.cancel()
+            accountPollingTask = Task { await pollSignIn(attemptID: started.attemptID) }
+        } catch { report(error) }
+    }
+
+    func completeAppleSignIn(
+        identityToken: String,
+        authorizationCode: String,
+        nonce: String,
+        name: String?
+    ) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let session = try await api.signInWithApple(
+                identityToken: identityToken,
+                authorizationCode: authorizationCode,
+                nonce: nonce,
+                name: name
+            )
+            try await activate(session: session)
         } catch { report(error) }
     }
 
     func signOut() async {
+        accountPollingTask?.cancel()
+        accountPollingTask = nil
         connectorPollingTask?.cancel()
         connectorPollingTask = nil
         connectorRefreshTask?.cancel()
@@ -82,6 +106,27 @@ final class AppModel {
         lastBillingRefresh = .distantPast
         isBusy = false
         await api.signOut()
+        clearAccountState()
+    }
+
+    func deleteAccount() async {
+        guard let accountID = account?.id, !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await api.deleteAccount()
+            do {
+                try await stateStore.delete(accountID: accountID)
+            } catch {
+                clearAccountState()
+                report(error)
+                return
+            }
+            clearAccountState()
+        } catch { report(error) }
+    }
+
+    private func clearAccountState() {
         account = nil
         profile = nil
         bots = []
@@ -136,6 +181,7 @@ final class AppModel {
     }
 
     func sendInitialMessageIfNeeded(botID: UUID) async {
+        guard profile?.tier != "free" else { return }
         guard let bot = bots.first(where: { $0.id == botID }), bot.messages.isEmpty else { return }
         await runAgent(botID: botID, userText: "", initial: true)
     }
@@ -296,7 +342,9 @@ final class AppModel {
     }
 
     private func pollSignIn(attemptID: String) async {
+        defer { accountPollingTask = nil }
         for _ in 0..<120 {
+            guard !Task.isCancelled else { return }
             do {
                 let status = try await api.authStatus(attemptID: attemptID)
                 if status.status == "complete" {
@@ -484,6 +532,13 @@ private actor AccountStateStore {
         let url = try fileURL(accountID: accountID)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoder.encode(state).write(to: url, options: [.atomic, .completeFileProtection])
+    }
+
+    func delete(accountID: String) throws {
+        let url = try fileURL(accountID: accountID)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
     }
 
     private func fileURL(accountID: String) throws -> URL {

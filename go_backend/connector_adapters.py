@@ -129,13 +129,17 @@ class ComposioConnectorGateway:
         return self.client is not None
 
     def health(self) -> dict[str, Any]:
-        available = sum(
-            1 for connector_id in CONNECTOR_CATALOG if self.describe(connector_id)["available"]
-        )
+        unavailable = [
+            connector_id
+            for connector_id in CONNECTOR_CATALOG
+            if not self.describe(connector_id)["available"]
+        ]
         return {
             "configured": self.configured or bool(self.native_gateway and self.native_gateway.configured),
-            "available_connectors": available,
+            "available_connectors": len(CONNECTOR_CATALOG) - len(unavailable),
             "catalog_connectors": len(CONNECTOR_CATALOG),
+            "all_connectors_available": not unavailable,
+            "unavailable_connectors": unavailable,
         }
 
     def describe(self, connector_id: str) -> dict[str, Any]:

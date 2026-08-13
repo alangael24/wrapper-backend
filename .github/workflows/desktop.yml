@@ -63,6 +63,31 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm pack:desktop
+      - name: Launch packaged macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          executable="$(find release -path '*/Agent Genia.app/Contents/MacOS/Agent Genia' -type f -print -quit)"
+          test -n "$executable"
+          AGENTGENIA_DISABLE_AUTO_UPDATE=1 "$executable" --smoke-test
+      - name: Launch packaged Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $executable = Get-ChildItem release -Recurse -File -Filter 'Agent Genia.exe' |
+            Where-Object { $_.FullName -match 'win-' } | Select-Object -First 1
+          if (-not $executable) { throw 'Packaged Windows executable was not found' }
+          $process = Start-Process -FilePath $executable.FullName -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed with $($process.ExitCode)" }
+      - name: Launch packaged Linux application
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          executable="$(find release -type f -path '*/linux-*/agent-genia' -perm -111 -print -quit)"
+          test -n "$executable"
+          AGENTGENIA_DISABLE_AUTO_UPDATE=1 xvfb-run -a "$executable" --smoke-test
       - name: Upload unpacked smoke package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

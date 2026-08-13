@@ -7,7 +7,8 @@ aviso explica qué datos tratamos al usar nuestras aplicaciones y servicios.
 
 ## Datos que tratamos
 
-- Identidad de cuenta: nombre, email, identificador y foto que entrega Google.
+- Identidad de cuenta: nombre, email, identificador y, cuando esté disponible,
+  foto que entrega Google o Apple.
 - Uso del producto: bots, instrucciones, mensajes, workflows, preferencias,
   conectores elegidos y metadatos de ejecución.
 - Contenido solicitado por el usuario: texto, archivos, capturas y resultados
@@ -43,15 +44,20 @@ instrucciones técnicas necesarias para prestar el servicio.
 Conservamos datos mientras la cuenta esté activa y durante el tiempo razonable
 para seguridad, facturación, disputas y obligaciones legales. Los grants internos
 de conectores son efímeros; los secretos se cifran; los tokens de sesión se
-guardan hasheados o en almacenamiento seguro del dispositivo. Los backups pueden
-persistir temporalmente después de una eliminación.
+guardan hasheados o en almacenamiento seguro del dispositivo. Al eliminar una
+cuenta, las apps borran su estado local y rotan el identificador aleatorio de la
+instalación. Los backups pueden persistir temporalmente después de una eliminación.
 
 ## Controles del usuario
 
-Puedes desconectar proveedores desde Plugins, cerrar sesiones y solicitar acceso,
-corrección, exportación o eliminación escribiendo a `privacy@agentgenia.com`.
-También puedes revocar permisos desde la cuenta del proveedor conectado. Podemos
-pedir verificación de identidad antes de responder.
+Puedes desconectar proveedores desde Plugins y cerrar sesiones. Para eliminar tu
+cuenta y sus datos, usa **Cuenta → Eliminar cuenta y datos** en Electron, iOS o
+Android.
+Si ya no tienes acceso a la app, visita
+`https://agentgenia-api.onrender.com/account-deletion`. Para acceso, corrección o
+exportación escribe a `privacy@agentgenia.com`. También puedes revocar permisos
+desde la cuenta del proveedor conectado. Podemos pedir verificación de identidad
+antes de responder.
 
 ## Menores y transferencias
 

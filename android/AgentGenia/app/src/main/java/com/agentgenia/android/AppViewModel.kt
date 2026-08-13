@@ -74,6 +74,16 @@ class AppViewModel(
         _state.value = AppUiState(phase = AppPhase.SignedOut)
     }
 
+    fun deleteAccount() = launchBusy {
+        val accountId = _state.value.account?.id ?: return@launchBusy
+        api.deleteAccount()
+        val cleanupError = runCatching { store.deleteAccountState(accountId) }.exceptionOrNull()
+        _state.value = AppUiState(
+            phase = AppPhase.SignedOut,
+            error = cleanupError?.let(::userMessage),
+        )
+    }
+
     fun selectSection(section: MainSection) {
         _state.update { it.copy(section = section) }
         when (section) {
@@ -299,6 +309,7 @@ class AppViewModel(
     }
 
     private fun sendInitialMessageIfNeeded(botId: String) {
+        if (_state.value.profile?.tier == "free") return
         val bot = _state.value.bots.firstOrNull { it.id == botId } ?: return
         if (bot.messages.isEmpty()) runAgent(botId, "", initial = true)
     }

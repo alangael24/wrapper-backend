@@ -624,6 +624,34 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(ws.backend.store.available_count(), 2)
 
+    def test_legacy_signup_can_be_disabled(self):
+        self.ws.cfg.public_legacy_signup_enabled = False
+        status, body = self.ws.req("POST", "/v1/signup", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["type"], "not_found")
+
+    def test_authenticated_user_can_delete_account_and_release_capacity(self):
+        signup = self.new_user("delete-me")
+        user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
+        self.assertIsNotNone(user)
+        subscription_id = user["subscription_id"]
+        status, body = self.ws.req(
+            "POST",
+            "/v1/account/delete",
+            {"confirmation": "DELETE"},
+            headers={"Authorization": f"Bearer {signup['api_key']}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["deleted"])
+        self.assertIsNone(self.ws.backend.store.get_user_by_id(user["id"]))
+        self.assertEqual(
+            self.ws.backend.store.get_subscription(subscription_id)["status"], "available"
+        )
+        status, _ = self.ws.req(
+            "GET", "/v1/me", headers={"Authorization": f"Bearer {signup['api_key']}"}
+        )
+        self.assertEqual(status, 401)
+
     def test_keys_encrypted_at_rest(self):
         self.add_pool_keys(1)
         store = self.ws.backend.store
@@ -987,6 +1015,28 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(headers["X-Request-Id"].startswith("req_"))
         self.assertIn("api_key", body)
 
+    def test_structured_json_endpoints_reject_oversized_bodies(self):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.ws.httpd.server_address[1], timeout=10
+        )
+        connection.putrequest("POST", "/v1/signup")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str((1024 * 1024) + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        connection.close()
+        self.assertEqual(response.status, 413)
+        self.assertEqual(body["error"]["type"], "body_too_large")
+
+    def test_structured_endpoints_reject_non_object_json(self):
+        status, body = self.ws.req("POST", "/v1/signup", "not-an-object")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "bad_body")
+        status, body = self.ws.req("POST", "/v1/signup", [], raw=False)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "bad_body")
+
     def test_unhandled_errors_are_private_and_have_request_id(self):
         with patch.object(self.ws.backend.store, "health", side_effect=RuntimeError("secret SQL table")):
             status, body = self.ws.req("GET", "/readyz")
@@ -994,6 +1044,53 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(body["error"]["message"], "Internal server error")
         self.assertNotIn("secret SQL table", json.dumps(body))
         self.assertTrue(body["error"]["request_id"].startswith("req_"))
+
+    def test_liveness_never_waits_for_dependency_readiness(self):
+        with patch.object(self.ws.backend.store, "health", side_effect=RuntimeError("database unavailable")):
+            status, body = self.ws.req("GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["liveness"])
+        self.assertNotIn("database", body)
+
+    def test_platform_health_checks_the_database_without_third_party_providers(self):
+        with (
+            patch.object(self.ws.backend.store, "health", return_value={"ready": True}),
+            patch.object(self.ws.backend.pi, "status", side_effect=AssertionError("must not run")),
+            patch.object(
+                self.ws.backend.connector_gateway,
+                "health",
+                side_effect=AssertionError("must not run"),
+            ),
+            patch.object(
+                self.ws.backend.computers,
+                "health",
+                side_effect=AssertionError("must not run"),
+            ),
+        ):
+            status, body = self.ws.req("GET", "/platformz")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["database_ready"])
+        self.assertNotIn("database", body)
+
+    def test_production_readiness_fails_closed_for_every_required_runtime(self):
+        self.ws.cfg.environment = "production"
+        status, body = self.ws.req("GET", "/readyz")
+        self.assertEqual(status, 503)
+        self.assertFalse(body["ready"])
+        self.assertEqual(
+            set(body["checks"]),
+            {
+                "database", "google_auth", "apple_auth", "stripe", "connectors",
+                "computers", "pi", "pi_chrome", "model_capacity",
+            },
+        )
+        self.assertFalse(all(body["checks"].values()))
+        self.assertNotIn("database", body)
+        self.assertNotIn("pi", body)
+        self.assertNotIn("connectors", body)
+        self.assertNotIn("computers", body)
 
     def test_production_requires_database_master_secret_and_admin_token(self):
         cfg = self.ws.cfg
@@ -1487,6 +1584,10 @@ class TestBackend(unittest.TestCase):
         with self.assertRaises(ConnectorBrokerError) as error:
             gateway.start("usr_alice", "salesforce")
         self.assertEqual(error.exception.code, "connector_not_configured")
+        health = gateway.health()
+        self.assertFalse(health["all_connectors_available"])
+        self.assertIn("salesforce", health["unavailable_connectors"])
+        self.assertLess(health["available_connectors"], health["catalog_connectors"])
 
     def test_composio_gateway_rate_limits_new_links_per_user(self):
         user_id = self.new_user("rate-user")["user_id"]

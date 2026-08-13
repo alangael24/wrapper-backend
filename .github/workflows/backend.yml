@@ -11,6 +11,7 @@ on:
       - "extensions/**"
       - "scripts/**"
       - "tests/**"
+      - "requirements.in"
       - "requirements.txt"
       - "package.json"
       - "pnpm-lock.yaml"
@@ -26,6 +27,7 @@ on:
       - "extensions/**"
       - "scripts/**"
       - "tests/**"
+      - "requirements.in"
       - "requirements.txt"
       - "package.json"
       - "pnpm-lock.yaml"
@@ -53,8 +55,13 @@ jobs:
           cache: pnpm
       - name: Install sandbox prerequisites
         run: sudo apt-get update && sudo apt-get install -y bubblewrap socat util-linux
-      - run: pip install -r requirements.txt
+      - run: pip install --require-hashes -r requirements.txt
+      - name: Audit locked backend dependencies
+        run: |
+          python -m pip install pip-audit==2.10.1
+          pip-audit --require-hashes --disable-pip -r requirements.txt
       - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod
       - run: python -m unittest discover -s tests -p 'test_*.py'
       - run: pnpm test:desktop
       - run: pnpm test:connectors

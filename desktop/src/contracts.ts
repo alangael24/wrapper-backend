@@ -265,6 +265,7 @@ export interface DesktopApi {
   connectionSnapshot(): Promise<ConnectorConnectionSnapshot>;
   signIn(): Promise<ConnectorConnectionSnapshot>;
   signOut(): Promise<ConnectorConnectionSnapshot>;
+  deleteAccount(): Promise<ConnectorConnectionSnapshot>;
   connectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   disconnectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   billingSnapshot(): Promise<BillingSnapshot>;

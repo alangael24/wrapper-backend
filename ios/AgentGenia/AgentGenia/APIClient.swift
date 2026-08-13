@@ -74,6 +74,27 @@ private struct AuthStatusRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey { case attemptID = "attempt_id"; case deviceID = "device_id" }
 }
 
+private struct AppleAuthRequest: Encodable, Sendable {
+    let identityToken: String
+    let authorizationCode: String
+    let nonce: String
+    let deviceID: String
+    let name: String?
+    enum CodingKeys: String, CodingKey {
+        case identityToken = "identity_token"
+        case authorizationCode = "authorization_code"
+        case nonce
+        case deviceID = "device_id"
+        case name
+    }
+}
+
+private struct DeleteAccountRequest: Encodable, Sendable {
+    let confirmation = "DELETE"
+}
+
+private struct DeleteAccountResponse: Decodable, Sendable { let deleted: Bool }
+
 private struct AttemptStatusRequest: Encodable, Sendable {
     let attemptID: String
     enum CodingKeys: String, CodingKey { case attemptID = "attempt_id" }
@@ -125,6 +146,7 @@ private struct PortalResponse: Decodable, Sendable {
 }
 
 actor APIClient {
+    private static let deviceIDKey = "agentgenia.device-id"
     private let baseURL: URL
     private let urlSession: URLSession
     private let keychain = KeychainSessionStore()
@@ -179,6 +201,29 @@ actor APIClient {
         return next
     }
 
+    func signInWithApple(
+        identityToken: String,
+        authorizationCode: String,
+        nonce: String,
+        name: String?
+    ) async throws -> AccountSession {
+        let next: AccountSession = try await request(
+            "/v1/account-auth/apple",
+            method: "POST",
+            body: AppleAuthRequest(
+                identityToken: identityToken,
+                authorizationCode: authorizationCode,
+                nonce: nonce,
+                deviceID: deviceID,
+                name: name
+            ),
+            authorized: false
+        )
+        try keychain.write(next)
+        session = next
+        return next
+    }
+
     func signOut() async {
         refreshTask?.cancel()
         refreshTask = nil
@@ -193,6 +238,24 @@ actor APIClient {
         }
         session = nil
         try? keychain.clear()
+    }
+
+    func deleteAccount() async throws {
+        let response: DeleteAccountResponse = try await request(
+            "/v1/account/delete", method: "POST", body: DeleteAccountRequest()
+        )
+        guard response.deleted else {
+            throw ServiceError(
+                message: "El servidor no confirmó la eliminación.",
+                code: "deletion_unconfirmed",
+                status: 502
+            )
+        }
+        refreshTask?.cancel()
+        refreshTask = nil
+        session = nil
+        try keychain.clear()
+        UserDefaults.standard.removeObject(forKey: Self.deviceIDKey)
     }
 
     func clearLocalSessionForUITesting() {
@@ -408,10 +471,9 @@ actor APIClient {
     }
 
     private var deviceID: String {
-        let key = "agentgenia.device-id"
-        if let existing = UserDefaults.standard.string(forKey: key), UUID(uuidString: existing) != nil { return existing }
+        if let existing = UserDefaults.standard.string(forKey: Self.deviceIDKey), UUID(uuidString: existing) != nil { return existing }
         let created = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(created, forKey: key)
+        UserDefaults.standard.set(created, forKey: Self.deviceIDKey)
         return created
     }
 

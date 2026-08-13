@@ -218,6 +218,12 @@ button { color: inherit; }
 .billing-plan > button { width: 100%; margin-top: auto; border: 0; border-radius: 12px; background: #171719; padding: 12px; color: white; font-size: 11px; font-weight: 650; cursor: pointer; }
 .billing-plan.featured > button { background: #7854df; }
 .billing-plan > button:disabled { background: #ececee; color: #96969a; cursor: default; }
+.account-deletion-card { display: flex; align-items: center; gap: 20px; margin-top: 26px; border: 1px solid #f0d6d9; border-radius: 20px; background: #fffafb; padding: 20px 22px; }
+.account-deletion-card > span { display: grid; gap: 5px; }
+.account-deletion-card strong { color: #aa2637; font-size: 13px; }
+.account-deletion-card small { max-width: 620px; color: #77777c; font-size: 10px; line-height: 1.5; }
+.account-deletion-card button { flex: 0 0 auto; margin-left: auto; }
+.account-deletion-card button:disabled { cursor: wait; opacity: .6; }
 .billing-notice { margin: 18px 0 0; border-radius: 13px; background: #e8f5ed; padding: 13px 15px; color: #17653f; font-size: 11px; }
 .bot-builder-view, .bot-detail-view, .bot-chat-view { display: flex; flex-direction: column; height: 100%; }
 .bot-chat-view { position: relative; }
@@ -488,6 +494,8 @@ button:disabled { cursor: wait; }
   .bot-setup-thread { padding-inline: 22px; }
   .billing-plans { grid-template-columns: 1fr; }
   .billing-plan { min-height: 0; }
+  .account-deletion-card { align-items: stretch; flex-direction: column; }
+  .account-deletion-card button { margin-left: 0; }
 }
 
 @media (max-width: 760px) {

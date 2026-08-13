@@ -6,6 +6,7 @@ const api: DesktopApi = Object.freeze({
   connectionSnapshot: () => ipcRenderer.invoke("desktop:connection-snapshot"),
   signIn: () => ipcRenderer.invoke("desktop:sign-in"),
   signOut: () => ipcRenderer.invoke("desktop:sign-out"),
+  deleteAccount: () => ipcRenderer.invoke("desktop:delete-account"),
   connectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:connect-connector", connectorId),
   disconnectConnector: (connectorId: string) => ipcRenderer.invoke("desktop:disconnect-connector", connectorId),
   billingSnapshot: () => ipcRenderer.invoke("desktop:billing-snapshot"),

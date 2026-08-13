@@ -168,6 +168,27 @@ class StripeClient:
                 code="stripe_unavailable",
             ) from exc
 
+    def _delete(self, path: str, *, idempotency_key: str | None = None) -> dict:
+        request = urllib.request.Request(f"{self.api_base}{path}", data=b"", method="DELETE")
+        request.add_header("Authorization", f"Bearer {self.secret_key}")
+        request.add_header("User-Agent", "Agentgenia-Wrapper/1.0")
+        if idempotency_key:
+            request.add_header("Idempotency-Key", idempotency_key)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read())
+                message = payload.get("error", {}).get("message") or f"Stripe respondió HTTP {exc.code}"
+            except Exception:
+                message = f"Stripe respondió HTTP {exc.code}"
+            raise StripeApiError(message, status=502, code="stripe_api_error") from exc
+        except (OSError, TimeoutError) as exc:
+            raise StripeApiError(
+                f"No se pudo contactar Stripe: {exc}", status=502, code="stripe_unavailable"
+            ) from exc
+
     def create_checkout_session(
         self,
         *,
@@ -209,6 +230,12 @@ class StripeClient:
     def retrieve_subscription(self, subscription_id: str) -> dict:
         encoded_id = urllib.parse.quote(subscription_id, safe="")
         return self._get(f"/subscriptions/{encoded_id}")
+
+    def cancel_subscription(self, subscription_id: str, *, idempotency_key: str) -> dict:
+        encoded_id = urllib.parse.quote(subscription_id, safe="")
+        return self._delete(
+            f"/subscriptions/{encoded_id}", idempotency_key=idempotency_key
+        )
 
 
 def verify_webhook_signature(
@@ -358,6 +385,44 @@ class BillingService:
         if not url or urlparse(url).scheme != "https" or urlparse(url).hostname != "billing.stripe.com":
             raise StripeApiError("Stripe no devolvió una URL de portal válida", status=502, code="invalid_portal_url")
         return {"portal_url": url}
+
+    def cancel_for_account_deletion(self, user: dict) -> bool:
+        """Cancel an active Stripe subscription before personal data is erased."""
+        current = self.store.get_billing_status(user["id"])
+        subscription = current.get("subscription")
+        if not subscription or subscription.get("status") in TERMINAL_STATUSES:
+            return False
+        self._require_enabled()
+        subscription_id = subscription.get("stripe_subscription_id")
+        if not isinstance(subscription_id, str) or not subscription_id:
+            raise BillingError(
+                "La suscripción guardada no tiene un identificador de Stripe",
+                status=500,
+                code="billing_state_invalid",
+            )
+        remote = self.client.retrieve_subscription(subscription_id)
+        if _string(remote.get("id")) != subscription_id:
+            raise StripeApiError(
+                "Stripe devolvió una suscripción distinta a la solicitada",
+                status=502,
+                code="invalid_stripe_subscription",
+            )
+        # A previous deletion attempt may have canceled Stripe successfully and
+        # then failed while revoking another provider. Treat that retry as a
+        # confirmed cancellation instead of trapping the user account forever.
+        if _string(remote.get("status")) in TERMINAL_STATUSES:
+            return True
+        result = self.client.cancel_subscription(
+            subscription_id,
+            idempotency_key=f"agentgenia-delete-{hashlib.sha256(user['id'].encode()).hexdigest()}",
+        )
+        if result.get("status") != "canceled":
+            raise StripeApiError(
+                "Stripe no confirmó la cancelación de la suscripción",
+                status=502,
+                code="stripe_cancel_unconfirmed",
+            )
+        return True
 
     def _refresh_activation_from_stripe(self, action: dict[str, Any]) -> None:
         """Revalida en Stripe antes de conceder acceso pagado."""

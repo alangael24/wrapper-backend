@@ -340,6 +340,26 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
   assert.match(renderer, /data-open-billing-portal/);
 });
 
+test("deletes the signed-in account and local per-account state through isolated IPC", async () => {
+  const [main, preload, oauth, renderer] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:delete-account/);
+  assert.match(main, /stateStore\.deleteActiveAccount\(\)/);
+  assert.match(main, /teachRecordingsDirectory, accountScope\(accountId\)/);
+  assert.match(main, /Promise\.allSettled/);
+  assert.match(preload, /deleteAccount/);
+  assert.match(oauth, /"\/v1\/account\/delete"/);
+  assert.match(oauth, /confirmation: "DELETE"/);
+  assert.match(oauth, /deviceStore\.clear\(\)/);
+  assert.match(renderer, /data-delete-account/);
+  assert.match(renderer, /window\.confirm/);
+  assert.doesNotMatch(preload, /\/v1\/account\/delete/);
+});
+
 test("stores real OAuth sessions outside the renderer and binds them to one signed-in account", async () => {
   const [oauth, main, preload, renderer] = await Promise.all([
     readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
@@ -389,4 +409,18 @@ test("keeps one normal Electron main process so renderer and IPC handlers cannot
   assert.match(main, /app\.on\("second-instance"/);
   assert.match(main, /mainWindow\.focus\(\)/);
   assert.match(main, /if \(hasSingleInstanceLock\) app\.whenReady\(\)/);
+});
+
+test("runs packaged smoke tests with isolated temporary user data on every desktop OS", async () => {
+  const [main, oauth, workflow] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../.github/workflows/desktop.yml", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /mkdtempSync\(path\.join\(tmpdir\(\), "agentgenia-smoke-"\)\)/);
+  assert.match(main, /app\.setPath\("userData", smokeUserDataPath\)/);
+  assert.match(oauth, /const encrypted = await readFile\(this\.options\.filePath\);[\s\S]{0,160}safeStorage\.isEncryptionAvailable/);
+  assert.match(workflow, /Launch packaged macOS application/);
+  assert.match(workflow, /Launch packaged Windows application/);
+  assert.match(workflow, /Launch packaged Linux application/);
 });

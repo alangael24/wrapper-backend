@@ -295,6 +295,13 @@ class GoogleAccountAuth:
     def logout(self, access_token: str) -> bool:
         return self.store.revoke_account_session(access_token)
 
+    def issue_session(self, *, account: dict, device_id: str) -> dict:
+        """Issue the same opaque Agent Genia session for another verified IdP."""
+        self._validate_device_id(device_id)
+        if account.get("account_status") != "active":
+            raise GoogleAuthError("La cuenta está deshabilitada", status=403, code="account_disabled")
+        return self._create_session(account=account, device_id=device_id)
+
     def _create_session(self, *, account: dict, device_id: str) -> dict:
         now = time.time()
         access_token = "aga_" + secrets.token_urlsafe(48)

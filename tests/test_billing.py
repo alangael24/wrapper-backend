@@ -47,6 +47,7 @@ class FakeStripeClient:
     def __init__(self):
         self.checkout_calls: list[dict] = []
         self.portal_calls: list[dict] = []
+        self.cancel_calls: list[tuple[str, str]] = []
         self.retrieve_calls: list[str] = []
         self.subscriptions: dict[str, dict] = {}
 
@@ -61,6 +62,10 @@ class FakeStripeClient:
     def retrieve_subscription(self, subscription_id: str):
         self.retrieve_calls.append(subscription_id)
         return self.subscriptions[subscription_id]
+
+    def cancel_subscription(self, subscription_id: str, *, idempotency_key: str):
+        self.cancel_calls.append((subscription_id, idempotency_key))
+        return {"id": subscription_id, "status": "canceled"}
 
 
 class TestBilling(unittest.TestCase):
@@ -259,6 +264,46 @@ class TestBilling(unittest.TestCase):
         response = self.service.create_portal(self.user)
         self.assertEqual(response["portal_url"], "https://billing.stripe.com/p/session/example")
         self.assertEqual(self.client.portal_calls[0]["customer_id"], "cus_live")
+
+    def test_account_deletion_cancels_active_stripe_subscription(self):
+        self.activate_plus()
+        current_user = self.store.get_user_by_id(self.user["id"])
+
+        self.assertTrue(self.service.cancel_for_account_deletion(current_user))
+        self.assertEqual(self.client.cancel_calls[0][0], "sub_stripe")
+        self.assertTrue(
+            self.client.cancel_calls[0][1].startswith("agentgenia-delete-")
+        )
+
+        self.process(self.event(
+            "evt_canceled",
+            "customer.subscription.deleted",
+            {
+                "id": "sub_stripe",
+                "customer": "cus_live",
+                "status": "canceled",
+                "metadata": {"user_id": self.user["id"], "tier": "basic"},
+                "items": {"data": [{"price": {"id": PLUS_PRICE}}]},
+            },
+            created=1_800_000_100,
+        ))
+        self.assertFalse(
+            self.service.cancel_for_account_deletion(
+                self.store.get_user_by_id(self.user["id"])
+            )
+        )
+
+    def test_account_deletion_retry_accepts_subscription_already_canceled_remotely(self):
+        self.activate_plus()
+        self.client.subscriptions["sub_stripe"]["status"] = "canceled"
+
+        self.assertTrue(
+            self.service.cancel_for_account_deletion(
+                self.store.get_user_by_id(self.user["id"])
+            )
+        )
+        self.assertEqual(self.client.retrieve_calls[-1], "sub_stripe")
+        self.assertEqual(self.client.cancel_calls, [])
 
     def test_invalid_signature_and_wrong_mode_are_rejected(self):
         payload = b'{"id":"evt"}'

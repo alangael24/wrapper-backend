@@ -345,6 +345,20 @@ async function signInAccount(): Promise<void> {
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
   } catch (error) {
     transientError = errorMessage(error);
+    try {
+      connections = await desktopApi.connectionSnapshot();
+      state = await desktopApi.bootstrap();
+      if (!connections.account.connected) {
+        billing = emptyBillingSnapshot();
+        billingLoaded = false;
+        selectedConnectorIds = new Set();
+        computerSnapshot = idleComputerSnapshot();
+        computerLoadedBotId = "";
+        computerBusy = false;
+        closeBotSettings();
+        activeView = "connectors";
+      }
+    } catch {}
   } finally {
     accountAuthBusy = false;
   }
@@ -561,7 +575,11 @@ function renderBilling(): void {
             ${renderBillingPlan("free", "Free", 0, "Para explorar Agentgenia", ["Crea y personaliza bots", "Conecta tus herramientas", "Sin acceso al modelo incluido"], tier)}
             ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", ["Acceso al modelo incluido", "50% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
             ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", ["Acceso al modelo incluido", "100% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
-          </div>`}
+          </div>
+          <section class="account-deletion-card">
+            <span><strong>Eliminar cuenta y datos</strong><small>Cancela la suscripción, desconecta tus herramientas y borra permanentemente tus bots, sesiones y datos.</small></span>
+            <button class="danger-action" type="button" data-delete-account ${accountAuthBusy ? "disabled" : ""}>${accountAuthBusy ? "Eliminando…" : "Eliminar cuenta"}</button>
+          </section>`}
         ${billingNotice ? `<p class="billing-notice">${escapeHtml(billingNotice)}</p>` : ""}
         ${!billing.configured && billingLoaded && connections.account.connected ? '<p class="inline-error">El servicio de pagos todavía no está habilitado en producción.</p>' : renderError()}
       </div>
@@ -574,9 +592,36 @@ function renderBilling(): void {
     if (connections.account.connected) await refreshBilling();
   });
   document.querySelector("[data-open-billing-portal]")?.addEventListener("click", () => void openBillingPortal());
+  document.querySelector("[data-delete-account]")?.addEventListener("click", () => void deleteAccount());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-plan]")) {
     button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro"));
   }
+}
+
+async function deleteAccount(): Promise<void> {
+  if (accountAuthBusy || !connections.account.connected) return;
+  const confirmed = window.confirm("Esta acción es permanente. Se cancelará tu suscripción y se eliminarán tu cuenta, bots, sesiones, conectores y datos. ¿Continuar?");
+  if (!confirmed) return;
+  accountAuthBusy = true;
+  transientError = "";
+  render();
+  try {
+    connections = await desktopApi.deleteAccount();
+    state = await desktopApi.bootstrap();
+    billing = emptyBillingSnapshot();
+    billingLoaded = false;
+    selectedConnectorIds = new Set();
+    computerSnapshot = idleComputerSnapshot();
+    computerLoadedBotId = "";
+    computerBusy = false;
+    closeBotSettings();
+    activeView = "connectors";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    accountAuthBusy = false;
+  }
+  render();
 }
 
 function renderBillingPlan(
@@ -1751,6 +1796,11 @@ function createPreviewApi(): DesktopApi {
     },
     async signOut() {
       previewConnections = emptyConnectionSnapshot();
+      return structuredClone(previewConnections);
+    },
+    async deleteAccount() {
+      previewConnections = emptyConnectionSnapshot();
+      previewState = initialAppState();
       return structuredClone(previewConnections);
     },
     async connectConnector(connectorId) {

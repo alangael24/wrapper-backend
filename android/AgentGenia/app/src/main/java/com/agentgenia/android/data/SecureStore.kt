@@ -42,6 +42,14 @@ class SecureStore(private val context: Context) {
         preferences.edit { remove(SESSION_KEY) }
     }
 
+    @Synchronized
+    fun clearAfterAccountDeletion() {
+        preferences.edit {
+            remove(SESSION_KEY)
+            remove(DEVICE_KEY)
+        }
+    }
+
     fun deviceId(): String {
         preferences.getString(DEVICE_KEY, null)?.let { return it }
         val generated = java.util.UUID.randomUUID().toString().lowercase()
@@ -68,6 +76,11 @@ class SecureStore(private val context: Context) {
             file.writeBytes(encrypted)
             temporary.delete()
         }
+    }
+
+    fun deleteAccountState(accountId: String) {
+        val file = accountFile(accountId)
+        check(!file.exists() || file.delete()) { "No fue posible eliminar los datos locales de la cuenta." }
     }
 
     private fun accountFile(accountId: String): File {

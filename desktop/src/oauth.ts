@@ -136,6 +136,11 @@ export class DesktopOAuthController {
     return this.snapshot();
   }
 
+  async deleteAccount(): Promise<ConnectorConnectionSnapshot> {
+    await this.client.deleteAccount();
+    return this.snapshot();
+  }
+
   async connect(connectorId: string, signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
     if (!await this.accountStore.get()) {
       await this.client.signIn(shellSafeSignal(signal));
@@ -304,6 +309,16 @@ class WrapperServiceClient {
     }
     this.session = null;
     await this.options.accountStore.clear();
+  }
+
+  async deleteAccount(): Promise<void> {
+    await this.authorizedJson("/v1/account/delete", {
+      method: "POST",
+      body: { confirmation: "DELETE" }
+    });
+    this.session = null;
+    await this.options.accountStore.clear();
+    await this.options.deviceStore.clear();
   }
 
   connector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -507,6 +522,10 @@ class DeviceIdentityStore {
     await chmod(this.filePath, 0o600);
     return identity;
   }
+
+  async clear(): Promise<void> {
+    await rm(this.filePath, { force: true });
+  }
 }
 
 class EncryptedJsonStore<T> {
@@ -517,9 +536,10 @@ class EncryptedJsonStore<T> {
   }) {}
 
   async get(): Promise<T | null> {
-    if (!this.options.safeStorage.isEncryptionAvailable()) return null;
     try {
-      const value: unknown = JSON.parse(this.options.safeStorage.decryptString(await readFile(this.options.filePath)));
+      const encrypted = await readFile(this.options.filePath);
+      if (!this.options.safeStorage.isEncryptionAvailable()) return null;
+      const value: unknown = JSON.parse(this.options.safeStorage.decryptString(encrypted));
       return this.options.validate(value) ? value : null;
     } catch {
       return null;

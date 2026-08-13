@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from "electron";
 import { autoUpdater } from "electron-updater";
@@ -26,6 +28,7 @@ const CHANNELS = Object.freeze({
   connectionSnapshot: "desktop:connection-snapshot",
   signIn: "desktop:sign-in",
   signOut: "desktop:sign-out",
+  deleteAccount: "desktop:delete-account",
   connectConnector: "desktop:connect-connector",
   disconnectConnector: "desktop:disconnect-connector",
   billingSnapshot: "desktop:billing-snapshot",
@@ -105,6 +108,15 @@ class DesktopStateStore {
     return structuredClone(snapshot);
   }
 
+  async deleteActiveAccount(): Promise<AppState> {
+    await this.writes;
+    const accountFilePath = this.filePath;
+    this.filePath = null;
+    this.state = initialAppState();
+    if (accountFilePath) await rm(accountFilePath, { force: true });
+    return structuredClone(this.state);
+  }
+
   private async persist(snapshot: AppState): Promise<void> {
     if (!this.filePath) return;
     await mkdir(path.dirname(this.filePath), { recursive: true });
@@ -129,6 +141,10 @@ let oauthController: DesktopOAuthController;
 let teachRecordingsDirectory = "";
 let activeTeachRecording: ActiveTeachRecording | null = null;
 const smokeTest = process.argv.includes("--smoke-test");
+const smokeUserDataPath = smokeTest
+  ? mkdtempSync(path.join(tmpdir(), "agentgenia-smoke-"))
+  : null;
+if (smokeUserDataPath) app.setPath("userData", smokeUserDataPath);
 const hasSingleInstanceLock = smokeTest || app.requestSingleInstanceLock();
 
 if (!hasSingleInstanceLock) app.quit();
@@ -173,6 +189,26 @@ function registerDesktopIpc(): void {
     computerWindow?.close();
     const connections = await oauthController.signOut();
     await stateStore.activateAccount(null);
+    return connections;
+  });
+  ipcMain.handle(CHANNELS.deleteAccount, async () => {
+    activeTeachRecording = null;
+    issuedComputerViewerUrls.clear();
+    computerWindow?.close();
+    const accountId = await oauthController.accountId();
+    const connections = await oauthController.deleteAccount();
+    const cleanup = await Promise.allSettled([
+      stateStore.deleteActiveAccount(),
+      accountId
+        ? rm(path.join(teachRecordingsDirectory, accountScope(accountId)), {
+          recursive: true,
+          force: true
+        })
+        : Promise.resolve()
+    ]);
+    if (cleanup.some((result) => result.status === "rejected")) {
+      throw new Error("La cuenta se eliminó, pero no fue posible borrar todos los datos locales.");
+    }
     return connections;
   });
   ipcMain.handle(CHANNELS.connectConnector, (_event, connectorId: unknown) => {
@@ -773,4 +809,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+app.on("will-quit", () => {
+  if (smokeUserDataPath) rmSync(smokeUserDataPath, { recursive: true, force: true });
 });

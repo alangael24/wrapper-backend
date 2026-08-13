@@ -20,7 +20,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = releaseVersionCode
-        versionName = "1.0.0"
+        versionName = "1.0.1"
 
         buildConfigField("String", "API_BASE_URL", "\"https://agentgenia-api.onrender.com\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

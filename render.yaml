@@ -4,8 +4,8 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    autoDeploy: true
-    healthCheckPath: /readyz
+    autoDeployTrigger: checksPass
+    healthCheckPath: /platformz
     envVars:
       - key: ENVIRONMENT
         value: production
@@ -27,8 +27,18 @@ services:
         sync: false
       - key: GOOGLE_OAUTH_REDIRECT_URI
         sync: false
-      - key: STRIPE_ENABLED
+      - key: APPLE_CLIENT_ID
+        value: com.agentgenia.ios
+      - key: APPLE_TEAM_ID
+        sync: false
+      - key: APPLE_KEY_ID
+        sync: false
+      - key: APPLE_PRIVATE_KEY_BASE64
+        sync: false
+      - key: PUBLIC_LEGACY_SIGNUP_ENABLED
         value: "0"
+      - key: STRIPE_ENABLED
+        value: "1"
       - key: STRIPE_LIVE_MODE
         value: "1"
       - key: STRIPE_SECRET_KEY
@@ -52,12 +62,16 @@ services:
       - key: CONNECTOR_PUBLIC_URL
         sync: false
       - key: COMPOSIO_AUTH_CONFIGS_JSON
-        value: "{}"
+        sync: false
       - key: COMPOSIO_TOOLKIT_OVERRIDES_JSON
         value: "{}"
       - key: COMPUTERS_ENABLED
-        value: "0"
+        value: "1"
       - key: DAYTONA_API_KEY
         sync: false
       - key: PI_ENABLED
-        value: "0"
+        value: "1"
+      - key: PI_CHROME_AUTO_AUTHORIZE
+        value: "1"
+      - key: PI_CHROME_ISOLATION
+        value: per_run
