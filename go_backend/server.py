@@ -834,11 +834,18 @@ class Backend:
             "google_auth": self.google_auth.configured,
             "apple_auth": self.apple_auth.configured,
             "stripe": self.billing.configured,
+            # A third-party catalog entry can be temporarily unavailable (or
+            # require customer-specific OAuth) without making every other
+            # connector unusable. Readiness therefore verifies the private
+            # gateway and at least one executable connector; catalog
+            # completeness remains visible in the detailed health payload.
             "connectors": bool(connectors.get("configured"))
-            and bool(connectors.get("all_connectors_available"))
-            and int(connectors.get("available_connectors") or 0)
-            == int(connectors.get("catalog_connectors") or -1),
-            "computers": bool(computers.get("configured")),
+            and int(connectors.get("available_connectors") or 0) > 0,
+            # Persistent computers are an optional capability. When explicitly
+            # enabled, ComputerConfig already fails closed without a provider
+            # key and readiness still requires the provider to be configured.
+            "computers": not self.cfg.computers_enabled
+            or bool(computers.get("configured")),
             "pi": bool(pi.get("enabled"))
             and bool(pi.get("available"))
             and bool(pi.get("node_available"))

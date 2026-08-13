@@ -1092,6 +1092,60 @@ class TestBackend(unittest.TestCase):
         self.assertNotIn("connectors", body)
         self.assertNotIn("computers", body)
 
+    def test_readiness_checks_accept_partial_connector_catalog_and_disabled_computers(self):
+        self.ws.cfg.environment = "production"
+        self.ws.cfg.computers_enabled = False
+        with (
+            patch.object(self.ws.backend.store, "health", return_value={"ready": True}),
+            patch.object(
+                self.ws.backend.pi,
+                "status",
+                return_value={
+                    "enabled": True,
+                    "available": True,
+                    "node_available": True,
+                    "connectors_available": True,
+                    "browser_available": True,
+                    "browser_auto_authorize": True,
+                    "browser_isolation": "per_run",
+                },
+            ),
+            patch.object(
+                self.ws.backend.connector_gateway,
+                "health",
+                return_value={
+                    "configured": True,
+                    "available_connectors": 48,
+                    "catalog_connectors": 49,
+                    "all_connectors_available": False,
+                    "unavailable_connectors": ["loom"],
+                },
+            ),
+            patch.object(
+                self.ws.backend.computers,
+                "health",
+                return_value={"configured": False},
+            ),
+            patch.object(
+                self.ws.backend.store,
+                "list_subscriptions",
+                return_value=[{"status": "available"}],
+            ),
+        ):
+            readiness = self.ws.backend.readiness()
+        self.assertTrue(readiness["checks"]["connectors"])
+        self.assertTrue(readiness["checks"]["computers"])
+
+    def test_readiness_requires_computers_when_feature_is_enabled(self):
+        self.ws.cfg.computers_enabled = True
+        with patch.object(
+            self.ws.backend.computers,
+            "health",
+            return_value={"configured": False},
+        ):
+            readiness = self.ws.backend.readiness()
+        self.assertFalse(readiness["checks"]["computers"])
+
     def test_production_requires_database_master_secret_and_admin_token(self):
         cfg = self.ws.cfg
         cfg.environment = "production"
