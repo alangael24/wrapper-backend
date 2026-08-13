@@ -81,8 +81,10 @@ if (!/linux:\s+[\s\S]*?executableName: agent-genia/u.test(builder)) {
 for (const [key, value] of [
   ["PUBLIC_LEGACY_SIGNUP_ENABLED", "0"],
   ["STRIPE_ENABLED", "1"],
+  ["CREDITS_MODE", "shadow"],
   ["COMPUTERS_ENABLED", "1"],
   ["PI_ENABLED", "1"],
+  ["PI_MAX_CONCURRENT", "4"],
   ["PI_CHROME_AUTO_AUTHORIZE", "1"],
 ]) {
   const pattern = new RegExp(`key: ${key}\\s+value: ["']?${value}["']?`, "u");
@@ -131,7 +133,8 @@ for (const key of [
   "DATABASE_URL", "WRAPPER_SECRET", "ADMIN_TOKEN", "DEEPSEEK_API_KEY",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URI",
   "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_BASE64",
-  "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "COMPOSIO_API_KEY",
+  "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_STARTER_PRICE_ID",
+  "STRIPE_PRO_PRICE_ID", "STRIPE_BUSINESS_PRICE_ID", "COMPOSIO_API_KEY",
   "COMPOSIO_AUTH_CONFIGS_JSON", "DAYTONA_API_KEY",
 ]) {
   if (!new RegExp(`key: ${key}\\s+sync: false`, "u").test(render)) {
@@ -147,6 +150,7 @@ const expectedMigrations = [
   "20260812180737_production_security_hardening.sql",
   "20260813032540_apple_identity_tokens.sql",
   "20260813143000_deepseek_direct.sql",
+  "20260813190000_credit_ledger.sql",
 ];
 const migrationContents = await Promise.all(
   expectedMigrations.map((name) => readFile(`supabase/migrations/${name}`, "utf8")),

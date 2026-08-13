@@ -133,7 +133,7 @@ export interface ConnectorConnectionSnapshot {
 
 export interface BillingSubscriptionStatus {
   stripe_subscription_id: string;
-  tier: "basic" | "pro";
+  tier: "basic" | "pro" | "business";
   stripe_price_id: string;
   status: string;
   cancel_at_period_end: boolean;
@@ -142,12 +142,13 @@ export interface BillingSubscriptionStatus {
 
 export interface BillingSnapshot {
   configured: boolean;
-  tier: "free" | "basic" | "pro";
+  tier: "free" | "basic" | "pro" | "business";
   customer: boolean;
   subscription: BillingSubscriptionStatus | null;
   plans: {
-    basic: { name: string; amount: number; currency: string; interval: string };
-    pro: { name: string; amount: number; currency: string; interval: string };
+    basic: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
+    pro: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
+    business: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
   };
 }
 
@@ -269,7 +270,7 @@ export interface DesktopApi {
   connectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   disconnectConnector(connectorId: string): Promise<ConnectorConnectionSnapshot>;
   billingSnapshot(): Promise<BillingSnapshot>;
-  startCheckout(tier: "basic" | "pro"): Promise<void>;
+  startCheckout(tier: "basic" | "pro" | "business"): Promise<void>;
   openBillingPortal(): Promise<void>;
   computerStatus(botId: string): Promise<BotComputerSnapshot>;
   ensureComputer(botId: string, botName: string): Promise<BotComputerSnapshot>;

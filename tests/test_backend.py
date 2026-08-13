@@ -111,7 +111,7 @@ class WrapperServer:
         os.environ["DB_PATH"] = os.path.join(tmp, "test.sqlite")
         os.environ["SECRET_FILE"] = os.path.join(tmp, "secret.key")
         os.environ["ADMIN_TOKEN"] = "test-admin"
-        os.environ["ENFORCE_LIMITS"] = "1"
+        os.environ["CREDITS_MODE"] = "shadow"
         os.environ["PI_ENABLED"] = "0"
         os.environ.pop("WRAPPER_SECRET", None)
         os.environ.pop("GOOGLE_OAUTH_CLIENT_ID", None)
@@ -124,7 +124,8 @@ class WrapperServer:
             os.environ.pop(name, None)
         for name in (
             "STRIPE_ENABLED", "STRIPE_LIVE_MODE", "STRIPE_SECRET_KEY",
-            "STRIPE_WEBHOOK_SECRET", "STRIPE_PLUS_PRICE_ID", "STRIPE_PRO_PRICE_ID",
+            "STRIPE_WEBHOOK_SECRET", "STRIPE_PLUS_PRICE_ID", "STRIPE_STARTER_PRICE_ID",
+            "STRIPE_PRO_PRICE_ID", "STRIPE_BUSINESS_PRICE_ID",
             "STRIPE_SUCCESS_URL", "STRIPE_CANCEL_URL", "STRIPE_PORTAL_RETURN_URL",
         ):
             os.environ.pop(name, None)
@@ -669,11 +670,11 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(body["choices"][0]["message"]["content"], "hola")
 
-    def test_usage_limit_429(self):
+    def test_shadow_credits_replace_rolling_usage_block(self):
         ws = self.ws
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        # inyectar uso que supera el limite de 5h ($12)
+        # El historial en dólares sigue visible, pero shadow no bloquea por ventanas.
         sub_id = ws.backend.store.get_user_by_api_key(signup["api_key"])["subscription_id"]
         for _ in range(3):
             ws.backend.store.record_usage(
@@ -683,8 +684,11 @@ class TestBackend(unittest.TestCase):
         status, body = ws.req("POST", "/v1/chat/completions",
                               {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
                               headers=headers)
-        self.assertEqual(status, 429)
-        self.assertEqual(body["error"]["type"], "usage_limit")
+        self.assertEqual(status, 200)
+        status, credits = ws.req("GET", "/v1/credits", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(credits["mode"], "shadow")
+        self.assertEqual(credits["credits"]["available"], 30.0)
 
     def test_auth_required(self):
         status, _ = self.ws.req("GET", "/v1/models")
@@ -910,18 +914,17 @@ class TestBackend(unittest.TestCase):
         status, signup = ws.req("POST", "/v1/signup", {"name": "free-user", "tier": "free"})
         self.assertEqual(status, 201)
         self.assertEqual(signup["tier"], "free")
-        self.assertEqual(signup["tier_label"], "Free")
+        self.assertEqual(signup["tier_label"], "Free Trial")
         self.assertNotIn("subscription_id", signup)
         self.assertEqual(signup["limits"]["5h"], 0.0)
         self.assertEqual(signup["limits"]["week"], 0.0)
         self.assertEqual(signup["limits"]["month"], 0.0)
-        # free no puede llamar modelos
+        # El trial free sí puede usar modelos mientras tenga créditos.
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         status, body = ws.req("POST", "/v1/chat/completions",
                               {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
                               headers=headers)
-        self.assertEqual(status, 402)
-        self.assertEqual(body["error"]["type"], "tier_requires_upgrade")
+        self.assertEqual(status, 200)
         # /v1/usage refleja el tier y limites en cero
         status, usage = ws.req("GET", "/v1/usage", headers=headers)
         self.assertEqual(status, 200)
@@ -996,7 +999,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(tier_column["dflt_value"], "'free'")
         self.assertEqual(store.get_user_by_id("legacy")["tier"], "basic")
 
-    def test_schema_v10_retires_provider_assignments_and_preserves_usage(self):
+    def test_schema_v11_retires_provider_assignments_and_adds_run_cost_fields(self):
         db_path = Path(self.tmp) / "provider-migration.sqlite"
         store = Store(db_path)
         user = store.create_user("legacy-provider-user", "Legacy", None)
@@ -1032,7 +1035,13 @@ class TestBackend(unittest.TestCase):
               created_at REAL NOT NULL
             )"""
         )
-        connection.execute("INSERT INTO usage_events SELECT * FROM usage_events_nullable")
+        connection.execute(
+            "INSERT INTO usage_events(id,user_id,subscription_id,model,endpoint,input_tokens,"
+            "output_tokens,cached_read_tokens,cached_write_tokens,estimated_cost_usd,status,created_at) "
+            "SELECT id,user_id,subscription_id,model,endpoint,input_tokens,output_tokens,"
+            "cached_read_tokens,cached_write_tokens,estimated_cost_usd,status,created_at "
+            "FROM usage_events_nullable"
+        )
         connection.execute("DROP TABLE usage_events_nullable")
         connection.commit()
         connection.close()
@@ -1044,6 +1053,12 @@ class TestBackend(unittest.TestCase):
             if row["name"] == "subscription_id"
         )
         self.assertEqual(subscription_column["notnull"], 0)
+        usage_columns = {
+            row["name"] for row in migrated._q("PRAGMA table_info(usage_events)")
+        }
+        self.assertIn("run_id", usage_columns)
+        self.assertIn("estimated_cost_microusd", usage_columns)
+        self.assertEqual(migrated.health()["schema_version"], 11)
         self.assertIsNone(migrated.get_user_by_id(user["id"])["subscription_id"])
         legacy = migrated.get_subscription("sub_legacy")
         self.assertEqual(legacy["status"], "revoked")
@@ -1055,44 +1070,28 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(len(migrated.usage_all()["events"]), 2)
 
-    def test_usage_limits_basic_vs_pro(self):
+    def test_plan_catalog_starter_pro_and_business(self):
         ws = self.ws
         basic = self.new_user(tier="basic")
         pro = self.new_user(tier="pro")
+        business = self.new_user(tier="business")
         basic_headers = {"Authorization": f"Bearer {basic['api_key']}"}
         pro_headers = {"Authorization": f"Bearer {pro['api_key']}"}
-        basic_user = ws.backend.store.get_user_by_api_key(basic["api_key"])
-        pro_user = ws.backend.store.get_user_by_api_key(pro["api_key"])
-        payload = {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]}
-
-        def inject(user, n):
-            for _ in range(n):
-                ws.backend.store.record_usage(
-                    user["id"], user["subscription_id"], "deepseek-v4-flash", "/chat/completions",
-                    1000000, 1000000, 0, 0, 3.0, 200,
-                )
-
-        # basic: $6 de uso -> alcanza su limite 5h ($6) -> 429
-        inject(basic_user, 2)
-        status, body = ws.req("POST", "/v1/chat/completions", payload, headers=basic_headers)
-        self.assertEqual(status, 429)
-        self.assertEqual(body["error"]["type"], "usage_limit")
-        # pro: mismo $6 de uso -> sigue por debajo de $12 -> 200
-        inject(pro_user, 2)
-        status, _ = ws.req("POST", "/v1/chat/completions", payload, headers=pro_headers)
-        self.assertEqual(status, 200)
-        # pro: sube a $15 -> 429
-        inject(pro_user, 3)
-        status, body = ws.req("POST", "/v1/chat/completions", payload, headers=pro_headers)
-        self.assertEqual(status, 429)
-        # /v1/me muestra tier y limites correctos
+        business_headers = {"Authorization": f"Bearer {business['api_key']}"}
         status, me = ws.req("GET", "/v1/me", headers=basic_headers)
         self.assertEqual(status, 200)
         self.assertEqual(me["tier"], "basic")
-        self.assertEqual(me["limits"]["5h"], 6.0)
+        self.assertEqual(me["plan"]["label"], "Starter")
+        self.assertEqual(me["plan"]["monthly_credit_milli"], 300_000)
+        self.assertEqual(me["plan"]["max_concurrent_runs"], 1)
         status, me = ws.req("GET", "/v1/me", headers=pro_headers)
         self.assertEqual(me["tier"], "pro")
-        self.assertEqual(me["limits"]["5h"], 12.0)
+        self.assertEqual(me["plan"]["monthly_credit_milli"], 1_000_000)
+        self.assertEqual(me["plan"]["max_concurrent_runs"], 2)
+        status, me = ws.req("GET", "/v1/me", headers=business_headers)
+        self.assertEqual(me["tier"], "business")
+        self.assertEqual(me["plan"]["monthly_credit_milli"], 3_000_000)
+        self.assertEqual(me["plan"]["max_concurrent_runs"], 4)
 
     def test_admin_set_tier_changes_entitlement_without_provider_key(self):
         ws = self.ws
@@ -1133,7 +1132,9 @@ class TestBackend(unittest.TestCase):
         self.assertNotIn("vision", info)
         self.assertNotIn("binary", info)
         status, body = self.ws.req(
-            "POST", "/v1/agent/run", {"prompt": "haz una tarea"}, headers=headers
+            "POST", "/v1/agent/run",
+            {"prompt": "haz una tarea", "idempotency_key": "disabled-run"},
+            headers=headers
         )
         self.assertEqual(status, 503)
         self.assertEqual(body["error"]["type"], "pi_disabled")
@@ -1144,12 +1145,18 @@ class TestBackend(unittest.TestCase):
         self.ws.enable_fake_pi()
 
         status, result = self.ws.req(
-            "POST", "/v1/agent/run", {"prompt": "prueba end to end"}, headers=headers
+            "POST", "/v1/agent/run",
+            {"prompt": "prueba end to end", "idempotency_key": "pi-e2e-run"},
+            headers=headers
         )
         self.assertEqual(status, 200)
         self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
         self.assertEqual(result["usage"]["input_tokens"], 11)
         self.assertEqual(result["usage"]["cached_read_tokens"], 3)
+        self.assertEqual(result["usage"]["llm_cost_microusd"], 2)
+        self.assertEqual(result["usage"]["llm_cost_usd"], 0.000002)
+        self.assertGreaterEqual(result["usage"]["duration_seconds"], 0)
+        self.assertEqual(result["credits"]["charged"], 0.1)
 
         upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream_calls), 1)
@@ -1441,6 +1448,7 @@ class TestBackend(unittest.TestCase):
             {
                 "prompt": "consulta mis repositorios y calendario",
                 "connector_ids": ["github", "google-workspace", "github"],
+                "idempotency_key": "connector-run",
             },
             headers=headers,
         )
@@ -1476,7 +1484,11 @@ class TestBackend(unittest.TestCase):
         status, body = self.ws.req(
             "POST",
             "/v1/agent/run",
-            {"prompt": "haz algo", "connector_ids": ["unknown-provider"]},
+            {
+                "prompt": "haz algo",
+                "connector_ids": ["unknown-provider"],
+                "idempotency_key": "unknown-connector-run",
+            },
             headers=headers,
         )
         self.assertEqual(status, 400)
@@ -1518,7 +1530,11 @@ class TestBackend(unittest.TestCase):
             status, result = self.ws.req(
                 "POST",
                 "/v1/agent/run",
-                {"prompt": prompt, "browser": True},
+                {
+                    "prompt": prompt,
+                    "browser": True,
+                    "idempotency_key": f"chrome-run-{len(results)}",
+                },
                 headers=headers,
             )
             self.assertEqual(status, 200)

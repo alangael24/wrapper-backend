@@ -5,6 +5,21 @@ y versionado semántico para los clientes distribuidos.
 
 ## [Unreleased]
 
+### Added
+
+- Wallet de créditos entero y auditable con grants, reservas atómicas por run,
+  allocations, liquidación por consumo real y tokens efímeros exclusivos de Pi.
+- Planes Starter, Pro y Business con grants mensuales idempotentes por periodo
+  de Stripe, concurrencia por usuario y trial único de 30 créditos.
+- Endpoints de balance y ajustes administrativos, costo en microUSD por llamada
+  y límites autorizados por ejecución con modo inicial `shadow`.
+
+### Changed
+
+- Desktop, iOS y Android envían una clave de idempotencia y un máximo de
+  créditos por trabajo; la facturación muestra el catálogo actual del backend.
+- El esquema de persistencia sube a la versión 11.
+
 ## [1.0.1] - 2026-08-12
 
 ### Added

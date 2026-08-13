@@ -544,7 +544,7 @@ async function leaveConnectors(nextView: View): Promise<void> {
 function renderBilling(): void {
   const tier = billing.tier;
   const subscription = billing.subscription;
-  const currentLabel = tier === "basic" ? "Plus" : tier === "pro" ? "Pro" : "Free";
+  const currentLabel = tier === "basic" ? "Starter" : tier === "pro" ? "Pro" : tier === "business" ? "Business" : "Free Trial";
   appRoot.innerHTML = renderDesktopShell(`
     <section class="billing-view">
       <header class="workspace-topbar">
@@ -572,9 +572,10 @@ function renderBilling(): void {
             ${billing.customer ? '<button type="button" class="secondary-action" data-open-billing-portal>Administrar en Stripe</button>' : ""}
           </div>
           <div class="billing-plans">
-            ${renderBillingPlan("free", "Free", 0, "Para explorar Agentgenia", ["Crea y personaliza bots", "Conecta tus herramientas", "Sin acceso al modelo incluido"], tier)}
-            ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", ["Acceso al modelo incluido", "50% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
-            ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", ["Acceso al modelo incluido", "100% de la capacidad de uso", "Portal de facturación y cancelación"], tier)}
+            ${renderBillingPlan("free", "Free Trial", 0, "Para probar Agentgenia", ["30 créditos por única vez", "1 ejecución a la vez", "Vence después de 30 días"], tier)}
+            ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", planBenefits(billing.plans.basic), tier)}
+            ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", planBenefits(billing.plans.pro), tier)}
+            ${renderBillingPlan("business", billing.plans.business.name, billing.plans.business.amount, "Para equipos en crecimiento", planBenefits(billing.plans.business), tier)}
           </div>
           <section class="account-deletion-card">
             <span><strong>Eliminar cuenta y datos</strong><small>Cancela la suscripción, desconecta tus herramientas y borra permanentemente tus bots, sesiones y datos.</small></span>
@@ -594,8 +595,19 @@ function renderBilling(): void {
   document.querySelector("[data-open-billing-portal]")?.addEventListener("click", () => void openBillingPortal());
   document.querySelector("[data-delete-account]")?.addEventListener("click", () => void deleteAccount());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-plan]")) {
-    button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro"));
+    button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro" | "business"));
   }
+}
+
+function planBenefits(plan: BillingSnapshot["plans"]["basic"]): string[] {
+  const simultaneous = plan.max_concurrent_runs === 1
+    ? "1 ejecución a la vez"
+    : `${plan.max_concurrent_runs} ejecuciones simultáneas`;
+  return [
+    `${plan.monthly_credits.toLocaleString()} créditos al mes`,
+    simultaneous,
+    "Portal de facturación y cancelación"
+  ];
 }
 
 async function deleteAccount(): Promise<void> {
@@ -625,7 +637,7 @@ async function deleteAccount(): Promise<void> {
 }
 
 function renderBillingPlan(
-  id: "free" | "basic" | "pro",
+  id: "free" | "basic" | "pro" | "business",
   name: string,
   amount: number,
   subtitle: string,
@@ -633,7 +645,7 @@ function renderBillingPlan(
   currentTier: string
 ): string {
   const current = id === currentTier;
-  const paid = id === "basic" || id === "pro";
+  const paid = id === "basic" || id === "pro" || id === "business";
   return `
     <article class="billing-plan${id === "pro" ? " featured" : ""}${current ? " current" : ""}">
       <span class="plan-kicker">${id === "pro" ? "MÁS CAPACIDAD" : current ? "TU PLAN" : "MENSUAL"}</span>
@@ -674,7 +686,7 @@ async function refreshBilling(): Promise<void> {
   render();
 }
 
-async function startCheckout(tier: "basic" | "pro"): Promise<void> {
+async function startCheckout(tier: "basic" | "pro" | "business"): Promise<void> {
   if (billingBusy) return;
   billingBusy = true;
   transientError = "";
@@ -1763,8 +1775,9 @@ function emptyBillingSnapshot(): BillingSnapshot {
     customer: false,
     subscription: null,
     plans: {
-      basic: { name: "Plus", amount: 50, currency: "usd", interval: "month" },
-      pro: { name: "Pro", amount: 200, currency: "usd", interval: "month" }
+      basic: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 },
+      pro: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 },
+      business: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 }
     }
   };
 }

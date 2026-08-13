@@ -166,7 +166,7 @@ export class DesktopOAuthController {
     return parseBillingSnapshot(await this.client.billing(signal));
   }
 
-  startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+  startCheckout(tier: "basic" | "pro" | "business", signal?: AbortSignal): Promise<void> {
     return this.client.startCheckout(tier, signal);
   }
 
@@ -357,7 +357,9 @@ class WrapperServiceClient {
         browser: options.browser === true,
         computer: options.computer === true,
         bot_id: options.botId ?? "",
-        connector_ids: connectorIds
+        connector_ids: connectorIds,
+        max_credits: 25,
+        idempotency_key: randomUUID()
       },
       signal: options.signal
     });
@@ -409,7 +411,7 @@ class WrapperServiceClient {
     return { deleted: result.deleted === true };
   }
 
-  async startCheckout(tier: "basic" | "pro", signal?: AbortSignal): Promise<void> {
+  async startCheckout(tier: "basic" | "pro" | "business", signal?: AbortSignal): Promise<void> {
     const result = await this.authorizedJson("/v1/billing/checkout", {
       method: "POST",
       body: { tier },
@@ -585,20 +587,39 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
   const plans = isRecord(value.plans) ? value.plans : {};
   const basic = isRecord(plans.basic) ? plans.basic : {};
   const pro = isRecord(plans.pro) ? plans.pro : {};
-  if (tier !== "free" && tier !== "basic" && tier !== "pro") {
+  const business = isRecord(plans.business) ? plans.business : {};
+  if (tier !== "free" && tier !== "basic" && tier !== "pro" && tier !== "business") {
     throw new Error("El servicio devolvió un plan inválido.");
   }
-  const parsePlan = (plan: Record<string, unknown>, fallbackName: string, fallbackAmount: number) => ({
-    name: stringValue(plan.name) || fallbackName,
-    amount: numberValue(plan.amount) || fallbackAmount,
-    currency: stringValue(plan.currency) || "usd",
-    interval: stringValue(plan.interval) || "month"
-  });
+  const parsePlan = (
+    plan: Record<string, unknown>,
+    tierId: "basic" | "pro" | "business"
+  ) => {
+    const parsed = {
+      name: stringValue(plan.name),
+      amount: numberValue(plan.amount),
+      currency: stringValue(plan.currency),
+      interval: stringValue(plan.interval),
+      monthly_credits: numberValue(plan.monthly_credits),
+      max_concurrent_runs: numberValue(plan.max_concurrent_runs)
+    };
+    if (
+      !parsed.name
+      || parsed.amount <= 0
+      || !parsed.currency
+      || !parsed.interval
+      || parsed.monthly_credits <= 0
+      || parsed.max_concurrent_runs <= 0
+    ) {
+      throw new Error(`El servicio devolvió un catálogo incompleto para ${tierId}.`);
+    }
+    return parsed;
+  };
   let subscription: BillingSnapshot["subscription"] = null;
   if (isRecord(value.subscription)) {
     const item = value.subscription;
     const itemTier = item.tier;
-    if (itemTier === "basic" || itemTier === "pro") {
+    if (itemTier === "basic" || itemTier === "pro" || itemTier === "business") {
       subscription = {
         stripe_subscription_id: stringValue(item.stripe_subscription_id),
         tier: itemTier,
@@ -614,7 +635,11 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
     tier,
     customer: value.customer === true,
     subscription,
-    plans: { basic: parsePlan(basic, "Plus", 50), pro: parsePlan(pro, "Pro", 200) }
+    plans: {
+      basic: parsePlan(basic, "basic"),
+      pro: parsePlan(pro, "pro"),
+      business: parsePlan(business, "business")
+    }
   };
 }
 

@@ -7,6 +7,8 @@ cache-miss price.
 
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
+
 # (cache miss input, output, cache hit input, cache write) USD / 1M tokens.
 _PRICES: dict[str, tuple[float, float, float, float]] = {
     "deepseek-v4-flash": (0.14, 0.28, 0.0028, 0.0),
@@ -14,12 +16,6 @@ _PRICES: dict[str, tuple[float, float, float, float]] = {
 }
 
 DEFAULT_PRICES = _PRICES["deepseek-v4-flash"]
-
-# Product usage budgets. These are Agent Genia entitlements, not provider
-# subscriptions; the provider account is owned and paid by Agent Genia.
-LIMITS = {"5h": 12.0, "week": 30.0, "month": 60.0}
-WINDOWS = {"5h": 5 * 3600, "week": 7 * 86400, "month": 30 * 86400}
-
 
 def prices_for(model: str, total_tokens: int | None = None) -> tuple[float, float, float, float]:
     del total_tokens
@@ -36,12 +32,27 @@ def estimate_cost_usd(
     cached_read: int | None,
     cached_write: int | None,
 ) -> float:
+    return estimate_cost_microusd(
+        model, input_tokens, output_tokens, cached_read, cached_write
+    ) / 1_000_000
+
+
+def estimate_cost_microusd(
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_read: int | None,
+    cached_write: int | None,
+) -> int:
+    """Return cost in integer millionths of USD without float balance drift."""
     if input_tokens is None and output_tokens is None:
-        return 0.0
+        return 0
     p_in, p_out, p_cached, p_write = prices_for(model)
     uncached = max(0, (input_tokens or 0) - (cached_read or 0))
-    cost = uncached / 1_000_000 * p_in
-    cost += (output_tokens or 0) / 1_000_000 * p_out
-    cost += (cached_read or 0) / 1_000_000 * p_cached
-    cost += (cached_write or 0) / 1_000_000 * p_write
-    return round(cost, 6)
+    # Prices are USD per 1M tokens. Multiplying tokens by the price yields
+    # microUSD directly. Round only the aggregate provider call once.
+    cost_microusd = Decimal(uncached) * Decimal(str(p_in))
+    cost_microusd += Decimal(output_tokens or 0) * Decimal(str(p_out))
+    cost_microusd += Decimal(cached_read or 0) * Decimal(str(p_cached))
+    cost_microusd += Decimal(cached_write or 0) * Decimal(str(p_write))
+    return max(0, int(cost_microusd.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))

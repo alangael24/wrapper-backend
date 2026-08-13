@@ -177,9 +177,15 @@ y los tres workflows de release
 lo consultan antes de firmar o publicar cualquier binario; si producción no está
 realmente operativa, la distribución se detiene.
 
-La migración `20260813143000_deepseek_direct.sql` lleva el esquema a la
-versión 10. Debe aplicarse antes de desplegar el binario; el verificador de release
+Las migraciones `20260813143000_deepseek_direct.sql` y
+`20260813190000_credit_ledger.sql` llevan el esquema a la versión 11. La última
+añade wallets, grants, reservas, ledger, runs y tokens efímeros. Deben aplicarse
+antes de desplegar el binario; el verificador de release
 impide publicar si el historial local deja de coincidir con el historial remoto.
+
+Producción inicia con `CREDITS_MODE=shadow`. Antes de cambiar a `enforce`, valida
+7–14 días de costos reales, grants por periodo y liberación de reservas. Stripe
+debe tener tres Price IDs live privados: Starter $29, Pro $79 y Business $199.
 
 El sandbox Bubblewrap requiere un host Linux con user namespaces habilitados. Si
 el runtime de contenedores los bloquea, `/v1/agent/status` debe permanecer

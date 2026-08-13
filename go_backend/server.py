@@ -15,7 +15,7 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/connectors/disconnect Revocar la cuenta del usuario
   POST /v1/signup          Crear usuario free (los tiers pagados requieren admin/pago verificado)
   GET  /v1/billing         Consultar plan y suscripción Stripe
-  POST /v1/billing/checkout Crear Checkout para Plus/Pro
+  POST /v1/billing/checkout Crear Checkout para Starter/Pro/Business
   POST /v1/billing/portal  Abrir Customer Portal
   POST /v1/billing/webhook Procesar eventos Stripe firmados
   GET  /v1/models          Catalogo de modelos de DeepSeek
@@ -54,6 +54,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -75,16 +76,28 @@ from .crypto_utils import (
 )
 from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
 from .computers import ComputerConfig, ComputerError, ComputerManager
-from .deepseek_prices import estimate_cost_usd
+from .credits import CreditConfig, CreditService, credits_float
+from .deepseek_prices import estimate_cost_microusd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
     PiHarness,
     PiHarnessBusy,
     PiHarnessError,
+    PiHarnessTimeout,
+    PiHarnessUsageError,
 )
 from .postgres_store import create_store
-from .tiers import DEFAULT_TIER, effective_limits, has_model_access, is_valid, tier_label
+from .store import hash_agent_run_token
+from .tiers import (
+    DEFAULT_TIER,
+    effective_limits,
+    has_model_access,
+    is_valid,
+    plan_for,
+    plan_payload,
+    tier_label,
+)
 from .upstream import DEFAULT_UA, proxy_request
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
@@ -162,6 +175,28 @@ class Config:
         self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
+        try:
+            self.credits = CreditConfig(
+                mode=(os.environ.get("CREDITS_MODE") or "shadow").strip().lower(),
+                llm_multiplier_bps=int(os.environ.get("CREDIT_LLM_MULTIPLIER_BPS", "12500")),
+                display_increment_milli=int(
+                    os.environ.get("CREDIT_DISPLAY_INCREMENT_MILLI", "100")
+                ),
+                trial_credit_milli=int(Decimal(os.environ.get("TRIAL_CREDITS", "30")) * 1000),
+                trial_ttl_days=int(os.environ.get("TRIAL_CREDITS_TTL_DAYS", "30")),
+                default_run_max_milli=int(
+                    Decimal(os.environ.get("DEFAULT_RUN_MAX_CREDITS", "25")) * 1000
+                ),
+                deep_run_max_milli=int(
+                    Decimal(os.environ.get("DEEP_RUN_MAX_CREDITS", "50")) * 1000
+                ),
+                reservation_ttl_seconds=int(
+                    os.environ.get("CREDIT_RESERVATION_TTL_SECONDS", "3900")
+                ),
+            )
+            self.credits.validate()
+        except (ValueError, InvalidOperation) as exc:
+            raise UnsafeConfigurationError(f"Configuración de créditos inválida: {exc}") from exc
         self.wrapper_secret = os.environ.get("WRAPPER_SECRET") or None
         self.wrapper_secret_version = int(os.environ.get("WRAPPER_SECRET_VERSION", "1"))
         try:
@@ -201,8 +236,15 @@ class Config:
         self.stripe_live_mode = os.environ.get("STRIPE_LIVE_MODE", "1") != "0"
         self.stripe_secret_key = (os.environ.get("STRIPE_SECRET_KEY") or "").strip() or None
         self.stripe_webhook_secret = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip() or None
-        self.stripe_plus_price_id = (os.environ.get("STRIPE_PLUS_PRICE_ID") or "").strip() or None
+        self.stripe_starter_price_id = (
+            os.environ.get("STRIPE_STARTER_PRICE_ID")
+            or os.environ.get("STRIPE_PLUS_PRICE_ID")
+            or ""
+        ).strip() or None
         self.stripe_pro_price_id = (os.environ.get("STRIPE_PRO_PRICE_ID") or "").strip() or None
+        self.stripe_business_price_id = (
+            os.environ.get("STRIPE_BUSINESS_PRICE_ID") or ""
+        ).strip() or None
         self.stripe_success_url = (os.environ.get("STRIPE_SUCCESS_URL") or "").strip() or None
         self.stripe_cancel_url = (os.environ.get("STRIPE_CANCEL_URL") or "").strip() or None
         self.stripe_portal_return_url = (
@@ -220,7 +262,7 @@ class Config:
         self.pi_model = os.environ.get("PI_MODEL", "deepseek-v4-flash")
         self.pi_thinking = os.environ.get("PI_THINKING", "high")
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
-        self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "2"))
+        self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
         self.pi_node_bin_dir = os.environ.get("PI_NODE_BIN_DIR") or None
         if "PI_CONNECTOR_EXTENSION" in os.environ:
@@ -377,14 +419,16 @@ class Backend:
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = create_store(database_url=cfg.database_url, db_path=cfg.db_path)
+        self.credits = CreditService(self.store, cfg.credits)
         try:
             billing_config = BillingConfig.from_values(
                 enabled=cfg.stripe_enabled,
                 live_mode=cfg.stripe_live_mode,
                 secret_key=cfg.stripe_secret_key,
                 webhook_secret=cfg.stripe_webhook_secret,
-                basic_price_id=cfg.stripe_plus_price_id,
+                basic_price_id=cfg.stripe_starter_price_id,
                 pro_price_id=cfg.stripe_pro_price_id,
+                business_price_id=cfg.stripe_business_price_id,
                 success_url=cfg.stripe_success_url,
                 cancel_url=cfg.stripe_cancel_url,
                 portal_return_url=cfg.stripe_portal_return_url,
@@ -539,6 +583,61 @@ class Backend:
             error_response(handler, 401, "Sesión o API key del wrapper inválida", "unauthorized")
             return None
         return user
+
+    def require_model_principal(
+        self, handler: BaseHTTPRequestHandler
+    ) -> tuple[dict, dict | None] | None:
+        """Authenticate either a user session or a single-purpose run token."""
+        key = self.bearer(handler)
+        if not key:
+            error_response(handler, 401, "Falta Authorization: Bearer <token>", "unauthorized")
+            return None
+        run = self.store.get_agent_run_by_token(key)
+        if run:
+            user = self.store.get_user_by_id(run["user_id"])
+            if user and user.get("account_status") == "active":
+                return user, run
+        user = self.store.get_user_by_api_key(key) or self.google_auth.authenticate(key)
+        if not user:
+            error_response(handler, 401, "Sesión o token de ejecución inválido", "unauthorized")
+            return None
+        return user, None
+
+    def ensure_trial(self, user: dict) -> None:
+        self.credits.ensure_trial(user["id"])
+
+    def credits_payload(self, user: dict, *, recent_limit: int = 20) -> dict:
+        self.ensure_trial(user)
+        tier = user.get("tier") or DEFAULT_TIER
+        plan = plan_for(tier)
+        summary = self.store.credit_summary(user["id"], recent_limit=recent_limit)
+        activity = [
+            {
+                "type": item["entry_type"],
+                "run_id": item.get("run_id"),
+                "credits": round(item["amount_milli"] / 1000, 3),
+                "created_at": item["created_at"],
+            }
+            for item in summary["recent_activity"]
+        ]
+        billing = self.store.get_billing_status(user["id"])
+        subscription = billing.get("subscription") or {}
+        return {
+            "mode": self.cfg.credits.mode,
+            "plan": {
+                "tier": tier,
+                "name": plan.label,
+                "monthly_credits": plan.monthly_credit_milli // 1000,
+                "max_concurrent_runs": plan.max_concurrent_runs,
+            },
+            "credits": {
+                "available": credits_float(summary["available_milli"]),
+                "reserved": credits_float(summary["reserved_milli"]),
+                "total": credits_float(summary["total_milli"]),
+            },
+            "cycle": {"ends_at": subscription.get("current_period_end")},
+            "recent_activity": activity,
+        }
 
     def require_admin(self, handler: BaseHTTPRequestHandler) -> bool:
         key = self.bearer(handler)
@@ -739,6 +838,7 @@ class Backend:
         tier = DEFAULT_TIER
         api_key = secrets.token_hex(32)
         user = self.store.create_user(api_key, name, email, tier=tier)
+        credits = self.credits_payload(user, recent_limit=0)
         json_response(handler, 201, {
             "api_key": api_key,
             "user_id": user["id"],
@@ -746,9 +846,10 @@ class Backend:
             "tier": tier,
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
+            "credits": credits["credits"],
             "note": (
                 "Guarda el api_key; no se puede volver a mostrar. La cuenta inicia en free; "
-                "basic/pro se activan exclusivamente después de verificar el pago."
+                "Starter/Pro/Business se activan exclusivamente después de verificar el pago."
             ),
         })
 
@@ -815,7 +916,9 @@ class Backend:
         user = self.require_user(handler)
         if not user:
             return
-        json_response(handler, 200, self.billing.status(user))
+        payload = self.billing.status(user)
+        payload["credits"] = self.credits_payload(user, recent_limit=5)["credits"]
+        json_response(handler, 200, payload)
 
     def handle_billing_checkout(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -840,32 +943,50 @@ class Backend:
 
     # ---------- proxy ----------
     def handle_proxy(self, handler: BaseHTTPRequestHandler, path: str) -> None:
-        user = self.require_user(handler)
-        if not user:
+        principal = self.require_model_principal(handler)
+        if not principal:
             return
-        tier = user.get("tier") or DEFAULT_TIER
-        if not has_model_access(tier):
+        user, run = principal
+        if run and path != "/chat/completions":
             error_response(
-                handler, 402,
-                f"El tier '{tier}' ({tier_label(tier)}) no incluye acceso a modelos. "
-                "Cambia a basic o pro para usar el LLM.",
-                "tier_requires_upgrade",
+                handler,
+                403,
+                "El token de ejecución solo puede llamar chat/completions",
+                "run_token_scope",
             )
             return
+        tier = user.get("tier") or DEFAULT_TIER
+        if not run:
+            self.ensure_trial(user)
+        if path == "/chat/completions":
+            if run:
+                consumed = self.credits.billable_milli(
+                    self.store.agent_run_cost_microusd(run["id"]),
+                    int(run.get("extra_cost_microusd") or 0),
+                )
+                if consumed >= int(run["max_credit_milli"]):
+                    error_response(
+                        handler, 402, "La ejecución alcanzó su máximo autorizado",
+                        "run_budget_exhausted",
+                    )
+                    return
+            elif self.cfg.credits.mode == "enforce":
+                error_response(
+                    handler, 403,
+                    "Las llamadas al modelo requieren un token efímero de ejecución",
+                    "run_token_required",
+                )
+                return
+            elif not has_model_access(tier):
+                summary = self.store.credit_summary(user["id"], recent_limit=0)
+                if summary["available_milli"] <= 0:
+                    error_response(
+                        handler, 402, "No quedan créditos disponibles", "insufficient_credits"
+                    )
+                    return
         if not self.cfg.deepseek_api_key:
             error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
             return
-        if self.cfg.enforce_limits:
-            summary = self.store.usage_summary(user["id"], None, tier)["windows"]
-            hit = next((k for k, v in summary.items() if v["spent_usd"] >= v["limit_usd"]), None)
-            if hit:
-                error_response(
-                    handler, 429,
-                    f"Limite de uso alcanzado ({hit}: ${summary[hit]['spent_usd']:.2f} de "
-                    f"${summary[hit]['limit_usd']:.2f}). Espera a que se renueve.",
-                    "usage_limit",
-                )
-                return
         body = self.read_body(handler)
 
         ua = handler.headers.get("user-agent", "")
@@ -917,7 +1038,7 @@ class Backend:
             self.cfg.deepseek_api_key,
             on_chunk=on_chunk, on_headers=on_headers,
         )
-        self.record(user, path, status, usage)
+        self.record(user, path, status, usage, run_id=run["id"] if run else None)
 
         if stream_state["started"]:
             handler.close_connection = True
@@ -941,17 +1062,20 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def record(self, user, path, status, usage) -> None:
+    def record(self, user, path, status, usage, *, run_id: str | None = None) -> None:
         model = usage.model
-        cost = estimate_cost_usd(model, usage.input_tokens, usage.output_tokens,
-                                 usage.cached_read, usage.cached_write) if usage.any() else 0.0
+        cost_microusd = estimate_cost_microusd(
+            model, usage.input_tokens, usage.output_tokens,
+            usage.cached_read, usage.cached_write,
+        ) if usage.any() else 0
+        cost = cost_microusd / 1_000_000
         self.store.record_usage(
             user["id"], None, model, path,
             usage.input_tokens if usage.any() else None,
             usage.output_tokens if usage.any() else None,
             usage.cached_read if usage.any() else None,
             usage.cached_write if usage.any() else None,
-            cost, status,
+            cost, status, run_id=run_id, estimated_cost_microusd=cost_microusd,
         )
 
     # ---------- Pi agent harness ----------
@@ -967,13 +1091,7 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        if not has_model_access(tier):
-            error_response(
-                handler, 402,
-                f"El tier '{tier}' no incluye ejecuciones de Pi",
-                "tier_requires_upgrade",
-            )
-            return
+        self.ensure_trial(user)
         if not self.cfg.deepseek_api_key:
             error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
             return
@@ -984,6 +1102,10 @@ class Backend:
         computer_requested = body.get("computer", False)
         bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
+        idempotency_key = body.get("idempotency_key")
+        max_credits_value = body.get(
+            "max_credits", self.cfg.credits.default_run_max_milli / 1000
+        )
         if not isinstance(prompt, str) or not prompt.strip():
             error_response(handler, 400, "Envia un prompt de texto no vacio", "bad_prompt")
             return
@@ -995,6 +1117,33 @@ class Backend:
             return
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
+            return
+        if (
+            not isinstance(idempotency_key, str)
+            or not 8 <= len(idempotency_key.strip()) <= 200
+        ):
+            error_response(
+                handler, 400, "idempotency_key es obligatorio", "bad_idempotency_key"
+            )
+            return
+        idempotency_key = idempotency_key.strip()
+        requested_credits = Decimal(0)
+        try:
+            requested_credits = Decimal(str(max_credits_value))
+            max_credit_milli = int(requested_credits * 1000)
+        except (InvalidOperation, ValueError):
+            max_credit_milli = 0
+        if (
+            max_credit_milli <= 0
+            or requested_credits * 1000 != max_credit_milli
+            or max_credit_milli > self.cfg.credits.deep_run_max_milli
+        ):
+            error_response(
+                handler, 400,
+                f"max_credits debe ser positivo y no superar "
+                f"{credits_float(self.cfg.credits.deep_run_max_milli)}",
+                "bad_max_credits",
+            )
             return
         try:
             connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
@@ -1024,33 +1173,164 @@ class Backend:
             )
             return
 
-        api_key = self.bearer(handler)
-        assert api_key is not None
-        connector_run_token = (
-            self.connectors.issue(
-                user_id=user["id"],
-                connector_ids=connector_ids,
-                computer_id=bot_id if computer_enabled else None,
-            )
-            if connector_ids or computer_enabled
-            else None
-        )
+        run_api_key = "agrn_" + secrets.token_urlsafe(48)
         try:
+            prepared = self.store.create_agent_run(
+                user_id=user["id"],
+                idempotency_key=idempotency_key,
+                model=self.cfg.pi_model,
+                browser=browser,
+                max_credit_milli=max_credit_milli,
+                max_concurrent_runs=plan_for(tier).max_concurrent_runs,
+                token_hash=hash_agent_run_token(run_api_key),
+                token_expires_at=time.time() + self.cfg.credits.reservation_ttl_seconds,
+                enforce=self.cfg.credits.mode == "enforce",
+            )
+        except RuntimeError as exc:
+            if str(exc) == "insufficient_credits":
+                error_response(handler, 402, "Créditos insuficientes", "insufficient_credits")
+                return
+            if str(exc) == "credit_concurrency_limit":
+                error_response(
+                    handler, 429, "Tu plan alcanzó su límite de ejecuciones simultáneas",
+                    "run_concurrency_limit",
+                )
+                return
+            raise
+        if prepared["duplicate"]:
+            existing = prepared["run"]
+            error_response(
+                handler, 409,
+                f"La ejecución ya existe: {existing['id']} ({existing['status']})",
+                "run_already_exists",
+            )
+            return
+        run = prepared["run"]
+        run_id = run["id"]
+        started_at = time.monotonic()
+
+        def settle(final_status: str, error_code: str | None = None) -> tuple[dict, dict]:
+            llm_cost = self.store.agent_run_cost_microusd(run_id)
+            run_state = self.store.get_agent_run(run_id) or run
+            extra_cost = int(run_state.get("extra_cost_microusd") or 0)
+            charged = (
+                0
+                if self.cfg.credits.mode == "off"
+                else self.credits.billable_milli(llm_cost, extra_cost)
+            )
+            if charged >= max_credit_milli and final_status != "succeeded":
+                final_status = "budget_exhausted"
+                error_code = "run_budget_exhausted"
+            settled = self.store.settle_agent_run(
+                run_id=run_id,
+                charged_milli=charged,
+                final_status=final_status,
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+                error_code=error_code,
+            )
+            balance = self.store.credit_summary(user["id"], recent_limit=0)
+            reserved = int(settled["reserved_credit_milli"])
+            actual = int(settled["charged_credit_milli"])
+            credits = {
+                "mode": self.cfg.credits.mode,
+                "reserved": credits_float(reserved),
+                "charged": credits_float(actual),
+                "released": credits_float(max(0, reserved - actual)),
+                "balance_after": credits_float(balance["available_milli"]),
+            }
+            return settled, credits
+
+        connector_run_token = None
+        try:
+            if connector_ids or computer_enabled:
+                connector_run_token = self.connectors.issue(
+                    user_id=user["id"],
+                    connector_ids=connector_ids,
+                    computer_id=bot_id if computer_enabled else None,
+                )
+            self.store.mark_agent_run_running(run_id)
             result = self.pi.run(
-                user_api_key=api_key,
+                run_id=run_id,
+                run_api_key=run_api_key,
                 prompt=prompt,
                 browser=browser,
                 connector_run_token=connector_run_token,
             )
+        except ConnectorBrokerError as e:
+            self.store.release_agent_run(
+                run_id=run_id,
+                final_status="failed",
+                error_code=e.code,
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+            error_response(handler, e.status, str(e), e.code)
+            return
         except PiHarnessBusy as e:
+            self.store.release_agent_run(
+                run_id=run_id,
+                final_status="failed",
+                error_code="pi_busy",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
             error_response(handler, 429, str(e), "pi_busy")
             return
-        except PiHarnessError as e:
-            error_response(handler, 502, str(e), "pi_error")
+        except PiHarnessUsageError as e:
+            error_code = "pi_timeout" if isinstance(e, PiHarnessTimeout) else "pi_task_error"
+            _settled, _credits = settle("failed", error_code)
+            error_response(
+                handler,
+                504 if isinstance(e, PiHarnessTimeout) else 502,
+                str(e),
+                error_code,
+            )
             return
+        except PiHarnessError as e:
+            # A failure in our own harness must not consume customer credits.
+            # The only exception is a model call that was explicitly stopped
+            # because it reached the user's authorized run budget.
+            llm_cost = self.store.agent_run_cost_microusd(run_id)
+            run_state = self.store.get_agent_run(run_id) or run
+            consumed = self.credits.billable_milli(
+                llm_cost, int(run_state.get("extra_cost_microusd") or 0)
+            )
+            if consumed >= max_credit_milli:
+                settle("budget_exhausted", "run_budget_exhausted")
+                error_response(
+                    handler,
+                    402,
+                    "La ejecución alcanzó su máximo autorizado",
+                    "run_budget_exhausted",
+                )
+            else:
+                self.store.release_agent_run(
+                    run_id=run_id,
+                    final_status="failed",
+                    error_code="pi_error",
+                    duration_seconds=max(0.0, time.monotonic() - started_at),
+                )
+                error_response(handler, 502, str(e), "pi_error")
+            return
+        except Exception:
+            self.store.release_agent_run(
+                run_id=run_id,
+                final_status="failed",
+                error_code="internal_error",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+            raise
         finally:
             self.connectors.revoke(connector_run_token)
+        settled, credits = settle("succeeded")
         payload = result.as_dict()
+        payload["run_id"] = run_id
+        payload["status"] = settled["status"]
+        payload["credits"] = credits
+        payload["usage"].update({
+            "llm_cost_microusd": int(settled["llm_cost_microusd"]),
+            "llm_cost_usd": round(int(settled["llm_cost_microusd"]) / 1_000_000, 6),
+            "extra_cost_microusd": int(settled["extra_cost_microusd"]),
+            "duration_seconds": float(settled["duration_seconds"] or 0),
+        })
         payload["connector_ids"] = list(connector_ids)
         payload["computer_enabled"] = computer_enabled
         json_response(handler, 200, payload)
@@ -1295,7 +1575,49 @@ class Backend:
             return
         json_response(handler, 200, self.store.usage_all())
 
+    def handle_admin_credits(self, handler: BaseHTTPRequestHandler, user_id: str) -> None:
+        if not self.require_admin(handler):
+            return
+        user = self.store.get_user_by_id(user_id)
+        if not user:
+            error_response(handler, 404, "Usuario no encontrado", "not_found")
+            return
+        body = self.read_json(handler) or {}
+        reason = body.get("reason")
+        idempotency_key = body.get("idempotency_key")
+        try:
+            amount = Decimal(str(body.get("credits")))
+            amount_milli = int(amount * 1000)
+        except (InvalidOperation, ValueError):
+            amount = Decimal(0)
+            amount_milli = 0
+        if amount_milli <= 0 or amount * 1000 != amount_milli:
+            error_response(handler, 400, "credits debe ser positivo", "bad_credits")
+            return
+        if not isinstance(reason, str) or not reason.strip():
+            error_response(handler, 400, "reason es obligatorio", "bad_reason")
+            return
+        if not isinstance(idempotency_key, str) or len(idempotency_key.strip()) < 8:
+            error_response(
+                handler, 400, "idempotency_key es obligatorio", "bad_idempotency_key"
+            )
+            return
+        self.store.grant_credits(
+            user_id=user_id,
+            amount_milli=amount_milli,
+            source_type="admin_adjustment",
+            source_key=f"admin:{idempotency_key.strip()}",
+            metadata={"reason": reason.strip()},
+        )
+        json_response(handler, 201, self.credits_payload(user, recent_limit=10))
+
     # ---------- usage/me ----------
+    def handle_credits(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, self.credits_payload(user))
+
     def handle_usage(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
         if not user:
@@ -1304,6 +1626,8 @@ class Backend:
         summary = self.store.usage_summary(user["id"], None, tier)
         summary["tier"] = tier
         summary["tier_label"] = tier_label(tier)
+        summary["legacy_windows"] = summary["windows"]
+        summary["credits"] = self.credits_payload(user, recent_limit=0)["credits"]
         json_response(handler, 200, summary)
 
     def handle_me(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1316,6 +1640,8 @@ class Backend:
             "tier": tier,
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
+            "plan": plan_payload(tier),
+            "credits": self.credits_payload(user, recent_limit=0)["credits"],
         })
 
 
@@ -1393,6 +1719,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_proxy(self, UPSTREAM_PATHS[path])
             elif self.command == "GET" and path == "/v1/usage":
                 backend.handle_usage(self)
+            elif self.command == "GET" and path == "/v1/credits":
+                backend.handle_credits(self)
             elif self.command == "GET" and path == "/v1/me":
                 backend.handle_me(self)
             elif self.command == "GET" and path == "/v1/agent/status":
@@ -1425,6 +1753,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_admin_revoke(self, path.split("/")[3])
             elif self.command == "POST" and path.startswith("/admin/users/") and path.endswith("/tier"):
                 backend.handle_admin_set_tier(self, path.split("/")[3])
+            elif self.command == "POST" and path.startswith("/admin/users/") and path.endswith("/credits"):
+                backend.handle_admin_credits(self, path.split("/")[3])
             elif self.command == "GET" and path == "/admin/usage":
                 backend.handle_admin_usage(self)
             elif self.command == "GET" and path == "/healthz":

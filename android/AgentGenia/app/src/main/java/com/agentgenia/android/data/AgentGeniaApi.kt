@@ -24,6 +24,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 data class AuthStart(val attemptId: String, val authorizeUrl: String, val expiresIn: Int)
@@ -174,7 +175,9 @@ class AgentGeniaApi(
                 .put("browser", false)
                 .put("computer", true)
                 .put("bot_id", botId)
-                .put("connector_ids", JSONArray(connectorIds)),
+                .put("connector_ids", JSONArray(connectorIds))
+                .put("max_credits", 25)
+                .put("idempotency_key", UUID.randomUUID().toString()),
         )
         return json.optString("answer")
     }
@@ -194,13 +197,15 @@ class AgentGeniaApi(
         val json = requestJson("/v1/billing")
         val planJson = json.optJSONObject("plans") ?: JSONObject()
         val plans = buildMap {
-            listOf("basic", "pro").forEach { id ->
+            listOf("basic", "pro", "business").forEach { id ->
                 planJson.optJSONObject(id)?.let { value ->
                     put(id, BillingPlan(
                         name = value.optString("name", id.replaceFirstChar { it.uppercase() }),
                         amount = value.optInt("amount"),
                         currency = value.optString("currency", "usd"),
                         interval = value.optString("interval", "month"),
+                        monthlyCredits = value.optInt("monthly_credits"),
+                        maxConcurrentRuns = value.optInt("max_concurrent_runs"),
                     ))
                 }
             }

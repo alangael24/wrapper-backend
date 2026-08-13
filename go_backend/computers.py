@@ -547,7 +547,11 @@ class ComputerManager:
 
     def _user_limit(self, user_id: str) -> int:
         user = self.store.get_user_by_id(user_id)
-        return self.config.pro_limit if user and user.get("tier") == "pro" else self.config.basic_limit
+        return (
+            self.config.pro_limit
+            if user and user.get("tier") in {"pro", "business"}
+            else self.config.basic_limit
+        )
 
     def _response(self, row: dict[str, Any] | None, **overrides: Any) -> dict[str, Any]:
         state = overrides.get("state") or (row or {}).get("state") or "off"

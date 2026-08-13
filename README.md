@@ -1,9 +1,10 @@
 # Agent Genia — backend y runtime de agentes
 
-Backend de Agent Genia: **cada usuario nuevo empieza en `free`**. Un webhook de
-pago verificado o un administrador autenticado activa `basic`/`pro`. El backend
-usa una cuenta oficial de DeepSeek propiedad de Agent Genia, registra el uso por
-usuario y aplica los presupuestos del producto. La clave `DEEPSEEK_API_KEY` vive
+Backend de Agent Genia: **cada usuario nuevo empieza en `free` con un trial de
+30 créditos**. Un webhook de pago verificado o un administrador autenticado
+activa `basic`/`pro`/`business`. El backend usa una cuenta oficial de DeepSeek
+propiedad de Agent Genia, registra el costo entero por ejecución y liquida un
+wallet auditable de créditos. La clave `DEEPSEEK_API_KEY` vive
 únicamente en el servidor: no se asignan keys de proveedor a usuarios y no hay
 un modo para reemplazarla desde el cliente.
 
@@ -17,35 +18,38 @@ desactivado por defecto.
 
 ## Tiers de usuario
 
-Hay 3 tiers; cada uno aplica un porcentaje de los presupuestos internos de uso
-($12 / 5h, $30 / semana, $60 / mes):
+`basic` sigue siendo el identificador estable de API, pero se presenta como
+Starter. Un crédito representa $0.01 de costo variable normalizado.
 
-| Tier | Límites (5h / semana / mes) | Acceso a modelos |
-|---|---|---|
-| `free` | $0 / $0 / $0 | ❌ (402 `tier_requires_upgrade`) |
-| `basic` | $6 / $15 / $30 | ✅ |
-| `pro` | $12 / $30 / $60 | ✅ |
+| Tier | Nombre | Precio | Créditos | Concurrencia |
+|---|---|---:|---:|---:|
+| `free` | Free Trial | $0 | 30 una sola vez, 30 días | 1 |
+| `basic` | Starter | $29/mes | 300/mes | 1 |
+| `pro` | Pro | $79/mes | 1,000/mes | 2 |
+| `business` | Business | $199/mes | 3,000/mes | 4 |
 
 - `POST /v1/signup` siempre crea `free`. Cualquier `tier` enviado por el
   cliente se ignora.
-- `free` no puede llamar modelos.
-- `basic` y `pro` usan la cuenta DeepSeek administrada por el servidor.
+- `free` puede ejecutar agentes mientras conserve créditos de trial o promoción.
+- Todos los tiers usan la cuenta DeepSeek administrada por el servidor.
 - Después de verificar el pago, el administrador puede cambiar el tier con
   `POST /admin/users/<id>/tier` `{"tier": "pro"}`.
 - La activación del entitlement se ejecuta dentro de la misma transacción que
   procesa el evento Stripe.
-- Los límites se reescalan según el tier: un usuario `basic` recibe 429 al
-  llegar a $6 en 5h; uno `pro` al llegar a $12.
+- Los runs reservan un máximo autorizado y al terminar cobran solo su consumo
+  real, sin superar nunca ese máximo.
 
 ## Cómo funciona el acceso al modelo
 
 1. Cada registro público (`POST /v1/signup`) crea un usuario `free`.
 2. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
-   firmado activa `basic`/`pro` después de confirmar el estado actual en Stripe.
-3. Pi llama al endpoint OpenAI-compatible del wrapper usando la sesión del
-   usuario. El wrapper valida tier y límites y usa su propia `DEEPSEEK_API_KEY`.
-4. El backend registra input, output y cache hits por usuario. La caché de
+   firmado activa Starter, Pro o Business y concede el grant del periodo una sola vez.
+3. Antes de iniciar Pi, el wrapper crea un `agent_run`, reserva créditos y emite
+   un token efímero que solo puede llamar `/v1/chat/completions` para ese run.
+4. El backend registra input, output y cache hits con `run_id`. La caché de
    contexto de DeepSeek es automática y reduce el costo cuando hay coincidencias.
+5. Al finalizar, suma `cost_microusd`, aplica el multiplicador normalizado y
+   redondea una sola vez a 0.1 crédito; después cobra y libera la reserva sobrante.
 
 ### Persistencia con PostgreSQL/Supabase
 
@@ -56,9 +60,9 @@ habilitado como defensa adicional. El backend se conecta exclusivamente con
 usan SQLite cuando esa variable está vacía.
 
 Las migraciones versionadas viven en `supabase/migrations/`. Las transiciones de
-tier y el procesamiento idempotente y cronológico de webhooks se ejecutan dentro
-de transacciones. La versión 10 retira las asignaciones históricas de keys de
-proveedor y permite atribuir uso directamente al usuario.
+tier, los grants, las reservas y el procesamiento idempotente y cronológico de
+webhooks se ejecutan dentro de transacciones. La versión 11 añade el ledger de
+créditos, runs, allocations, tokens efímeros y costo entero en microUSD.
 
 En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
 `WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de
@@ -69,11 +73,13 @@ son temporales y no forman parte de la base de datos.
 
 La integración usa Checkout alojado, el Customer Portal y webhooks idempotentes.
 Electron nunca recibe la secret key, el webhook secret ni un price ID arbitrario.
-El cliente solo solicita `basic` (Plus) o `pro`; el backend resuelve el price ID
-live configurado y el tier no cambia hasta recibir un evento firmado.
+El cliente solo solicita `basic` (Starter), `pro` o `business`; el backend
+resuelve el price ID live configurado y el tier no cambia hasta recibir un
+evento firmado.
 
 1. Aplica las migraciones de Supabase, incluida
-   `20260813143000_deepseek_direct.sql`, antes de desplegar esta versión
+   `20260813143000_deepseek_direct.sql` y
+   `20260813190000_credit_ledger.sql`, antes de desplegar esta versión
    del backend.
 2. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
    del host y establece `STRIPE_ENABLED=1`.
@@ -199,7 +205,7 @@ cd android/AgentGenia
 open app/build/outputs/apk/debug
 ```
 
-Para compilar se necesita JDK 17 y Android SDK Platform 37 con Build Tools
+Para compilar se necesita JDK 17 y Android SDK Platform 36 con Build Tools
 36.0.0; Android Studio instala y administra esas dependencias. El Gradle
 Wrapper 9.5 queda incluido en el repositorio para que CI y Windows usen la
 misma versión.
@@ -472,7 +478,7 @@ Para habilitarla:
 1. Crea una API key server-side en Daytona y define `DAYTONA_API_KEY`.
 2. Define `COMPUTERS_ENABLED=1`. Opcionalmente usa `DAYTONA_SNAPSHOT` para una
    imagen preparada con Chromium y las aplicaciones que quieras entregar.
-3. Aplica la migración `20260812233000_bot_computers.sql` en Supabase y despliega
+3. Aplica la migración `20260812174201_bot_computers.sql` en Supabase y despliega
    el backend. `PI_CONNECTOR_EXTENSION` debe seguir apuntando a la extensión
    first-party incluida en este repositorio.
 
@@ -520,14 +526,15 @@ proviene del flujo de signup.
 | POST | `/v1/connectors/status` | Consulta y consume el consentimiento con `attempt_id` en el body |
 | POST | `/v1/connectors/disconnect` | Revoca las cuentas del toolkit para el usuario |
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
-| POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
+| POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"|"business"}`; el servidor fija el price ID |
 | POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
+| GET | `/v1/credits` | Plan, saldo disponible/reservado, ciclo y actividad reciente |
 | GET | `/v1/models` | Catálogo de modelos del proveedor configurado |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
-| GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
-| GET | `/v1/me` | Usuario, tier y límites del producto |
+| GET | `/v1/usage` | Compatibilidad temporal: reporting histórico y saldo de créditos |
+| GET | `/v1/me` | Usuario, plan y saldo de créditos |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, computer?: false, bot_id?: string, connector_ids?: string[]}` y espera el resultado |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, idempotency_key, max_credits?:25, browser?:false, computer?:false, bot_id?:string, connector_ids?:string[]}` |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
 | POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
 | POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |
@@ -552,19 +559,20 @@ Bearer = `ADMIN_TOKEN`:
 |---|---|---|
 | GET | `/admin/users` | Listar usuarios y tiers |
 | POST | `/admin/users/<id>/revoke` | Deshabilitar la cuenta y revocar API key, sesiones, conectores y computadoras |
-| POST | `/admin/users/<id>/tier` | Cambiar tier `{tier: "free"|"basic"|"pro"}` |
+| POST | `/admin/users/<id>/tier` | Cambiar tier `{tier: "free"|"basic"|"pro"|"business"}` |
+| POST | `/admin/users/<id>/credits` | Grant idempotente `{credits,reason,idempotency_key}` |
 | GET | `/admin/usage` | Eventos de uso recientes |
 
-## Uso y límites
+## Créditos y medición
 
-- Los presupuestos internos son **$12 por 5 horas, $30 por semana, $60 por mes**.
-- El tier del usuario escala esos límites (`basic` = 50%, `pro` = 100%).
-- El backend estima el costo por request con la tabla de precios de
-  `go_backend/deepseek_prices.py` y responde `429 usage_limit` cuando el usuario
-  alcanza un límite (configurable con `ENFORCE_LIMITS=0`).
-- El uso se registra en `usage_events` con tokens input/output/cacheados y
-  costo estimado. En streaming, el uso se captura del evento final si el
-  upstream lo incluye (si no, se cuenta la request sin tokens).
+- La fuente de verdad usa enteros: `cost_microusd` y `credit_milli`; los floats
+  históricos solo permanecen para reporting compatible.
+- DeepSeek se normaliza inicialmente con 1.25x. Browser, herramientas, visión,
+  proxy y cloud computer pueden añadirse como costo extra medido por run.
+- Un run estándar autoriza hasta 25 créditos; deep work puede autorizar hasta 50.
+- `CREDITS_MODE=shadow` calcula y muestra sin bloquear ni descontar. Cambia a
+  `enforce` después de validar producción para reservar, cobrar y detener runs.
+- `/v1/usage` conserva las ventanas históricas una versión; ya no gobiernan el acceso.
 
 ## Configuración (env)
 
@@ -587,7 +595,14 @@ runtime se agrupan aquí por función.
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
 | `DEEPSEEK_API_KEY` | vacío | Obligatoria en producción; clave única propiedad del servidor |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Endpoint oficial OpenAI-compatible de DeepSeek |
-| `ENFORCE_LIMITS` | `1` | Rechazar al superar los presupuestos de uso |
+| `CREDITS_MODE` | `shadow` | `off`, `shadow` o `enforce` |
+| `CREDIT_LLM_MULTIPLIER_BPS` | `12500` | Normalización inicial del costo LLM (1.25x) |
+| `CREDIT_DISPLAY_INCREMENT_MILLI` | `100` | Redondeo final por run (0.1 crédito) |
+| `TRIAL_CREDITS` | `30` | Grant único del trial |
+| `TRIAL_CREDITS_TTL_DAYS` | `30` | Vencimiento del trial |
+| `DEFAULT_RUN_MAX_CREDITS` | `25` | Máximo autorizado predeterminado |
+| `DEEP_RUN_MAX_CREDITS` | `50` | Máximo que puede solicitar un cliente |
+| `CREDIT_RESERVATION_TTL_SECONDS` | `3900` | Liberación automática tras un crash |
 | `GOOGLE_OAUTH_CLIENT_ID` | vacío | Cliente OAuth web de Google |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | vacío | Secreto OAuth, solo servidor |
 | `GOOGLE_OAUTH_REDIRECT_URI` | vacío | Callback `/v1/account-auth/google/callback` registrado en Google |
@@ -604,8 +619,9 @@ runtime se agrupan aquí por función.
 | `STRIPE_LIVE_MODE` | `1` | Exige recursos live; usa `0` únicamente en pruebas |
 | `STRIPE_SECRET_KEY` | vacío | Secret key server-side |
 | `STRIPE_WEBHOOK_SECRET` | vacío | Signing secret `whsec_...` |
-| `STRIPE_PLUS_PRICE_ID` | vacío | Price allowlisted para `basic`/Plus |
+| `STRIPE_STARTER_PRICE_ID` | vacío | Price allowlisted para `basic`/Starter |
 | `STRIPE_PRO_PRICE_ID` | vacío | Price allowlisted para `pro` |
+| `STRIPE_BUSINESS_PRICE_ID` | vacío | Price allowlisted para `business` |
 | `STRIPE_SUCCESS_URL` | vacío | Retorno exitoso de Checkout |
 | `STRIPE_CANCEL_URL` | vacío | Retorno cancelado de Checkout |
 | `STRIPE_PORTAL_RETURN_URL` | vacío | Retorno del Customer Portal |
@@ -634,7 +650,7 @@ runtime se agrupan aquí por función.
 | `PI_MODEL` | `deepseek-v4-flash` | Modelo configurado en Pi |
 | `PI_THINKING` | `high` | Nivel de razonamiento de Pi |
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
-| `PI_MAX_CONCURRENT` | `2` | Procesos Pi simultáneos |
+| `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
 | `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con `connector_search` y herramientas diferidas |
 | `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |
@@ -658,7 +674,7 @@ runtime se agrupan aquí por función.
 | `COMPUTER_PREVIEW_TTL_SECONDS` | `3600` | Vigencia del viewer firmado solicitado por Electron |
 | `COMPUTER_VNC_PORT` | `6080` | Puerto noVNC expuesto mediante preview firmado |
 | `COMPUTER_VNC_RESOLUTION` | `1440x900` | Resolución fija del escritorio al crear la sandbox |
-| `COMPUTER_BASIC_LIMIT` | `1` | Máximo de computadoras persistentes para un usuario Plus |
+| `COMPUTER_BASIC_LIMIT` | `1` | Máximo de computadoras persistentes para un usuario Starter |
 | `COMPUTER_PRO_LIMIT` | `3` | Máximo de computadoras persistentes para un usuario Pro |
 
 ## Seguridad
@@ -668,7 +684,7 @@ runtime se agrupan aquí por función.
 - Las api keys de los usuarios del wrapper se guardan hasheadas (SHA-256);
   solo se muestran una vez en el signup.
 - El signup público siempre crea `free`. Solo una transición autenticada tras
-  comprobar el pago puede activar `basic`/`pro` y reclamar capacidad.
+  comprobar el pago puede activar `basic`/`pro`/`business` y conceder créditos.
 - Los eventos Stripe se verifican con HMAC, tolerancia temporal y `livemode`;
   `stripe_events.event_id` hace su procesamiento idempotente y
   `event.created` impide que un webhook antiguo sobrescriba el estado más

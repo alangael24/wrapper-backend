@@ -122,9 +122,12 @@ private struct AgentRunRequest: Encodable, Sendable {
     let computer: Bool
     let botID: String
     let connectorIDs: [String]
+    let maxCredits: Int
+    let idempotencyKey: String
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
         case botID = "bot_id"; case connectorIDs = "connector_ids"
+        case maxCredits = "max_credits"; case idempotencyKey = "idempotency_key"
     }
 }
 
@@ -311,7 +314,9 @@ actor APIClient {
                 browser: false,
                 computer: computer,
                 botID: botID.uuidString.lowercased(),
-                connectorIDs: connectorIDs
+                connectorIDs: connectorIDs,
+                maxCredits: 25,
+                idempotencyKey: UUID().uuidString.lowercased()
             )
         )
     }

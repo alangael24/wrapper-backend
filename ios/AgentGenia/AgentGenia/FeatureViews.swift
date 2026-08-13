@@ -228,7 +228,7 @@ struct AccountView: View {
                     } else if billing.customer {
                         Button("Administrar suscripción") { Task { await model.openBillingPortal() } }
                     } else if billing.configured {
-                        ForEach(["basic", "pro"], id: \.self) { tier in
+                        ForEach(["basic", "pro", "business"], id: \.self) { tier in
                             if let plan = billing.plans[tier] {
                                 Button {
                                     Task { await model.startCheckout(tier: tier) }
@@ -236,7 +236,7 @@ struct AccountView: View {
                                     HStack {
                                         VStack(alignment: .leading) {
                                             Text(plan.name).fontWeight(.semibold)
-                                            Text("Computadoras persistentes y ejecuciones de agentes")
+                                            Text("\(plan.monthlyCredits.formatted()) créditos · \(plan.maxConcurrentRuns) ejecución\(plan.maxConcurrentRuns == 1 ? "" : "es") simultánea\(plan.maxConcurrentRuns == 1 ? "" : "s")")
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                         }

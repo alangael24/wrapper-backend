@@ -115,7 +115,7 @@ test("normalizes learned workflows inside the account-scoped bot state", () => {
   assert.throws(() => contracts.createBotWorkflow({ title: "Vacío", summary: "", steps: [] }, "bad", "", ""));
 });
 
-test("teaches a task from a real display recording and replays it through Pi without changing the harness", async () => {
+test("records teach-task locally but fails closed while the text-only model cannot inspect frames", async () => {
   const [main, preload, oauth, renderer, styles] = await Promise.all([
     readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
     readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
@@ -133,16 +133,13 @@ test("teaches a task from a real display recording and replays it through Pi wit
   assert.match(main, /\{ computer: true, botId \}/);
   assert.match(preload, /startTeachRecording/);
   assert.match(preload, /stopTeachRecording/);
-  assert.match(oauth, /"\/v1\/responses"/);
-  assert.match(oauth, /type: "input_image"/);
-  assert.match(oauth, /parseTeachWorkflow/);
+  assert.match(oauth, /Teach a task está pausado mientras Agent Genia no tenga soporte visual/);
+  assert.doesNotMatch(oauth, /"\/v1\/responses"|type: "input_image"/);
   assert.match(renderer, /navigator\.mediaDevices\.getDisplayMedia/);
   assert.match(renderer, /new MediaRecorder/);
   assert.match(renderer, /Recording \$\{escapeHtml\(bot\.name\)\}'s computer/);
   assert.match(renderer, /Stop &amp; save/);
-  assert.match(renderer, /Record yourself doing a task/);
-  assert.match(renderer, /data-composer-teach/);
-  assert.match(renderer, /data-run-workflow/);
+  assert.match(renderer, /La grabación de tareas estará disponible cuando vuelva el soporte visual/);
   assert.match(styles, /\.teach-recording-overlay/);
   assert.match(styles, /\.workflow-panel/);
   assert.doesNotMatch(`${main}\n${preload}\n${renderer}`, /go_backend\/pi_harness|from "\.\.\/go_backend/);
@@ -328,7 +325,7 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
     readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
   ]);
   assert.match(main, /desktop:start-checkout/);
-  assert.match(main, /tier !== "basic" && tier !== "pro"/);
+  assert.match(main, /tier !== "basic" && tier !== "pro" && tier !== "business"/);
   assert.match(preload, /startCheckout/);
   assert.match(preload, /openBillingPortal/);
   assert.doesNotMatch(preload, /STRIPE_SECRET_KEY|sk_live_|whsec_/);
@@ -338,6 +335,10 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
   assert.match(renderer, /function renderBilling\(\)/);
   assert.match(renderer, /data-select-plan/);
   assert.match(renderer, /data-open-billing-portal/);
+  assert.match(renderer, /Starter/);
+  assert.match(renderer, /Business/);
+  assert.match(oauth, /idempotency_key: randomUUID\(\)/);
+  assert.match(oauth, /max_credits: 25/);
 });
 
 test("deletes the signed-in account and local per-account state through isolated IPC", async () => {

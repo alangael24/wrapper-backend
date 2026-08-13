@@ -171,8 +171,11 @@ private fun PlanCard(id: String, plan: BillingPlan, busy: Boolean, choose: () ->
     Card(shape = RoundedCornerShape(24.dp)) {
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(plan.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text("${formatter.format(plan.amount / 100.0)} / ${if (plan.interval == "month") "mes" else plan.interval}")
-            Text("Ejecuciones del agente, conectores y computadora persistente.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("${formatter.format(plan.amount.toDouble())} / ${if (plan.interval == "month") "mes" else plan.interval}")
+            Text(
+                "${plan.monthlyCredits} créditos · ${plan.maxConcurrentRuns} ejecución${if (plan.maxConcurrentRuns == 1) "" else "es"} simultánea${if (plan.maxConcurrentRuns == 1) "" else "s"}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Button(onClick = choose, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Elegir ${plan.name}") }
         }
     }

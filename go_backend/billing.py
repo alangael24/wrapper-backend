@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+from .tiers import PAID_TIERS, PLANS
 
-PAID_TIERS = frozenset({"basic", "pro"})
 ACTIVE_STATUSES = frozenset({"active", "trialing"})
 GRACE_STATUSES = frozenset({"past_due"})
 TERMINAL_STATUSES = frozenset({"canceled", "incomplete_expired", "paused", "unpaid"})
@@ -59,6 +59,7 @@ class BillingConfig:
     webhook_secret: str
     basic_price_id: str
     pro_price_id: str
+    business_price_id: str
     success_url: str
     cancel_url: str
     portal_return_url: str
@@ -74,6 +75,7 @@ class BillingConfig:
         webhook_secret: str | None,
         basic_price_id: str | None,
         pro_price_id: str | None,
+        business_price_id: str | None,
         success_url: str | None,
         cancel_url: str | None,
         portal_return_url: str | None,
@@ -86,6 +88,7 @@ class BillingConfig:
             webhook_secret=(webhook_secret or "").strip(),
             basic_price_id=(basic_price_id or "").strip(),
             pro_price_id=(pro_price_id or "").strip(),
+            business_price_id=(business_price_id or "").strip(),
             success_url=(success_url or "").strip(),
             cancel_url=(cancel_url or "").strip(),
             portal_return_url=(portal_return_url or "").strip(),
@@ -102,10 +105,13 @@ class BillingConfig:
             raise ValueError(f"STRIPE_SECRET_KEY debe comenzar con {expected_prefix} para el modo configurado")
         if not self.webhook_secret.startswith("whsec_"):
             raise ValueError("STRIPE_WEBHOOK_SECRET debe comenzar con whsec_")
-        if not self.basic_price_id.startswith("price_") or not self.pro_price_id.startswith("price_"):
+        if not all(
+            value.startswith("price_")
+            for value in (self.basic_price_id, self.pro_price_id, self.business_price_id)
+        ):
             raise ValueError("Los price IDs de Stripe deben comenzar con price_")
-        if self.basic_price_id == self.pro_price_id:
-            raise ValueError("Plus y Pro no pueden usar el mismo price ID")
+        if len({self.basic_price_id, self.pro_price_id, self.business_price_id}) != 3:
+            raise ValueError("Starter, Pro y Business deben usar price IDs distintos")
         _required_https_url(self.success_url, "STRIPE_SUCCESS_URL")
         _required_https_url(self.cancel_url, "STRIPE_CANCEL_URL")
         _required_https_url(self.portal_return_url, "STRIPE_PORTAL_RETURN_URL")
@@ -114,7 +120,11 @@ class BillingConfig:
 
     @property
     def tier_prices(self) -> dict[str, str]:
-        return {"basic": self.basic_price_id, "pro": self.pro_price_id}
+        return {
+            "basic": self.basic_price_id,
+            "pro": self.pro_price_id,
+            "business": self.business_price_id,
+        }
 
     @property
     def price_tiers(self) -> dict[str, str]:
@@ -334,8 +344,16 @@ class BillingService:
             "customer": bool(current.get("customer_id")),
             "subscription": current.get("subscription"),
             "plans": {
-                "basic": {"name": "Plus", "amount": 50, "currency": "usd", "interval": "month"},
-                "pro": {"name": "Pro", "amount": 200, "currency": "usd", "interval": "month"},
+                tier: {
+                    "name": plan.label,
+                    "amount": plan.monthly_price_usd,
+                    "currency": "usd",
+                    "interval": "month",
+                    "monthly_credits": plan.monthly_credit_milli // 1_000,
+                    "max_concurrent_runs": plan.max_concurrent_runs,
+                }
+                for tier, plan in PLANS.items()
+                if tier in PAID_TIERS
             },
         }
 
@@ -343,7 +361,7 @@ class BillingService:
         self._require_enabled()
         tier = tier.strip().lower()
         if tier not in PAID_TIERS:
-            raise BillingError("El plan debe ser basic o pro", code="invalid_plan")
+            raise BillingError("El plan debe ser Starter, Pro o Business", code="invalid_plan")
         current = self.store.get_billing_status(user["id"])
         subscription = current.get("subscription")
         if subscription and subscription.get("status") in ACTIVE_STATUSES | GRACE_STATUSES:
@@ -560,5 +578,8 @@ class BillingService:
             })
         if action["tier_action"] == "activate":
             self._refresh_activation_from_stripe(action)
+        tier = action.get("tier")
+        if action.get("tier_action") == "activate" and tier in PAID_TIERS:
+            action["grant_credit_milli"] = PLANS[tier].monthly_credit_milli
         result = self.store.apply_billing_event(action)
         return {"received": True, **result}

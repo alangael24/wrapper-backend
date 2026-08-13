@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
   cached_read_tokens   INTEGER,
   cached_write_tokens  INTEGER,
   estimated_cost_usd   REAL NOT NULL DEFAULT 0,
+  run_id               TEXT,
+  estimated_cost_microusd INTEGER NOT NULL DEFAULT 0,
   status               INTEGER,
   created_at           REAL NOT NULL
 );
@@ -176,6 +178,94 @@ CREATE TABLE IF NOT EXISTS account_provider_credentials (
   PRIMARY KEY(account_id, provider),
   FOREIGN KEY(account_id) REFERENCES account_identities(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id                    TEXT PRIMARY KEY,
+  user_id               TEXT NOT NULL,
+  idempotency_key       TEXT NOT NULL,
+  status                TEXT NOT NULL,
+  harness               TEXT NOT NULL DEFAULT 'pi',
+  model                 TEXT,
+  browser               INTEGER NOT NULL DEFAULT 0,
+  max_credit_milli      INTEGER NOT NULL,
+  reserved_credit_milli INTEGER NOT NULL DEFAULT 0,
+  charged_credit_milli  INTEGER NOT NULL DEFAULT 0,
+  llm_cost_microusd     INTEGER NOT NULL DEFAULT 0,
+  extra_cost_microusd   INTEGER NOT NULL DEFAULT 0,
+  duration_seconds      REAL,
+  error_code            TEXT,
+  warnings_json         TEXT NOT NULL DEFAULT '[]',
+  created_at            REAL NOT NULL,
+  started_at            REAL,
+  finished_at           REAL,
+  heartbeat_at          REAL,
+  CHECK(max_credit_milli > 0),
+  CHECK(reserved_credit_milli >= 0),
+  CHECK(charged_credit_milli >= 0),
+  CHECK(charged_credit_milli <= max_credit_milli),
+  CHECK(llm_cost_microusd >= 0),
+  CHECK(extra_cost_microusd >= 0),
+  UNIQUE(user_id, idempotency_key),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS credit_grants (
+  id               TEXT PRIMARY KEY,
+  user_id          TEXT NOT NULL,
+  source_type      TEXT NOT NULL,
+  source_key       TEXT NOT NULL UNIQUE,
+  original_milli   INTEGER NOT NULL CHECK(original_milli > 0),
+  remaining_milli  INTEGER NOT NULL CHECK(remaining_milli >= 0),
+  starts_at        REAL NOT NULL,
+  expires_at       REAL,
+  metadata_json    TEXT NOT NULL DEFAULT '{}',
+  created_at       REAL NOT NULL,
+  CHECK(remaining_milli <= original_milli),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS credit_reservations (
+  id               TEXT PRIMARY KEY,
+  user_id          TEXT NOT NULL,
+  run_id           TEXT NOT NULL UNIQUE,
+  reserved_milli   INTEGER NOT NULL CHECK(reserved_milli >= 0),
+  charged_milli    INTEGER NOT NULL DEFAULT 0 CHECK(charged_milli >= 0),
+  status           TEXT NOT NULL,
+  expires_at       REAL NOT NULL,
+  created_at       REAL NOT NULL,
+  settled_at       REAL,
+  CHECK(charged_milli <= reserved_milli),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS credit_reservation_allocations (
+  reservation_id  TEXT NOT NULL,
+  grant_id        TEXT NOT NULL,
+  allocated_milli INTEGER NOT NULL CHECK(allocated_milli > 0),
+  PRIMARY KEY(reservation_id, grant_id),
+  FOREIGN KEY(reservation_id) REFERENCES credit_reservations(id) ON DELETE CASCADE,
+  FOREIGN KEY(grant_id) REFERENCES credit_grants(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS credit_ledger (
+  id                TEXT PRIMARY KEY,
+  user_id           TEXT NOT NULL,
+  run_id            TEXT,
+  grant_id          TEXT,
+  reservation_id    TEXT,
+  entry_type        TEXT NOT NULL,
+  amount_milli      INTEGER NOT NULL,
+  idempotency_key   TEXT NOT NULL UNIQUE,
+  metadata_json     TEXT NOT NULL DEFAULT '{}',
+  created_at        REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS agent_run_tokens (
+  token_hash  TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  run_id      TEXT NOT NULL UNIQUE,
+  expires_at  REAL NOT NULL,
+  revoked_at  REAL,
+  created_at  REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -205,6 +295,11 @@ CREATE INDEX IF NOT EXISTS idx_account_identity_tokens_expires
   ON account_identity_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_account_provider_credentials_account
   ON account_provider_credentials(account_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_user_status ON agent_runs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_credit_grants_user_expiry
+  ON credit_grants(user_id, expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created
+  ON credit_ledger(user_id, created_at);
 """
 
 
@@ -226,6 +321,10 @@ def _hash_account_token(kind: str, token: str) -> str:
 
 def _hash_ephemeral(kind: str, value: str) -> str:
     return hashlib.sha256(f"agentgenia-{kind}|{value}".encode()).hexdigest()
+
+
+def hash_agent_run_token(token: str) -> str:
+    return _hash_ephemeral("run-token", token)
 
 
 class Store:
@@ -302,6 +401,25 @@ class Store:
                 self._conn.execute(
                     "UPDATE go_subscriptions SET status='revoked',assigned_user_id=NULL"
                 )
+            if previous_version < 11:
+                usage_columns = {
+                    row[1] for row in self._conn.execute("PRAGMA table_info(usage_events)")
+                }
+                if "run_id" not in usage_columns:
+                    self._conn.execute("ALTER TABLE usage_events ADD COLUMN run_id TEXT")
+                if "estimated_cost_microusd" not in usage_columns:
+                    self._conn.execute(
+                        "ALTER TABLE usage_events ADD COLUMN "
+                        "estimated_cost_microusd INTEGER NOT NULL DEFAULT 0"
+                    )
+                    self._conn.execute(
+                        "UPDATE usage_events SET estimated_cost_microusd="
+                        "CAST(ROUND(estimated_cost_usd * 1000000) AS INTEGER)"
+                    )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_run "
+                "ON usage_events(run_id, created_at)"
+            )
             self._conn.execute(
                 "INSERT INTO kv(k,v) VALUES('schema_version', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -323,12 +441,19 @@ class Store:
               cached_read_tokens   INTEGER,
               cached_write_tokens  INTEGER,
               estimated_cost_usd   REAL NOT NULL DEFAULT 0,
+              run_id               TEXT,
+              estimated_cost_microusd INTEGER NOT NULL DEFAULT 0,
               status               INTEGER,
               created_at           REAL NOT NULL
             )"""
         )
         self._conn.execute(
-            "INSERT INTO usage_events SELECT * FROM usage_events_legacy_provider"
+            "INSERT INTO usage_events("
+            "id,user_id,subscription_id,model,endpoint,input_tokens,output_tokens,"
+            "cached_read_tokens,cached_write_tokens,estimated_cost_usd,status,created_at"
+            ") SELECT id,user_id,subscription_id,model,endpoint,input_tokens,output_tokens,"
+            "cached_read_tokens,cached_write_tokens,estimated_cost_usd,status,created_at "
+            "FROM usage_events_legacy_provider"
         )
         self._conn.execute("DROP TABLE usage_events_legacy_provider")
         self._conn.execute(
@@ -1137,6 +1262,40 @@ class Store:
                 self._conn.execute(
                     "DELETE FROM connector_auth_attempts WHERE user_id=?", (user_id,)
                 )
+                active_reservations = self._conn.execute(
+                    "SELECT * FROM credit_reservations WHERE user_id=? AND status='active'",
+                    (user_id,),
+                ).fetchall()
+                for reservation in active_reservations:
+                    allocations = self._conn.execute(
+                        "SELECT * FROM credit_reservation_allocations WHERE reservation_id=?",
+                        (reservation["id"],),
+                    ).fetchall()
+                    for allocation in allocations:
+                        self._conn.execute(
+                            "UPDATE credit_grants SET remaining_milli=remaining_milli+? WHERE id=?",
+                            (allocation["allocated_milli"], allocation["grant_id"]),
+                        )
+                    self._ledger_locked(
+                        user_id=user_id, run_id=reservation["run_id"],
+                        reservation_id=reservation["id"], entry_type="release",
+                        amount_milli=int(reservation["reserved_milli"]),
+                        idempotency_key=f"revoke:{reservation['id']}",
+                        metadata={"reason": "account_revoked"}, now=now,
+                    )
+                    self._conn.execute(
+                        "UPDATE credit_reservations SET status='released',settled_at=? WHERE id=?",
+                        (now, reservation["id"]),
+                    )
+                self._conn.execute(
+                    "UPDATE agent_runs SET status='cancelled',finished_at=?,error_code='account_revoked' "
+                    "WHERE user_id=? AND status IN ('reserved','running')",
+                    (now, user_id),
+                )
+                self._conn.execute(
+                    "UPDATE agent_run_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                    (now, user_id),
+                )
                 self._conn.execute(
                     "UPDATE users SET tier='free',subscription_id=NULL,account_status='disabled',"
                     "disabled_at=?,api_key_hash=? WHERE id=?",
@@ -1167,6 +1326,16 @@ class Store:
                 usage = self._conn.execute(
                     "DELETE FROM usage_events WHERE user_id=?", (user_id,)
                 ).rowcount
+                self._conn.execute("DELETE FROM credit_ledger WHERE user_id=?", (user_id,))
+                self._conn.execute(
+                    "DELETE FROM credit_reservation_allocations WHERE reservation_id IN "
+                    "(SELECT id FROM credit_reservations WHERE user_id=?)",
+                    (user_id,),
+                )
+                self._conn.execute("DELETE FROM credit_reservations WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM agent_run_tokens WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM agent_runs WHERE user_id=?", (user_id,))
+                self._conn.execute("DELETE FROM credit_grants WHERE user_id=?", (user_id,))
                 self._conn.execute(
                     "DELETE FROM account_provider_credentials WHERE account_id IN "
                     "(SELECT id FROM account_identities WHERE user_id=?)",
@@ -1250,6 +1419,487 @@ class Store:
     def list_subscriptions(self) -> list[dict]:
         return [dict(r) for r in self._q("SELECT * FROM go_subscriptions ORDER BY created_at")]
 
+    # ---------- créditos y ejecuciones ----------
+    def _ledger_locked(
+        self,
+        *,
+        user_id: str,
+        entry_type: str,
+        amount_milli: int,
+        idempotency_key: str,
+        run_id: str | None = None,
+        grant_id: str | None = None,
+        reservation_id: str | None = None,
+        metadata: dict | None = None,
+        now: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO credit_ledger("
+            "id,user_id,run_id,grant_id,reservation_id,entry_type,amount_milli,"
+            "idempotency_key,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(idempotency_key) DO NOTHING",
+            (
+                new_id("led"), user_id, run_id, grant_id, reservation_id,
+                entry_type, amount_milli, idempotency_key,
+                json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True),
+                now if now is not None else _now(),
+            ),
+        )
+
+    def _grant_credits_locked(
+        self,
+        *,
+        user_id: str,
+        amount_milli: int,
+        source_type: str,
+        source_key: str,
+        starts_at: float,
+        expires_at: float | None,
+        metadata: dict | None,
+        allow_increase: bool,
+    ) -> dict:
+        if amount_milli <= 0:
+            raise ValueError("amount_milli debe ser positivo")
+        existing = self._conn.execute(
+            "SELECT * FROM credit_grants WHERE source_key=?", (source_key,)
+        ).fetchone()
+        now = _now()
+        if existing:
+            if existing["user_id"] != user_id:
+                raise ValueError("source_key ya pertenece a otro usuario")
+            current = int(existing["original_milli"])
+            if allow_increase and amount_milli > current:
+                delta = amount_milli - current
+                self._conn.execute(
+                    "UPDATE credit_grants SET original_milli=?,remaining_milli=remaining_milli+?,"
+                    "expires_at=?,metadata_json=? WHERE id=?",
+                    (
+                        amount_milli, delta, expires_at,
+                        json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True),
+                        existing["id"],
+                    ),
+                )
+                self._ledger_locked(
+                    user_id=user_id,
+                    grant_id=existing["id"],
+                    entry_type="grant",
+                    amount_milli=delta,
+                    idempotency_key=f"grant-increase:{source_key}:{amount_milli}",
+                    metadata={"source_type": source_type, "target_milli": amount_milli},
+                    now=now,
+                )
+            row = self._conn.execute(
+                "SELECT * FROM credit_grants WHERE id=?", (existing["id"],)
+            ).fetchone()
+            return dict(row)
+        grant_id = new_id("grt")
+        self._conn.execute(
+            "INSERT INTO credit_grants("
+            "id,user_id,source_type,source_key,original_milli,remaining_milli,"
+            "starts_at,expires_at,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                grant_id, user_id, source_type, source_key, amount_milli, amount_milli,
+                starts_at, expires_at,
+                json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True), now,
+            ),
+        )
+        self._ledger_locked(
+            user_id=user_id,
+            grant_id=grant_id,
+            entry_type="grant",
+            amount_milli=amount_milli,
+            idempotency_key=f"grant:{source_key}",
+            metadata={"source_type": source_type},
+            now=now,
+        )
+        row = self._conn.execute("SELECT * FROM credit_grants WHERE id=?", (grant_id,)).fetchone()
+        return dict(row)
+
+    def grant_credits(
+        self,
+        *,
+        user_id: str,
+        amount_milli: int,
+        source_type: str,
+        source_key: str,
+        expires_at: float | None = None,
+        metadata: dict | None = None,
+        starts_at: float | None = None,
+        allow_increase: bool = False,
+    ) -> dict:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._conn.execute(
+                    "SELECT 1 FROM users WHERE id=?", (user_id,)
+                ).fetchone():
+                    raise KeyError(user_id)
+                result = self._grant_credits_locked(
+                    user_id=user_id,
+                    amount_milli=amount_milli,
+                    source_type=source_type,
+                    source_key=source_key,
+                    starts_at=starts_at if starts_at is not None else _now(),
+                    expires_at=expires_at,
+                    metadata=metadata,
+                    allow_increase=allow_increase,
+                )
+                self._conn.commit()
+                return result
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_credit_grant_by_source(self, source_key: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM credit_grants WHERE source_key=?", (source_key,)
+        )
+        return dict(row) if row else None
+
+    def _expire_stale_locked(self, now: float) -> int:
+        stale = self._conn.execute(
+            "SELECT * FROM credit_reservations WHERE status='active' AND expires_at<=?",
+            (now,),
+        ).fetchall()
+        for reservation in stale:
+            allocations = self._conn.execute(
+                "SELECT * FROM credit_reservation_allocations WHERE reservation_id=?",
+                (reservation["id"],),
+            ).fetchall()
+            for allocation in allocations:
+                self._conn.execute(
+                    "UPDATE credit_grants SET remaining_milli=remaining_milli+? WHERE id=?",
+                    (allocation["allocated_milli"], allocation["grant_id"]),
+                )
+            self._ledger_locked(
+                user_id=reservation["user_id"],
+                run_id=reservation["run_id"],
+                reservation_id=reservation["id"],
+                entry_type="release",
+                amount_milli=int(reservation["reserved_milli"]),
+                idempotency_key=f"expire:{reservation['id']}",
+                metadata={"reason": "reservation_ttl"},
+                now=now,
+            )
+            self._conn.execute(
+                "UPDATE credit_reservations SET status='expired',settled_at=? WHERE id=?",
+                (now, reservation["id"]),
+            )
+            self._conn.execute(
+                "UPDATE agent_runs SET status='expired',finished_at=?,error_code='reservation_expired' "
+                "WHERE id=? AND status IN ('reserved','running')",
+                (now, reservation["run_id"]),
+            )
+            self._conn.execute(
+                "UPDATE agent_run_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL",
+                (now, reservation["run_id"]),
+            )
+        expired_grants = self._conn.execute(
+            "SELECT * FROM credit_grants WHERE remaining_milli>0 AND expires_at IS NOT NULL "
+            "AND expires_at<=?",
+            (now,),
+        ).fetchall()
+        for grant in expired_grants:
+            amount = int(grant["remaining_milli"])
+            self._conn.execute(
+                "UPDATE credit_grants SET remaining_milli=0 WHERE id=?", (grant["id"],)
+            )
+            self._ledger_locked(
+                user_id=grant["user_id"], grant_id=grant["id"], entry_type="expire",
+                amount_milli=-amount, idempotency_key=f"expire-grant:{grant['id']}", now=now,
+            )
+        return len(stale)
+
+    def expire_stale_reservations(self, now: float | None = None) -> int:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                count = self._expire_stale_locked(now if now is not None else _now())
+                self._conn.commit()
+                return count
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def credit_summary(self, user_id: str, *, recent_limit: int = 20) -> dict:
+        now = _now()
+        self.expire_stale_reservations(now)
+        available = self._one(
+            "SELECT COALESCE(SUM(remaining_milli),0) AS n FROM credit_grants "
+            "WHERE user_id=? AND starts_at<=? AND (expires_at IS NULL OR expires_at>?)",
+            (user_id, now, now),
+        )
+        reserved = self._one(
+            "SELECT COALESCE(SUM(reserved_milli),0) AS n FROM credit_reservations "
+            "WHERE user_id=? AND status='active'",
+            (user_id,),
+        )
+        recent = self._q(
+            "SELECT entry_type,amount_milli,run_id,created_at FROM credit_ledger "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, max(0, min(recent_limit, 100))),
+        )
+        available_milli = int(available["n"] if available else 0)
+        reserved_milli = int(reserved["n"] if reserved else 0)
+        return {
+            "available_milli": available_milli,
+            "reserved_milli": reserved_milli,
+            "total_milli": available_milli + reserved_milli,
+            "recent_activity": [dict(row) for row in recent],
+        }
+
+    def create_agent_run(
+        self,
+        *,
+        user_id: str,
+        idempotency_key: str,
+        model: str,
+        browser: bool,
+        max_credit_milli: int,
+        max_concurrent_runs: int,
+        token_hash: str,
+        token_expires_at: float,
+        enforce: bool,
+    ) -> dict:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._expire_stale_locked(now)
+                existing = self._conn.execute(
+                    "SELECT * FROM agent_runs WHERE user_id=? AND idempotency_key=?",
+                    (user_id, idempotency_key),
+                ).fetchone()
+                if existing:
+                    self._conn.rollback()
+                    return {"duplicate": True, "run": dict(existing)}
+                active = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM agent_runs WHERE user_id=? "
+                    "AND status IN ('reserved','running')",
+                    (user_id,),
+                ).fetchone()
+                if int(active["n"] or 0) >= max_concurrent_runs:
+                    raise RuntimeError("credit_concurrency_limit")
+                grants = self._conn.execute(
+                    "SELECT * FROM credit_grants WHERE user_id=? AND remaining_milli>0 "
+                    "AND starts_at<=? AND (expires_at IS NULL OR expires_at>?) "
+                    "ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END,expires_at,"
+                    "CASE source_type WHEN 'subscription' THEN 0 WHEN 'trial' THEN 1 "
+                    "WHEN 'promotion' THEN 2 WHEN 'topup' THEN 3 ELSE 4 END,created_at",
+                    (user_id, now, now),
+                ).fetchall()
+                available = sum(int(grant["remaining_milli"]) for grant in grants)
+                if enforce and available < max_credit_milli:
+                    raise RuntimeError("insufficient_credits")
+                reserve_amount = max_credit_milli if enforce else 0
+                run_id = new_id("run")
+                reservation_id = new_id("rsv")
+                self._conn.execute(
+                    "INSERT INTO agent_runs("
+                    "id,user_id,idempotency_key,status,harness,model,browser,max_credit_milli,"
+                    "reserved_credit_milli,created_at,heartbeat_at) VALUES(?,?,?,'reserved','pi',?,?,?,?,?,?)",
+                    (
+                        run_id, user_id, idempotency_key, model, int(browser), max_credit_milli,
+                        reserve_amount, now, now,
+                    ),
+                )
+                self._conn.execute(
+                    "INSERT INTO credit_reservations("
+                    "id,user_id,run_id,reserved_milli,status,expires_at,created_at) "
+                    "VALUES(?,?,?,?, 'active',?,?)",
+                    (reservation_id, user_id, run_id, reserve_amount, token_expires_at, now),
+                )
+                remaining = reserve_amount
+                for grant in grants:
+                    if remaining <= 0:
+                        break
+                    allocated = min(remaining, int(grant["remaining_milli"]))
+                    self._conn.execute(
+                        "UPDATE credit_grants SET remaining_milli=remaining_milli-? WHERE id=?",
+                        (allocated, grant["id"]),
+                    )
+                    self._conn.execute(
+                        "INSERT INTO credit_reservation_allocations("
+                        "reservation_id,grant_id,allocated_milli) VALUES(?,?,?)",
+                        (reservation_id, grant["id"], allocated),
+                    )
+                    remaining -= allocated
+                if reserve_amount:
+                    self._ledger_locked(
+                        user_id=user_id, run_id=run_id, reservation_id=reservation_id,
+                        entry_type="reserve", amount_milli=-reserve_amount,
+                        idempotency_key=f"reserve:{reservation_id}", now=now,
+                    )
+                self._conn.execute(
+                    "INSERT INTO agent_run_tokens(token_hash,user_id,run_id,expires_at,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (token_hash, user_id, run_id, token_expires_at, now),
+                )
+                self._conn.commit()
+                row = self._one("SELECT * FROM agent_runs WHERE id=?", (run_id,))
+                return {"duplicate": False, "run": dict(row)}
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_agent_run_running(self, run_id: str) -> None:
+        now = _now()
+        self._exec(
+            "UPDATE agent_runs SET status='running',started_at=?,heartbeat_at=? "
+            "WHERE id=? AND status='reserved'",
+            (now, now, run_id),
+        )
+
+    def get_agent_run(self, run_id: str) -> dict | None:
+        row = self._one("SELECT * FROM agent_runs WHERE id=?", (run_id,))
+        return dict(row) if row else None
+
+    def get_agent_run_by_token(self, token: str) -> dict | None:
+        now = _now()
+        row = self._one(
+            "SELECT r.*,t.expires_at AS token_expires_at,u.account_status "
+            "FROM agent_run_tokens t JOIN agent_runs r ON r.id=t.run_id "
+            "JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.revoked_at IS NULL "
+            "AND t.expires_at>? AND r.status IN ('reserved','running') AND u.account_status='active'",
+            (hash_agent_run_token(token), now),
+        )
+        return dict(row) if row else None
+
+    def agent_run_cost_microusd(self, run_id: str) -> int:
+        row = self._one(
+            "SELECT COALESCE(SUM(estimated_cost_microusd),0) AS n FROM usage_events WHERE run_id=?",
+            (run_id,),
+        )
+        return int(row["n"] if row else 0)
+
+    def record_run_extra_cost(self, run_id: str, cost_microusd: int) -> None:
+        """Add a measured non-LLM cost to an active run using integer units."""
+        if cost_microusd < 0:
+            raise ValueError("cost_microusd no puede ser negativo")
+        self._exec(
+            "UPDATE agent_runs SET extra_cost_microusd=extra_cost_microusd+?,heartbeat_at=? "
+            "WHERE id=? AND status IN ('reserved','running')",
+            (int(cost_microusd), _now(), run_id),
+        )
+
+    def settle_agent_run(
+        self,
+        *,
+        run_id: str,
+        charged_milli: int,
+        final_status: str,
+        duration_seconds: float | None,
+        error_code: str | None = None,
+        warnings: list[str] | None = None,
+        reservation_status: str = "settled",
+    ) -> dict:
+        if reservation_status not in {"settled", "released"}:
+            raise ValueError("reservation_status inválido")
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                run = self._conn.execute(
+                    "SELECT * FROM agent_runs WHERE id=?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    raise KeyError(run_id)
+                if run["status"] not in {"reserved", "running"}:
+                    self._conn.rollback()
+                    return dict(run)
+                reservation = self._conn.execute(
+                    "SELECT * FROM credit_reservations WHERE run_id=?", (run_id,)
+                ).fetchone()
+                reserved = int(reservation["reserved_milli"] if reservation else 0)
+                charged = min(max(0, charged_milli), int(run["max_credit_milli"]))
+                if reserved:
+                    charged = min(charged, reserved)
+                    allocations = self._conn.execute(
+                        "SELECT a.*,g.expires_at,g.created_at FROM credit_reservation_allocations a "
+                        "JOIN credit_grants g ON g.id=a.grant_id WHERE a.reservation_id=? "
+                        "ORDER BY CASE WHEN g.expires_at IS NULL THEN 1 ELSE 0 END,g.expires_at,g.created_at",
+                        (reservation["id"],),
+                    ).fetchall()
+                    consume_remaining = charged
+                    for allocation in allocations:
+                        allocated = int(allocation["allocated_milli"])
+                        consumed = min(allocated, consume_remaining)
+                        refund = allocated - consumed
+                        if refund:
+                            self._conn.execute(
+                                "UPDATE credit_grants SET remaining_milli=remaining_milli+? WHERE id=?",
+                                (refund, allocation["grant_id"]),
+                            )
+                        consume_remaining -= consumed
+                    self._ledger_locked(
+                        user_id=run["user_id"], run_id=run_id,
+                        reservation_id=reservation["id"], entry_type="release",
+                        amount_milli=reserved,
+                        idempotency_key=f"release:{reservation['id']}", now=now,
+                    )
+                    if charged:
+                        self._ledger_locked(
+                            user_id=run["user_id"], run_id=run_id,
+                            reservation_id=reservation["id"], entry_type="charge",
+                            amount_milli=-charged,
+                            idempotency_key=f"charge:{reservation['id']}", now=now,
+                        )
+                    self._conn.execute(
+                        "UPDATE credit_reservations SET charged_milli=?,status=?,settled_at=? "
+                        "WHERE id=?",
+                        (charged, reservation_status, now, reservation["id"]),
+                    )
+                run_cost = self._conn.execute(
+                    "SELECT COALESCE(SUM(estimated_cost_microusd),0) AS n "
+                    "FROM usage_events WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                self._conn.execute(
+                    "UPDATE agent_runs SET status=?,charged_credit_milli=?,llm_cost_microusd=?,"
+                    "duration_seconds=?,error_code=?,warnings_json=?,finished_at=?,heartbeat_at=? WHERE id=?",
+                    (
+                        final_status, charged, int(run_cost["n"] if run_cost else 0),
+                        duration_seconds, error_code,
+                        json.dumps(warnings or [], separators=(",", ":")), now, now, run_id,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE agent_run_tokens SET revoked_at=? WHERE run_id=? AND revoked_at IS NULL",
+                    (now, run_id),
+                )
+                self._conn.commit()
+                row = self._one("SELECT * FROM agent_runs WHERE id=?", (run_id,))
+                return dict(row)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def release_agent_run(
+        self,
+        *,
+        run_id: str,
+        final_status: str = "cancelled",
+        error_code: str | None = None,
+        duration_seconds: float | None = None,
+    ) -> dict:
+        """Release the complete reservation without charging the user."""
+        return self.settle_agent_run(
+            run_id=run_id,
+            charged_milli=0,
+            final_status=final_status,
+            duration_seconds=duration_seconds,
+            error_code=error_code,
+            reservation_status="released",
+        )
+
+    def recent_agent_runs(self, user_id: str, limit: int = 20) -> list[dict]:
+        return [
+            dict(row) for row in self._q(
+                "SELECT * FROM agent_runs WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, max(1, min(limit, 100))),
+            )
+        ]
+
     # ---------- uso ----------
     def record_usage(
         self,
@@ -1263,15 +1913,22 @@ class Store:
         cached_write: int | None,
         estimated_cost_usd: float,
         status: int,
+        run_id: str | None = None,
+        estimated_cost_microusd: int | None = None,
     ) -> None:
+        microusd = (
+            max(0, int(estimated_cost_microusd))
+            if estimated_cost_microusd is not None
+            else max(0, int(round(estimated_cost_usd * 1_000_000)))
+        )
         with self._lock:
             self._conn.execute(
                 "INSERT INTO usage_events(user_id, subscription_id, model, endpoint, input_tokens, output_tokens, "
-                "cached_read_tokens, cached_write_tokens, estimated_cost_usd, status, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "cached_read_tokens, cached_write_tokens, estimated_cost_usd,run_id,"
+                "estimated_cost_microusd,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     user_id, subscription_id, model, endpoint, input_tokens, output_tokens,
-                    cached_read, cached_write, estimated_cost_usd, status, _now(),
+                    cached_read, cached_write, estimated_cost_usd, run_id, microusd, status, _now(),
                 ),
             )
             self._conn.commit()
@@ -1423,7 +2080,7 @@ class Store:
                     existing["stripe_price_id"] if existing else None
                 )
                 status = action.get("status") or (existing["status"] if existing else "unknown")
-                if stripe_subscription_id and tier in {"basic", "pro"}:
+                if stripe_subscription_id and tier in {"basic", "pro", "business"}:
                     self._conn.execute(
                         "INSERT INTO billing_subscriptions("
                         "stripe_subscription_id,user_id,tier,stripe_price_id,status,"
@@ -1449,9 +2106,28 @@ class Store:
 
                 tier_action = action.get("tier_action")
                 if tier_action == "activate":
-                    if tier not in {"basic", "pro"}:
+                    if tier not in {"basic", "pro", "business"}:
                         raise ValueError("No se pudo resolver el tier pagado del evento Stripe")
                     self._transition_user_tier_locked(user_id, tier)
+                    grant_milli = int(action.get("grant_credit_milli") or 0)
+                    period_end = action.get("current_period_end")
+                    if grant_milli > 0 and stripe_subscription_id and period_end:
+                        self._grant_credits_locked(
+                            user_id=user_id,
+                            amount_milli=grant_milli,
+                            source_type="subscription",
+                            source_key=(
+                                f"stripe-period:{stripe_subscription_id}:{int(period_end)}"
+                            ),
+                            starts_at=now,
+                            expires_at=float(period_end),
+                            metadata={
+                                "tier": tier,
+                                "stripe_subscription_id": stripe_subscription_id,
+                                "current_period_end": int(period_end),
+                            },
+                            allow_increase=True,
+                        )
                 elif tier_action == "free":
                     self._transition_user_tier_locked(user_id, "free")
 
@@ -1498,7 +2174,8 @@ class Store:
     def usage_all(self) -> dict:
         events = self._q(
             "SELECT user_id, subscription_id, model, endpoint, input_tokens, output_tokens, "
-            "cached_read_tokens, cached_write_tokens, estimated_cost_usd, status, created_at "
+            "cached_read_tokens, cached_write_tokens, estimated_cost_usd,run_id,"
+            "estimated_cost_microusd,status,created_at "
             "FROM usage_events ORDER BY created_at DESC LIMIT 500"
         )
         return {"events": [dict(r) for r in events]}

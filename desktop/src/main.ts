@@ -221,7 +221,7 @@ function registerDesktopIpc(): void {
   });
   ipcMain.handle(CHANNELS.billingSnapshot, () => oauthController.billingStatus());
   ipcMain.handle(CHANNELS.startCheckout, (_event, tier: unknown) => {
-    if (tier !== "basic" && tier !== "pro") throw new Error("Plan inválido.");
+    if (tier !== "basic" && tier !== "pro" && tier !== "business") throw new Error("Plan inválido.");
     return oauthController.startCheckout(tier);
   });
   ipcMain.handle(CHANNELS.openBillingPortal, () => oauthController.openBillingPortal());

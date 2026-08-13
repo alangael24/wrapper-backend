@@ -20,6 +20,7 @@ from go_backend.store import Store
 
 PLUS_PRICE = "price_plus_live"
 PRO_PRICE = "price_pro_live"
+BUSINESS_PRICE = "price_business_live"
 
 
 def config(*, live_mode: bool = True) -> BillingConfig:
@@ -30,6 +31,7 @@ def config(*, live_mode: bool = True) -> BillingConfig:
         webhook_secret="whsec_example",
         basic_price_id=PLUS_PRICE,
         pro_price_id=PRO_PRICE,
+        business_price_id=BUSINESS_PRICE,
         success_url="https://agentgenia.example/billing/success",
         cancel_url="https://agentgenia.example/pricing",
         portal_return_url="https://agentgenia.example/account",
@@ -142,8 +144,47 @@ class TestBilling(unittest.TestCase):
         billing = self.store.get_billing_status(self.user["id"])
         self.assertEqual(billing["customer_id"], "cus_live")
         self.assertEqual(billing["subscription"]["stripe_subscription_id"], "sub_stripe")
+        grants = self.store._q(
+            "SELECT source_key,original_milli,remaining_milli FROM credit_grants WHERE user_id=?",
+            (self.user["id"],),
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0]["source_key"], "stripe-period:sub_stripe:1900000000")
+        self.assertEqual(grants[0]["original_milli"], 300_000)
         duplicate = self.activate_plus()
         self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(
+            self.store._one("SELECT COUNT(*) AS n FROM credit_grants")["n"], 1
+        )
+
+    def test_midcycle_upgrade_grants_only_the_plan_delta(self):
+        self.activate_plus(created=1_800_000_000)
+        self.client.subscriptions["sub_stripe"] = {
+            "id": "sub_stripe",
+            "customer": "cus_live",
+            "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_end": 1_900_000_000,
+            "metadata": {"user_id": self.user["id"], "tier": "pro"},
+            "items": {"data": [{"price": {"id": PRO_PRICE}}]},
+        }
+        self.process(self.event(
+            "evt_upgrade",
+            "customer.subscription.updated",
+            self.client.subscriptions["sub_stripe"],
+            created=1_800_000_100,
+        ))
+        grant = self.store._one(
+            "SELECT original_milli,remaining_milli FROM credit_grants WHERE source_key=?",
+            ("stripe-period:sub_stripe:1900000000",),
+        )
+        self.assertEqual(grant["original_milli"], 1_000_000)
+        self.assertEqual(grant["remaining_milli"], 1_000_000)
+        ledger = self.store._q(
+            "SELECT amount_milli FROM credit_ledger WHERE grant_id=(SELECT id FROM credit_grants WHERE source_key=?)",
+            ("stripe-period:sub_stripe:1900000000",),
+        )
+        self.assertEqual(sorted(row["amount_milli"] for row in ledger), [300_000, 700_000])
 
     def test_past_due_keeps_access_but_terminal_status_revokes_it(self):
         self.activate_plus()
@@ -328,6 +369,7 @@ class TestBilling(unittest.TestCase):
                 webhook_secret="whsec_example",
                 basic_price_id=PLUS_PRICE,
                 pro_price_id=PRO_PRICE,
+                business_price_id=BUSINESS_PRICE,
                 success_url="https://example.com/success",
                 cancel_url="https://example.com/cancel",
                 portal_return_url="https://example.com/account",
@@ -340,6 +382,7 @@ class TestBilling(unittest.TestCase):
                 webhook_secret="whsec_example",
                 basic_price_id=PLUS_PRICE,
                 pro_price_id=PLUS_PRICE,
+                business_price_id=BUSINESS_PRICE,
                 success_url="https://example.com/success",
                 cancel_url="https://example.com/cancel",
                 portal_return_url="https://example.com/account",

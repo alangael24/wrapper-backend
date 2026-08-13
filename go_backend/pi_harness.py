@@ -11,7 +11,6 @@ import socket
 import subprocess
 import threading
 import time
-import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -31,13 +30,21 @@ class PiHarnessBusy(PiHarnessError):
     """No hay un slot de ejecucion disponible."""
 
 
+class PiHarnessUsageError(PiHarnessError):
+    """La tarea comenzó y debe liquidarse por el consumo real acumulado."""
+
+
+class PiHarnessTimeout(PiHarnessUsageError):
+    """La tarea consumió recursos pero no terminó antes de su deadline."""
+
+
 @dataclass
 class PiRunResult:
     run_id: str
     answer: str
     model: str
     duration_seconds: float
-    usage: dict[str, int]
+    usage: dict[str, int | float]
     browser: bool
     event_log: str
     stderr_log: str
@@ -208,7 +215,8 @@ class PiHarness:
     def run(
         self,
         *,
-        user_api_key: str,
+        run_id: str,
+        run_api_key: str,
         prompt: str,
         browser: bool = False,
         connector_run_token: str | None = None,
@@ -234,7 +242,8 @@ class PiHarness:
             raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
         try:
             return self._run(
-                user_api_key=user_api_key,
+                run_id=run_id,
+                run_api_key=run_api_key,
                 prompt=prompt,
                 browser=browser,
                 connector_run_token=connector_run_token,
@@ -295,7 +304,7 @@ class PiHarness:
         self,
         run_dir: Path,
         config_dir: Path,
-        user_api_key: str,
+        run_api_key: str,
         chrome_bridge_port: int | None = None,
         connector_run_token: str | None = None,
     ) -> dict[str, str]:
@@ -313,7 +322,7 @@ class PiHarness:
             "PI_SKIP_VERSION_CHECK": "1",
             "PI_TELEMETRY": "0",
             "PI_OFFLINE": "1",
-            API_KEY_ENV: user_api_key,
+            API_KEY_ENV: run_api_key,
         }
         if chrome_bridge_port is not None:
             env["PI_CHROME_BRIDGE_HOST"] = "127.0.0.1"
@@ -453,12 +462,12 @@ class PiHarness:
     def _run(
         self,
         *,
-        user_api_key: str,
+        run_id: str,
+        run_api_key: str,
         prompt: str,
         browser: bool,
         connector_run_token: str | None,
     ) -> PiRunResult:
-        run_id = uuid.uuid4().hex
         run_dir = self.runs_dir / run_id
         config_dir = run_dir / "config"
         work_dir = run_dir / "workspace"
@@ -502,7 +511,7 @@ class PiHarness:
                     env=self._child_env(
                         run_dir,
                         config_dir,
-                        user_api_key,
+                        run_api_key,
                         chrome_bridge_port=bridge_port,
                         connector_run_token=connector_run_token,
                     ),
@@ -613,12 +622,16 @@ class PiHarness:
                             send({"type": "abort"})
                         except (BrokenPipeError, OSError):
                             pass
-                        raise PiHarnessError(f"Pi excedio el timeout de {self.timeout_seconds}s")
+                        raise PiHarnessTimeout(
+                            f"Pi excedio el timeout de {self.timeout_seconds}s"
+                        )
                     raise PiHarnessError(
                         f"Pi termino antes de completar la tarea (exit={process.poll()})"
                     )
                 if agent_error:
-                    raise PiHarnessError(f"Pi no pudo completar la tarea: {agent_error}")
+                    raise PiHarnessUsageError(
+                        f"Pi no pudo completar la tarea: {agent_error}"
+                    )
                 if not answer:
                     raise PiHarnessError("Pi completo la ejecucion sin una respuesta final")
             finally:
