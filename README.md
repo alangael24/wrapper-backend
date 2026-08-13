@@ -173,7 +173,8 @@ dispositivo. Access token y refresh token se guardan en Keychain con protección
 iOS. Cada cuenta guarda sus bots en un archivo distinto bajo Application
 Support, protegido por iOS, de modo que cerrar sesión no mezcla conversaciones.
 
-El chat llama realmente a `/v1/agent/run` y conserva los widgets de preguntas
+El chat precalienta la sesión aislada del bot con `/v1/agent/warm`, llama realmente
+a `/v1/agent/run` y conserva los widgets de preguntas
 generados por el LLM, sin saludos ni opciones hardcodeadas. El marketplace
 muestra el catálogo completo, autoriza cuentas mediante el mismo gateway de
 Composio/adaptadores first-party y su pestaña `Tuyos` contiene los plugins que
@@ -562,6 +563,7 @@ proviene del flujo de signup.
 | GET | `/v1/me` | Usuario, plan y saldo de créditos |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
 | POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}` |
+| POST | `/v1/agent/warm` | Prepara la sesión aislada de Pi para `{bot_id}` sin llamar al modelo ni consumir créditos |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
 | POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
 | POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |

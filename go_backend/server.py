@@ -21,6 +21,7 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/models          Catalogo de modelos de DeepSeek
   POST /v1/chat/completions
   GET  /v1/agent/status    Estado del harness de Pi
+  POST /v1/agent/warm      Precalentar la sesión aislada de un bot
   POST /v1/agent/run       Ejecutar una tarea con Pi
   GET  /v1/computers/<bot_id> Estado de la computadora persistente del bot
   POST /v1/computers/<bot_id>/ensure Crear/despertar y obtener un viewer firmado
@@ -585,6 +586,8 @@ class Backend:
         self.cfg = cfg
         self._run_timing_lock = threading.Lock()
         self._run_timings: dict[str, dict[str, float]] = {}
+        self._run_provider_lock = threading.Lock()
+        self._run_providers: dict[str, dict[str, Any]] = {}
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -735,6 +738,22 @@ class Backend:
                 return {}
             return {key: value for key, value in timing.items() if not key.startswith("_")}
 
+    def _run_provider(
+        self,
+        run_id: str,
+        *,
+        value: dict[str, Any] | None = None,
+        pop: bool = False,
+    ) -> dict[str, Any] | None:
+        """Keep a decrypted provider credential only for one active run."""
+        with self._run_provider_lock:
+            if value is not None:
+                self._run_providers[run_id] = value
+                return value
+            if pop:
+                return self._run_providers.pop(run_id, None)
+            return self._run_providers.get(run_id)
+
     # ---------- auth helpers ----------
     def encrypt_secret(self, plaintext: str, key_id: str) -> bytes:
         """Encrypt a connector or identity secret with the active master key."""
@@ -777,9 +796,18 @@ class Backend:
         """Resolve the authenticated account's server-side model provider."""
         if user.get("model_provider_override") == "opencode":
             subscription_id = user.get("subscription_id")
-            subscription = (
-                self.store.get_subscription(subscription_id) if subscription_id else None
-            )
+            subscription = None
+            if subscription_id and user.get("provider_subscription_id") == subscription_id:
+                subscription = {
+                    "id": user.get("provider_subscription_id"),
+                    "api_key_enc": user.get("provider_api_key_enc"),
+                    "key_id": user.get("provider_key_id"),
+                    "key_version": user.get("provider_key_version"),
+                    "status": user.get("provider_subscription_status"),
+                    "assigned_user_id": user.get("provider_assigned_user_id"),
+                }
+            elif subscription_id:
+                subscription = self.store.get_subscription(subscription_id)
             if (
                 not subscription
                 or subscription.get("status") != "assigned"
@@ -845,8 +873,21 @@ class Backend:
             return None
         run = self.store.get_agent_run_by_token(key)
         if run:
-            user = self.store.get_user_by_id(run["user_id"])
-            if user and user.get("account_status") == "active":
+            user = {
+                "id": run.get("principal_user_id") or run["user_id"],
+                "tier": run.get("principal_tier") or DEFAULT_TIER,
+                "unlimited_usage": run.get("principal_unlimited_usage") or 0,
+                "model_provider_override": run.get("principal_model_provider_override"),
+                "subscription_id": run.get("principal_subscription_id"),
+                "account_status": run.get("account_status"),
+                "provider_subscription_id": run.get("provider_subscription_id"),
+                "provider_api_key_enc": run.get("provider_api_key_enc"),
+                "provider_key_id": run.get("provider_key_id"),
+                "provider_key_version": run.get("provider_key_version"),
+                "provider_subscription_status": run.get("provider_subscription_status"),
+                "provider_assigned_user_id": run.get("provider_assigned_user_id"),
+            }
+            if user.get("account_status") == "active":
                 return user, run
         user = self.store.get_user_by_api_key(key) or self.google_auth.authenticate(key)
         if not user:
@@ -1252,11 +1293,13 @@ class Backend:
                         handler, 402, "No quedan créditos disponibles", "insufficient_credits"
                     )
                     return
-        try:
-            provider = self.model_provider(user)
-        except ModelProviderUnavailable as exc:
-            error_response(handler, 503, str(exc), "model_unavailable")
-            return
+        provider = self._run_provider(run_id) if run_id else None
+        if provider is None:
+            try:
+                provider = self.model_provider(user)
+            except ModelProviderUnavailable as exc:
+                error_response(handler, 503, str(exc), "model_unavailable")
+                return
         body = self.read_body(handler)
 
         ua = handler.headers.get("user-agent", "")
@@ -1428,6 +1471,34 @@ class Backend:
         )
         json_response(handler, 200, status)
 
+    def handle_agent_warm(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        bot_id = body.get("bot_id")
+        if not isinstance(bot_id, str) or not bot_id.strip() or len(bot_id.strip()) > 200:
+            error_response(handler, 400, "bot_id no es válido", "bad_bot_id")
+            return
+        try:
+            self.model_provider(user)
+            result = self.pi.prewarm(
+                conversation_key=f"{user['id']}\0{bot_id.strip()}",
+            )
+        except ModelProviderUnavailable as exc:
+            error_response(handler, 503, str(exc), "model_unavailable")
+            return
+        except PiHarnessBusy as exc:
+            error_response(handler, 429, str(exc), "pi_busy")
+            return
+        except PiHarnessTimeout as exc:
+            error_response(handler, 504, str(exc), "pi_warm_timeout")
+            return
+        except PiHarnessError as exc:
+            error_response(handler, 502, str(exc), "pi_warm_error")
+            return
+        json_response(handler, 200, result)
+
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
         request_started_at = time.monotonic()
         user = self.require_user(handler)
@@ -1435,9 +1506,10 @@ class Backend:
             return
         tier = user.get("tier") or DEFAULT_TIER
         unlimited = self.unlimited_usage(user)
-        self.ensure_trial(user)
+        if not unlimited:
+            self.ensure_trial(user)
         try:
-            self.model_provider(user)
+            selected_provider = self.model_provider(user)
         except ModelProviderUnavailable as exc:
             error_response(handler, 503, str(exc), "model_unavailable")
             return
@@ -1628,6 +1700,7 @@ class Backend:
             return settled, credits
 
         connector_run_token = None
+        self._run_provider(run_id, value=selected_provider)
         try:
             if connector_ids or computer_enabled:
                 connector_run_token = self.connectors.issue(
@@ -1733,6 +1806,7 @@ class Backend:
             raise
         finally:
             self.connectors.revoke(connector_run_token)
+            self._run_provider(run_id, pop=True)
         settled, credits = settle("succeeded")
         payload = result.as_dict()
         payload["run_id"] = run_id
@@ -2150,6 +2224,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_me(self)
             elif self.command == "GET" and path == "/v1/agent/status":
                 backend.handle_agent_status(self)
+            elif self.command == "POST" and path == "/v1/agent/warm":
+                backend.handle_agent_warm(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
             elif path.startswith("/v1/computers/"):

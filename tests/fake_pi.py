@@ -41,6 +41,15 @@ if connector_token and not runtime_auth_file:
 
 for line in sys.stdin:
     command = json.loads(line)
+    if command.get("type") == "get_state":
+        print(json.dumps({
+            "id": command.get("id"),
+            "type": "response",
+            "command": "get_state",
+            "success": True,
+            "data": {"isStreaming": False},
+        }), flush=True)
+        continue
     if command.get("type") == "extension_ui_response" and command.get("id") == "fake-chrome-confirm":
         print(json.dumps({
             "id": "chrome-authorize",

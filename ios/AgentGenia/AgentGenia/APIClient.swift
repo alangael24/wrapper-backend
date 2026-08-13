@@ -134,6 +134,15 @@ private struct AgentRunRequest: Encodable, Sendable {
     }
 }
 
+private struct AgentWarmRequest: Encodable, Sendable {
+    let botID: String
+    enum CodingKeys: String, CodingKey { case botID = "bot_id" }
+}
+
+private struct AgentWarmResponse: Decodable, Sendable {
+    let ready: Bool
+}
+
 struct AgentRunResponse: Decodable, Sendable { let answer: String }
 private struct AgentStreamDelta: Decodable, Sendable { let text: String }
 private struct AgentStreamFailure: Decodable, Sendable {
@@ -334,6 +343,21 @@ actor APIClient {
             canRefresh: true,
             onDelta: onDelta
         )
+    }
+
+    func warmAgent(botID: UUID) async throws {
+        let response: AgentWarmResponse = try await request(
+            "/v1/agent/warm",
+            method: "POST",
+            body: AgentWarmRequest(botID: botID.uuidString.lowercased())
+        )
+        guard response.ready else {
+            throw ServiceError(
+                message: "El agente todavía no está listo.",
+                code: "pi_warm_incomplete",
+                status: 502
+            )
+        }
     }
 
     func computerStatus(botID: UUID) async throws -> ComputerSnapshot {

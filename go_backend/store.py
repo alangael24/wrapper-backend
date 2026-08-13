@@ -953,7 +953,12 @@ class Store:
 
     def get_user_by_api_key(self, api_key: str) -> dict | None:
         row = self._one(
-            "SELECT * FROM users WHERE api_key_hash=? AND account_status='active'",
+            "SELECT u.*,gs.id AS provider_subscription_id,"
+            "gs.api_key_enc AS provider_api_key_enc,gs.key_id AS provider_key_id,"
+            "gs.key_version AS provider_key_version,gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id "
+            "FROM users u LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+            "WHERE u.api_key_hash=? AND u.account_status='active'",
             (hash_wrapper_key(api_key),),
         )
         return dict(row) if row else None
@@ -1175,9 +1180,14 @@ class Store:
 
     def get_user_by_access_token(self, access_token: str) -> dict | None:
         row = self._one(
-            "SELECT u.* FROM account_sessions s "
+            "SELECT u.*,gs.id AS provider_subscription_id,"
+            "gs.api_key_enc AS provider_api_key_enc,gs.key_id AS provider_key_id,"
+            "gs.key_version AS provider_key_version,gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id "
+            "FROM account_sessions s "
             "JOIN account_identities a ON a.id=s.account_id "
             "JOIN users u ON u.id=a.user_id "
+            "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
             "WHERE s.access_token_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>? "
             "AND u.account_status='active'",
             (_hash_account_token("access", access_token), _now()),
@@ -1858,9 +1868,19 @@ class Store:
     def get_agent_run_by_token(self, token: str) -> dict | None:
         now = _now()
         row = self._one(
-            "SELECT r.*,t.expires_at AS token_expires_at,u.account_status "
+            "SELECT r.*,t.expires_at AS token_expires_at,u.account_status,"
+            "u.id AS principal_user_id,u.tier AS principal_tier,"
+            "u.unlimited_usage AS principal_unlimited_usage,"
+            "u.model_provider_override AS principal_model_provider_override,"
+            "u.subscription_id AS principal_subscription_id,"
+            "gs.id AS provider_subscription_id,gs.api_key_enc AS provider_api_key_enc,"
+            "gs.key_id AS provider_key_id,gs.key_version AS provider_key_version,"
+            "gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id "
             "FROM agent_run_tokens t JOIN agent_runs r ON r.id=t.run_id "
-            "JOIN users u ON u.id=t.user_id WHERE t.token_hash=? AND t.revoked_at IS NULL "
+            "JOIN users u ON u.id=t.user_id "
+            "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+            "WHERE t.token_hash=? AND t.revoked_at IS NULL "
             "AND t.expires_at>? AND r.status IN ('reserved','running') AND u.account_status='active'",
             (hash_agent_run_token(token), now),
         )

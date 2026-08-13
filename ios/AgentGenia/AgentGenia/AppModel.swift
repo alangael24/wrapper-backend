@@ -30,6 +30,8 @@ final class AppModel {
     private var connectorPollingTask: Task<Void, Never>?
     private var connectorRefreshTask: Task<ConnectorSnapshot, Error>?
     private var billingRefreshTask: Task<BillingSnapshot, Error>?
+    private var agentWarmTasks: [UUID: Task<Bool, Never>] = [:]
+    private var warmedBotUntil: [UUID: Date] = [:]
     private var lastConnectorRefresh = Date.distantPast
     private var lastBillingRefresh = Date.distantPast
     private var browserPurpose: BrowserRequest.Purpose?
@@ -102,6 +104,9 @@ final class AppModel {
         connectorRefreshTask = nil
         billingRefreshTask?.cancel()
         billingRefreshTask = nil
+        for task in agentWarmTasks.values { task.cancel() }
+        agentWarmTasks = [:]
+        warmedBotUntil = [:]
         lastConnectorRefresh = .distantPast
         lastBillingRefresh = .distantPast
         isBusy = false
@@ -137,6 +142,9 @@ final class AppModel {
         browserRequest = nil
         browserPurpose = nil
         computer = nil
+        for task in agentWarmTasks.values { task.cancel() }
+        agentWarmTasks = [:]
+        warmedBotUntil = [:]
         phase = .signedOut
     }
 
@@ -158,7 +166,7 @@ final class AppModel {
         bots.append(bot)
         destination = .bot(bot.id)
         await persist()
-        await sendInitialMessageIfNeeded(botID: bot.id)
+        await prepareBot(botID: bot.id)
     }
 
     func updateBot(
@@ -190,6 +198,34 @@ final class AppModel {
         let value = clean(text, maximum: 20_000)
         guard !value.isEmpty else { return }
         await runAgent(botID: botID, userText: value, initial: false)
+    }
+
+    func prepareBot(botID: UUID) async {
+        async let warming: Void = warmAgent(botID: botID)
+        await sendInitialMessageIfNeeded(botID: botID)
+        _ = await warming
+    }
+
+    private func warmAgent(botID: UUID) async {
+        guard phase == .ready, account != nil else { return }
+        if let expiresAt = warmedBotUntil[botID], expiresAt > Date() { return }
+        let task: Task<Bool, Never>
+        if let existing = agentWarmTasks[botID] {
+            task = existing
+        } else {
+            task = Task { [api] in
+                do {
+                    try await api.warmAgent(botID: botID)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            agentWarmTasks[botID] = task
+        }
+        let ready = await task.value
+        agentWarmTasks[botID] = nil
+        if ready { warmedBotUntil[botID] = Date().addingTimeInterval(10 * 60) }
     }
 
     func refreshConnectors(force: Bool = false) async {
@@ -460,6 +496,7 @@ final class AppModel {
                 id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
             ))
         }
+        await warmAgent(botID: botID)
         do {
             let connectorIDs = initial
                 ? []

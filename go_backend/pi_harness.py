@@ -299,6 +299,95 @@ class PiHarness:
         finally:
             self._slots.release()
 
+    def prewarm(self, *, conversation_key: str, timeout_seconds: float = 25.0) -> dict[str, Any]:
+        """Start one isolated RPC session and wait until it accepts commands.
+
+        This does not call a model or create conversation history. The runtime
+        credential file intentionally remains empty until an actual run writes
+        its one-time token.
+        """
+        if not self.enabled:
+            raise PiHarnessError("El harness de Pi esta desactivado (PI_ENABLED=0)")
+        if not self.warm_sessions_enabled:
+            raise PiHarnessError("Las sesiones cálidas de Pi están desactivadas")
+        if not conversation_key:
+            raise PiHarnessError("La sesión cálida requiere una identidad de bot")
+        if not self._resolved_binary():
+            raise PiHarnessError(f"No se encontro el ejecutable de Pi: {self.binary}")
+        if not self._slots.acquire(blocking=False):
+            raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
+
+        session: _WarmSession | None = None
+        fatal = False
+        started_new = False
+        started_at = time.monotonic()
+        try:
+            session = self._acquire_warm_session(conversation_key)
+            if session.process is None or session.process.poll() is not None:
+                self._stop_warm_session(session)
+                self._start_warm_session(
+                    session,
+                    run_api_key="",
+                    connector_run_token=None,
+                )
+                started_new = True
+
+            process = session.process
+            events = session.events
+            assert process is not None and process.stdin is not None and events is not None
+            request_id = f"prewarm-{time.time_ns()}"
+            process.stdin.write(json.dumps({"id": request_id, "type": "get_state"}) + "\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + max(1.0, timeout_seconds)
+            while time.monotonic() < deadline:
+                try:
+                    remaining = max(0.01, deadline - time.monotonic())
+                    line = events.get(timeout=min(0.5, remaining))
+                except queue.Empty:
+                    if process.poll() is not None:
+                        break
+                    continue
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "extension_ui_request":
+                    process.stdin.write(json.dumps({
+                        "type": "extension_ui_response",
+                        "id": event.get("id"),
+                        "cancelled": True,
+                    }) + "\n")
+                    process.stdin.flush()
+                    continue
+                if event.get("type") == "response" and event.get("id") == request_id:
+                    if not event.get("success"):
+                        fatal = True
+                        raise PiHarnessError(str(event.get("error") or "Pi no aceptó el precalentamiento"))
+                    session.last_used = time.monotonic()
+                    return {
+                        "ready": True,
+                        "started": started_new,
+                        "duration_ms": round((time.monotonic() - started_at) * 1000, 3),
+                    }
+            fatal = True
+            raise PiHarnessTimeout("Pi no estuvo listo antes del timeout de precalentamiento")
+        except (BrokenPipeError, OSError) as exc:
+            fatal = True
+            raise PiHarnessError("La sesión de Pi se cerró durante el precalentamiento") from exc
+        finally:
+            if session is not None:
+                try:
+                    self._atomic_runtime_auth(session.auth_file)
+                except OSError:
+                    fatal = True
+                session.last_used = time.monotonic()
+                if fatal:
+                    self._remove_warm_session(session)
+                session.lock.release()
+            self._slots.release()
+
     def _write_config(self, config_dir: Path) -> None:
         payload = {
             "providers": {

@@ -1382,6 +1382,45 @@ class TestBackend(unittest.TestCase):
         upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream_calls), 2)
 
+    def test_pi_prewarm_starts_the_same_isolated_session_without_model_usage(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        status, warmed = self.ws.req(
+            "POST",
+            "/v1/agent/warm",
+            {"bot_id": "bot-precalentado"},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(warmed["ready"])
+        self.assertTrue(warmed["started"])
+        session = next(iter(self.ws.backend.pi._sessions.values()))
+        process_id = session.process.pid
+        self.assertEqual(
+            json.loads(session.auth_file.read_text(encoding="utf-8")),
+            {"run_api_key": "", "connector_run_token": ""},
+        )
+        self.assertEqual(
+            [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"],
+            [],
+        )
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "hola",
+                "bot_id": "bot-precalentado",
+                "idempotency_key": "prewarmed-session-run",
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("fake-pi", result["answer"])
+        self.assertEqual(next(iter(self.ws.backend.pi._sessions.values())).process.pid, process_id)
+
     def test_pi_sessions_are_separated_by_account_and_bot(self):
         first = self.new_user()
         second = self.new_user()

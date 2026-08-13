@@ -263,7 +263,7 @@ private struct BotView: View {
                 }
                 .sheet(isPresented: $showingSettings) { BotSettingsView(botID: botID) }
                 .sheet(isPresented: $showingComputer) { ComputerPanel(botID: botID) }
-                .task(id: botID) { await model.sendInitialMessageIfNeeded(botID: botID) }
+                .task(id: botID) { await model.prepareBot(botID: botID) }
             } else {
                 ContentUnavailableView("Bot no encontrado", systemImage: "exclamationmark.circle")
             }
