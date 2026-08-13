@@ -112,9 +112,11 @@ if (!pythonLock.includes("--hash=sha256:")) {
 if (!desktopReleaseWorkflow.includes("inputs.platforms == 'windows'")
   || !desktopReleaseWorkflow.includes("mac_pkg")
   || !desktopReleaseWorkflow.includes("electron-builder --mac")
+  || !desktopReleaseWorkflow.includes("--universal --publish never")
   || !desktopReleaseWorkflow.includes("electron-builder --win --publish never -c.forceCodeSigning=true")
   || !desktopReleaseWorkflow.includes("electron-builder --linux --publish never -c.forceCodeSigning=false")
   || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")
+  || !desktopReleaseWorkflow.includes("gh release delete-asset")
   || !desktopReleaseWorkflow.includes("attestations: write")) {
   throw new Error("Desktop release must append Windows only through its signed, checksum-preserving path");
 }
