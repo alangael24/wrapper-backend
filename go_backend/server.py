@@ -79,6 +79,7 @@ from .computers import ComputerConfig, ComputerError, ComputerManager
 from .credits import CreditConfig, CreditService, credits_float
 from .deepseek_prices import estimate_cost_microusd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
+from .opencode_prices import estimate_cost_microusd as estimate_opencode_cost_microusd
 from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
     PiHarness,
@@ -116,6 +117,7 @@ DEFAULT_PI_CONNECTOR_EXTENSION = (
     Path(__file__).resolve().parent.parent / "extensions" / "connectors" / "index.ts"
 )
 DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com"
+DEFAULT_OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
 MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
@@ -137,6 +139,10 @@ class RequestBodyTooLarge(RequestBodyError):
 
 
 class UnsafeConfigurationError(RuntimeError):
+    pass
+
+
+class ModelProviderUnavailable(RuntimeError):
     pass
 
 
@@ -172,6 +178,9 @@ class Config:
             "DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE
         ).rstrip("/")
         self.deepseek_api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        self.opencode_base_url = os.environ.get(
+            "OPENCODE_BASE_URL", DEFAULT_OPENCODE_BASE
+        ).rstrip("/")
         self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
@@ -567,6 +576,65 @@ class Backend:
             allow_secret_file=self.cfg.environment != "production",
         )
 
+    def subscription_key(self, subscription: dict) -> str:
+        """Decrypt and opportunistically rotate a server-owned provider key."""
+        version = int(subscription.get("key_version") or 1)
+        plaintext = self.decrypt_secret(
+            bytes(subscription["api_key_enc"]), subscription["key_id"], version
+        )
+        if version != self.cfg.wrapper_secret_version:
+            self.store.update_subscription_encryption(
+                subscription["id"],
+                self.encrypt_secret(plaintext, subscription["key_id"]),
+                self.cfg.wrapper_secret_version,
+            )
+        return plaintext
+
+    def model_provider(self, user: dict) -> dict:
+        """Resolve the authenticated account's server-side model provider."""
+        if user.get("model_provider_override") == "opencode":
+            subscription_id = user.get("subscription_id")
+            subscription = (
+                self.store.get_subscription(subscription_id) if subscription_id else None
+            )
+            if (
+                not subscription
+                or subscription.get("status") != "assigned"
+                or subscription.get("assigned_user_id") != user["id"]
+            ):
+                raise ModelProviderUnavailable(
+                    "La credencial privada de OpenCode no está asignada"
+                )
+            try:
+                api_key = self.subscription_key(subscription)
+            except Exception as exc:
+                logging.exception(
+                    "No se pudo descifrar la credencial OpenCode de %s", user["id"]
+                )
+                raise ModelProviderUnavailable(
+                    "No se pudo cargar la credencial privada de OpenCode"
+                ) from exc
+            return {
+                "name": "opencode",
+                "base_url": self.cfg.opencode_base_url,
+                "api_key": api_key,
+                "subscription_id": subscription["id"],
+            }
+        if not self.cfg.deepseek_api_key:
+            raise ModelProviderUnavailable(
+                "El proveedor de modelos predeterminado no está configurado"
+            )
+        return {
+            "name": "deepseek",
+            "base_url": self.cfg.deepseek_base_url,
+            "api_key": self.cfg.deepseek_api_key,
+            "subscription_id": None,
+        }
+
+    @staticmethod
+    def unlimited_usage(user: dict) -> bool:
+        return bool(int(user.get("unlimited_usage") or 0))
+
     def bearer(self, handler: BaseHTTPRequestHandler) -> str | None:
         auth = handler.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
@@ -609,6 +677,7 @@ class Backend:
     def credits_payload(self, user: dict, *, recent_limit: int = 20) -> dict:
         self.ensure_trial(user)
         tier = user.get("tier") or DEFAULT_TIER
+        unlimited = self.unlimited_usage(user)
         plan = plan_for(tier)
         summary = self.store.credit_summary(user["id"], recent_limit=recent_limit)
         activity = [
@@ -623,14 +692,17 @@ class Backend:
         billing = self.store.get_billing_status(user["id"])
         subscription = billing.get("subscription") or {}
         return {
-            "mode": self.cfg.credits.mode,
+            "mode": "unlimited" if unlimited else self.cfg.credits.mode,
+            "unlimited": unlimited,
             "plan": {
                 "tier": tier,
                 "name": plan.label,
                 "monthly_credits": plan.monthly_credit_milli // 1000,
                 "five_hour_credits": plan.five_hour_credit_milli // 1000,
                 "seven_day_credits": plan.seven_day_credit_milli // 1000,
-                "max_concurrent_runs": plan.max_concurrent_runs,
+                "max_concurrent_runs": (
+                    self.cfg.pi_max_concurrent if unlimited else plan.max_concurrent_runs
+                ),
             },
             "credits": {
                 "available": credits_float(summary["available_milli"]),
@@ -949,6 +1021,7 @@ class Backend:
         if not principal:
             return
         user, run = principal
+        unlimited = self.unlimited_usage(user)
         if run and path != "/chat/completions":
             error_response(
                 handler,
@@ -961,7 +1034,7 @@ class Backend:
         if not run:
             self.ensure_trial(user)
         if path == "/chat/completions":
-            if run:
+            if run and not unlimited:
                 consumed = self.credits.billable_milli(
                     self.store.agent_run_cost_microusd(run["id"]),
                     int(run.get("extra_cost_microusd") or 0),
@@ -972,22 +1045,24 @@ class Backend:
                         "run_budget_exhausted",
                     )
                     return
-            elif self.cfg.credits.mode == "enforce":
+            elif self.cfg.credits.mode == "enforce" and not unlimited:
                 error_response(
                     handler, 403,
                     "Las llamadas al modelo requieren un token efímero de ejecución",
                     "run_token_required",
                 )
                 return
-            elif not has_model_access(tier):
+            elif not unlimited and not has_model_access(tier):
                 summary = self.store.credit_summary(user["id"], recent_limit=0)
                 if summary["available_milli"] <= 0:
                     error_response(
                         handler, 402, "No quedan créditos disponibles", "insufficient_credits"
                     )
                     return
-        if not self.cfg.deepseek_api_key:
-            error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
+        try:
+            provider = self.model_provider(user)
+        except ModelProviderUnavailable as exc:
+            error_response(handler, 503, str(exc), "model_unavailable")
             return
         body = self.read_body(handler)
 
@@ -1033,14 +1108,21 @@ class Backend:
 
         status, out_headers, out_body, usage = proxy_request(
             handler.command,
-            self.cfg.deepseek_base_url,
+            provider["base_url"],
             path,
             headers,
             body,
-            self.cfg.deepseek_api_key,
+            provider["api_key"],
             on_chunk=on_chunk, on_headers=on_headers,
         )
-        self.record(user, path, status, usage, run_id=run["id"] if run else None)
+        self.record(
+            user,
+            provider,
+            path,
+            status,
+            usage,
+            run_id=run["id"] if run else None,
+        )
 
         if stream_state["started"]:
             handler.close_connection = True
@@ -1064,15 +1146,29 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def record(self, user, path, status, usage, *, run_id: str | None = None) -> None:
+    def record(
+        self,
+        user: dict,
+        provider: dict,
+        path: str,
+        status: int,
+        usage,
+        *,
+        run_id: str | None = None,
+    ) -> None:
         model = usage.model
-        cost_microusd = estimate_cost_microusd(
+        estimator = (
+            estimate_opencode_cost_microusd
+            if provider["name"] == "opencode"
+            else estimate_cost_microusd
+        )
+        cost_microusd = estimator(
             model, usage.input_tokens, usage.output_tokens,
             usage.cached_read, usage.cached_write,
         ) if usage.any() else 0
         cost = cost_microusd / 1_000_000
         self.store.record_usage(
-            user["id"], None, model, path,
+            user["id"], provider["subscription_id"], model, path,
             usage.input_tokens if usage.any() else None,
             usage.output_tokens if usage.any() else None,
             usage.cached_read if usage.any() else None,
@@ -1082,10 +1178,14 @@ class Backend:
 
     # ---------- Pi agent harness ----------
     def handle_agent_status(self, handler: BaseHTTPRequestHandler) -> None:
-        if not self.require_user(handler):
+        user = self.require_user(handler)
+        if not user:
             return
         status = self.pi.status()
         status.pop("binary", None)  # no exponer rutas internas del servidor
+        status["model_provider"] = (
+            "opencode" if user.get("model_provider_override") == "opencode" else "deepseek"
+        )
         json_response(handler, 200, status)
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1093,9 +1193,12 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
+        unlimited = self.unlimited_usage(user)
         self.ensure_trial(user)
-        if not self.cfg.deepseek_api_key:
-            error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
+        try:
+            self.model_provider(user)
+        except ModelProviderUnavailable as exc:
+            error_response(handler, 503, str(exc), "model_unavailable")
             return
 
         body = self.read_json(handler) or {}
@@ -1184,12 +1287,14 @@ class Backend:
                 model=self.cfg.pi_model,
                 browser=browser,
                 max_credit_milli=max_credit_milli,
-                max_concurrent_runs=plan.max_concurrent_runs,
+                max_concurrent_runs=(
+                    self.cfg.pi_max_concurrent if unlimited else plan.max_concurrent_runs
+                ),
                 five_hour_credit_milli=plan.five_hour_credit_milli,
                 seven_day_credit_milli=plan.seven_day_credit_milli,
                 token_hash=hash_agent_run_token(run_api_key),
                 token_expires_at=time.time() + self.cfg.credits.reservation_ttl_seconds,
-                enforce=self.cfg.credits.mode == "enforce",
+                enforce=self.cfg.credits.mode == "enforce" and not unlimited,
             )
         except RuntimeError as exc:
             if str(exc) == "insufficient_credits":
@@ -1226,10 +1331,10 @@ class Backend:
             extra_cost = int(run_state.get("extra_cost_microusd") or 0)
             charged = (
                 0
-                if self.cfg.credits.mode == "off"
+                if self.cfg.credits.mode == "off" or unlimited
                 else self.credits.billable_milli(llm_cost, extra_cost)
             )
-            if charged >= max_credit_milli and final_status != "succeeded":
+            if not unlimited and charged >= max_credit_milli and final_status != "succeeded":
                 final_status = "budget_exhausted"
                 error_code = "run_budget_exhausted"
             settled = self.store.settle_agent_run(
@@ -1304,7 +1409,7 @@ class Backend:
             consumed = self.credits.billable_milli(
                 llm_cost, int(run_state.get("extra_cost_microusd") or 0)
             )
-            if consumed >= max_credit_milli:
+            if not unlimited and consumed >= max_credit_milli:
                 settle("budget_exhausted", "run_budget_exhausted")
                 error_response(
                     handler,
@@ -1514,6 +1619,8 @@ class Backend:
             users.append({
                 "id": u["id"], "name": u["name"], "email": u["email"],
                 "tier": u.get("tier") or DEFAULT_TIER,
+                "model_provider": u.get("model_provider_override") or "deepseek",
+                "unlimited_usage": self.unlimited_usage(u),
                 "account_status": u.get("account_status") or "active",
                 "disabled_at": u.get("disabled_at"),
                 "created_at": u["created_at"],
@@ -1652,6 +1759,8 @@ class Backend:
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
             "plan": plan_payload(tier),
+            "model_provider": user.get("model_provider_override") or "deepseek",
+            "unlimited_usage": self.unlimited_usage(user),
             "credits": self.credits_payload(user, recent_limit=0)["credits"],
         })
 

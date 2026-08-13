@@ -108,6 +108,7 @@ class WrapperServer:
     def __init__(self, upstream_base: str, tmp: str):
         os.environ["DEEPSEEK_BASE_URL"] = upstream_base + "/v1"
         os.environ["DEEPSEEK_API_KEY"] = "sk-deepseek-server"
+        os.environ["OPENCODE_BASE_URL"] = upstream_base + "/v1"
         os.environ["DB_PATH"] = os.path.join(tmp, "test.sqlite")
         os.environ["SECRET_FILE"] = os.path.join(tmp, "secret.key")
         os.environ["ADMIN_TOKEN"] = "test-admin"
@@ -610,6 +611,88 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["data"][0]["id"], "deepseek-v4-flash")
 
+    def test_private_opencode_override_is_scoped_to_one_unlimited_account(self):
+        ws = self.ws
+        opencode_signup = self.new_user(tier="free")
+        deepseek_signup = self.new_user(tier="pro")
+        opencode_user = ws.backend.store.get_user_by_api_key(opencode_signup["api_key"])
+        encrypted = ws.backend.encrypt_secret("sk-opencode-private", "opencode-test")
+        credential = ws.backend.store.add_subscription(
+            encrypted,
+            "opencode-test",
+            "Private OpenCode override",
+            key_version=ws.cfg.wrapper_secret_version,
+        )
+        configured = ws.backend.store.configure_user_model_provider(
+            opencode_user["id"],
+            provider="opencode",
+            subscription_id=credential["id"],
+            unlimited_usage=True,
+        )
+        self.assertEqual(configured["model_provider_override"], "opencode")
+        self.assertEqual(configured["unlimited_usage"], 1)
+
+        opencode_headers = {"Authorization": f"Bearer {opencode_signup['api_key']}"}
+        status, me = ws.req("GET", "/v1/me", headers=opencode_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(me["model_provider"], "opencode")
+        self.assertTrue(me["unlimited_usage"])
+        status, credits = ws.req("GET", "/v1/credits", headers=opencode_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(credits["mode"], "unlimited")
+
+        MockUpstream.requests.clear()
+        status, _ = ws.req("GET", "/v1/models", headers=opencode_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            MockUpstream.requests[-1][2]["Authorization"],
+            "Bearer sk-opencode-private",
+        )
+
+        deepseek_headers = {"Authorization": f"Bearer {deepseek_signup['api_key']}"}
+        status, _ = ws.req("GET", "/v1/models", headers=deepseek_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            MockUpstream.requests[-1][2]["Authorization"],
+            "Bearer sk-deepseek-server",
+        )
+
+    def test_unlimited_opencode_account_runs_pi_without_consuming_credits(self):
+        ws = self.ws
+        signup = self.new_user(tier="free")
+        user = ws.backend.store.get_user_by_api_key(signup["api_key"])
+        encrypted = ws.backend.encrypt_secret("sk-opencode-private", "opencode-pi")
+        credential = ws.backend.store.add_subscription(
+            encrypted,
+            "opencode-pi",
+            "Private OpenCode Pi",
+            key_version=ws.cfg.wrapper_secret_version,
+        )
+        ws.backend.store.configure_user_model_provider(
+            user["id"],
+            provider="opencode",
+            subscription_id=credential["id"],
+            unlimited_usage=True,
+        )
+        ws.enable_fake_pi()
+        MockUpstream.requests.clear()
+        status, result = ws.req(
+            "POST",
+            "/v1/agent/run",
+            {"prompt": "usa OpenCode", "idempotency_key": "private-opencode-pi"},
+            headers={"Authorization": f"Bearer {signup['api_key']}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["credits"]["charged"], 0.0)
+        upstream_calls = [
+            request for request in MockUpstream.requests
+            if request[1] == "/v1/chat/completions"
+        ]
+        self.assertEqual(len(upstream_calls), 1)
+        self.assertEqual(
+            upstream_calls[0][2]["Authorization"], "Bearer sk-opencode-private"
+        )
+
     def test_chat_completions_records_usage(self):
         ws = self.ws
         signup = self.new_user()
@@ -1058,7 +1141,10 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 11)
+        self.assertEqual(migrated.health()["schema_version"], 12)
+        migrated_user = migrated.get_user_by_id(user["id"])
+        self.assertIsNone(migrated_user["model_provider_override"])
+        self.assertEqual(migrated_user["unlimited_usage"], 0)
         self.assertIsNone(migrated.get_user_by_id(user["id"])["subscription_id"])
         legacy = migrated.get_subscription("sub_legacy")
         self.assertEqual(legacy["status"], "revoked")

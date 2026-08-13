@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS users (
   tier            TEXT NOT NULL DEFAULT 'free',
   account_status  TEXT NOT NULL DEFAULT 'active',
   disabled_at     REAL,
+  model_provider_override TEXT CHECK(model_provider_override IS NULL OR model_provider_override='opencode'),
+  unlimited_usage INTEGER NOT NULL DEFAULT 0 CHECK(unlimited_usage IN (0,1)),
   created_at      REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS go_subscriptions (
@@ -351,6 +353,14 @@ class Store:
                 )
             if "disabled_at" not in cols:
                 self._conn.execute("ALTER TABLE users ADD COLUMN disabled_at REAL")
+            if "model_provider_override" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN model_provider_override TEXT"
+                )
+            if "unlimited_usage" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN unlimited_usage INTEGER NOT NULL DEFAULT 0"
+                )
             tier_column = next(
                 row for row in self._conn.execute("PRAGMA table_info(users)") if row[1] == "tier"
             )
@@ -478,12 +488,16 @@ class Store:
                   tier            TEXT NOT NULL DEFAULT 'free',
                   account_status  TEXT NOT NULL DEFAULT 'active',
                   disabled_at     REAL,
+                  model_provider_override TEXT,
+                  unlimited_usage INTEGER NOT NULL DEFAULT 0,
                   created_at      REAL NOT NULL
                 )"""
             )
             self._conn.execute(
-                "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,created_at) "
-                "SELECT id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,created_at "
+                "INSERT INTO users(id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,"
+                "model_provider_override,unlimited_usage,created_at) "
+                "SELECT id, name, email, api_key_hash, subscription_id, tier,account_status,disabled_at,"
+                "model_provider_override,unlimited_usage,created_at "
                 "FROM users_legacy_default_basic"
             )
             self._conn.execute("DROP TABLE users_legacy_default_basic")
@@ -1383,6 +1397,71 @@ class Store:
                     (user_id, subscription_id),
                 )
             self._conn.commit()
+
+    def configure_user_model_provider(
+        self,
+        user_id: str,
+        *,
+        provider: str | None,
+        subscription_id: str | None = None,
+        unlimited_usage: bool = False,
+    ) -> dict:
+        """Atomically configure a private provider override for one account.
+
+        DeepSeek remains the implicit default (``provider=None``). OpenCode is
+        available only when an encrypted, server-owned credential is assigned
+        to the same user. This intentionally does not expose a public BYOK or
+        provider-selection surface.
+        """
+        if provider not in {None, "opencode"}:
+            raise ValueError("Proveedor de modelo inválido")
+        if provider == "opencode" and not subscription_id:
+            raise ValueError("OpenCode requiere una credencial asignada")
+        if provider is None and subscription_id is not None:
+            raise ValueError("DeepSeek no utiliza credenciales por usuario")
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                user = self._conn.execute(
+                    "SELECT * FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                if user is None:
+                    raise KeyError(user_id)
+                old_subscription_id = user["subscription_id"]
+                if old_subscription_id and old_subscription_id != subscription_id:
+                    self._conn.execute(
+                        "UPDATE go_subscriptions SET status='revoked',assigned_user_id=NULL "
+                        "WHERE id=?",
+                        (old_subscription_id,),
+                    )
+                if subscription_id:
+                    credential = self._conn.execute(
+                        "SELECT * FROM go_subscriptions WHERE id=?", (subscription_id,)
+                    ).fetchone()
+                    if credential is None:
+                        raise KeyError(subscription_id)
+                    assigned_to = credential["assigned_user_id"]
+                    if assigned_to and assigned_to != user_id:
+                        raise ValueError("La credencial ya pertenece a otra cuenta")
+                    self._conn.execute(
+                        "UPDATE go_subscriptions SET status='assigned',assigned_user_id=? "
+                        "WHERE id=?",
+                        (user_id, subscription_id),
+                    )
+                self._conn.execute(
+                    "UPDATE users SET model_provider_override=?,subscription_id=?,"
+                    "unlimited_usage=? WHERE id=?",
+                    (provider, subscription_id, int(unlimited_usage), user_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        configured = self.get_user_by_id(user_id)
+        if configured is None:  # pragma: no cover - defensive consistency check
+            raise RuntimeError("No se pudo leer la cuenta configurada")
+        return configured
 
     # ---------- suscripciones Go ----------
     def add_subscription(self, api_key_enc: bytes, key_id: str, label: str | None, source: str = "pool", user_id: str | None = None, sub_id: str | None = None, key_version: int = 1) -> dict:
