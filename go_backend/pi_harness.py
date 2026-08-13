@@ -276,9 +276,11 @@ class PiHarness:
                             "compat": {
                                 "supportsStore": False,
                                 "supportsDeveloperRole": False,
+                                "supportsReasoningEffort": True,
                                 "maxTokensField": "max_tokens",
                                 "supportsLongCacheRetention": False,
                                 "requiresReasoningContentOnAssistantMessages": True,
+                                "thinkingFormat": "deepseek",
                             },
                         }
                     ],

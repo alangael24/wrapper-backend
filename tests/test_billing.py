@@ -73,7 +73,6 @@ class TestBilling(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "billing.sqlite")
         self.user = self.store.create_user("wrapper-key", "Alan", "alan@example.com")
-        self.store.add_subscription(b"encrypted", "go-key", "pool", sub_id="sub_pool")
         self.client = FakeStripeClient()
         self.service = BillingService(self.store, config(), client=self.client)
 
@@ -139,8 +138,7 @@ class TestBilling(unittest.TestCase):
         self.assertEqual(result["tier"], "basic")
         updated = self.store.get_user_by_id(self.user["id"])
         self.assertEqual(updated["tier"], "basic")
-        self.assertEqual(updated["subscription_id"], "sub_pool")
-        self.assertEqual(self.store.get_subscription("sub_pool")["assigned_user_id"], self.user["id"])
+        self.assertIsNone(updated["subscription_id"])
         billing = self.store.get_billing_status(self.user["id"])
         self.assertEqual(billing["customer_id"], "cus_live")
         self.assertEqual(billing["subscription"]["stripe_subscription_id"], "sub_stripe")
@@ -163,7 +161,6 @@ class TestBilling(unittest.TestCase):
         updated = self.store.get_user_by_id(self.user["id"])
         self.assertEqual(updated["tier"], "free")
         self.assertIsNone(updated["subscription_id"])
-        self.assertEqual(self.store.get_subscription("sub_pool")["status"], "available")
 
     def test_out_of_order_paid_invoice_cannot_restore_canceled_access(self):
         self.activate_plus(created=1_800_000_100)

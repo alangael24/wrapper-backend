@@ -21,7 +21,7 @@ REQUIRED_CHECKS = {
     "computers": True,
     "pi": True,
     "pi_chrome": True,
-    "model_capacity": True,
+    "model_provider": True,
 }
 
 

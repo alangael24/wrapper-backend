@@ -369,32 +369,11 @@ class WrapperServiceClient {
     durationMs: number,
     signal?: AbortSignal
   ): Promise<BotWorkflowDraft> {
-    const response = await this.authorizedJson("/v1/responses", {
-      method: "POST",
-      body: {
-        model: "deepseek-v4-flash",
-        stream: false,
-        max_output_tokens: 3000,
-        input: [{
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: [
-                `You are extracting a reusable workflow taught to the Agent Genia bot ${botName}.`,
-                `The screenshots are chronological samples from a ${Math.max(1, Math.round(durationMs / 1000))}-second screen recording.`,
-                "Infer only steps supported by visible transitions. Never include passwords, tokens, personal data, or invented values.",
-                "Write each step as an instruction the Pi agent can execute later with browser and connector tools.",
-                "Return JSON only: {\"title\":\"short task name\",\"summary\":\"one sentence\",\"steps\":[\"ordered step\"]}. Include 2-30 steps."
-              ].join("\n")
-            },
-            ...frames.map((imageUrl) => ({ type: "input_image", image_url: imageUrl }))
-          ]
-        }]
-      },
-      signal
-    });
-    return parseTeachWorkflow(responseText(response));
+    void botName;
+    void frames;
+    void durationMs;
+    void signal;
+    throw new Error("Teach a task está pausado mientras Agent Genia no tenga soporte visual.");
   }
 
   billing(signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -599,47 +578,6 @@ function stringValue(value: unknown): string {
 
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function responseText(payload: Record<string, unknown>): string {
-  if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text.trim();
-  if (Array.isArray(payload.output)) {
-    for (const item of payload.output) {
-      if (!isRecord(item) || !Array.isArray(item.content)) continue;
-      for (const part of item.content) {
-        if (!isRecord(part)) continue;
-        if (typeof part.text === "string" && part.text.trim()) return part.text.trim();
-        if (typeof part.output_text === "string" && part.output_text.trim()) return part.output_text.trim();
-      }
-    }
-  }
-  if (Array.isArray(payload.choices)) {
-    const choice = payload.choices.find(isRecord);
-    const message = choice && isRecord(choice.message) ? choice.message : {};
-    if (typeof message.content === "string" && message.content.trim()) return message.content.trim();
-  }
-  throw new Error("El modelo no devolvió los pasos aprendidos.");
-}
-
-function parseTeachWorkflow(value: string): BotWorkflowDraft {
-  const candidate = value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    throw new Error("El modelo devolvió un workflow inválido. Intenta grabar la tarea otra vez.");
-  }
-  if (!isRecord(parsed)) throw new Error("El modelo devolvió un workflow inválido.");
-  const title = stringValue(parsed.title).replace(/\s+/g, " ").trim().slice(0, 120);
-  const summary = stringValue(parsed.summary).replace(/\s+/g, " ").trim().slice(0, 500);
-  const steps = Array.isArray(parsed.steps)
-    ? parsed.steps.flatMap((step): string[] => {
-      const normalized = typeof step === "string" ? step.replace(/\s+/g, " ").trim().slice(0, 600) : "";
-      return normalized ? [normalized] : [];
-    }).slice(0, 30)
-    : [];
-  if (!title || steps.length < 2) throw new Error("No hubo suficientes pasos visibles para aprender la tarea.");
-  return { title, summary, steps };
 }
 
 function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {

@@ -843,7 +843,6 @@ function renderReadyBot(bot: BotProfile): void {
         <strong>${escapeHtml(bot.name)}</strong>
         <div class="topbar-actions">
           <span>${bot.connectorIds.length} plugins</span>
-          <button class="teach-task-button" type="button" data-teach-task="top_bar" title="Record yourself doing a task. ${escapeAttribute(bot.name)} learns the steps and can run them again on its own." ${teachStatus.phase !== "idle" ? "disabled" : ""}>Teach a task</button>
           ${bot.workflows.length ? `<button class="topbar-link" type="button" data-open-workflows>${bot.workflows.length} aprendidas</button>` : ""}
           <button id="edit-connectors" class="topbar-link" type="button">Plugins</button>
           <button id="delete-bot" class="topbar-link" type="button">Eliminar</button>
@@ -875,7 +874,6 @@ function renderReadyBot(bot: BotProfile): void {
   bindBotChat(bot);
   document.querySelector("[data-computer-open]")?.addEventListener("click", () => void openBotComputer(bot));
   document.querySelector("[data-computer-hand-back]")?.addEventListener("click", () => void handBackBotComputer(bot.id));
-  document.querySelector("[data-teach-task]")?.addEventListener("click", () => void startTeachTask(bot, "top_bar"));
   document.querySelector("[data-open-workflows]")?.addEventListener("click", () => {
     workflowPanelOpen = !workflowPanelOpen;
     composerMenuOpen = false;
@@ -1017,7 +1015,6 @@ function bindBotChat(bot: BotProfile): void {
     composerMenuOpen = !composerMenuOpen;
     render();
   });
-  document.querySelector("[data-composer-teach]")?.addEventListener("click", () => void startTeachTask(bot, "composer_menu"));
   document.querySelector("[data-composer-workflows]")?.addEventListener("click", () => {
     composerMenuOpen = false;
     workflowPanelOpen = true;
@@ -1416,7 +1413,6 @@ function renderMessageComposer(botName: string, botId = ""): string {
         <button type="button" data-composer-add aria-label="Agregar" aria-expanded="${composerMenuOpen}">＋</button>
         ${composerMenuOpen ? `
           <span class="composer-menu" role="menu">
-            <button type="button" role="menuitem" data-composer-teach ${teachStatus.phase !== "idle" ? "disabled" : ""}><strong>Teach a task</strong><small>Record yourself doing a task</small></button>
             <button type="button" role="menuitem" data-composer-workflows><strong>Learned tasks</strong><small>Run a saved workflow again</small></button>
           </span>` : ""}
       </span>
@@ -1434,7 +1430,7 @@ function renderTeachOverlay(bot: BotProfile): string {
     return `
       <aside class="teach-recording-overlay processing" aria-live="assertive">
         <span class="teach-spinner" aria-hidden="true"></span>
-        <span><strong>${escapeHtml(bot.name)} is learning your steps…</strong><small>Luna is reading the recording and DeepSeek is building a reusable workflow.</small></span>
+        <span><strong>${escapeHtml(bot.name)} is learning your steps…</strong><small>Agent Genia is recording the workflow so the bot can repeat it.</small></span>
       </aside>`;
   }
   return `
@@ -1460,7 +1456,7 @@ function renderWorkflowPanel(bot: BotProfile): string {
               <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId ? "disabled" : ""}>Run now</button></span>
             </footer>
           </article>`).join("") : `
-          <div class="workflow-empty"><strong>No learned tasks yet</strong><p>Record yourself doing a task. ${escapeHtml(bot.name)} learns the steps and can run them again on its own.</p><button type="button" data-composer-teach>Teach a task</button></div>`}
+          <div class="workflow-empty"><strong>No learned tasks yet</strong><p>La grabación de tareas estará disponible cuando vuelva el soporte visual.</p></div>`}
       </div>
     </section>`;
 }

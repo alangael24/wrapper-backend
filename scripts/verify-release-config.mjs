@@ -128,7 +128,7 @@ if (!androidReleaseWorkflow.includes("if: inputs.publish_to_play == true")
   throw new Error("Android release must separate immutable signed AAB publication from Google Play promotion");
 }
 for (const key of [
-  "DATABASE_URL", "WRAPPER_SECRET", "ADMIN_TOKEN",
+  "DATABASE_URL", "WRAPPER_SECRET", "ADMIN_TOKEN", "DEEPSEEK_API_KEY",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URI",
   "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_BASE64",
   "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "COMPOSIO_API_KEY",
@@ -146,6 +146,7 @@ const expectedMigrations = [
   "20260812174212_stripe_event_ordering.sql",
   "20260812180737_production_security_hardening.sql",
   "20260813032540_apple_identity_tokens.sql",
+  "20260813143000_deepseek_direct.sql",
 ];
 const migrationContents = await Promise.all(
   expectedMigrations.map((name) => readFile(`supabase/migrations/${name}`, "utf8")),

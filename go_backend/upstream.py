@@ -1,4 +1,4 @@
-"""Cliente HTTP hacia el upstream de OpenCode Go.
+"""HTTP client for Agent Genia's server-owned DeepSeek account.
 
 Soporta forwarding con streaming (SSE) y extraccion de `usage` de las
 respuestas para registrar consumo.
@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urljoin
 
-UPSTREAM_TIMEOUT = 900  # 15 min, igual que el gateway de vision local
+UPSTREAM_TIMEOUT = 900
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -72,6 +72,8 @@ def parse_usage_from_body(body: bytes, model: str | None = None) -> tuple[str | 
     if cached_read is None:
         cached_read = u.get("cached_tokens")
     if cached_read is None:
+        cached_read = u.get("prompt_cache_hit_tokens")
+    if cached_read is None:
         cached_read = u.get("cache_read_input_tokens")  # Anthropic
         cached_write = u.get("cache_creation_input_tokens")
     return m, Usage(m, input_tokens, output_tokens, cached_read, cached_write)
@@ -100,7 +102,11 @@ def parse_usage_from_sse_line(line: str, model: str | None = None) -> tuple[str 
             if output_tokens is None:
                 output_tokens = u.get("completion_tokens")
             det = u.get("input_tokens_details") or u.get("prompt_tokens_details") or {}
-            cached_read = det.get("cached_tokens") or u.get("cached_tokens")
+            cached_read = (
+                det.get("cached_tokens")
+                or u.get("cached_tokens")
+                or u.get("prompt_cache_hit_tokens")
+            )
             cached_write = u.get("cache_creation_input_tokens")
             if isinstance(data.get("type"), str) and data["type"] == "response.completed":
                 cached_read = cached_read or u.get("cached_tokens")
@@ -114,7 +120,7 @@ def proxy_request(
     path: str,
     headers: dict,
     body: bytes | None,
-    go_api_key: str,
+    api_key: str,
     on_chunk=None,
     on_headers=None,
 ) -> tuple[int, dict, bytes | None, Usage]:
@@ -125,7 +131,7 @@ def proxy_request(
       on_chunk(bytes) con cada trozo (SSE) mientras llega.
     """
     hdrs = dict(headers)
-    hdrs["Authorization"] = f"Bearer {go_api_key}"
+    hdrs["Authorization"] = f"Bearer {api_key}"
     req = build_request(method, base_url, path, hdrs, body)
     try:
         resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)

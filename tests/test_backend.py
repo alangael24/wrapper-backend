@@ -1,7 +1,4 @@
-"""Tests de integracion del wrapper backend contra un upstream mock.
-
-No se hace ninguna llamada real a OpenCode Go.
-"""
+"""Integration tests against a mock DeepSeek-compatible upstream."""
 
 from __future__ import annotations
 
@@ -44,14 +41,12 @@ from go_backend.connector_adapters import (  # noqa: E402
 )
 from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
-from go_backend.store import NoSubscriptionAvailable, Store, new_id  # noqa: E402
+from go_backend.store import Store, new_id  # noqa: E402
 
 
 class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     requests: list = []
-    fail_luna = False
-    fail_mimo = False
 
     def log_message(self, fmt, *args):
         pass
@@ -68,7 +63,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     def do_GET(self):
         type(self).requests.append((self.command, self.path, dict(self.headers)))
         if self.path == "/v1/models":
-            catalog = {"object": "list", "data": [{"id": "deepseek-v4-flash", "object": "model", "owned_by": "opencode"}]}
+            catalog = {"object": "list", "data": [{"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"}]}
             self._send(200, json.dumps(catalog).encode())
         else:
             self._send(404, json.dumps({"error": "not found"}).encode())
@@ -79,17 +74,6 @@ class MockUpstream(BaseHTTPRequestHandler):
         type(self).requests.append((self.command, self.path, dict(self.headers), body))
         payload = json.loads(body) if body else {}
         if self.path == "/v1/chat/completions":
-            if payload.get("model") == "mimo-v2.5":
-                if type(self).fail_mimo:
-                    self._send(503, json.dumps({"error": {"message": "mimo unavailable"}}).encode())
-                    return
-                resp = {
-                    "id": "vision-fallback", "model": "mimo-v2.5",
-                    "choices": [{"message": {"role": "assistant", "content": "IMAGE 1: panel azul, texto OK"}}],
-                    "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
-                }
-                self._send(200, json.dumps(resp).encode())
-                return
             if payload.get("stream"):
                 self._send(
                     200,
@@ -106,37 +90,10 @@ class MockUpstream(BaseHTTPRequestHandler):
                     "choices": [{"message": {"role": "assistant", "content": "hola"}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                               "total_tokens": 15,
-                              "input_tokens_details": {"cached_tokens": 4}},
+                              "prompt_cache_hit_tokens": 4,
+                              "prompt_cache_miss_tokens": 6},
                 }
                 self._send(200, json.dumps(resp).encode())
-        elif self.path == "/v1/responses":
-            if payload.get("model") == "gpt-5.6-luna":
-                if type(self).fail_luna:
-                    self._send(503, json.dumps({"error": {"message": "luna unavailable"}}).encode())
-                    return
-                resp = {
-                    "id": "vision-luna", "model": "gpt-5.6-luna",
-                    "output_text": "IMAGE 1: panel azul, texto OK",
-                    "output": [],
-                    "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16},
-                }
-                self._send(200, json.dumps(resp).encode())
-                return
-            resp = {
-                "id": "resp-test", "model": "deepseek-v4-flash",
-                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hola"}]}],
-                "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27,
-                          "input_tokens_details": {"cached_tokens": 3}},
-            }
-            self._send(200, json.dumps(resp).encode())
-        elif self.path == "/v1/messages":
-            resp = {
-                "id": "msg-test", "model": "deepseek-v4-flash",
-                "content": [{"type": "text", "text": "hola"}],
-                "usage": {"input_tokens": 30, "output_tokens": 4,
-                          "cache_read_input_tokens": 2, "cache_creation_input_tokens": 1},
-            }
-            self._send(200, json.dumps(resp).encode())
         else:
             self._send(404, json.dumps({"error": "not found"}).encode())
 
@@ -149,15 +106,12 @@ def start_mock() -> tuple[ThreadingHTTPServer, str]:
 
 class WrapperServer:
     def __init__(self, upstream_base: str, tmp: str):
-        os.environ["GO_BASE_URL"] = upstream_base
+        os.environ["DEEPSEEK_BASE_URL"] = upstream_base + "/v1"
+        os.environ["DEEPSEEK_API_KEY"] = "sk-deepseek-server"
         os.environ["DB_PATH"] = os.path.join(tmp, "test.sqlite")
         os.environ["SECRET_FILE"] = os.path.join(tmp, "secret.key")
         os.environ["ADMIN_TOKEN"] = "test-admin"
         os.environ["ENFORCE_LIMITS"] = "1"
-        os.environ["VISION_ENABLED"] = "1"
-        os.environ["VISION_MODEL"] = "gpt-5.6-luna"
-        os.environ["VISION_FALLBACK_MODEL"] = "mimo-v2.5"
-        os.environ["VISION_TARGET_MODELS"] = "deepseek-v4"
         os.environ["PI_ENABLED"] = "0"
         os.environ.pop("WRAPPER_SECRET", None)
         os.environ.pop("GOOGLE_OAUTH_CLIENT_ID", None)
@@ -182,7 +136,6 @@ class WrapperServer:
         ):
             os.environ.pop(name, None)
         self.cfg = Config()
-        self.cfg.go_base_url = upstream_base + "/v1"
         self.backend = Backend(self.cfg)
         Handler.backend = self.backend
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -383,29 +336,18 @@ class TestBackend(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="wrapper-test-")
         self.ws = WrapperServer(self.mock_base, self.tmp)
         MockUpstream.requests.clear()
-        MockUpstream.fail_luna = False
-        MockUpstream.fail_mimo = False
 
     def tearDown(self):
         self.ws.stop()
         MockUpstream.requests.clear()
-        MockUpstream.fail_luna = False
-        MockUpstream.fail_mimo = False
 
 
     # ---------- helpers ----------
-    def add_pool_keys(self, n=1, prefix="sk-go-"):
-        keys = [f"{prefix}{i:04d}" for i in range(n)]
-        status, body = self.ws.req("POST", "/admin/subscriptions", {"keys": keys}, self.ws.admin_headers)
-        self.assertEqual(status, 201)
-        return body
-
     def new_user(self, name=None, tier="pro"):
         status, signup = self.ws.req("POST", "/v1/signup", {"name": name} if name else {})
         self.assertEqual(status, 201)
         self.assertEqual(signup["tier"], "free")
         if tier != "free":
-            self.add_pool_keys(1)
             status, upgraded = self.ws.req(
                 "POST",
                 f"/admin/users/{signup['user_id']}/tier",
@@ -414,12 +356,7 @@ class TestBackend(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             signup["tier"] = tier
-            signup["subscription_id"] = upgraded["subscription_id"]
         return signup
-
-    def image_data_url(self):
-        # Firma PNG suficiente para probar normalizacion, deduplicacion y routing.
-        return "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
     def upstream_payloads(self, path, model=None):
         payloads = []
@@ -604,10 +541,8 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(replayed["error"]["type"], "not_found")
 
-    def test_public_signup_always_free_and_never_consumes_pool(self):
+    def test_public_signup_always_free_and_ignores_requested_tier(self):
         ws = self.ws
-        created = self.add_pool_keys(2, prefix="sk-go-x")
-        self.assertEqual(len(created["created"]), 2)
 
         for requested_tier in (None, "basic", "pro", "ultra"):
             payload = {"name": f"usuario-{requested_tier or 'default'}"}
@@ -618,11 +553,7 @@ class TestBackend(unittest.TestCase):
             self.assertIn("api_key", body)
             self.assertEqual(len(body["api_key"]), 64)
             self.assertEqual(body["tier"], "free")
-            self.assertIsNone(body["subscription_id"])
-            self.assertEqual(body["subscription_status"], "none")
-            self.assertEqual(body["available_left"], 2)
-
-        self.assertEqual(ws.backend.store.available_count(), 2)
+            self.assertNotIn("subscription_id", body)
 
     def test_legacy_signup_can_be_disabled(self):
         self.ws.cfg.public_legacy_signup_enabled = False
@@ -630,11 +561,10 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["type"], "not_found")
 
-    def test_authenticated_user_can_delete_account_and_release_capacity(self):
+    def test_authenticated_user_can_delete_account(self):
         signup = self.new_user("delete-me")
         user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
         self.assertIsNotNone(user)
-        subscription_id = user["subscription_id"]
         status, body = self.ws.req(
             "POST",
             "/v1/account/delete",
@@ -644,24 +574,13 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["deleted"])
         self.assertIsNone(self.ws.backend.store.get_user_by_id(user["id"]))
-        self.assertEqual(
-            self.ws.backend.store.get_subscription(subscription_id)["status"], "available"
-        )
         status, _ = self.ws.req(
             "GET", "/v1/me", headers={"Authorization": f"Bearer {signup['api_key']}"}
         )
         self.assertEqual(status, 401)
 
-    def test_keys_encrypted_at_rest(self):
-        self.add_pool_keys(1)
-        store = self.ws.backend.store
-        for sub in store.list_subscriptions():
-            blob = sub["api_key_enc"]
-            self.assertTrue(blob.startswith((b"aesv1:", b"aes:", b"kc:")))
-            self.assertNotIn(b"sk-go-", blob)
-
     def test_admin_auth_required(self):
-        status, _ = self.ws.req("POST", "/admin/subscriptions", {"keys": ["x"]})
+        status, _ = self.ws.req("GET", "/admin/users")
         self.assertEqual(status, 401)
 
     def test_server_rejects_published_example_admin_token(self):
@@ -711,238 +630,6 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(ev["input_tokens"], 10)
         self.assertEqual(ev["output_tokens"], 5)
         self.assertEqual(ev["cached_read_tokens"], 4)
-
-    def test_responses_and_messages(self):
-        ws = self.ws
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        status, body = ws.req("POST", "/v1/responses",
-                              {"model": "deepseek-v4-flash", "input": "hi"}, headers=headers)
-        self.assertEqual(status, 200)
-        status, body = ws.req("POST", "/v1/messages",
-                              {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
-                              headers=headers)
-        self.assertEqual(status, 200)
-        self.assertIn("cache_read_input_tokens", body["usage"])
-        status, usage = ws.req("GET", "/v1/usage", headers=headers)
-        self.assertEqual(usage["windows"]["5h"]["requests"], 2)
-
-    def test_responses_images_are_analyzed_by_luna_for_deepseek(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        payload = {
-            "model": "deepseek-v4-flash",
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Que texto aparece?"},
-                    {"type": "input_image", "image_url": self.image_data_url()},
-                ],
-            }],
-        }
-
-        status, body, response_headers = self.ws.req(
-            "POST", "/v1/responses", payload, headers=headers, include_headers=True
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
-        self.assertEqual(body["output"][0]["content"][0]["text"], "hola")
-
-        luna_calls = self.upstream_payloads("/v1/responses", "gpt-5.6-luna")
-        deepseek_calls = self.upstream_payloads("/v1/responses", "deepseek-v4-flash")
-        self.assertEqual(len(luna_calls), 1)
-        self.assertEqual(len(deepseek_calls), 1)
-        self.assertIn("input_image", json.dumps(luna_calls[0]))
-        forwarded = json.dumps(deepseek_calls[0])
-        self.assertNotIn("input_image", forwarded)
-        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
-        self.assertIn("untrusted visual evidence", forwarded)
-
-        _, usage = self.ws.req("GET", "/v1/usage", headers=headers)
-        self.assertEqual(usage["windows"]["5h"]["requests"], 2)
-        self.assertIn("gpt-5.6-luna", usage["by_model"])
-        self.assertIn("deepseek-v4-flash", usage["by_model"])
-        _, admin_usage = self.ws.req("GET", "/admin/usage", headers=self.ws.admin_headers)
-        self.assertEqual(
-            {event["endpoint"] for event in admin_usage["events"]},
-            {"/vision/responses", "/responses"},
-        )
-
-    def test_chat_images_are_converted_for_pi_protocol(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        payload = {
-            "model": "deepseek-v4-flash",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe el panel"},
-                    {"type": "image_url", "image_url": {"url": self.image_data_url()}},
-                ],
-            }],
-        }
-
-        status, _body, response_headers = self.ws.req(
-            "POST", "/v1/chat/completions", payload, headers=headers, include_headers=True
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
-        forwarded = json.dumps(
-            self.upstream_payloads("/v1/chat/completions", "deepseek-v4-flash")[0]
-        )
-        self.assertNotIn("image_url", forwarded)
-        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
-
-    def test_anthropic_message_images_are_converted(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        encoded_image = self.image_data_url().split(",", 1)[1]
-        payload = {
-            "model": "deepseek-v4-pro",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Que ves?"},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": encoded_image,
-                        },
-                    },
-                ],
-            }],
-        }
-
-        status, _body, response_headers = self.ws.req(
-            "POST", "/v1/messages", payload, headers=headers, include_headers=True
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
-        forwarded = json.dumps(self.upstream_payloads("/v1/messages", "deepseek-v4-pro")[0])
-        self.assertNotIn('"type": "image"', forwarded)
-        self.assertIn("VISION_SUBSYSTEM_REPORT", forwarded)
-
-    def test_streaming_with_images_preserves_sse_and_vision_header(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        payload = {
-            "model": "deepseek-v4-flash",
-            "stream": True,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Lee la captura"},
-                    {"type": "image_url", "image_url": {"url": self.image_data_url()}},
-                ],
-            }],
-        }
-        status, body, response_headers = self.ws.req(
-            "POST",
-            "/v1/chat/completions",
-            payload,
-            headers=headers,
-            raw=True,
-            include_headers=True,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "gpt-5.6-luna")
-        self.assertIn(b"data:", body)
-        self.assertIn(b"[DONE]", body)
-
-    def test_luna_failure_falls_back_to_mimo(self):
-        MockUpstream.fail_luna = True
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        payload = {
-            "model": "deepseek-v4-flash",
-            "input": [{
-                "role": "user",
-                "content": [{"type": "input_image", "image_url": self.image_data_url()}],
-            }],
-        }
-
-        status, _body, response_headers = self.ws.req(
-            "POST", "/v1/responses", payload, headers=headers, include_headers=True
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(response_headers["X-Wrapper-Vision-Model"], "mimo-v2.5")
-        self.assertEqual(len(self.upstream_payloads("/v1/responses", "gpt-5.6-luna")), 1)
-        self.assertEqual(len(self.upstream_payloads("/v1/chat/completions", "mimo-v2.5")), 1)
-        forwarded = json.dumps(
-            self.upstream_payloads("/v1/responses", "deepseek-v4-flash")[0]
-        )
-        self.assertIn('model=\\"mimo-v2.5\\"', forwarded)
-
-    def test_vision_cache_includes_the_user_prompt(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-
-        def request(prompt):
-            return self.ws.req(
-                "POST",
-                "/v1/responses",
-                {
-                    "model": "deepseek-v4-flash",
-                    "input": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": self.image_data_url()},
-                        ],
-                    }],
-                },
-                headers=headers,
-            )
-
-        self.assertEqual(request("Lee el titulo")[0], 200)
-        self.assertEqual(request("Lee el titulo")[0], 200)
-        self.assertEqual(request("Lee el precio")[0], 200)
-        self.assertEqual(len(self.upstream_payloads("/v1/responses", "gpt-5.6-luna")), 2)
-        self.assertEqual(len(self.upstream_payloads("/v1/responses", "deepseek-v4-flash")), 3)
-
-    def test_vision_failure_does_not_send_images_to_deepseek(self):
-        MockUpstream.fail_luna = True
-        MockUpstream.fail_mimo = True
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        status, body = self.ws.req(
-            "POST",
-            "/v1/responses",
-            {
-                "model": "deepseek-v4-flash",
-                "input": [{
-                    "role": "user",
-                    "content": [{"type": "input_image", "image_url": self.image_data_url()}],
-                }],
-            },
-            headers=headers,
-        )
-        self.assertEqual(status, 502)
-        self.assertEqual(body["error"]["type"], "vision_error")
-        self.assertEqual(len(self.upstream_payloads("/v1/responses", "deepseek-v4-flash")), 0)
-
-    def test_visual_request_limit_prevents_unbounded_auxiliary_calls(self):
-        signup = self.new_user()
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        images = [
-            {"type": "input_image", "image_url": f"https://example.test/image-{index}.png"}
-            for index in range(13)
-        ]
-        status, body = self.ws.req(
-            "POST",
-            "/v1/responses",
-            {
-                "model": "deepseek-v4-flash",
-                "input": [{"role": "user", "content": images}],
-            },
-            headers=headers,
-        )
-        self.assertEqual(status, 413)
-        self.assertEqual(body["error"]["type"], "vision_limit")
-        self.assertEqual(len(self.upstream_payloads("/v1/responses")), 0)
 
     def test_streaming_passthrough(self):
         ws = self.ws
@@ -1083,7 +770,7 @@ class TestBackend(unittest.TestCase):
             set(body["checks"]),
             {
                 "database", "google_auth", "apple_auth", "stripe", "connectors",
-                "computers", "pi", "pi_chrome", "model_capacity",
+                "computers", "pi", "pi_chrome", "model_provider",
             },
         )
         self.assertFalse(all(body["checks"].values()))
@@ -1126,11 +813,6 @@ class TestBackend(unittest.TestCase):
                 "health",
                 return_value={"configured": False},
             ),
-            patch.object(
-                self.ws.backend.store,
-                "list_subscriptions",
-                return_value=[{"status": "available"}],
-            ),
         ):
             readiness = self.ws.backend.readiness()
         self.assertTrue(readiness["checks"]["connectors"])
@@ -1152,28 +834,14 @@ class TestBackend(unittest.TestCase):
         cfg.database_url = None
         cfg.wrapper_secret = None
         cfg.admin_token = None
+        cfg.deepseek_api_key = ""
         with self.assertRaisesRegex(
-            UnsafeConfigurationError, "DATABASE_URL, WRAPPER_SECRET, ADMIN_TOKEN"
+            UnsafeConfigurationError, "DATABASE_URL, WRAPPER_SECRET, ADMIN_TOKEN, DEEPSEEK_API_KEY"
         ):
             validate_runtime_security(cfg)
 
-    def test_byok(self):
+    def test_revoke_disables_account_and_private_resources(self):
         ws = self.ws
-        signup = self.new_user("byok-user")
-        headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        # agrega su propia key de Go
-        status, body = ws.req("POST", "/v1/byok", {"apiKey": "sk-go-personal"}, headers=headers)
-        self.assertEqual(status, 201)
-        self.assertEqual(body["source"], "byok")
-        # el usuario ahora usa SU key (no la del pool)
-        status, models = ws.req("GET", "/v1/models", headers=headers)
-        self.assertEqual(status, 200)
-        auths = [r[2]["Authorization"] for r in MockUpstream.requests]
-        self.assertIn("Bearer sk-go-personal", auths)
-
-    def test_revoke_returns_to_pool(self):
-        ws = self.ws
-        ws.req("POST", "/admin/subscriptions", {"keys": ["sk-go-zzz"]}, ws.admin_headers)
         status, signup = ws.req("POST", "/v1/signup", {})
         self.assertEqual(status, 201)
         status, _ = ws.req(
@@ -1218,9 +886,6 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["revoked"])
         self.assertEqual(body["ephemeral_grants_revoked"], 1)
-        sub = ws.backend.store.get_subscription(user["subscription_id"])
-        self.assertEqual(sub["status"], "available")
-        self.assertEqual(ws.backend.store.available_count(), 1)
         self.assertEqual(ws.backend.store.get_user_by_id(user["id"])["account_status"], "disabled")
         self.assertIsNone(ws.backend.store.get_user_by_api_key(signup["api_key"]))
         self.assertIsNone(ws.backend.store.get_user_by_access_token("aga_" + "a" * 50))
@@ -1239,15 +904,14 @@ class TestBackend(unittest.TestCase):
 
 
     # ---------- tiers ----------
-    def test_signup_free_without_pool(self):
+    def test_signup_free_without_provider_credentials(self):
         ws = self.ws
         # free no necesita key del pool
         status, signup = ws.req("POST", "/v1/signup", {"name": "free-user", "tier": "free"})
         self.assertEqual(status, 201)
         self.assertEqual(signup["tier"], "free")
         self.assertEqual(signup["tier_label"], "Free")
-        self.assertIsNone(signup["subscription_id"])
-        self.assertEqual(signup["subscription_status"], "none")
+        self.assertNotIn("subscription_id", signup)
         self.assertEqual(signup["limits"]["5h"], 0.0)
         self.assertEqual(signup["limits"]["week"], 0.0)
         self.assertEqual(signup["limits"]["month"], 0.0)
@@ -1266,12 +930,11 @@ class TestBackend(unittest.TestCase):
 
     def test_paid_tiers_require_verified_admin_transition(self):
         ws = self.ws
-        self.add_pool_keys(2)
 
         status, basic = ws.req("POST", "/v1/signup", {"name": "b", "tier": "basic"})
         self.assertEqual(status, 201)
         self.assertEqual(basic["tier"], "free")
-        self.assertIsNone(basic["subscription_id"])
+        self.assertNotIn("subscription_id", basic)
         status, basic_upgrade = ws.req(
             "POST",
             f"/admin/users/{basic['user_id']}/tier",
@@ -1280,12 +943,12 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(basic_upgrade["tier"], "basic")
-        self.assertIsNotNone(basic_upgrade["subscription_id"])
+        self.assertNotIn("subscription_id", basic_upgrade)
 
         status, pro = ws.req("POST", "/v1/signup", {"name": "p", "tier": "pro"})
         self.assertEqual(status, 201)
         self.assertEqual(pro["tier"], "free")
-        self.assertIsNone(pro["subscription_id"])
+        self.assertNotIn("subscription_id", pro)
         status, pro_upgrade = ws.req(
             "POST",
             f"/admin/users/{pro['user_id']}/tier",
@@ -1294,7 +957,7 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(pro_upgrade["tier"], "pro")
-        self.assertIsNotNone(pro_upgrade["subscription_id"])
+        self.assertNotIn("subscription_id", pro_upgrade)
 
         for signup, expected_tier, expected_limit in (
             (basic, "basic", 6.0),
@@ -1305,47 +968,6 @@ class TestBackend(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(me["tier"], expected_tier)
             self.assertEqual(me["limits"]["5h"], expected_limit)
-
-    def test_atomic_tier_transition_cannot_double_assign_subscription(self):
-        db_path = Path(self.tmp) / "race.sqlite"
-        store_a = Store(db_path)
-        store_b = Store(db_path)
-        user_a = store_a.create_user("race-api-a", "a", None)
-        user_b = store_a.create_user("race-api-b", "b", None)
-        store_a.add_subscription(b"encrypted", "race-key", "race", sub_id="sub_race")
-        barrier = threading.Barrier(3)
-        outcomes: list[tuple[str, str]] = []
-
-        def upgrade(store, user_id):
-            barrier.wait()
-            try:
-                store.transition_user_tier(user_id, "pro", needs_subscription=True)
-                outcomes.append((user_id, "assigned"))
-            except NoSubscriptionAvailable:
-                outcomes.append((user_id, "no_capacity"))
-
-        threads = [
-            threading.Thread(target=upgrade, args=(store_a, user_a["id"])),
-            threading.Thread(target=upgrade, args=(store_b, user_b["id"])),
-        ]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(timeout=5)
-            self.assertFalse(thread.is_alive())
-
-        self.assertEqual(sorted(outcome for _, outcome in outcomes), ["assigned", "no_capacity"])
-        assigned_users = [
-            user for user in store_a.list_users() if user["subscription_id"] == "sub_race"
-        ]
-        self.assertEqual(len(assigned_users), 1)
-        subscription = store_a.get_subscription("sub_race")
-        self.assertEqual(subscription["assigned_user_id"], assigned_users[0]["id"])
-        index_sql = store_a._one(  # noqa: SLF001 - verifica la defensa del esquema
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='uniq_user_subscription'"
-        )["sql"]
-        self.assertIn("WHERE subscription_id IS NOT NULL", index_sql)
 
     def test_existing_database_default_is_migrated_to_free(self):
         db_path = Path(self.tmp) / "legacy.sqlite"
@@ -1373,6 +995,65 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(tier_column["dflt_value"], "'free'")
         self.assertEqual(store.get_user_by_id("legacy")["tier"], "basic")
+
+    def test_schema_v10_retires_provider_assignments_and_preserves_usage(self):
+        db_path = Path(self.tmp) / "provider-migration.sqlite"
+        store = Store(db_path)
+        user = store.create_user("legacy-provider-user", "Legacy", None)
+        store.add_subscription(
+            b"encrypted-legacy-key",
+            "legacy-key-id",
+            "legacy",
+            user_id=user["id"],
+            sub_id="sub_legacy",
+        )
+        store.record_usage(
+            user["id"], "sub_legacy", "deepseek-v4-flash", "/chat/completions",
+            10, 5, 4, 0, 0.01, 200,
+        )
+        store.close()
+
+        connection = sqlite3.connect(db_path)
+        connection.execute("UPDATE kv SET v='9' WHERE k='schema_version'")
+        connection.execute("ALTER TABLE usage_events RENAME TO usage_events_nullable")
+        connection.execute(
+            """CREATE TABLE usage_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id TEXT NOT NULL,
+              subscription_id TEXT NOT NULL,
+              model TEXT,
+              endpoint TEXT,
+              input_tokens INTEGER,
+              output_tokens INTEGER,
+              cached_read_tokens INTEGER,
+              cached_write_tokens INTEGER,
+              estimated_cost_usd REAL NOT NULL DEFAULT 0,
+              status INTEGER,
+              created_at REAL NOT NULL
+            )"""
+        )
+        connection.execute("INSERT INTO usage_events SELECT * FROM usage_events_nullable")
+        connection.execute("DROP TABLE usage_events_nullable")
+        connection.commit()
+        connection.close()
+
+        migrated = Store(db_path)
+        subscription_column = next(
+            row
+            for row in migrated._q("PRAGMA table_info(usage_events)")
+            if row["name"] == "subscription_id"
+        )
+        self.assertEqual(subscription_column["notnull"], 0)
+        self.assertIsNone(migrated.get_user_by_id(user["id"])["subscription_id"])
+        legacy = migrated.get_subscription("sub_legacy")
+        self.assertEqual(legacy["status"], "revoked")
+        self.assertIsNone(legacy["assigned_user_id"])
+        self.assertEqual(len(migrated.usage_all()["events"]), 1)
+        migrated.record_usage(
+            user["id"], None, "deepseek-v4-flash", "/chat/completions",
+            1, 1, 0, 0, 0.0, 200,
+        )
+        self.assertEqual(len(migrated.usage_all()["events"]), 2)
 
     def test_usage_limits_basic_vs_pro(self):
         ws = self.ws
@@ -1413,31 +1094,22 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(me["tier"], "pro")
         self.assertEqual(me["limits"]["5h"], 12.0)
 
-    def test_admin_set_tier_assigns_and_releases_subscription(self):
+    def test_admin_set_tier_changes_entitlement_without_provider_key(self):
         ws = self.ws
         # free sin suscripcion
         status, signup = ws.req("POST", "/v1/signup", {"tier": "free"})
         self.assertEqual(status, 201)
         user = ws.backend.store.get_user_by_api_key(signup["api_key"])
         self.assertIsNone(user["subscription_id"])
-        # subir a pro sin pool -> 409
-        status, _ = ws.req("POST", f"/admin/users/{user['id']}/tier",
-                           {"tier": "pro"}, headers=ws.admin_headers)
-        self.assertEqual(status, 409)
-        # agregar pool y subir a pro -> asigna suscripcion
-        self.add_pool_keys(1, prefix="sk-tier-")
         status, body = ws.req("POST", f"/admin/users/{user['id']}/tier",
-                              {"tier": "pro"}, headers=ws.admin_headers)
+                           {"tier": "pro"}, headers=ws.admin_headers)
         self.assertEqual(status, 200)
         self.assertEqual(body["tier"], "pro")
-        self.assertIsNotNone(body["subscription_id"])
-        self.assertEqual(ws.backend.store.available_count(), 0)
-        # bajar a free -> libera la suscripcion al pool
+        self.assertNotIn("subscription_id", body)
         status, body = ws.req("POST", f"/admin/users/{user['id']}/tier",
                               {"tier": "free"}, headers=ws.admin_headers)
         self.assertEqual(status, 200)
-        self.assertIsNone(body["subscription_id"])
-        self.assertEqual(ws.backend.store.available_count(), 1)
+        self.assertNotIn("subscription_id", body)
         # tier invalido -> 400
         status, _ = ws.req("POST", f"/admin/users/{user['id']}/tier",
                            {"tier": "mega"}, headers=ws.admin_headers)
@@ -1454,12 +1126,11 @@ class TestBackend(unittest.TestCase):
         status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
         self.assertEqual(status, 200)
         self.assertFalse(info["enabled"])
-        self.assertTrue(info["image_input"])
+        self.assertFalse(info["image_input"])
         self.assertTrue(info["connectors_available"])
         self.assertEqual(info["connector_tool_loading"], "dynamic")
         self.assertEqual(info["connector_auth_scope"], "ephemeral_run")
-        self.assertTrue(info["vision"]["enabled"])
-        self.assertEqual(info["vision"]["primary_model"], "gpt-5.6-luna")
+        self.assertNotIn("vision", info)
         self.assertNotIn("binary", info)
         status, body = self.ws.req(
             "POST", "/v1/agent/run", {"prompt": "haz una tarea"}, headers=headers
@@ -1467,7 +1138,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(body["error"]["type"], "pi_disabled")
 
-    def test_pi_rpc_uses_wrapper_key_and_assigned_go_key(self):
+    def test_pi_rpc_uses_wrapper_auth_and_server_deepseek_key(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi()
@@ -1482,7 +1153,7 @@ class TestBackend(unittest.TestCase):
 
         upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream_calls), 1)
-        self.assertEqual(upstream_calls[0][2]["Authorization"], "Bearer sk-go-0000")
+        self.assertEqual(upstream_calls[0][2]["Authorization"], "Bearer sk-deepseek-server")
 
         status, usage = self.ws.req("GET", "/v1/usage", headers=headers)
         self.assertEqual(status, 200)
@@ -1491,6 +1162,20 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
+
+    def test_pi_uses_native_deepseek_thinking_compatibility(self):
+        config_dir = Path(self.tmp) / "pi-model-config"
+        config_dir.mkdir()
+        self.ws.backend.pi._write_config(config_dir)
+        payload = json.loads((config_dir / "models.json").read_text(encoding="utf-8"))
+        model = payload["providers"]["wrapper-backend"]["models"][0]
+        self.assertEqual(model["input"], ["text"])
+        self.assertEqual(model["compat"]["thinkingFormat"], "deepseek")
+        self.assertTrue(model["compat"]["supportsReasoningEffort"])
+        self.assertTrue(
+            model["compat"]["requiresReasoningContentOnAssistantMessages"]
+        )
+        self.assertNotIn("extraBody", model)
 
     def test_connector_broker_scopes_catalog_and_execution_to_run_grant(self):
         signup = self.new_user()

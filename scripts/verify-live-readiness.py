@@ -21,7 +21,7 @@ REQUIRED_CHECKS = (
     "computers",
     "pi",
     "pi_chrome",
-    "model_capacity",
+    "model_provider",
 )
 
 

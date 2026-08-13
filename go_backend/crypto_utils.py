@@ -1,4 +1,4 @@
-"""Cifrado de las API keys de OpenCode Go en reposo.
+"""Encryption for server-side connector and identity credentials.
 
 Dos backends:
 1. AES-256-GCM via `cryptography` (recomendado, portable).

@@ -18,11 +18,8 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/billing/checkout Crear Checkout para Plus/Pro
   POST /v1/billing/portal  Abrir Customer Portal
   POST /v1/billing/webhook Procesar eventos Stripe firmados
-  POST /v1/byok            El usuario registra su propia key de Go
-  GET  /v1/models          Catalogo de modelos (proxy a Go)
+  GET  /v1/models          Catalogo de modelos de DeepSeek
   POST /v1/chat/completions
-  POST /v1/responses
-  POST /v1/messages
   GET  /v1/agent/status    Estado del harness de Pi
   POST /v1/agent/run       Ejecutar una tarea con Pi
   GET  /v1/computers/<bot_id> Estado de la computadora persistente del bot
@@ -33,18 +30,15 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/me
 
 Endpoints admin (Bearer ADMIN_TOKEN):
-  POST /admin/subscriptions    Agregar keys de Go al pool
-  GET  /admin/subscriptions    Listar pool (keys enmascaradas)
   GET  /admin/users
   POST /admin/users/<id>/revoke
-  POST /admin/users/<id>/tier  Cambiar tier (asigna/libera sub del pool)
+  POST /admin/users/<id>/tier  Cambiar tier
   GET  /admin/usage
 
 CLI:
   python3 -m go_backend.server init-db
   python3 -m go_backend.server serve [--port N]
-  python3 -m go_backend.server add-key <sk-...> [...]   (o "-" para leer stdin)
-  python3 -m go_backend.server users | subs | usage
+  python3 -m go_backend.server users | usage
 """
 
 from __future__ import annotations
@@ -77,12 +71,11 @@ from .crypto_utils import (
     CryptoError,
     decrypt_api_key,
     encrypt_api_key,
-    hash_wrapper_key,
     parse_secret_versions,
 )
 from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
 from .computers import ComputerConfig, ComputerError, ComputerManager
-from .go_prices import estimate_cost_usd
+from .deepseek_prices import estimate_cost_usd
 from .google_auth import GoogleAccountAuth, GoogleAuthError, completion_html
 from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
@@ -91,10 +84,8 @@ from .pi_harness import (
     PiHarnessError,
 )
 from .postgres_store import create_store
-from .tiers import DEFAULT_TIER, effective_limits, is_valid, requires_subscription, tier_label
-from .store import NoSubscriptionAvailable, new_id
+from .tiers import DEFAULT_TIER, effective_limits, has_model_access, is_valid, tier_label
 from .upstream import DEFAULT_UA, proxy_request
-from .vision import VisionError, VisionRouter
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "secret.key"
@@ -111,25 +102,17 @@ DEFAULT_PI_CHROME_EXTENSION = (
 DEFAULT_PI_CONNECTOR_EXTENSION = (
     Path(__file__).resolve().parent.parent / "extensions" / "connectors" / "index.ts"
 )
-DEFAULT_GO_BASE = "https://opencode.ai/zen/go/v1"
+DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com"
 MAX_BODY = 160 * 1024 * 1024  # 160 MB
 MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 
-# Rutas expuestas por el wrapper -> rutas relativas al upstream de Go
+# OpenAI-compatible routes exposed by the wrapper.
 UPSTREAM_PATHS = {
     "/v1/chat/completions": "/chat/completions",
-    "/v1/responses": "/responses",
-    "/v1/messages": "/messages",
     "/v1/models": "/models",
 }
-
-
-def masked(key: str) -> str:
-    if len(key) <= 12:
-        return "***"
-    return key[:4] + "..." + key[-4:]
 
 
 class RequestBodyError(ValueError):
@@ -172,7 +155,10 @@ class Config:
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
         self.database_url = (os.environ.get("DATABASE_URL") or "").strip() or None
         self.secret_file = Path(os.environ.get("SECRET_FILE", str(DEFAULT_SECRET_FILE)))
-        self.go_base_url = os.environ.get("GO_BASE_URL", DEFAULT_GO_BASE).rstrip("/")
+        self.deepseek_base_url = os.environ.get(
+            "DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE
+        ).rstrip("/")
+        self.deepseek_api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         self.host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.port = int(os.environ.get("PORT", "8787"))
         self.enforce_limits = os.environ.get("ENFORCE_LIMITS", "1") != "0"
@@ -225,23 +211,6 @@ class Config:
         self.stripe_webhook_tolerance_seconds = int(
             os.environ.get("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300")
         )
-        self.vision_enabled = os.environ.get("VISION_ENABLED", "1") != "0"
-        self.vision_model = os.environ.get("VISION_MODEL", "gpt-5.6-luna")
-        self.vision_fallback_model = os.environ.get("VISION_FALLBACK_MODEL", "mimo-v2.5") or None
-        self.vision_target_models = tuple(
-            value.strip()
-            for value in os.environ.get("VISION_TARGET_MODELS", "deepseek-v4").split(",")
-            if value.strip()
-        )
-        self.vision_max_output_tokens = int(os.environ.get("VISION_MAX_OUTPUT_TOKENS", "2048"))
-        self.vision_fallback_max_output_tokens = int(
-            os.environ.get("VISION_FALLBACK_MAX_OUTPUT_TOKENS", "4096")
-        )
-        self.vision_reasoning_effort = os.environ.get("VISION_REASONING_EFFORT", "minimal")
-        self.vision_report_limit = int(os.environ.get("VISION_REPORT_LIMIT", "8000"))
-        self.vision_cache_entries = int(os.environ.get("VISION_CACHE_ENTRIES", "128"))
-        self.vision_max_groups = int(os.environ.get("VISION_MAX_GROUPS", "6"))
-        self.vision_max_images = int(os.environ.get("VISION_MAX_IMAGES", "12"))
         self.pi_enabled = os.environ.get("PI_ENABLED", "0") == "1"
         self.pi_bin = os.environ.get("PI_BIN", str(DEFAULT_PI_BIN))
         self.pi_backend_url = os.environ.get(
@@ -303,6 +272,7 @@ def validate_runtime_security(cfg: Config) -> None:
                 ("DATABASE_URL", cfg.database_url),
                 ("WRAPPER_SECRET", cfg.wrapper_secret),
                 ("ADMIN_TOKEN", cfg.admin_token),
+                ("DEEPSEEK_API_KEY", cfg.deepseek_api_key),
                 ("GOOGLE_OAUTH_CLIENT_ID", cfg.google_oauth_client_id),
                 ("GOOGLE_OAUTH_CLIENT_SECRET", cfg.google_oauth_client_secret),
                 ("GOOGLE_OAUTH_REDIRECT_URI", cfg.google_oauth_redirect_uri),
@@ -508,20 +478,6 @@ class Backend:
             )
         except (RuntimeError, ValueError) as exc:
             raise UnsafeConfigurationError(f"Configuración de computadoras inválida: {exc}") from exc
-        self.vision = VisionRouter(
-            enabled=cfg.vision_enabled,
-            base_url=cfg.go_base_url,
-            primary_model=cfg.vision_model,
-            fallback_model=cfg.vision_fallback_model,
-            target_model_prefixes=cfg.vision_target_models,
-            max_output_tokens=cfg.vision_max_output_tokens,
-            fallback_max_output_tokens=cfg.vision_fallback_max_output_tokens,
-            reasoning_effort=cfg.vision_reasoning_effort,
-            report_limit=cfg.vision_report_limit,
-            cache_entries=cfg.vision_cache_entries,
-            max_groups=cfg.vision_max_groups,
-            max_images=cfg.vision_max_images,
-        )
         self.pi = PiHarness(
             enabled=cfg.pi_enabled,
             binary=cfg.pi_bin,
@@ -532,7 +488,7 @@ class Backend:
             timeout_seconds=cfg.pi_timeout_seconds,
             max_concurrent=cfg.pi_max_concurrent,
             max_prompt_chars=cfg.pi_max_prompt_chars,
-            supports_images=self.vision.supports_model(cfg.pi_model),
+            supports_images=False,
             node_bin_dir=cfg.pi_node_bin_dir,
             connector_extension=cfg.pi_connector_extension,
             connector_broker_url=cfg.pi_backend_url,
@@ -545,6 +501,7 @@ class Backend:
 
     # ---------- auth helpers ----------
     def encrypt_secret(self, plaintext: str, key_id: str) -> bytes:
+        """Encrypt a connector or identity secret with the active master key."""
         return encrypt_api_key(
             plaintext,
             key_id,
@@ -565,16 +522,6 @@ class Backend:
             secret_versions=self.cfg.wrapper_secret_versions,
             allow_secret_file=self.cfg.environment != "production",
         )
-
-    def subscription_key(self, sub: dict) -> str:
-        version = int(sub.get("key_version") or 1)
-        plaintext = self.decrypt_secret(bytes(sub["api_key_enc"]), sub["key_id"], version)
-        if version != self.cfg.wrapper_secret_version:
-            rotated = self.encrypt_secret(plaintext, sub["key_id"])
-            self.store.update_subscription_encryption(
-                sub["id"], rotated, self.cfg.wrapper_secret_version
-            )
-        return plaintext
 
     def bearer(self, handler: BaseHTTPRequestHandler) -> str | None:
         auth = handler.headers.get("Authorization", "")
@@ -799,9 +746,6 @@ class Backend:
             "tier": tier,
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
-            "subscription_id": None,
-            "subscription_status": "none",
-            "available_left": self.store.available_count(),
             "note": (
                 "Guarda el api_key; no se puede volver a mostrar. La cuenta inicia en free; "
                 "basic/pro se activan exclusivamente después de verificar el pago."
@@ -826,9 +770,6 @@ class Backend:
         pi.pop("binary", None)
         connectors = self.connector_gateway.health()
         computers = self.computers.health()
-        capacity = sum(
-            1 for item in self.store.list_subscriptions() if item.get("status") != "revoked"
-        )
         checks = {
             "database": bool(database.get("ready")),
             "google_auth": self.google_auth.configured,
@@ -853,7 +794,7 @@ class Backend:
             "pi_chrome": bool(pi.get("browser_available"))
             and bool(pi.get("browser_auto_authorize"))
             and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN,
-            "model_capacity": capacity > 0,
+            "model_provider": bool(self.cfg.deepseek_api_key),
         }
         ready = all(checks.values()) if self.cfg.environment == "production" else checks["database"]
         return {
@@ -863,7 +804,10 @@ class Backend:
             "pi": pi,
             "connectors": connectors,
             "computers": computers,
-            "model_capacity": capacity,
+            "model_provider": {
+                "configured": bool(self.cfg.deepseek_api_key),
+                "base_url": self.cfg.deepseek_base_url,
+            },
         }
 
     # ---------- billing ----------
@@ -894,62 +838,13 @@ class Backend:
         payload = self.read_body(handler, max_bytes=MAX_STRIPE_WEBHOOK_BODY)
         json_response(handler, 200, self.billing.process_webhook(payload, signature))
 
-    def handle_byok(self, handler: BaseHTTPRequestHandler) -> None:
-        user = self.require_user(handler)
-        if not user:
-            return
-        body = self.read_json(handler) or {}
-        go_key = (body.get("apiKey") or "").strip()
-        if not go_key:
-            error_response(handler, 400, "Falta apiKey", "bad_request")
-            return
-        # Validacion best-effort contra el upstream
-        ok, message = self.validate_go_key(go_key)
-        if ok is False:
-            error_response(handler, 400, f"Key de Go rechazada por el upstream: {message}", "invalid_go_key")
-            return
-        sub_id = new_id("sub")
-        blob = self.encrypt_secret(go_key, sub_id)
-        self.store.add_subscription(
-            blob,
-            sub_id,
-            label=f"byok-{user['id']}",
-            source="byok",
-            sub_id=sub_id,
-            key_version=self.cfg.wrapper_secret_version,
-        )
-        self.store.update_user_subscription(user["id"], sub_id)
-        json_response(handler, 201, {
-            "subscription_id": sub_id,
-            "source": "byok",
-            "validated": ok is True,
-        })
-
-    def validate_go_key(self, go_key: str) -> tuple[bool | None, str]:
-        try:
-            import urllib.request
-
-            req = urllib.request.Request(self.cfg.go_base_url + "/models")
-            req.add_header("Authorization", f"Bearer {go_key}")
-            req.add_header("User-Agent", DEFAULT_UA)
-            try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    return resp.status == 200, f"http {resp.status}"
-            except Exception as e:
-                code = getattr(e, "code", None)
-                if code in (401, 403):
-                    return False, f"http {code}"
-                return None, f"network error: {e}"
-        except Exception as e:
-            return None, str(e)
-
     # ---------- proxy ----------
     def handle_proxy(self, handler: BaseHTTPRequestHandler, path: str) -> None:
         user = self.require_user(handler)
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        if not requires_subscription(tier):
+        if not has_model_access(tier):
             error_response(
                 handler, 402,
                 f"El tier '{tier}' ({tier_label(tier)}) no incluye acceso a modelos. "
@@ -957,53 +852,21 @@ class Backend:
                 "tier_requires_upgrade",
             )
             return
-        sub = self.store.get_subscription(user["subscription_id"]) if user["subscription_id"] else None
-        if not sub or sub["status"] != "assigned":
-            error_response(handler, 402, "El usuario no tiene una suscripcion de Go asignada", "no_subscription")
+        if not self.cfg.deepseek_api_key:
+            error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
             return
         if self.cfg.enforce_limits:
-            summary = self.store.usage_summary(user["id"], sub["id"], tier)["windows"]
+            summary = self.store.usage_summary(user["id"], None, tier)["windows"]
             hit = next((k for k, v in summary.items() if v["spent_usd"] >= v["limit_usd"]), None)
             if hit:
                 error_response(
                     handler, 429,
                     f"Limite de uso alcanzado ({hit}: ${summary[hit]['spent_usd']:.2f} de "
-                    f"${summary[hit]['limit_usd']:.2f}). Espera a que se renueve o usa /v1/byok.",
+                    f"${summary[hit]['limit_usd']:.2f}). Espera a que se renueve.",
                     "usage_limit",
                 )
                 return
-        try:
-            go_key = self.subscription_key(sub)
-        except Exception:
-            logging.exception("No se pudo descifrar una key Go")
-            error_response(
-                handler,
-                500,
-                "Internal server error",
-                "internal_error",
-                include_request_id=True,
-            )
-            return
-
         body = self.read_body(handler)
-        vision_models: tuple[str, ...] = ()
-        if body and handler.command == "POST":
-            try:
-                vision_result = self.vision.transform(path, body, go_key)
-            except VisionError as e:
-                for analysis in e.analyses:
-                    self.record(user, sub, analysis.path, analysis.status, analysis.usage)
-                error_response(
-                    handler,
-                    e.status,
-                    f"No se pudo analizar la imagen: {e}",
-                    e.code,
-                )
-                return
-            body = vision_result.body
-            vision_models = vision_result.models
-            for analysis in vision_result.analyses:
-                self.record(user, sub, analysis.path, analysis.status, analysis.usage)
 
         ua = handler.headers.get("user-agent", "")
         headers = {
@@ -1034,8 +897,6 @@ class Backend:
                 handler.send_header("Cache-Control", "no-store, max-age=0")
                 handler.send_header("Pragma", "no-cache")
                 handler.send_header("X-Request-Id", handler.request_id)
-                if vision_models:
-                    handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
                 handler.end_headers()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -1048,10 +909,15 @@ class Backend:
                 pass
 
         status, out_headers, out_body, usage = proxy_request(
-            handler.command, self.cfg.go_base_url, path, headers, body, go_key,
+            handler.command,
+            self.cfg.deepseek_base_url,
+            path,
+            headers,
+            body,
+            self.cfg.deepseek_api_key,
             on_chunk=on_chunk, on_headers=on_headers,
         )
-        self.record(user, sub, path, status, usage)
+        self.record(user, path, status, usage)
 
         if stream_state["started"]:
             handler.close_connection = True
@@ -1068,8 +934,6 @@ class Backend:
             handler.send_header("Cache-Control", "no-store, max-age=0")
             handler.send_header("Pragma", "no-cache")
             handler.send_header("X-Request-Id", handler.request_id)
-            if vision_models:
-                handler.send_header("X-Wrapper-Vision-Model", ",".join(vision_models))
             handler.send_header("Content-Length", str(len(raw)))
             handler.end_headers()
             if raw:
@@ -1077,12 +941,12 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def record(self, user, sub, path, status, usage) -> None:
+    def record(self, user, path, status, usage) -> None:
         model = usage.model
         cost = estimate_cost_usd(model, usage.input_tokens, usage.output_tokens,
                                  usage.cached_read, usage.cached_write) if usage.any() else 0.0
         self.store.record_usage(
-            user["id"], sub["id"], model, path,
+            user["id"], None, model, path,
             usage.input_tokens if usage.any() else None,
             usage.output_tokens if usage.any() else None,
             usage.cached_read if usage.any() else None,
@@ -1096,7 +960,6 @@ class Backend:
             return
         status = self.pi.status()
         status.pop("binary", None)  # no exponer rutas internas del servidor
-        status["vision"] = self.vision.status()
         json_response(handler, 200, status)
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1104,16 +967,15 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        if not requires_subscription(tier):
+        if not has_model_access(tier):
             error_response(
                 handler, 402,
                 f"El tier '{tier}' no incluye ejecuciones de Pi",
                 "tier_requires_upgrade",
             )
             return
-        sub = self.store.get_subscription(user["subscription_id"]) if user["subscription_id"] else None
-        if not sub or sub["status"] != "assigned":
-            error_response(handler, 402, "El usuario no tiene una suscripcion de Go asignada", "no_subscription")
+        if not self.cfg.deepseek_api_key:
+            error_response(handler, 503, "El proveedor de modelos no está configurado", "model_unavailable")
             return
 
         body = self.read_json(handler) or {}
@@ -1205,7 +1067,7 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        if not requires_subscription(tier):
+        if not has_model_access(tier):
             error_response(handler, 402, "Tu plan no incluye una computadora persistente", "tier_requires_upgrade")
             return
         body = self.read_json(handler) or {}
@@ -1353,43 +1215,6 @@ class Backend:
         return value
 
     # ---------- admin ----------
-    def handle_admin_add_subscriptions(self, handler: BaseHTTPRequestHandler) -> None:
-        if not self.require_admin(handler):
-            return
-        body = self.read_json(handler) or {}
-        keys = body.get("keys") or ([body["key"]] if body.get("key") else [])
-        if not keys:
-            error_response(handler, 400, "Envia {keys: [...]} o {key: ...}", "bad_request")
-            return
-        created = []
-        for raw in keys:
-            k = (raw or "").strip()
-            if not k:
-                continue
-            sub_id = new_id("sub")
-            blob = self.encrypt_secret(k, sub_id)
-            sub = self.store.add_subscription(
-                blob,
-                sub_id,
-                label=body.get("label"),
-                sub_id=sub_id,
-                key_version=self.cfg.wrapper_secret_version,
-            )
-            created.append({"id": sub["id"], "status": sub["status"], "key_masked": masked(k)})
-        json_response(handler, 201, {"created": created, "available_left": self.store.available_count()})
-
-    def handle_admin_list_subscriptions(self, handler: BaseHTTPRequestHandler) -> None:
-        if not self.require_admin(handler):
-            return
-        subs = []
-        for s in self.store.list_subscriptions():
-            subs.append({
-                "id": s["id"], "status": s["status"], "source": s["source"],
-                "assigned_user_id": s["assigned_user_id"], "label": s["label"],
-                "api_key_enc_length": len(s["api_key_enc"]),
-            })
-        json_response(handler, 200, {"subscriptions": subs})
-
     def handle_admin_users(self, handler: BaseHTTPRequestHandler) -> None:
         if not self.require_admin(handler):
             return
@@ -1400,7 +1225,7 @@ class Backend:
                 "tier": u.get("tier") or DEFAULT_TIER,
                 "account_status": u.get("account_status") or "active",
                 "disabled_at": u.get("disabled_at"),
-                "subscription_id": u["subscription_id"], "created_at": u["created_at"],
+                "created_at": u["created_at"],
             })
         json_response(handler, 200, {"users": users})
 
@@ -1459,24 +1284,10 @@ class Backend:
         if not is_valid(tier):
             error_response(handler, 400, f"Tier invalido: {tier}", "bad_tier")
             return
-        try:
-            updated = self.store.transition_user_tier(
-                user_id,
-                tier,
-                needs_subscription=requires_subscription(tier),
-            )
-        except NoSubscriptionAvailable:
-            error_response(
-                handler,
-                409,
-                "No hay suscripciones disponibles para asignar al subir de tier",
-                "no_subscriptions_available",
-            )
-            return
+        self.store.transition_user_tier(user_id, tier)
         json_response(handler, 200, {
             "user_id": user_id,
             "tier": tier,
-            "subscription_id": updated["subscription_id"],
         })
 
     def handle_admin_usage(self, handler: BaseHTTPRequestHandler) -> None:
@@ -1490,7 +1301,7 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        summary = self.store.usage_summary(user["id"], user["subscription_id"], tier)
+        summary = self.store.usage_summary(user["id"], None, tier)
         summary["tier"] = tier
         summary["tier_label"] = tier_label(tier)
         json_response(handler, 200, summary)
@@ -1500,15 +1311,11 @@ class Backend:
         if not user:
             return
         tier = user.get("tier") or DEFAULT_TIER
-        sub = self.store.get_subscription(user["subscription_id"]) if user["subscription_id"] else None
         json_response(handler, 200, {
             "user_id": user["id"], "name": user["name"], "email": user["email"],
             "tier": tier,
             "tier_label": tier_label(tier),
             "limits": effective_limits(tier),
-            "subscription": {
-                "id": sub["id"], "status": sub["status"], "source": sub["source"],
-            } if sub else None,
         })
 
 
@@ -1580,9 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_billing_portal(self)
             elif self.command == "POST" and path == "/v1/billing/webhook":
                 backend.handle_billing_webhook(self)
-            elif self.command == "POST" and path == "/v1/byok":
-                backend.handle_byok(self)
-            elif path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+            elif self.command == "POST" and path == "/v1/chat/completions":
                 backend.handle_proxy(self, UPSTREAM_PATHS[path])
             elif self.command == "GET" and path == "/v1/models":
                 backend.handle_proxy(self, UPSTREAM_PATHS[path])
@@ -1614,10 +1419,6 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_connector_execute(self)
             elif self.command == "POST" and path == "/v1/internal/computers/execute":
                 backend.handle_computer_execute(self)
-            elif self.command == "POST" and path == "/admin/subscriptions":
-                backend.handle_admin_add_subscriptions(self)
-            elif self.command == "GET" and path == "/admin/subscriptions":
-                backend.handle_admin_list_subscriptions(self)
             elif self.command == "GET" and path == "/admin/users":
                 backend.handle_admin_users(self)
             elif self.command == "POST" and path.startswith("/admin/users/") and path.endswith("/revoke"):
@@ -1709,10 +1510,9 @@ def serve(cfg: Config) -> None:
     Handler.backend = backend
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     print(f"[server] wrapper backend v{__version__} escuchando en http://{cfg.host}:{cfg.port}")
-    print(f"[server] upstream Go: {cfg.go_base_url}")
+    print(f"[server] model provider: DeepSeek ({cfg.deepseek_base_url})")
     database_backend = "postgres" if cfg.database_url else f"sqlite:{cfg.db_path}"
     print(f"[server] enforce_limits={cfg.enforce_limits} database={database_backend}")
-    print(f"[server] vision_enabled={cfg.vision_enabled} vision_model={cfg.vision_model}")
     print(f"[server] pi_enabled={cfg.pi_enabled} pi_model={cfg.pi_model}")
     print(f"[server] computers={backend.computers.health()}")
     try:
@@ -1725,20 +1525,14 @@ def serve(cfg: Config) -> None:
 
 
 def cli() -> None:
-    parser = argparse.ArgumentParser(prog="wrapper-backend", description="Backend del wrapper sobre OpenCode Go")
+    parser = argparse.ArgumentParser(prog="wrapper-backend", description="Backend de Agent Genia sobre DeepSeek")
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("init-db", help="Crear la base de datos")
     serve_cmd = sub.add_parser("serve", help="Arrancar el servidor HTTP")
     serve_cmd.add_argument("--port", type=int, default=None)
     sub.add_parser("users", help="Listar usuarios")
-    sub.add_parser("subs", help="Listar suscripciones del pool")
     sub.add_parser("usage", help="Ver eventos de uso")
-    add_key = sub.add_parser("add-key", help="Agregar key(s) de Go al pool (usa '-' para leer de stdin)")
-    add_key.add_argument("keys", nargs="*", help="Keys de Go, '-' para stdin, o nada con --from-keychain")
-    add_key.add_argument("--label", default=None)
-    add_key.add_argument("--from-keychain", action="store_true",
-                         help="Leer la key del Keychain de macOS (item 'codex-opencode-api-key')")
 
     args = parser.parse_args()
     cfg = Config()
@@ -1761,51 +1555,12 @@ def cli() -> None:
     elif args.cmd == "users":
         for u in backend.store.list_users():
             print(u["id"], "|", u.get("name") or "-", "|", u.get("email") or "-",
-                  "| tier:", u.get("tier") or "-", "| sub:", u["subscription_id"] or "-")
-    elif args.cmd == "subs":
-        for s in backend.store.list_subscriptions():
-            print(s["id"], "|", s["status"], "|", s["source"], "|", s["assigned_user_id"] or "-")
+                  "| tier:", u.get("tier") or "-")
     elif args.cmd == "usage":
         data = backend.store.usage_all()
         for e in data["events"]:
             print(f"{e['created_at']:.0f} | {e['user_id']} | {e['model'] or '-'} | {e['endpoint']} | "
                   f"in={e['input_tokens']} out={e['output_tokens']} | ${e['estimated_cost_usd']:.6f} | {e['status']}")
-    elif args.cmd == "add-key":
-        keys: list[str] = []
-        for k in args.keys:
-            if k == "-":
-                keys.extend(line.strip() for line in sys.stdin if line.strip())
-            else:
-                keys.append(k)
-        if args.from_keychain:
-            import subprocess
-            out = subprocess.run(
-                ["security", "find-generic-password", "-a", os.environ.get("USER", "alan"),
-                 "-s", "codex-opencode-api-key", "-w"],
-                check=False, capture_output=True,
-            )
-            if out.returncode != 0:
-                print("[error] no se pudo leer el item del Keychain:",
-                      out.stderr.decode().strip(), file=sys.stderr)
-                sys.exit(1)
-            keys.append(out.stdout.decode().strip())
-        if not keys:
-            print("[error] no se dieron keys (usa: add-key <key> | add-key - | add-key --from-keychain)",
-                  file=sys.stderr)
-            sys.exit(1)
-        created = []
-        for k in keys:
-            sub_id = new_id("sub")
-            blob = backend.encrypt_secret(k, sub_id)
-            sub = backend.store.add_subscription(
-                blob,
-                sub_id,
-                label=args.label,
-                sub_id=sub_id,
-                key_version=cfg.wrapper_secret_version,
-            )
-            created.append(sub)
-        print(f"[ok] {len(created)} key(s) agregadas al pool. Disponibles: {backend.store.available_count()}")
     else:
         parser.print_help()
 

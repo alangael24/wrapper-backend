@@ -1,14 +1,15 @@
 # Agent Genia — backend y runtime de agentes
 
-Backend de Agent Genia: **cada usuario nuevo empieza en `free`, sin capacidad
-de pago asignada**. La capacidad administrada solo se reclama después de que un
-webhook de pago verificado o un administrador autenticado activa `basic`/`pro`.
-El backend envía las requests de LLM al proveedor configurado con la credencial
-asignada a ese usuario, registra uso y vigila los límites de la suscripción.
-También puede ejecutar
-tareas completas con **Pi** en modo RPC usando esa misma identidad y modelo.
-Aunque DeepSeek V4 es de solo texto, el backend le añade visión mediante
-**GPT-5.6 Luna**, con MiMo como fallback.
+Backend de Agent Genia: **cada usuario nuevo empieza en `free`**. Un webhook de
+pago verificado o un administrador autenticado activa `basic`/`pro`. El backend
+usa una cuenta oficial de DeepSeek propiedad de Agent Genia, registra el uso por
+usuario y aplica los presupuestos del producto. La clave `DEEPSEEK_API_KEY` vive
+únicamente en el servidor: no se asignan keys de proveedor a usuarios y no hay
+un modo para reemplazarla desde el cliente.
+
+Las tareas completas se ejecutan con **Pi** en modo RPC. DeepSeek V4 se mantiene
+como modelo principal y Pi conserva herramientas, conectores y pi-chrome. Por el
+momento el producto es text-only: no se incluye un puente de visión.
 
 El backend base requiere Python, `cryptography` y `psycopg` con su pool cuando usa
 Supabase/Postgres; Pi es una dependencia opcional de Node.js y viene
@@ -19,39 +20,32 @@ desactivado por defecto.
 Hay 3 tiers; cada uno aplica un porcentaje de los presupuestos internos de uso
 ($12 / 5h, $30 / semana, $60 / mes):
 
-| Tier | Capacidad administrada | Límites (5h / semana / mes) | Acceso a modelos |
-|---|---|---|---|
-| `free` | No se asigna | $0 / $0 / $0 | ❌ (402 `tier_requires_upgrade`) |
-| `basic` | 50% | $6 / $15 / $30 | ✅ |
-| `pro` | 100% | $12 / $30 / $60 | ✅ |
+| Tier | Límites (5h / semana / mes) | Acceso a modelos |
+|---|---|---|
+| `free` | $0 / $0 / $0 | ❌ (402 `tier_requires_upgrade`) |
+| `basic` | $6 / $15 / $30 | ✅ |
+| `pro` | $12 / $30 / $60 | ✅ |
 
 - `POST /v1/signup` siempre crea `free`. Cualquier `tier` enviado por el
-  cliente se ignora y nunca consume una key del pool.
-- `free` se crea **sin** suscripción y no puede llamar modelos.
-- `basic` y `pro` necesitan una key disponible en el pool.
+  cliente se ignora.
+- `free` no puede llamar modelos.
+- `basic` y `pro` usan la cuenta DeepSeek administrada por el servidor.
 - Después de verificar el pago, el administrador puede cambiar el tier con
-  `POST /admin/users/<id>/tier` `{"tier": "pro"}`: subir de tier asigna una
-  suscripción del pool si no tiene una; bajarlo la libera de vuelta al pool.
-- La activación y la reclamación de capacidad se ejecutan bajo
-  `BEGIN IMMEDIATE`; un índice único parcial impide asociar una misma
-  suscripción a dos usuarios.
+  `POST /admin/users/<id>/tier` `{"tier": "pro"}`.
+- La activación del entitlement se ejecuta dentro de la misma transacción que
+  procesa el evento Stripe.
 - Los límites se reescalan según el tier: un usuario `basic` recibe 429 al
   llegar a $6 en 5h; uno `pro` al llegar a $12.
 
-## Cómo funciona el modelo de capacidad
+## Cómo funciona el acceso al modelo
 
-Las credenciales del proveedor de modelos se administran exclusivamente en el
-servidor mediante un **pool de capacidad**:
-
-1. El operador carga las credenciales del proveedor al pool.
-2. Cada registro público (`POST /v1/signup`) crea un usuario `free` sin key.
-3. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
-   con firma verificada activa `basic`/`pro` después del pago.
-4. La transición pagada reclama una sola key del pool de forma atómica.
-5. El usuario también puede traer su propia key (`POST /v1/byok`), pero el
-   acceso sigue dependiendo del tier guardado por el servidor.
-6. El backend proxya `chat/completions`, `responses` y `messages` al upstream
-   con la key asignada, y registra el uso por ventanas.
+1. Cada registro público (`POST /v1/signup`) crea un usuario `free`.
+2. Stripe Checkout cobra un price ID fijo elegido por el servidor; un webhook
+   firmado activa `basic`/`pro` después de confirmar el estado actual en Stripe.
+3. Pi llama al endpoint OpenAI-compatible del wrapper usando la sesión del
+   usuario. El wrapper valida tier y límites y usa su propia `DEEPSEEK_API_KEY`.
+4. El backend registra input, output y cache hits por usuario. La caché de
+   contexto de DeepSeek es automática y reduce el costo cuando hay coincidencias.
 
 ### Persistencia con PostgreSQL/Supabase
 
@@ -62,10 +56,9 @@ habilitado como defensa adicional. El backend se conecta exclusivamente con
 usan SQLite cuando esa variable está vacía.
 
 Las migraciones versionadas viven en `supabase/migrations/`. Las transiciones de
-tier, el procesamiento idempotente de webhooks y la reclamación de capacidad se
-ejecutan dentro de transacciones. Los índices únicos parciales son la defensa
-final que impide asignar una misma suscripción a dos usuarios, incluso ante una
-carrera.
+tier y el procesamiento idempotente y cronológico de webhooks se ejecutan dentro
+de transacciones. La versión 10 retira las asignaciones históricas de keys de
+proveedor y permite atribuir uso directamente al usuario.
 
 En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
 `WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de
@@ -80,7 +73,7 @@ El cliente solo solicita `basic` (Plus) o `pro`; el backend resuelve el price ID
 live configurado y el tier no cambia hasta recibir un evento firmado.
 
 1. Aplica las migraciones de Supabase, incluida
-   `20260812233100_stripe_event_ordering.sql`, antes de desplegar esta versión
+   `20260813143000_deepseek_direct.sql`, antes de desplegar esta versión
    del backend.
 2. Configura las variables `STRIPE_*` de `.env.example` en el gestor de secretos
    del host y establece `STRIPE_ENABLED=1`.
@@ -94,8 +87,8 @@ live configurado y el tier no cambia hasta recibir un evento firmado.
 
 Los estados `active` y `trialing` activan acceso. `past_due` conserva el acceso
 durante los reintentos de Stripe; `unpaid`, `canceled`, `paused` e
-`incomplete_expired` vuelven a `free` y liberan la capacidad. Si el pool no tiene
-una key disponible, la transacción se revierte y Stripe reintenta el webhook.
+`incomplete_expired` vuelven a `free`. Ningún estado de Stripe asigna o expone
+una credencial de DeepSeek.
 
 ## Requisitos
 
@@ -262,24 +255,23 @@ IPC.
 
 ### Teach a task
 
-Cada bot ofrece `Teach a task` en el top bar y en el menú `+` del composer. La
-app abre el selector nativo de pantalla/ventana, reserva una sola grabación a la
-vez y muestra un overlay con cronómetro, `Stop & save` y `Discard`. La grabación
-no incluye audio, dura como máximo cinco minutos y se limita a 64 MB.
+Los accesos para iniciar una grabación nueva están ocultos mientras el producto
+no tenga un modelo visual. La implementación local de grabación se conserva para
+reactivarla después: usa el selector nativo de pantalla/ventana, admite una sola
+grabación a la vez, no incluye audio y limita cada captura a cinco minutos y
+64 MB.
 
 Al guardar, Electron conserva el video con permisos `0600` dentro de
-`userData/teach-recordings/<hash-de-cuenta>` y envía hasta doce fotogramas
-cronológicos al endpoint `responses` del propio `wrapper-backend`. Luna convierte
-los fotogramas en evidencia visual y DeepSeek genera un workflow JSON con título,
-resumen y pasos. El workflow queda dentro del mismo estado local aislado por
-cuenta que el bot; eliminar el workflow o el bot elimina también su video.
+`userData/teach-recordings/<hash-de-cuenta>`. La extracción automática desde
+fotogramas está pausada mientras el producto no tenga un modelo visual. Los
+workflows ya guardados siguen siendo locales, aislados por cuenta y ejecutables;
+eliminar el workflow o el bot elimina también su video.
 
-`Run now` vuelve a ejecutar los pasos mediante el endpoint existente de Pi con
+`Run now` puede volver a ejecutar los workflows existentes mediante Pi con
 el navegador aislado y los conectores autorizados del bot. Esta función no
 modifica `go_backend/pi_harness.py` ni comparte el perfil original grabado: si
 la tarea necesita una sesión web, el usuario debe autorizarla en el perfil
-temporal de esa ejecución o usar un conector OAuth. La extracción requiere un
-plan con acceso a modelos y una sesión de Agent Genia iniciada.
+temporal de esa ejecución o usar un conector OAuth.
 
 ### Login con Google
 
@@ -355,25 +347,12 @@ tokens, API keys de Composio ni client secrets. Electron consulta todas sus
 conexiones con un único `GET /v1/connectors`; el backend es la fuente de verdad
 y no persiste estados OAuth de proveedores en el dispositivo.
 
-Cargar credenciales del proveedor al pool:
-
-```bash
-# key(s) a mano
-.venv/bin/python -m go_backend.server add-key MODEL_KEY_1 MODEL_KEY_2
-
-# desde stdin
-echo "MODEL_KEY_1" | .venv/bin/python -m go_backend.server add-key -
-
-# desde tu Keychain de macOS
-.venv/bin/python -m go_backend.server add-key --from-keychain
-```
-
 Probar el flujo:
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/signup \
   -H 'Content-Type: application/json' -d '{"name":"ana"}'
-# -> { "api_key": "...", "tier": "free", "subscription_id": null, ... }
+# -> { "api_key": "...", "tier": "free", "limits": {...}, ... }
 
 # Solo después de verificar el pago:
 curl -X POST http://127.0.0.1:8787/admin/users/USER_ID/tier \
@@ -397,9 +376,9 @@ curl -X POST http://127.0.0.1:8787/v1/agent/run \
 ```
 
 El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
-Por eso las llamadas que hace Pi usan la capacidad asignada al
-usuario y aparecen en `/v1/usage`. Cada ejecución tiene un workspace y logs
-propios bajo `PI_RUNS_DIR`.
+El wrapper autentica al usuario pero firma la llamada a DeepSeek con la key del
+servidor; el consumo aparece en `/v1/usage`. Cada ejecución tiene un workspace
+y logs propios bajo `PI_RUNS_DIR`.
 
 En producción Pi se ejecuta únicamente en Linux mediante el launcher
 Bubblewrap fail-closed. Instala `bubblewrap`, `socat` y `util-linux`, ejecuta
@@ -440,27 +419,6 @@ pnpm test:connectors
 python3 -m unittest tests.test_backend -v
 ```
 
-## Visión para DeepSeek
-
-El puente multimodal viene activo por defecto para modelos cuyo nombre empieza
-con `deepseek-v4` y funciona en `responses`, `chat/completions` y `messages`:
-
-```text
-imagen → Luna → reporte visual no confiable → DeepSeek V4 → respuesta/acciones
-                  ↘ MiMo-V2.5 si Luna falla
-```
-
-- Luna recibe las imágenes con la misma capacidad de modelos asignada al usuario.
-- DeepSeek recibe texto/OCR, estado de UI, defectos y evidencia relevante; no
-  recibe los bytes de la imagen que no sabe interpretar.
-- El consumo de Luna/MiMo y el de DeepSeek se registran como eventos separados.
-- Los reportes se cachean por contenido de imagen **y prompt**, con límite LRU.
-- Cada request admite como máximo 6 grupos y 12 imágenes para evitar ráfagas
-  accidentales de llamadas visuales.
-- `X-Wrapper-Vision-Model` indica qué modelo visual se usó.
-- El reporte se marca explícitamente como evidencia no confiable para evitar
-  que instrucciones escritas dentro de una imagen controlen al agente.
-
 ## Navegación con pi-chrome
 
 `pi-chrome` está fijado en `package.json` y Pi carga automáticamente su extensión
@@ -496,8 +454,8 @@ El servidor se niega a arrancar con `PI_CHROME_ISOLATION=shared` o cualquier
 otro modo. Un perfil nuevo no contiene sesiones autenticadas: si una tarea debe
 iniciar sesión, debe hacerlo dentro de esa ejecución y esos datos no se conservan.
 
-Las capturas que produzca `pi-chrome` pasan por Luna antes de llegar a DeepSeek,
-de modo que el agente puede observar la página y decidir su siguiente acción.
+DeepSeek recibe texto y resultados estructurados de herramientas. Sin un modelo
+visual activo, capturas o adjuntos de imagen no se anuncian como input soportado.
 
 ## Computadora persistente por bot
 
@@ -564,13 +522,10 @@ proviene del flujo de signup.
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
 | POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"}`; el servidor fija el price ID |
 | POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
-| POST | `/v1/byok` | El usuario registra su propia credencial de proveedor `{apiKey}` |
 | GET | `/v1/models` | Catálogo de modelos del proveedor configurado |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
-| POST | `/v1/responses` | Proxy Responses API (stream y no-stream) |
-| POST | `/v1/messages` | Proxy estilo Anthropic |
 | GET | `/v1/usage` | Uso por ventanas con límites ajustados al tier |
-| GET | `/v1/me` | Usuario, tier y suscripción asignada |
+| GET | `/v1/me` | Usuario, tier y límites del producto |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
 | POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, browser?: false, computer?: false, bot_id?: string, connector_ids?: string[]}` y espera el resultado |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
@@ -595,9 +550,7 @@ Bearer = `ADMIN_TOKEN`:
 
 | Método | Ruta | Descripción |
 |---|---|---|
-| POST | `/admin/subscriptions` | Agregar credenciales de proveedor al pool `{keys:[...]}` |
-| GET | `/admin/subscriptions` | Listar pool (keys cifradas, enmascaradas) |
-| GET | `/admin/users` | Listar usuarios y asignaciones |
+| GET | `/admin/users` | Listar usuarios y tiers |
 | POST | `/admin/users/<id>/revoke` | Deshabilitar la cuenta y revocar API key, sesiones, conectores y computadoras |
 | POST | `/admin/users/<id>/tier` | Cambiar tier `{tier: "free"|"basic"|"pro"}` |
 | GET | `/admin/usage` | Eventos de uso recientes |
@@ -607,7 +560,7 @@ Bearer = `ADMIN_TOKEN`:
 - Los presupuestos internos son **$12 por 5 horas, $30 por semana, $60 por mes**.
 - El tier del usuario escala esos límites (`basic` = 50%, `pro` = 100%).
 - El backend estima el costo por request con la tabla de precios de
-  `go_backend/go_prices.py` y responde `429 usage_limit` cuando el usuario
+  `go_backend/deepseek_prices.py` y responde `429 usage_limit` cuando el usuario
   alcanza un límite (configurable con `ENFORCE_LIMITS=0`).
 - El uso se registra en `usage_events` con tokens input/output/cacheados y
   costo estimado. En streaming, el uso se captura del evento final si el
@@ -632,7 +585,8 @@ runtime se agrupan aquí por función.
 | `ADMIN_TOKEN` | efímero solo en desarrollo | Obligatorio en producción; nunca se imprime |
 | `DATABASE_URL` | SQLite solo en desarrollo | PostgreSQL/Supabase y obligatorio en producción |
 | `DB_PATH` | `data/wrapper.sqlite` | Base de datos SQLite |
-| `GO_BASE_URL` | valor de `.env.example` | Upstream OpenAI-compatible; el nombre se conserva por compatibilidad histórica |
+| `DEEPSEEK_API_KEY` | vacío | Obligatoria en producción; clave única propiedad del servidor |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Endpoint oficial OpenAI-compatible de DeepSeek |
 | `ENFORCE_LIMITS` | `1` | Rechazar al superar los presupuestos de uso |
 | `GOOGLE_OAUTH_CLIENT_ID` | vacío | Cliente OAuth web de Google |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | vacío | Secreto OAuth, solo servidor |
@@ -668,21 +622,10 @@ runtime se agrupan aquí por función.
 | `COMPOSIO_TOOLKIT_OVERRIDES_JSON` | `{}` | Overrides de toolkit por connector ID |
 | `COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS` | `600` | Vida de un intento de conexión |
 
-### Visión y Pi
+### Pi
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `VISION_ENABLED` | `1` | Añadir visión a los modelos objetivo de solo texto |
-| `VISION_MODEL` | `gpt-5.6-luna` | Modelo primario de percepción visual |
-| `VISION_FALLBACK_MODEL` | `mimo-v2.5` | Fallback visual; vacío lo desactiva |
-| `VISION_TARGET_MODELS` | `deepseek-v4` | Prefijos de modelo separados por coma |
-| `VISION_MAX_OUTPUT_TOKENS` | `2048` | Máximo del reporte de Luna |
-| `VISION_FALLBACK_MAX_OUTPUT_TOKENS` | `4096` | Máximo del reporte fallback |
-| `VISION_REASONING_EFFORT` | `minimal` | Esfuerzo de Luna para percepción |
-| `VISION_REPORT_LIMIT` | `8000` | Caracteres máximos inyectados por reporte |
-| `VISION_CACHE_ENTRIES` | `128` | Máximo de reportes visuales en caché LRU |
-| `VISION_MAX_GROUPS` | `6` | Máximo de grupos visuales por request |
-| `VISION_MAX_IMAGES` | `12` | Máximo de imágenes únicas por request |
 | `PI_ENABLED` | `0` | Habilitar el endpoint de tareas de Pi |
 | `PI_BIN` | `./scripts/pi-sandbox` | Launcher Bubblewrap fail-closed; ejecuta el Pi real dentro del sandbox Linux |
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
@@ -793,7 +736,7 @@ Las credenciales y el procedimiento exacto están en
 ## Tests
 
 ```bash
-# Backend, billing, persistencia, visión, conectores y computadoras
+# Backend, billing, persistencia, conectores y computadoras
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 
 # Electron y extensión dinámica de conectores
@@ -818,8 +761,8 @@ cd android/AgentGenia
 ```
 
 Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del
-proveedor ni realizan cobros. Cubren signup siempre-free, activación, carrera de
-asignación, proxy y streaming, uso, tiers, BYOK, Stripe, cifrado, Google OAuth,
-Pi RPC, visión, grants efímeros, conectores, computadoras, aislamiento por
+proveedor ni realizan cobros. Cubren signup siempre-free, activación, proxy y
+streaming, uso, tiers, Stripe, cifrado, Google OAuth, Pi RPC, grants efímeros,
+conectores, computadoras, aislamiento por
 cuenta, widgets del LLM y contratos de Electron. Las compilaciones móviles
 validan además que los proyectos nativos y sus catálogos de assets sean válidos.

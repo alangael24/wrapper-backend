@@ -177,8 +177,8 @@ y los tres workflows de release
 lo consultan antes de firmar o publicar cualquier binario; si producción no está
 realmente operativa, la distribución se detiene.
 
-La migración `20260813032540_apple_identity_tokens.sql` lleva el esquema a la
-versión 9. Debe aplicarse antes de desplegar el binario; el verificador de release
+La migración `20260813143000_deepseek_direct.sql` lleva el esquema a la
+versión 10. Debe aplicarse antes de desplegar el binario; el verificador de release
 impide publicar si el historial local deja de coincidir con el historial remoto.
 
 El sandbox Bubblewrap requiere un host Linux con user namespaces habilitados. Si

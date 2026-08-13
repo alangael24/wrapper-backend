@@ -1,4 +1,4 @@
-"""Capa de datos: SQLite (stdlib) con esquema de usuarios, suscripciones Go y uso."""
+"""SQLite persistence for accounts, billing, connectors, computers, and usage."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS go_subscriptions (
   key_id           TEXT NOT NULL,          -- id usado en el Keychain (si aplica)
   key_version      INTEGER NOT NULL DEFAULT 1,
   label            TEXT,
-  source           TEXT NOT NULL DEFAULT 'pool',   -- pool | byok
+  source           TEXT NOT NULL DEFAULT 'pool',   -- retired provider-key records
   status           TEXT NOT NULL DEFAULT 'available', -- available | assigned | revoked
   assigned_user_id TEXT,
   note             TEXT,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS go_subscriptions (
 CREATE TABLE IF NOT EXISTS usage_events (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id              TEXT NOT NULL,
-  subscription_id      TEXT NOT NULL,
+  subscription_id      TEXT,
   model                TEXT,
   endpoint             TEXT,
   input_tokens         INTEGER,
@@ -212,10 +212,6 @@ def _now() -> float:
     return time.time()
 
 
-class NoSubscriptionAvailable(RuntimeError):
-    pass
-
-
 class ComputerLimitReached(RuntimeError):
     pass
 
@@ -242,6 +238,10 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            version_row = self._conn.execute(
+                "SELECT v FROM kv WHERE k='schema_version'"
+            ).fetchone()
+            previous_version = int(version_row["v"]) if version_row else 0
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(users)").fetchall()}
             if "tier" not in cols:
                 self._conn.execute("ALTER TABLE users ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
@@ -288,12 +288,55 @@ class Store:
                 self._conn.execute(
                     "ALTER TABLE connector_credentials ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
                 )
+            if previous_version < 10:
+                usage_subscription = next(
+                    row
+                    for row in self._conn.execute("PRAGMA table_info(usage_events)")
+                    if row[1] == "subscription_id"
+                )
+                if usage_subscription[3]:
+                    self._migrate_usage_subscription_nullable()
+                # Version 10 retires per-user provider credentials. Historical
+                # ciphertext remains only as a revoked migration record.
+                self._conn.execute("UPDATE users SET subscription_id=NULL")
+                self._conn.execute(
+                    "UPDATE go_subscriptions SET status='revoked',assigned_user_id=NULL"
+                )
             self._conn.execute(
                 "INSERT INTO kv(k,v) VALUES('schema_version', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                 (str(SCHEMA_VERSION),),
             )
             self._conn.commit()
+
+    def _migrate_usage_subscription_nullable(self) -> None:
+        self._conn.execute("ALTER TABLE usage_events RENAME TO usage_events_legacy_provider")
+        self._conn.execute(
+            """CREATE TABLE usage_events (
+              id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id              TEXT NOT NULL,
+              subscription_id      TEXT,
+              model                TEXT,
+              endpoint             TEXT,
+              input_tokens         INTEGER,
+              output_tokens        INTEGER,
+              cached_read_tokens   INTEGER,
+              cached_write_tokens  INTEGER,
+              estimated_cost_usd   REAL NOT NULL DEFAULT 0,
+              status               INTEGER,
+              created_at           REAL NOT NULL
+            )"""
+        )
+        self._conn.execute(
+            "INSERT INTO usage_events SELECT * FROM usage_events_legacy_provider"
+        )
+        self._conn.execute("DROP TABLE usage_events_legacy_provider")
+        self._conn.execute(
+            "CREATE INDEX idx_usage_user_time ON usage_events(user_id, created_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX idx_usage_sub_time ON usage_events(subscription_id, created_at)"
+        )
 
     def _migrate_users_default_to_free(self) -> None:
         """Reconstruye la tabla para cambiar el DEFAULT de bases ya existentes."""
@@ -1079,7 +1122,7 @@ class Store:
                     raise KeyError(user_id)
                 if user["subscription_id"]:
                     self._conn.execute(
-                        "UPDATE go_subscriptions SET status='available',assigned_user_id=NULL "
+                        "UPDATE go_subscriptions SET status='revoked',assigned_user_id=NULL "
                         "WHERE id=?",
                         (user["subscription_id"],),
                     )
@@ -1121,13 +1164,6 @@ class Store:
                 if user is None:
                     raise KeyError(user_id)
                 subscription_id = user["subscription_id"]
-                subscription_source = None
-                if subscription_id:
-                    subscription = self._conn.execute(
-                        "SELECT source FROM go_subscriptions WHERE id=?", (subscription_id,)
-                    ).fetchone()
-                    subscription_source = subscription["source"] if subscription else None
-
                 usage = self._conn.execute(
                     "DELETE FROM usage_events WHERE user_id=?", (user_id,)
                 ).rowcount
@@ -1148,13 +1184,9 @@ class Store:
                 self._conn.execute("DELETE FROM billing_customers WHERE user_id=?", (user_id,))
                 self._conn.execute("DELETE FROM account_identities WHERE user_id=?", (user_id,))
                 self._conn.execute("DELETE FROM users WHERE id=?", (user_id,))
-                if subscription_id and subscription_source == "byok":
+                if subscription_id:
                     self._conn.execute(
-                        "DELETE FROM go_subscriptions WHERE id=?", (subscription_id,)
-                    )
-                elif subscription_id:
-                    self._conn.execute(
-                        "UPDATE go_subscriptions SET status='available',assigned_user_id=NULL "
+                        "UPDATE go_subscriptions SET status='revoked',assigned_user_id=NULL "
                         "WHERE id=?",
                         (subscription_id,),
                     )
@@ -1222,7 +1254,7 @@ class Store:
     def record_usage(
         self,
         user_id: str,
-        subscription_id: str,
+        subscription_id: str | None,
         model: str | None,
         endpoint: str,
         input_tokens: int | None,
@@ -1244,19 +1276,12 @@ class Store:
             )
             self._conn.commit()
 
-    def transition_user_tier(
-        self, user_id: str, tier: str, *, needs_subscription: bool
-    ) -> dict:
-        """Cambia tier y asignación dentro de una sola transacción de escritura.
-
-        BEGIN IMMEDIATE serializa esta operación incluso entre conexiones o
-        procesos. El UPDATE condicional y el índice único son defensas extra
-        para impedir que una suscripción termine asociada a dos usuarios.
-        """
+    def transition_user_tier(self, user_id: str, tier: str) -> dict:
+        """Change the product entitlement without assigning provider keys."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._transition_user_tier_locked(user_id, tier, needs_subscription=needs_subscription)
+                self._transition_user_tier_locked(user_id, tier)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -1267,39 +1292,21 @@ class Store:
             ).fetchone()
             return dict(updated)
 
-    def _transition_user_tier_locked(
-        self, user_id: str, tier: str, *, needs_subscription: bool
-    ) -> None:
+    def _transition_user_tier_locked(self, user_id: str, tier: str) -> None:
         user = self._conn.execute(
             "SELECT id, subscription_id FROM users WHERE id=?", (user_id,)
         ).fetchone()
         if user is None:
             raise KeyError(user_id)
         subscription_id = user["subscription_id"]
-        if needs_subscription and not subscription_id:
-            available = self._conn.execute(
-                "SELECT id FROM go_subscriptions "
-                "WHERE status='available' ORDER BY created_at LIMIT 1"
-            ).fetchone()
-            if available is None:
-                raise NoSubscriptionAvailable
-            subscription_id = available["id"]
-            claimed = self._conn.execute(
-                "UPDATE go_subscriptions SET status='assigned', assigned_user_id=? "
-                "WHERE id=? AND status='available'",
-                (user_id, subscription_id),
-            )
-            if claimed.rowcount != 1:
-                raise NoSubscriptionAvailable
-        elif not needs_subscription and subscription_id:
+        if subscription_id:
             self._conn.execute(
-                "UPDATE go_subscriptions SET status='available', assigned_user_id=NULL WHERE id=?",
+                "UPDATE go_subscriptions SET status='revoked', assigned_user_id=NULL WHERE id=?",
                 (subscription_id,),
             )
-            subscription_id = None
         self._conn.execute(
-            "UPDATE users SET subscription_id=?, tier=? WHERE id=?",
-            (subscription_id, tier, user_id),
+            "UPDATE users SET subscription_id=NULL, tier=? WHERE id=?",
+            (tier, user_id),
         )
 
     # ---------- facturación Stripe ----------
@@ -1444,9 +1451,9 @@ class Store:
                 if tier_action == "activate":
                     if tier not in {"basic", "pro"}:
                         raise ValueError("No se pudo resolver el tier pagado del evento Stripe")
-                    self._transition_user_tier_locked(user_id, tier, needs_subscription=True)
+                    self._transition_user_tier_locked(user_id, tier)
                 elif tier_action == "free":
-                    self._transition_user_tier_locked(user_id, "free", needs_subscription=False)
+                    self._transition_user_tier_locked(user_id, "free")
 
                 self._conn.execute(
                     "INSERT INTO stripe_events("
@@ -1463,8 +1470,8 @@ class Store:
     def usage_summary(self, user_id: str, subscription_id: str | None, tier: str = "free") -> dict:
         """Resume de uso por ventanas (5h/semana/mes) para el usuario.
 
-        Los limites se ajustan al tier: basic=50% de la suscripcion Go,
-        pro=100%. free no tiene acceso a modelos.
+        Limits are Agent Genia product budgets; no provider credential is tied
+        to an individual user.
         """
         from .tiers import effective_limits
 
@@ -1486,7 +1493,7 @@ class Store:
             agg = by_model.setdefault(m, {"requests": 0, "cost_usd": 0.0})
             agg["requests"] += 1
             agg["cost_usd"] = round(agg["cost_usd"] + e["estimated_cost_usd"], 6)
-        return {"user_id": user_id, "subscription_id": subscription_id, "windows": result, "by_model": by_model}
+        return {"user_id": user_id, "windows": result, "by_model": by_model}
 
     def usage_all(self) -> dict:
         events = self._q(
