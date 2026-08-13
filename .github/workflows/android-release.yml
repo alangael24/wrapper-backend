@@ -126,7 +126,9 @@ jobs:
             --pattern app-release.aab \
             --pattern SHA256SUMS.txt \
             --dir "$source_dir"
-          (cd "$source_dir" && sha256sum --check SHA256SUMS.txt)
+          expected_sha256="$(awk 'NR == 1 { print $1 }' "$source_dir/SHA256SUMS.txt")"
+          actual_sha256="$(sha256sum "$source_dir/app-release.aab" | awk '{ print $1 }')"
+          test -n "$expected_sha256" && test "$actual_sha256" = "$expected_sha256"
           cp "$source_dir/app-release.aab" "$output_dir/app-release.aab"
           cp "$source_dir/SHA256SUMS.txt" "$output_dir/SHA256SUMS.txt"
       - name: Verify AAB signature
