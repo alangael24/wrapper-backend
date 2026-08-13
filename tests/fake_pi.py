@@ -15,9 +15,20 @@ if os.environ.get("PI_CHROME_BRIDGE_PORT"):
     )
 config = json.loads((config_dir / "models.json").read_text(encoding="utf-8"))
 provider = config["providers"]["wrapper-backend"]
-wrapper_key = os.environ[provider["apiKey"].lstrip("$")]
-connector_token = os.environ.get("PI_CONNECTOR_RUN_TOKEN")
-if connector_token:
+runtime_auth_file = os.environ.get("PI_RUNTIME_AUTH_FILE")
+
+
+def runtime_credentials():
+    if runtime_auth_file:
+        return json.loads(Path(runtime_auth_file).read_text(encoding="utf-8"))
+    return {
+        "run_api_key": os.environ[provider["apiKey"].lstrip("$")],
+        "connector_run_token": os.environ.get("PI_CONNECTOR_RUN_TOKEN", ""),
+    }
+
+
+connector_token = runtime_credentials().get("connector_run_token")
+if connector_token and not runtime_auth_file:
     connector_request = urllib.request.Request(
         os.environ["PI_CONNECTOR_BROKER_URL"] + "/v1/internal/connectors/catalog",
         headers={"X-Connector-Run-Token": connector_token},
@@ -47,6 +58,19 @@ for line in sys.stdin:
             "title": "Authorize pi-chrome control?",
         }), flush=True)
         continue
+    credentials = runtime_credentials()
+    wrapper_key = credentials["run_api_key"]
+    connector_token = credentials.get("connector_run_token")
+    if connector_token:
+        connector_request = urllib.request.Request(
+            os.environ["PI_CONNECTOR_BROKER_URL"] + "/v1/internal/connectors/catalog",
+            headers={"X-Connector-Run-Token": connector_token},
+        )
+        with urllib.request.urlopen(connector_request, timeout=5) as response:
+            connector_catalog = json.load(response)
+        (config_dir / "connector-catalog.json").write_text(
+            json.dumps(connector_catalog), encoding="utf-8"
+        )
     model = provider["models"][0]["id"]
     request = urllib.request.Request(
         provider["baseUrl"] + "/chat/completions",

@@ -1,8 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readFileSync } from "node:fs";
 
 const BROKER_URL_ENV = "PI_CONNECTOR_BROKER_URL";
 const RUN_TOKEN_ENV = "PI_CONNECTOR_RUN_TOKEN";
+const AUTH_FILE_ENV = "PI_RUNTIME_AUTH_FILE";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_COMPUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -88,7 +90,7 @@ function provider(id: string, name: string, capabilities: string): {
 
 function brokerConfig(): { baseUrl: string; token: string } {
   const rawUrl = process.env[BROKER_URL_ENV] ?? "";
-  const token = process.env[RUN_TOKEN_ENV] ?? "";
+  const token = currentConnectorToken();
   if (!rawUrl || !token) throw new Error("Los conectores no estan autorizados para esta ejecucion.");
   const url = new URL(rawUrl);
   const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
@@ -96,6 +98,19 @@ function brokerConfig(): { baseUrl: string; token: string } {
     throw new Error("El broker de conectores debe ser una URL HTTP loopback sin credenciales.");
   }
   return { baseUrl: url.toString().replace(/\/$/, ""), token };
+}
+
+function currentConnectorToken(): string {
+  const authFile = process.env[AUTH_FILE_ENV] ?? "";
+  if (authFile) {
+    try {
+      const parsed = JSON.parse(readFileSync(authFile, "utf8")) as { connector_run_token?: unknown };
+      return typeof parsed.connector_run_token === "string" ? parsed.connector_run_token : "";
+    } catch {
+      return "";
+    }
+  }
+  return process.env[RUN_TOKEN_ENV] ?? "";
 }
 
 async function readLimited(response: Response, maxBytes = MAX_RESPONSE_BYTES): Promise<string> {
@@ -384,7 +399,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", () => {
-    const hasGrant = Boolean(process.env[RUN_TOKEN_ENV]);
+    const hasGrant = Boolean(currentConnectorToken() || process.env[AUTH_FILE_ENV]);
     const active = pi.getActiveTools().filter((name) => (
       !providerToolNames.has(name)
       && name !== "computer"

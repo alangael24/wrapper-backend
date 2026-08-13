@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -63,7 +63,9 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     const address = server.address();
     assert.equal(typeof address, "object");
     process.env.PI_CONNECTOR_BROKER_URL = `http://127.0.0.1:${address.port}`;
-    process.env.PI_CONNECTOR_RUN_TOKEN = "test-run-token";
+    const authFile = path.join(temporary, "runtime-auth.json");
+    await writeFile(authFile, JSON.stringify({ connector_run_token: "test-run-token" }), { mode: 0o600 });
+    process.env.PI_RUNTIME_AUTH_FILE = authFile;
 
     await build({
       entryPoints: [path.resolve("extensions/connectors/index.ts")],
@@ -130,7 +132,39 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
   } finally {
     delete process.env.PI_CONNECTOR_BROKER_URL;
     delete process.env.PI_CONNECTOR_RUN_TOKEN;
+    delete process.env.PI_RUNTIME_AUTH_FILE;
     await new Promise((resolve) => server.close(resolve));
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("runtime auth rota el token del modelo sin reiniciar la sesión", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "wrapper-runtime-auth-"));
+  const output = path.join(temporary, "runtime-auth.mjs");
+  const authFile = path.join(temporary, "runtime-auth.json");
+  try {
+    process.env.PI_RUNTIME_AUTH_FILE = authFile;
+    await build({
+      entryPoints: [path.resolve("extensions/runtime-auth/index.ts")],
+      outfile: output,
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      target: "node22",
+    });
+    const extension = (await import(`${pathToFileURL(output).href}?v=${Date.now()}`)).default;
+    const handlers = new Map();
+    extension({ on(name, handler) { handlers.set(name, handler); } });
+    const apply = async (token) => {
+      await writeFile(authFile, JSON.stringify({ run_api_key: token }), { mode: 0o600 });
+      const event = { headers: { Authorization: "Bearer stale" } };
+      handlers.get("before_provider_headers")(event, {});
+      return event.headers.Authorization;
+    };
+    assert.equal(await apply("run-token-one"), "Bearer run-token-one");
+    assert.equal(await apply("run-token-two"), "Bearer run-token-two");
+  } finally {
+    delete process.env.PI_RUNTIME_AUTH_FILE;
     await rm(temporary, { recursive: true, force: true });
   }
 });

@@ -384,8 +384,19 @@ curl -X POST http://127.0.0.1:8787/v1/agent/run \
 El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
 El wrapper autentica al usuario y firma la llamada con la credencial server-side
 del proveedor efectivo (DeepSeek por defecto u OpenCode para cuentas internas
-autorizadas); el consumo aparece en `/v1/usage`. Cada ejecución tiene un
-workspace y logs propios bajo `PI_RUNS_DIR`.
+autorizadas); el consumo aparece en `/v1/usage`. Cada ejecución tiene logs
+propios bajo `PI_RUNS_DIR`; las sesiones one-shot tienen además su propio
+workspace y las sesiones cálidas comparten únicamente el workspace aislado de
+su mismo `(usuario, bot)`.
+
+Cuando el cliente incluye `bot_id`, Render mantiene una sesión RPC cálida y un
+historial nativo de Pi aislados por `(usuario, bot)`. Los mensajes siguientes
+reutilizan el mismo proceso y permiten que el proveedor aproveche el prompt
+cache. El token del modelo y el grant de conectores siguen siendo efímeros: el
+backend los rota mediante un archivo `0600` antes de cada mensaje y los borra al
+recibir `agent_settled`. Las sesiones inactivas se cierran después de 15 minutos
+y el pool conserva como máximo cuatro procesos. Chrome sigue siendo one-shot
+para conservar un perfil aislado por ejecución.
 
 En hosts Linux que permiten user namespaces, `scripts/pi-sandbox` mantiene el
 launcher Bubblewrap fail-closed. Instala `bubblewrap`, `socat` y `util-linux`,
@@ -398,6 +409,9 @@ y el entorno sin secretos creado por el backend, desactiva todos los tools
 built-in de Pi (`bash`, `read`, `write`, `edit`, etc.) y admite únicamente las
 extensiones first-party seleccionadas por el servidor. Las operaciones de
 shell/archivos deben ejecutarse mediante la computadora aislada del bot.
+Las sesiones cálidas solo se habilitan con este launcher sin tools locales; el
+launcher Bubblewrap continúa usando ejecuciones efímeras para no introducir
+credenciales reales dentro de su namespace.
 
 ## Conectores nativos de Pi
 
@@ -655,6 +669,9 @@ runtime se agrupan aquí por función.
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
 | `PI_BACKEND_URL` | `http://127.0.0.1:$PORT` | URL que Pi usa para volver al wrapper |
 | `PI_RUNS_DIR` | `data/pi-runs` | Workspaces y logs por ejecución |
+| `PI_WARM_SESSIONS` | `0` (`1` en Render) | Reutiliza un proceso y la sesión nativa de Pi por `(usuario, bot)`; solo con `pi-render-safe` |
+| `PI_SESSION_IDLE_SECONDS` | `900` | Cierra una sesión cálida después de este tiempo sin actividad |
+| `PI_MAX_WARM_SESSIONS` | `PI_MAX_CONCURRENT` | Máximo de procesos Pi inactivos/activos conservados por instancia |
 | `PI_MODEL` | `deepseek-v4-flash` | Modelo configurado en Pi |
 | `PI_THINKING` | `high` | Nivel de razonamiento de Pi |
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |

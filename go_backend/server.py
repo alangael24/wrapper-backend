@@ -264,6 +264,10 @@ class Config:
         )
         self.pi_enabled = os.environ.get("PI_ENABLED", "0") == "1"
         self.pi_bin = os.environ.get("PI_BIN", str(DEFAULT_PI_BIN))
+        warm_sessions_default = "1" if Path(self.pi_bin).name == "pi-render-safe" else "0"
+        self.pi_warm_sessions = os.environ.get(
+            "PI_WARM_SESSIONS", warm_sessions_default
+        ) == "1"
         self.pi_backend_url = os.environ.get(
             "PI_BACKEND_URL", f"http://127.0.0.1:{self.port}"
         ).rstrip("/")
@@ -273,6 +277,12 @@ class Config:
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
+        self.pi_session_idle_seconds = int(
+            os.environ.get("PI_SESSION_IDLE_SECONDS", "900")
+        )
+        self.pi_max_warm_sessions = int(
+            os.environ.get("PI_MAX_WARM_SESSIONS", str(self.pi_max_concurrent))
+        )
         self.pi_node_bin_dir = os.environ.get("PI_NODE_BIN_DIR") or None
         if "PI_CONNECTOR_EXTENSION" in os.environ:
             self.pi_connector_extension = os.environ.get("PI_CONNECTOR_EXTENSION") or None
@@ -316,6 +326,14 @@ class Config:
 
 def validate_runtime_security(cfg: Config) -> None:
     validate_admin_token(cfg.admin_token)
+    if cfg.pi_warm_sessions and Path(cfg.pi_bin).name != "pi-render-safe":
+        raise UnsafeConfigurationError(
+            "PI_WARM_SESSIONS solo puede usarse con PI_BIN=pi-render-safe"
+        )
+    if cfg.pi_session_idle_seconds < 0 or cfg.pi_max_warm_sessions < 1:
+        raise UnsafeConfigurationError(
+            "PI_SESSION_IDLE_SECONDS y PI_MAX_WARM_SESSIONS no son válidos"
+        )
     if cfg.environment == "production":
         missing = [
             name
@@ -543,6 +561,9 @@ class Backend:
             timeout_seconds=cfg.pi_timeout_seconds,
             max_concurrent=cfg.pi_max_concurrent,
             max_prompt_chars=cfg.pi_max_prompt_chars,
+            warm_sessions_enabled=cfg.pi_warm_sessions,
+            session_idle_seconds=cfg.pi_session_idle_seconds,
+            max_warm_sessions=cfg.pi_max_warm_sessions,
             supports_images=False,
             node_bin_dir=cfg.pi_node_bin_dir,
             connector_extension=cfg.pi_connector_extension,
@@ -804,6 +825,7 @@ class Backend:
                 "computer_cleanup_failed",
             )
         ephemeral_grants = self.connectors.revoke_user(user["id"])
+        pi_sessions_deleted = self.pi.forget_user(user["id"])
         result = self.store.delete_user_account(user["id"])
         json_response(
             handler,
@@ -816,6 +838,7 @@ class Backend:
                 "managed_connectors_deleted": managed_deleted,
                 "ephemeral_grants_revoked": ephemeral_grants,
                 "computers_deleted": computer_cleanup["deleted"],
+                "pi_sessions_deleted": pi_sessions_deleted,
             },
         )
 
@@ -1234,6 +1257,14 @@ class Backend:
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
             return
+        if bot_id is not None and (
+            not isinstance(bot_id, str)
+            or not bot_id.strip()
+            or len(bot_id.strip()) > 200
+        ):
+            error_response(handler, 400, "bot_id no es válido", "bad_bot_id")
+            return
+        bot_id = bot_id.strip() if isinstance(bot_id, str) else None
         if (
             not isinstance(idempotency_key, str)
             or not 8 <= len(idempotency_key.strip()) <= 200
@@ -1382,6 +1413,9 @@ class Backend:
                 prompt=prompt,
                 browser=browser,
                 connector_run_token=connector_run_token,
+                conversation_key=(
+                    f"{user['id']}\0{bot_id}" if bot_id is not None else None
+                ),
             )
         except ConnectorBrokerError as e:
             self.store.release_agent_run(
@@ -1661,6 +1695,7 @@ class Backend:
             return
         result = self.store.revoke_user_account(user_id)
         ephemeral_grants_revoked = self.connectors.revoke_user(user_id)
+        pi_sessions_deleted = self.pi.forget_user(user_id)
         cleanup_errors: list[str] = []
         managed_deleted = 0
         try:
@@ -1685,6 +1720,7 @@ class Backend:
                 "managed_connectors_deleted": managed_deleted,
                 "ephemeral_grants_revoked": ephemeral_grants_revoked,
                 "computers_deleted": computer_cleanup["deleted"],
+                "pi_sessions_deleted": pi_sessions_deleted,
                 "cleanup_pending": cleanup_errors,
             },
         )
@@ -1993,6 +2029,7 @@ def serve(cfg: Config) -> None:
         print("\n[server] deteniendo...")
     finally:
         httpd.server_close()
+        backend.pi.close()
         backend.store.close()
 
 

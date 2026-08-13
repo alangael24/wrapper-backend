@@ -41,6 +41,7 @@ from go_backend.connector_adapters import (  # noqa: E402
 )
 from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
+from go_backend.pi_harness import RUNTIME_AUTH_EXTENSION  # noqa: E402
 from go_backend.store import Store, new_id  # noqa: E402
 
 
@@ -149,6 +150,7 @@ class WrapperServer:
         fake_pi = Path(__file__).resolve().parent / "fake_pi.py"
         self.backend.pi.enabled = True
         self.backend.pi.binary = str(fake_pi)
+        self.backend.pi.warm_sessions_enabled = True
         self.backend.pi.backend_url = self.base
         self.backend.pi.connector_broker_url = self.base
         self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
@@ -201,6 +203,7 @@ class WrapperServer:
     def stop(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+        self.backend.pi.close()
 
     def req(self, method, path, body=None, headers=None, raw=False, include_headers=False):
         url = self.base + path
@@ -602,6 +605,13 @@ class TestBackend(unittest.TestCase):
             cfg = Config()
         self.assertEqual(Path(cfg.pi_bin).name, "pi-sandbox")
         self.assertEqual(Path(cfg.pi_bin).parent.name, "scripts")
+
+    def test_warm_sessions_cannot_expose_tokens_to_the_strict_launcher(self):
+        cfg = Config()
+        cfg.pi_warm_sessions = True
+        cfg.pi_bin = str(Path("scripts/pi-sandbox").resolve())
+        with self.assertRaisesRegex(UnsafeConfigurationError, "pi-render-safe"):
+            validate_runtime_security(cfg)
 
     def test_models_proxy(self):
         ws = self.ws
@@ -1271,6 +1281,92 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
+
+    def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        results = []
+        process_ids = []
+        for index, prompt in enumerate(("primer mensaje", "segundo mensaje")):
+            status, result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": prompt,
+                    "bot_id": "bot-persistente",
+                    "idempotency_key": f"warm-session-{index}",
+                },
+                headers=headers,
+            )
+            self.assertEqual(status, 200)
+            results.append(result)
+            sessions = list(self.ws.backend.pi._sessions.values())
+            self.assertEqual(len(sessions), 1)
+            self.assertIsNotNone(sessions[0].process)
+            process_ids.append(sessions[0].process.pid)
+
+        self.assertEqual(process_ids[0], process_ids[1])
+        self.assertNotEqual(results[0]["run_id"], results[1]["run_id"])
+        session = next(iter(self.ws.backend.pi._sessions.values()))
+        command = self.ws.backend.pi._command(False, session_id=session.session_id)
+        self.assertIn("--session-id", command)
+        self.assertNotIn("--no-session", command)
+        self.assertIn(str(RUNTIME_AUTH_EXTENSION.resolve()), command)
+        credentials = json.loads(session.auth_file.read_text(encoding="utf-8"))
+        self.assertEqual(credentials, {"run_api_key": "", "connector_run_token": ""})
+        upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
+        self.assertEqual(len(upstream_calls), 2)
+
+    def test_pi_sessions_are_separated_by_account_and_bot(self):
+        first = self.new_user()
+        second = self.new_user()
+        self.ws.enable_fake_pi()
+        for index, signup in enumerate((first, second)):
+            status, _result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": "hola",
+                    "bot_id": "same-visible-bot-id",
+                    "idempotency_key": f"isolated-session-{index}",
+                },
+                headers={"Authorization": f"Bearer {signup['api_key']}"},
+            )
+            self.assertEqual(status, 200)
+        sessions = list(self.ws.backend.pi._sessions.values())
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(len({item.key for item in sessions}), 2)
+        self.assertEqual(len({item.process.pid for item in sessions}), 2)
+
+    def test_account_deletion_stops_and_erases_warm_pi_sessions(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        status, _result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "hola",
+                "bot_id": "bot-to-delete",
+                "idempotency_key": "delete-warm-session",
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        session = next(iter(self.ws.backend.pi._sessions.values()))
+        root = session.root
+        self.assertTrue(root.is_dir())
+        status, body = self.ws.req(
+            "POST",
+            "/v1/account/delete",
+            {"confirmation": "DELETE"},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["pi_sessions_deleted"], 1)
+        self.assertFalse(root.exists())
+        self.assertEqual(self.ws.backend.pi._sessions, {})
 
     def test_pi_uses_native_deepseek_thinking_compatibility(self):
         config_dir = Path(self.tmp) / "pi-model-config"

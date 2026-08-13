@@ -93,6 +93,12 @@ services:
         value: "1"
       - key: PI_BIN
         value: /app/scripts/pi-render-safe
+      - key: PI_WARM_SESSIONS
+        value: "1"
+      - key: PI_SESSION_IDLE_SECONDS
+        value: "900"
+      - key: PI_MAX_WARM_SESSIONS
+        value: "4"
       - key: PI_MAX_CONCURRENT
         value: "4"
       - key: PI_CHROME_AUTO_AUTHORIZE

@@ -27,7 +27,7 @@
     "release:verify": "node scripts/verify-release-config.mjs",
     "smoke:desktop": "pnpm build:desktop && electron . --smoke-test",
     "test:connectors": "pnpm typecheck:connectors && node --test tests/test_connector_extension.mjs",
-    "typecheck:connectors": "tsc -p extensions/connectors/tsconfig.json",
+    "typecheck:connectors": "tsc -p extensions/connectors/tsconfig.json && tsc -p extensions/runtime-auth/tsconfig.json",
     "typecheck:desktop": "tsc -p desktop/tsconfig.json --noEmit",
     "test:desktop": "pnpm typecheck:desktop && pnpm build:desktop && node --test tests/test_desktop.mjs"
   },
