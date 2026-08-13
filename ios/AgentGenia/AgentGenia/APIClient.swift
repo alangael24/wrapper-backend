@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import Security
 
 enum AppEnvironment {
@@ -124,14 +125,22 @@ private struct AgentRunRequest: Encodable, Sendable {
     let connectorIDs: [String]
     let maxCredits: Int
     let idempotencyKey: String
+    let stream: Bool
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
         case botID = "bot_id"; case connectorIDs = "connector_ids"
         case maxCredits = "max_credits"; case idempotencyKey = "idempotency_key"
+        case stream
     }
 }
 
 struct AgentRunResponse: Decodable, Sendable { let answer: String }
+private struct AgentStreamDelta: Decodable, Sendable { let text: String }
+private struct AgentStreamFailure: Decodable, Sendable {
+    let status: Int
+    let message: String
+    let type: String
+}
 
 private struct ComputerEnsureRequest: Encodable, Sendable {
     let botName: String
@@ -157,12 +166,14 @@ actor APIClient {
     private let decoder = JSONDecoder()
     private var session: AccountSession?
     private var refreshTask: Task<AccountSession, Error>?
+    private let logger = Logger(subsystem: "com.agentgenia.ios", category: "network")
 
     init(baseURL: URL) {
         self.baseURL = baseURL
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
+        configuration.waitsForConnectivity = true
         configuration.httpMaximumConnectionsPerHost = 6
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 1_800
@@ -304,20 +315,24 @@ actor APIClient {
         prompt: String,
         botID: UUID,
         connectorIDs: [String],
-        computer: Bool = true
+        computer: Bool = true,
+        onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> AgentRunResponse {
-        try await request(
-            "/v1/agent/run",
-            method: "POST",
-            body: AgentRunRequest(
-                prompt: prompt,
-                browser: false,
-                computer: computer,
-                botID: botID.uuidString.lowercased(),
-                connectorIDs: connectorIDs,
-                maxCredits: 15,
-                idempotencyKey: UUID().uuidString.lowercased()
-            )
+        let request = AgentRunRequest(
+            prompt: prompt,
+            browser: false,
+            computer: computer,
+            botID: botID.uuidString.lowercased(),
+            connectorIDs: connectorIDs,
+            maxCredits: 15,
+            idempotencyKey: UUID().uuidString.lowercased(),
+            stream: true
+        )
+        return try await streamAgent(
+            bodyData: try encoder.encode(request),
+            authorization: try await accessToken(),
+            canRefresh: true,
+            onDelta: onDelta
         )
     }
 
@@ -406,7 +421,7 @@ actor APIClient {
 
         let (data, rawResponse): (Data, URLResponse)
         do { (data, rawResponse) = try await urlSession.data(for: request) }
-        catch { throw ServiceError(message: "No fue posible conectar con Agent Genia.", code: "network_error", status: 0) }
+        catch { throw networkError(error, path: path) }
         guard let response = rawResponse as? HTTPURLResponse else {
             throw ServiceError(message: "Respuesta de red inválida.", code: "network_error", status: 0)
         }
@@ -429,6 +444,134 @@ actor APIClient {
             )
         }
         return data
+    }
+
+    private func streamAgent(
+        bodyData: Data,
+        authorization: String,
+        canRefresh: Bool,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> AgentRunResponse {
+        let path = "/v1/agent/run"
+        guard let url = URL(string: path, relativeTo: baseURL) else {
+            throw ServiceError(message: "Ruta inválida.", code: "invalid_url", status: 500)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 1_800
+        request.httpBody = bodyData
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(authorization)", forHTTPHeaderField: "Authorization")
+
+        let bytes: URLSession.AsyncBytes
+        let rawResponse: URLResponse
+        do { (bytes, rawResponse) = try await urlSession.bytes(for: request) }
+        catch { throw networkError(error, path: path) }
+        guard let response = rawResponse as? HTTPURLResponse else {
+            throw ServiceError(message: "Respuesta de red inválida.", code: "network_error", status: 0)
+        }
+        if response.statusCode == 401 && canRefresh {
+            let refreshed = try await refreshSession()
+            return try await streamAgent(
+                bodyData: bodyData,
+                authorization: refreshed.token,
+                canRefresh: false,
+                onDelta: onDelta
+            )
+        }
+        guard (200..<300).contains(response.statusCode) else {
+            var data = Data()
+            do { for try await byte in bytes { data.append(byte) } }
+            catch { throw networkError(error, path: path) }
+            let envelope = try? decoder.decode(ErrorEnvelope.self, from: data)
+            throw ServiceError(
+                message: envelope?.error?.message ?? "Agent Genia respondió HTTP \(response.statusCode).",
+                code: envelope?.error?.type ?? "http_error",
+                status: response.statusCode
+            )
+        }
+        if response.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("text/event-stream") != true {
+            // Keeps the mobile release compatible while the streaming backend
+            // rolls out across instances. The old endpoint returns one JSON body.
+            var data = Data()
+            do { for try await byte in bytes { data.append(byte) } }
+            catch { throw networkError(error, path: path) }
+            do { return try decoder.decode(AgentRunResponse.self, from: data) }
+            catch {
+                throw ServiceError(
+                    message: "Agent Genia devolvió una respuesta inválida.",
+                    code: "invalid_response",
+                    status: response.statusCode
+                )
+            }
+        }
+
+        var eventName = "message"
+        var dataLines: [String] = []
+        var finalResponse: AgentRunResponse?
+        do {
+            for try await line in bytes.lines {
+                if line.isEmpty {
+                    let payload = Data(dataLines.joined(separator: "\n").utf8)
+                    if eventName == "delta", let delta = try? decoder.decode(AgentStreamDelta.self, from: payload) {
+                        await onDelta(delta.text)
+                    } else if eventName == "done" {
+                        finalResponse = try decoder.decode(AgentRunResponse.self, from: payload)
+                    } else if eventName == "error", let failure = try? decoder.decode(AgentStreamFailure.self, from: payload) {
+                        throw ServiceError(message: failure.message, code: failure.type, status: failure.status)
+                    }
+                    eventName = "message"
+                    dataLines.removeAll(keepingCapacity: true)
+                } else if line.hasPrefix("event:") {
+                    eventName = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                } else if line.hasPrefix("data:") {
+                    dataLines.append(line.dropFirst(5).trimmingCharacters(in: .whitespaces))
+                }
+            }
+        } catch let error as ServiceError {
+            throw error
+        } catch {
+            throw networkError(error, path: path)
+        }
+        guard let finalResponse else {
+            throw ServiceError(
+                message: "La conexión terminó antes de recibir la respuesta final.",
+                code: "incomplete_stream",
+                status: 502
+            )
+        }
+        return finalResponse
+    }
+
+    private func networkError(_ error: Error, path: String) -> ServiceError {
+        let nsError = error as NSError
+        let urlError = error as? URLError
+        let code = urlError?.errorCode ?? nsError.code
+        logger.error("Request failed path=\(path, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(code, privacy: .public) description=\(nsError.localizedDescription, privacy: .public)")
+#if DEBUG
+        print("[AgentGenia.Network] path=\(path) domain=\(nsError.domain) code=\(code) description=\(nsError.localizedDescription)")
+#endif
+        let message: String
+        switch urlError?.code {
+        case .cancelled:
+            message = "iOS canceló la solicitud antes de terminar (código \(code))."
+        case .timedOut:
+            message = "Agent Genia tardó demasiado en responder (código \(code))."
+        case .networkConnectionLost:
+            message = "La conexión se interrumpió mientras Agent Genia respondía (código \(code))."
+        case .notConnectedToInternet:
+            message = "El iPhone no tiene conexión a internet (código \(code))."
+        case .cannotFindHost, .dnsLookupFailed:
+            message = "El iPhone no pudo resolver el servidor de Agent Genia (código \(code))."
+        case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
+             .serverCertificateHasUnknownRoot, .clientCertificateRejected:
+            message = "iOS rechazó la conexión segura con Agent Genia (código \(code))."
+        default:
+            message = "No fue posible conectar con Agent Genia (código \(code))."
+        }
+        return ServiceError(message: message, code: "network_\(code)", status: 0)
     }
 
     private func accessToken() async throws -> String {

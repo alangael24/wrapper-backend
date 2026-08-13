@@ -27,6 +27,7 @@ from go_backend.server import (  # noqa: E402
     Config,
     Handler,
     UnsafeConfigurationError,
+    _partial_json_text,
     serve,
     validate_runtime_security,
 )
@@ -186,6 +187,7 @@ class WrapperServer:
                 "with log_path.open('a', encoding='utf-8') as stream:\n"
                 "    stream.write(json.dumps({'argv': sys.argv[1:], "
                 "'has_admin_token': 'ADMIN_TOKEN' in os.environ}) + '\\n')\n"
+                "    stream.flush()\n"
                 "def stop(*_):\n"
                 "    raise SystemExit(0)\n"
                 "signal.signal(signal.SIGTERM, stop)\n"
@@ -1281,6 +1283,68 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(all_usage["events"][0]["input_tokens"], 10)
         self.assertEqual(all_usage["events"][0]["output_tokens"], 5)
+
+    def test_pi_agent_run_streams_visible_text_before_final_payload(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        status, body, response_headers = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "__stream_json__",
+                "bot_id": "streaming-bot",
+                "stream": True,
+                "idempotency_key": "pi-streaming-run",
+            },
+            headers=headers,
+            raw=True,
+            include_headers=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", response_headers["Content-Type"])
+        text = body.decode("utf-8")
+        self.assertIn("event: start", text)
+        self.assertIn("event: delta", text)
+        self.assertIn("event: done", text)
+        frames = [frame for frame in text.split("\n\n") if frame]
+        deltas = []
+        final = None
+        for frame in frames:
+            lines = frame.splitlines()
+            event = lines[0].removeprefix("event: ")
+            payload = json.loads(lines[1].removeprefix("data: "))
+            if event == "delta":
+                deltas.append(payload["text"])
+            elif event == "done":
+                final = payload
+        self.assertEqual("".join(deltas), "hola rápido")
+        self.assertEqual(
+            json.loads(final["answer"]),
+            {"text": "hola rápido", "widget": None},
+        )
+        timings = final["timings"]
+        for name in (
+            "run_reserved_ms", "pi_dispatch_ms", "proxy_received_ms",
+            "upstream_request_ms", "upstream_complete_ms", "pi_first_text_ms",
+            "pi_complete_ms", "response_ready_ms",
+        ):
+            self.assertIn(name, timings)
+        self.assertLessEqual(timings["upstream_request_ms"], timings["upstream_complete_ms"])
+        self.assertLessEqual(timings["pi_first_text_ms"], timings["pi_complete_ms"])
+        saved_run = self.ws.backend.store.get_agent_run(final["run_id"])
+        warnings = json.loads(saved_run["warnings_json"])
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0].startswith("timing:"))
+
+    def test_partial_json_text_waits_for_complete_unicode_surrogate_pair(self):
+        prefix = '{"text":"hola \\ud83d'
+        self.assertEqual(_partial_json_text(prefix), "hola ")
+        self.assertEqual(
+            _partial_json_text(prefix + '\\ude80 mundo"}'),
+            "hola 🚀 mundo",
+        )
 
     def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):
         signup = self.new_user()

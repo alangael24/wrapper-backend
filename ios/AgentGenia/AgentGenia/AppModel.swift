@@ -454,6 +454,12 @@ final class AppModel {
             ))
             await persist()
         }
+        let replyID = UUID()
+        if let index = bots.firstIndex(where: { $0.id == botID }) {
+            bots[index].messages.append(BotMessage(
+                id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
+            ))
+        }
         do {
             let connectorIDs = initial
                 ? []
@@ -462,18 +468,49 @@ final class AppModel {
                 prompt: prompt,
                 botID: botID,
                 connectorIDs: connectorIDs,
-                computer: !initial
+                computer: !initial,
+                onDelta: { [weak self] delta in
+                    await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
+                }
             )
             let generated = parseAgentAnswer(response.answer)
-            guard !generated.text.isEmpty, let index = bots.firstIndex(where: { $0.id == botID }) else {
+            guard !generated.text.isEmpty,
+                  let index = bots.firstIndex(where: { $0.id == botID }),
+                  let messageIndex = bots[index].messages.firstIndex(where: { $0.id == replyID })
+            else {
                 throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
             }
-            bots[index].messages.append(BotMessage(
-                id: UUID(), role: .assistant, text: generated.text, widget: generated.widget, createdAt: Date()
-            ))
+            let createdAt = bots[index].messages[messageIndex].createdAt
+            bots[index].messages[messageIndex] = BotMessage(
+                id: replyID,
+                role: .assistant,
+                text: generated.text,
+                widget: generated.widget,
+                createdAt: createdAt
+            )
             bots[index].messages = Array(bots[index].messages.suffix(200))
             await persist()
-        } catch { report(error) }
+        } catch {
+            if let index = bots.firstIndex(where: { $0.id == botID }) {
+                bots[index].messages.removeAll { $0.id == replyID }
+            }
+            report(error)
+        }
+    }
+
+    private func appendAgentDelta(botID: UUID, messageID: UUID, delta: String) {
+        guard !delta.isEmpty,
+              let botIndex = bots.firstIndex(where: { $0.id == botID }),
+              let messageIndex = bots[botIndex].messages.firstIndex(where: { $0.id == messageID })
+        else { return }
+        let current = bots[botIndex].messages[messageIndex]
+        bots[botIndex].messages[messageIndex] = BotMessage(
+            id: current.id,
+            role: current.role,
+            text: String((current.text + delta).prefix(20_000)),
+            widget: nil,
+            createdAt: current.createdAt
+        )
     }
 
     private func persist() async {

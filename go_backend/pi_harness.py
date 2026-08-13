@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PROVIDER_NAME = "wrapper-backend"
@@ -257,6 +257,7 @@ class PiHarness:
         browser: bool = False,
         connector_run_token: str | None = None,
         conversation_key: str | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
     ) -> PiRunResult:
         if not self.enabled:
             raise PiHarnessError("El harness de Pi esta desactivado (PI_ENABLED=0)")
@@ -285,6 +286,7 @@ class PiHarness:
                     prompt=prompt,
                     connector_run_token=connector_run_token,
                     conversation_key=conversation_key,
+                    on_text_delta=on_text_delta,
                 )
             return self._run(
                 run_id=run_id,
@@ -292,6 +294,7 @@ class PiHarness:
                 prompt=prompt,
                 browser=browser,
                 connector_run_token=connector_run_token,
+                on_text_delta=on_text_delta,
             )
         finally:
             self._slots.release()
@@ -740,6 +743,7 @@ class PiHarness:
         prompt: str,
         connector_run_token: str | None,
         conversation_key: str,
+        on_text_delta: Callable[[str], None] | None,
     ) -> PiRunResult:
         session = self._acquire_warm_session(conversation_key)
         run_dir = self.runs_dir / run_id
@@ -812,6 +816,12 @@ class PiHarness:
                             "id": event.get("id"),
                             "cancelled": True,
                         })
+                    if event.get("type") == "message_update":
+                        update = event.get("assistantMessageEvent") or {}
+                        if update.get("type") == "text_delta":
+                            delta = update.get("delta")
+                            if isinstance(delta, str) and delta and on_text_delta:
+                                on_text_delta(delta)
                     if event.get("type") == "message_end":
                         message = event.get("message") or {}
                         if message.get("role") == "assistant":
@@ -931,6 +941,7 @@ class PiHarness:
         prompt: str,
         browser: bool,
         connector_run_token: str | None,
+        on_text_delta: Callable[[str], None] | None,
     ) -> PiRunResult:
         run_dir = self.runs_dir / run_id
         config_dir = run_dir / "config"
@@ -969,9 +980,10 @@ class PiHarness:
                         stderr=chrome_stderr_log,
                         start_new_session=True,
                     )
-                    # Give Chromium a scheduling turn before Pi asks the bridge
-                    # to authorize; otherwise very fast clients can race startup.
-                    time.sleep(0.05)
+                    # Give Chromium enough time to enter its process before Pi
+                    # asks the bridge to authorize. This only affects explicit
+                    # browser runs and avoids a startup race on busy hosts.
+                    time.sleep(0.1)
                 process = subprocess.Popen(
                     self._command(browser),
                     cwd=work_dir,
@@ -1054,6 +1066,13 @@ class PiHarness:
                             send({"type": "extension_ui_response", "id": request_id, "confirmed": True})
                         else:
                             send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
+
+                    if event.get("type") == "message_update":
+                        update = event.get("assistantMessageEvent") or {}
+                        if update.get("type") == "text_delta":
+                            delta = update.get("delta")
+                            if isinstance(delta, str) and delta and on_text_delta:
+                                on_text_delta(delta)
 
                     if event.get("type") == "response" and event.get("id") == "chrome-authorize":
                         if not event.get("success"):

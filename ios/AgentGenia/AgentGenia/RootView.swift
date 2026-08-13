@@ -308,8 +308,15 @@ private struct MessageBubble: View {
         HStack {
             if message.role == .user { Spacer(minLength: 46) }
             VStack(alignment: .leading, spacing: 10) {
-                Text(message.text)
-                    .textSelection(.enabled)
+                if message.role == .assistant && message.text.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Pensando…").foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(message.text)
+                        .textSelection(.enabled)
+                }
                 if message.role == .assistant, let widget = message.widget {
                     QuestionWidgetView(widget: widget) { value in
                         Task { await model.sendMessage(botID: botID, text: value) }

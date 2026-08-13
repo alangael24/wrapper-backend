@@ -378,7 +378,7 @@ curl http://127.0.0.1:8787/v1/agent/status \
 curl -X POST http://127.0.0.1:8787/v1/agent/run \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Revisa mis issues urgentes", "connector_ids":["github","linear"]}'
+  -d '{"prompt":"Revisa mis issues urgentes", "connector_ids":["github","linear"], "stream":true}'
 ```
 
 El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
@@ -388,6 +388,12 @@ autorizadas); el consumo aparece en `/v1/usage`. Cada ejecución tiene logs
 propios bajo `PI_RUNS_DIR`; las sesiones one-shot tienen además su propio
 workspace y las sesiones cálidas comparten únicamente el workspace aislado de
 su mismo `(usuario, bot)`.
+
+Con `stream:true`, `/v1/agent/run` responde como `text/event-stream`: emite
+`start`, deltas del campo visible `text`, latidos mientras el modelo razona y
+`done` con el payload final. El modo JSON sin streaming se conserva para clientes
+anteriores. La app iOS usa streaming y muestra el primer fragmento sin esperar a
+que termine toda la ejecución.
 
 Cuando el cliente incluye `bot_id`, Render mantiene una sesión RPC cálida y un
 historial nativo de Pi aislados por `(usuario, bot)`. Los mensajes siguientes
@@ -555,7 +561,7 @@ proviene del flujo de signup.
 | GET | `/v1/usage` | Compatibilidad temporal: reporting histórico y saldo de créditos |
 | GET | `/v1/me` | Usuario, plan y saldo de créditos |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, idempotency_key, max_credits?:25, browser?:false, computer?:false, bot_id?:string, connector_ids?:string[]}` |
+| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}` |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
 | POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
 | POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |

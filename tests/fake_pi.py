@@ -83,13 +83,33 @@ for line in sys.stdin:
     with urllib.request.urlopen(request, timeout=5) as response:
         completion = json.load(response)
     upstream_text = completion["choices"][0]["message"]["content"]
+    answer_text = f"fake-pi uso {model}: {upstream_text}"
+    if command.get("message") == "__stream_json__":
+        answer_text = json.dumps(
+            {"text": "hola rápido", "widget": None}, ensure_ascii=False
+        )
+    midpoint = max(1, len(answer_text) // 2)
     events = [
         {"type": "agent_start"},
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "text_delta", "contentIndex": 0,
+                "delta": answer_text[:midpoint],
+            },
+        },
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "text_delta", "contentIndex": 0,
+                "delta": answer_text[midpoint:],
+            },
+        },
         {
             "type": "message_end",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": f"fake-pi uso {model}: {upstream_text}"}],
+                "content": [{"type": "text", "text": answer_text}],
                 "usage": {"input": 11, "output": 7, "cacheRead": 3, "cacheWrite": 0},
             },
         },

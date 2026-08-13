@@ -49,6 +49,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -122,6 +123,7 @@ MAX_BODY = 160 * 1024 * 1024  # 160 MB
 MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
+JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 
 # OpenAI-compatible routes exposed by the wrapper.
 UPSTREAM_PATHS = {
@@ -374,6 +376,144 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
     handler.wfile.write(body)
 
 
+def _partial_json_text(value: str) -> str | None:
+    """Decode the completed prefix of a top-level JSON ``text`` string.
+
+    Agent replies use a JSON envelope so widgets can travel beside visible text.
+    This deliberately small decoder lets the UI stream only the human-readable
+    field without briefly rendering JSON syntax while the model is still typing.
+    """
+    match = JSON_TEXT_FIELD_RE.search(value)
+    if not match:
+        return None
+    index = match.end()
+    output: list[str] = []
+    escapes = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+    while index < len(value):
+        char = value[index]
+        if char == '"':
+            break
+        if char != "\\":
+            output.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(value):
+            break
+        escaped = value[index + 1]
+        if escaped == "u":
+            digits = value[index + 2:index + 6]
+            if len(digits) != 4 or any(item not in "0123456789abcdefABCDEF" for item in digits):
+                break
+            codepoint = int(digits, 16)
+            if 0xD800 <= codepoint <= 0xDBFF:
+                low_prefix = value[index + 6:index + 8]
+                low_digits = value[index + 8:index + 12]
+                if (
+                    low_prefix != "\\u"
+                    or len(low_digits) != 4
+                    or any(item not in "0123456789abcdefABCDEF" for item in low_digits)
+                ):
+                    # Do not publish half of an emoji while its low surrogate is
+                    # still in flight in a later model delta.
+                    break
+                low = int(low_digits, 16)
+                if not 0xDC00 <= low <= 0xDFFF:
+                    break
+                output.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00))
+                index += 12
+                continue
+            if 0xDC00 <= codepoint <= 0xDFFF:
+                break
+            output.append(chr(codepoint))
+            index += 6
+            continue
+        replacement = escapes.get(escaped)
+        if replacement is None:
+            break
+        output.append(replacement)
+        index += 2
+    return "".join(output)
+
+
+class _AgentEventStream:
+    """Minimal SSE writer for a single synchronous Pi execution."""
+
+    def __init__(self, handler: BaseHTTPRequestHandler):
+        self.handler = handler
+        self.raw_answer = ""
+        self.visible_sent = ""
+        self.started = False
+        self.disconnected = False
+        self._write_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+
+    def start(self, run_id: str) -> None:
+        self.handler.close_connection = True
+        self.handler.send_response(200)
+        self.handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.handler.send_header("Cache-Control", "no-store, no-cache, max-age=0")
+        self.handler.send_header("Pragma", "no-cache")
+        self.handler.send_header("X-Accel-Buffering", "no")
+        self.handler.send_header("Connection", "close")
+        request_id = getattr(self.handler, "request_id", "")
+        if request_id:
+            self.handler.send_header("X-Request-Id", request_id)
+        self.handler.end_headers()
+        self.started = True
+        self.send("start", {"run_id": run_id})
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self) -> None:
+        while not self._heartbeat_stop.wait(10):
+            if self.disconnected:
+                return
+            self._write(b": keep-alive\n\n")
+
+    def _write(self, frame: bytes) -> None:
+        if self.disconnected:
+            return
+        try:
+            with self._write_lock:
+                self.handler.wfile.write(frame)
+                self.handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.disconnected = True
+            self._heartbeat_stop.set()
+
+    def send(self, event: str, payload: dict) -> None:
+        if self.disconnected:
+            return
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        frame = f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+        self._write(frame)
+
+    def model_delta(self, delta: str) -> None:
+        self.raw_answer += delta
+        visible = _partial_json_text(self.raw_answer)
+        if visible is None or len(visible) <= len(self.visible_sent):
+            return
+        next_delta = visible[len(self.visible_sent):]
+        self.visible_sent = visible
+        self.send("delta", {"text": next_delta})
+
+    def error(self, status: int, message: str, code: str) -> None:
+        self.send("error", {"status": status, "message": message, "type": code})
+        self._heartbeat_stop.set()
+
+    def done(self, payload: dict) -> None:
+        self.send("done", payload)
+        self._heartbeat_stop.set()
+
+
 def error_response(
     handler: BaseHTTPRequestHandler,
     status: int,
@@ -443,6 +583,8 @@ a{display:inline-block;background:#171717;color:white;padding:13px 18px;border-r
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._run_timing_lock = threading.Lock()
+        self._run_timings: dict[str, dict[str, float]] = {}
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,6 +716,24 @@ class Backend:
             chrome_binary=cfg.pi_chrome_bin,
             chrome_isolation=cfg.pi_chrome_isolation,
         )
+
+    def _start_run_timing(self, run_id: str, started_at: float) -> None:
+        with self._run_timing_lock:
+            self._run_timings[run_id] = {"_origin": started_at}
+
+    def _mark_run_timing(self, run_id: str, name: str) -> None:
+        with self._run_timing_lock:
+            timing = self._run_timings.get(run_id)
+            if timing is None or name in timing:
+                return
+            timing[name] = round((time.monotonic() - timing["_origin"]) * 1000, 3)
+
+    def _run_timing_snapshot(self, run_id: str, *, pop: bool = False) -> dict[str, float]:
+        with self._run_timing_lock:
+            timing = self._run_timings.pop(run_id, None) if pop else self._run_timings.get(run_id)
+            if timing is None:
+                return {}
+            return {key: value for key, value in timing.items() if not key.startswith("_")}
 
     # ---------- auth helpers ----------
     def encrypt_secret(self, plaintext: str, key_id: str) -> bytes:
@@ -1051,6 +1211,9 @@ class Backend:
         if not principal:
             return
         user, run = principal
+        run_id = run["id"] if run else None
+        if run_id:
+            self._mark_run_timing(run_id, "proxy_received_ms")
         unlimited = self.unlimited_usage(user)
         if run and path != "/chat/completions":
             error_response(
@@ -1115,6 +1278,8 @@ class Backend:
         stream_state = {"started": False}
 
         def on_headers(status: int, out_headers: dict) -> None:
+            if run_id:
+                self._mark_run_timing(run_id, "upstream_headers_ms")
             stream_state["started"] = True
             try:
                 handler.send_response(status)
@@ -1132,12 +1297,17 @@ class Backend:
                 pass
 
         def on_chunk(chunk: bytes) -> None:
+            if run_id and chunk.strip():
+                self._mark_run_timing(run_id, "upstream_first_byte_ms")
+                self._inspect_upstream_delta_timing(run_id, chunk)
             try:
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        if run_id:
+            self._mark_run_timing(run_id, "upstream_request_ms")
         status, out_headers, out_body, usage = proxy_request(
             handler.command,
             provider["base_url"],
@@ -1147,6 +1317,14 @@ class Backend:
             provider["api_key"],
             on_chunk=on_chunk, on_headers=on_headers,
         )
+        if run_id:
+            self._mark_run_timing(run_id, "upstream_complete_ms")
+            logging.info(
+                "model timing run_id=%s provider=%s timings=%s",
+                run_id,
+                provider["name"],
+                json.dumps(self._run_timing_snapshot(run_id), separators=(",", ":")),
+            )
         self.record(
             user,
             provider,
@@ -1179,6 +1357,34 @@ class Backend:
                 handler.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _inspect_upstream_delta_timing(self, run_id: str, chunk: bytes) -> None:
+        line = chunk.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            return
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        choices = event.get("choices") if isinstance(event, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return
+        delta = choices[0].get("delta")
+        if not isinstance(delta, dict):
+            return
+        reasoning = delta.get("reasoning_content")
+        if reasoning is None:
+            reasoning = delta.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            self._mark_run_timing(run_id, "upstream_first_reasoning_ms")
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            self._mark_run_timing(run_id, "upstream_first_content_ms")
+        if delta.get("tool_calls"):
+            self._mark_run_timing(run_id, "upstream_first_tool_call_ms")
 
     def record(
         self,
@@ -1223,6 +1429,7 @@ class Backend:
         json_response(handler, 200, status)
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
+        request_started_at = time.monotonic()
         user = self.require_user(handler)
         if not user:
             return
@@ -1239,6 +1446,7 @@ class Backend:
         prompt = body.get("prompt")
         browser = body.get("browser", False)
         computer_requested = body.get("computer", False)
+        stream_requested = body.get("stream", False)
         bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
         idempotency_key = body.get("idempotency_key")
@@ -1253,6 +1461,9 @@ class Backend:
             return
         if not isinstance(computer_requested, bool):
             error_response(handler, 400, "computer debe ser true o false", "bad_computer")
+            return
+        if not isinstance(stream_requested, bool):
+            error_response(handler, 400, "stream debe ser true o false", "bad_stream")
             return
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
@@ -1366,6 +1577,19 @@ class Backend:
         run = prepared["run"]
         run_id = run["id"]
         started_at = time.monotonic()
+        self._start_run_timing(run_id, request_started_at)
+        self._mark_run_timing(run_id, "run_reserved_ms")
+        event_stream = _AgentEventStream(handler) if stream_requested else None
+        if event_stream:
+            event_stream.start(run_id)
+
+        def agent_error(status: int, message: str, code: str) -> None:
+            self._mark_run_timing(run_id, "failed_ms")
+            if event_stream:
+                event_stream.error(status, message, code)
+            else:
+                error_response(handler, status, message, code)
+            self._run_timing_snapshot(run_id, pop=True)
 
         def settle(final_status: str, error_code: str | None = None) -> tuple[dict, dict]:
             llm_cost = self.store.agent_run_cost_microusd(run_id)
@@ -1385,6 +1609,11 @@ class Backend:
                 final_status=final_status,
                 duration_seconds=max(0.0, time.monotonic() - started_at),
                 error_code=error_code,
+                warnings=[
+                    "timing:" + json.dumps(
+                        self._run_timing_snapshot(run_id), separators=(",", ":")
+                    )
+                ],
             )
             balance = self.store.credit_summary(user["id"], recent_limit=0)
             reserved = int(settled["reserved_credit_milli"])
@@ -1407,6 +1636,13 @@ class Backend:
                     computer_id=bot_id if computer_enabled else None,
                 )
             self.store.mark_agent_run_running(run_id)
+            self._mark_run_timing(run_id, "pi_dispatch_ms")
+
+            def on_text_delta(delta: str) -> None:
+                self._mark_run_timing(run_id, "pi_first_text_ms")
+                if event_stream:
+                    event_stream.model_delta(delta)
+
             result = self.pi.run(
                 run_id=run_id,
                 run_api_key=run_api_key,
@@ -1416,7 +1652,9 @@ class Backend:
                 conversation_key=(
                     f"{user['id']}\0{bot_id}" if bot_id is not None else None
                 ),
+                on_text_delta=on_text_delta,
             )
+            self._mark_run_timing(run_id, "pi_complete_ms")
         except ConnectorBrokerError as e:
             self.store.release_agent_run(
                 run_id=run_id,
@@ -1424,7 +1662,7 @@ class Backend:
                 error_code=e.code,
                 duration_seconds=max(0.0, time.monotonic() - started_at),
             )
-            error_response(handler, e.status, str(e), e.code)
+            agent_error(e.status, str(e), e.code)
             return
         except PiHarnessBusy as e:
             self.store.release_agent_run(
@@ -1433,13 +1671,12 @@ class Backend:
                 error_code="pi_busy",
                 duration_seconds=max(0.0, time.monotonic() - started_at),
             )
-            error_response(handler, 429, str(e), "pi_busy")
+            agent_error(429, str(e), "pi_busy")
             return
         except PiHarnessUsageError as e:
             error_code = "pi_timeout" if isinstance(e, PiHarnessTimeout) else "pi_task_error"
             _settled, _credits = settle("failed", error_code)
-            error_response(
-                handler,
+            agent_error(
                 504 if isinstance(e, PiHarnessTimeout) else 502,
                 str(e),
                 error_code,
@@ -1467,8 +1704,7 @@ class Backend:
             )
             if not unlimited and consumed >= max_credit_milli:
                 settle("budget_exhausted", "run_budget_exhausted")
-                error_response(
-                    handler,
+                agent_error(
                     402,
                     "La ejecución alcanzó su máximo autorizado",
                     "run_budget_exhausted",
@@ -1480,7 +1716,7 @@ class Backend:
                     error_code="pi_error",
                     duration_seconds=max(0.0, time.monotonic() - started_at),
                 )
-                error_response(handler, 502, str(e), "pi_error")
+                agent_error(502, str(e), "pi_error")
             return
         except Exception:
             self.store.release_agent_run(
@@ -1489,6 +1725,11 @@ class Backend:
                 error_code="internal_error",
                 duration_seconds=max(0.0, time.monotonic() - started_at),
             )
+            if event_stream:
+                logging.exception("Streaming agent run failed run_id=%s", run_id)
+                agent_error(500, "Internal server error", "internal_error")
+                return
+            self._run_timing_snapshot(run_id, pop=True)
             raise
         finally:
             self.connectors.revoke(connector_run_token)
@@ -1505,7 +1746,13 @@ class Backend:
         })
         payload["connector_ids"] = list(connector_ids)
         payload["computer_enabled"] = computer_enabled
-        json_response(handler, 200, payload)
+        self._mark_run_timing(run_id, "response_ready_ms")
+        payload["timings"] = self._run_timing_snapshot(run_id)
+        if event_stream:
+            event_stream.done(payload)
+        else:
+            json_response(handler, 200, payload)
+        self._run_timing_snapshot(run_id, pop=True)
 
     # ---------- computadoras persistentes por bot ----------
     def handle_computer_status(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
