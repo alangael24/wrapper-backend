@@ -73,6 +73,9 @@ for (const artifact of ["lifecycle-runtime-compose", "lifecycle-viewmodel-compos
 for (const token of ["target: dmg", "target: pkg", "target: nsis", "target: appx", "AppImage", "deb", "rpm"]) {
   if (!builder.includes(token)) throw new Error(`Missing Electron target: ${token}`);
 }
+if (!/linux:\s+[\s\S]*?executableName: agent-genia/u.test(builder)) {
+  throw new Error("Linux executable name must match the packaged smoke test");
+}
 for (const [key, value] of [
   ["PUBLIC_LEGACY_SIGNUP_ENABLED", "0"],
   ["STRIPE_ENABLED", "1"],
