@@ -146,10 +146,21 @@ export interface BillingSnapshot {
   customer: boolean;
   subscription: BillingSubscriptionStatus | null;
   plans: {
-    basic: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
-    pro: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
-    business: { name: string; amount: number; currency: string; interval: string; monthly_credits: number; max_concurrent_runs: number };
+    basic: BillingPlan;
+    pro: BillingPlan;
+    business: BillingPlan;
   };
+}
+
+export interface BillingPlan {
+  name: string;
+  amount: number;
+  currency: string;
+  interval: string;
+  five_hour_credits: number;
+  seven_day_credits: number;
+  monthly_credits: number;
+  max_concurrent_runs: number;
 }
 
 export interface BotProfile {

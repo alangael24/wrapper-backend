@@ -315,7 +315,7 @@ actor APIClient {
                 computer: computer,
                 botID: botID.uuidString.lowercased(),
                 connectorIDs: connectorIDs,
-                maxCredits: 25,
+                maxCredits: 15,
                 idempotencyKey: UUID().uuidString.lowercased()
             )
         )

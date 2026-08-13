@@ -358,7 +358,7 @@ class WrapperServiceClient {
         computer: options.computer === true,
         bot_id: options.botId ?? "",
         connector_ids: connectorIds,
-        max_credits: 25,
+        max_credits: 15,
         idempotency_key: randomUUID()
       },
       signal: options.signal
@@ -600,6 +600,8 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
       amount: numberValue(plan.amount),
       currency: stringValue(plan.currency),
       interval: stringValue(plan.interval),
+      five_hour_credits: numberValue(plan.five_hour_credits),
+      seven_day_credits: numberValue(plan.seven_day_credits),
       monthly_credits: numberValue(plan.monthly_credits),
       max_concurrent_runs: numberValue(plan.max_concurrent_runs)
     };
@@ -608,6 +610,8 @@ function parseBillingSnapshot(value: Record<string, unknown>): BillingSnapshot {
       || parsed.amount <= 0
       || !parsed.currency
       || !parsed.interval
+      || parsed.five_hour_credits <= 0
+      || parsed.seven_day_credits <= 0
       || parsed.monthly_credits <= 0
       || parsed.max_concurrent_runs <= 0
     ) {

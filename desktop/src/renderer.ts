@@ -572,7 +572,7 @@ function renderBilling(): void {
             ${billing.customer ? '<button type="button" class="secondary-action" data-open-billing-portal>Administrar en Stripe</button>' : ""}
           </div>
           <div class="billing-plans">
-            ${renderBillingPlan("free", "Free Trial", 0, "Para probar Agentgenia", ["30 créditos por única vez", "1 ejecución a la vez", "Vence después de 30 días"], tier)}
+            ${renderBillingPlan("free", "Free Trial", 0, "Para probar Agentgenia", ["15 créditos cada 5 h", "30 créditos cada 7 días", "30 créditos por única vez", "1 ejecución a la vez"], tier)}
             ${renderBillingPlan("basic", billing.plans.basic.name, billing.plans.basic.amount, "Para uso individual", planBenefits(billing.plans.basic), tier)}
             ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", planBenefits(billing.plans.pro), tier)}
             ${renderBillingPlan("business", billing.plans.business.name, billing.plans.business.amount, "Para equipos en crecimiento", planBenefits(billing.plans.business), tier)}
@@ -604,6 +604,8 @@ function planBenefits(plan: BillingSnapshot["plans"]["basic"]): string[] {
     ? "1 ejecución a la vez"
     : `${plan.max_concurrent_runs} ejecuciones simultáneas`;
   return [
+    `${plan.five_hour_credits.toLocaleString()} créditos cada 5 h`,
+    `${plan.seven_day_credits.toLocaleString()} créditos cada 7 días`,
     `${plan.monthly_credits.toLocaleString()} créditos al mes`,
     simultaneous,
     "Portal de facturación y cancelación"
@@ -1775,9 +1777,9 @@ function emptyBillingSnapshot(): BillingSnapshot {
     customer: false,
     subscription: null,
     plans: {
-      basic: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 },
-      pro: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 },
-      business: { name: "Plan", amount: 0, currency: "usd", interval: "month", monthly_credits: 0, max_concurrent_runs: 0 }
+      basic: { name: "Plan", amount: 0, currency: "usd", interval: "month", five_hour_credits: 0, seven_day_credits: 0, monthly_credits: 0, max_concurrent_runs: 0 },
+      pro: { name: "Plan", amount: 0, currency: "usd", interval: "month", five_hour_credits: 0, seven_day_credits: 0, monthly_credits: 0, max_concurrent_runs: 0 },
+      business: { name: "Plan", amount: 0, currency: "usd", interval: "month", five_hour_credits: 0, seven_day_credits: 0, monthly_credits: 0, max_concurrent_runs: 0 }
     }
   };
 }

@@ -628,6 +628,8 @@ class Backend:
                 "tier": tier,
                 "name": plan.label,
                 "monthly_credits": plan.monthly_credit_milli // 1000,
+                "five_hour_credits": plan.five_hour_credit_milli // 1000,
+                "seven_day_credits": plan.seven_day_credit_milli // 1000,
                 "max_concurrent_runs": plan.max_concurrent_runs,
             },
             "credits": {
@@ -1175,13 +1177,16 @@ class Backend:
 
         run_api_key = "agrn_" + secrets.token_urlsafe(48)
         try:
+            plan = plan_for(tier)
             prepared = self.store.create_agent_run(
                 user_id=user["id"],
                 idempotency_key=idempotency_key,
                 model=self.cfg.pi_model,
                 browser=browser,
                 max_credit_milli=max_credit_milli,
-                max_concurrent_runs=plan_for(tier).max_concurrent_runs,
+                max_concurrent_runs=plan.max_concurrent_runs,
+                five_hour_credit_milli=plan.five_hour_credit_milli,
+                seven_day_credit_milli=plan.seven_day_credit_milli,
                 token_hash=hash_agent_run_token(run_api_key),
                 token_expires_at=time.time() + self.cfg.credits.reservation_ttl_seconds,
                 enforce=self.cfg.credits.mode == "enforce",
@@ -1195,6 +1200,12 @@ class Backend:
                     handler, 429, "Tu plan alcanzó su límite de ejecuciones simultáneas",
                     "run_concurrency_limit",
                 )
+                return
+            if str(exc) == "credit_5h_limit":
+                error_response(handler, 429, "Tu plan alcanzó el límite de créditos de 5 horas", "credit_5h_limit")
+                return
+            if str(exc) == "credit_7d_limit":
+                error_response(handler, 429, "Tu plan alcanzó el límite de créditos de 7 días", "credit_7d_limit")
                 return
             raise
         if prepared["duplicate"]:

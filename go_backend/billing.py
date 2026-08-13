@@ -350,6 +350,8 @@ class BillingService:
                     "currency": "usd",
                     "interval": "month",
                     "monthly_credits": plan.monthly_credit_milli // 1_000,
+                    "five_hour_credits": plan.five_hour_credit_milli // 1_000,
+                    "seven_day_credits": plan.seven_day_credit_milli // 1_000,
                     "max_concurrent_runs": plan.max_concurrent_runs,
                 }
                 for tier, plan in PLANS.items()

@@ -16,13 +16,15 @@ class Plan:
     monthly_price_usd: int
     monthly_credit_milli: int
     max_concurrent_runs: int
+    five_hour_credit_milli: int
+    seven_day_credit_milli: int
 
 
 PLANS: dict[str, Plan] = {
-    "free": Plan("Free Trial", 0, 0, 1),
-    "basic": Plan("Starter", 29, 300_000, 1),
-    "pro": Plan("Pro", 79, 1_000_000, 2),
-    "business": Plan("Business", 199, 3_000_000, 4),
+    "free": Plan("Free Trial", 0, 30_000, 1, 15_000, 30_000),
+    "basic": Plan("Starter", 29, 300_000, 1, 60_000, 150_000),
+    "pro": Plan("Pro", 79, 1_000_000, 2, 200_000, 500_000),
+    "business": Plan("Business", 199, 3_000_000, 4, 600_000, 1_500_000),
 }
 
 DEFAULT_TIER = "free"
@@ -52,11 +54,10 @@ def plan_payload(tier: str) -> dict:
 
 
 def effective_limits(tier: str) -> dict[str, float]:
-    """Deprecated response compatibility for one client migration cycle."""
-    legacy = {
-        "free": {"5h": 0.0, "week": 0.0, "month": 0.0},
-        "basic": {"5h": 6.0, "week": 15.0, "month": 30.0},
-        "pro": {"5h": 12.0, "week": 30.0, "month": 60.0},
-        "business": {"5h": 24.0, "week": 60.0, "month": 120.0},
+    """Credit budgets for the rolling windows and the billing cycle."""
+    plan = plan_for(tier)
+    return {
+        "5h": plan.five_hour_credit_milli / 1_000,
+        "week": plan.seven_day_credit_milli / 1_000,
+        "month": plan.monthly_credit_milli / 1_000,
     }
-    return legacy.get(tier, legacy[DEFAULT_TIER]).copy()

@@ -176,7 +176,7 @@ class AgentGeniaApi(
                 .put("computer", true)
                 .put("bot_id", botId)
                 .put("connector_ids", JSONArray(connectorIds))
-                .put("max_credits", 25)
+                .put("max_credits", 15)
                 .put("idempotency_key", UUID.randomUUID().toString()),
         )
         return json.optString("answer")
@@ -204,6 +204,8 @@ class AgentGeniaApi(
                         amount = value.optInt("amount"),
                         currency = value.optString("currency", "usd"),
                         interval = value.optString("interval", "month"),
+                        fiveHourCredits = value.optInt("five_hour_credits"),
+                        sevenDayCredits = value.optInt("seven_day_credits"),
                         monthlyCredits = value.optInt("monthly_credits"),
                         maxConcurrentRuns = value.optInt("max_concurrent_runs"),
                     ))

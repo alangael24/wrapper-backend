@@ -92,6 +92,8 @@ data class BillingPlan(
     val amount: Int,
     val currency: String,
     val interval: String,
+    val fiveHourCredits: Int,
+    val sevenDayCredits: Int,
     val monthlyCredits: Int,
     val maxConcurrentRuns: Int,
 )

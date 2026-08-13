@@ -236,7 +236,7 @@ struct AccountView: View {
                                     HStack {
                                         VStack(alignment: .leading) {
                                             Text(plan.name).fontWeight(.semibold)
-                                            Text("\(plan.monthlyCredits.formatted()) créditos · \(plan.maxConcurrentRuns) ejecución\(plan.maxConcurrentRuns == 1 ? "" : "es") simultánea\(plan.maxConcurrentRuns == 1 ? "" : "s")")
+                                            Text("\(plan.fiveHourCredits.formatted()) / 5 h · \(plan.sevenDayCredits.formatted()) / 7 días · \(plan.monthlyCredits.formatted()) / ciclo · \(plan.maxConcurrentRuns) ejecución\(plan.maxConcurrentRuns == 1 ? "" : "es") simultánea\(plan.maxConcurrentRuns == 1 ? "" : "s")")
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                         }

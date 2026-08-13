@@ -184,11 +184,15 @@ struct BillingPlan: Codable, Equatable, Sendable {
     let amount: Int
     let currency: String
     let interval: String
+    let fiveHourCredits: Int
+    let sevenDayCredits: Int
     let monthlyCredits: Int
     let maxConcurrentRuns: Int
 
     enum CodingKeys: String, CodingKey {
         case name, amount, currency, interval
+        case fiveHourCredits = "five_hour_credits"
+        case sevenDayCredits = "seven_day_credits"
         case monthlyCredits = "monthly_credits"
         case maxConcurrentRuns = "max_concurrent_runs"
     }

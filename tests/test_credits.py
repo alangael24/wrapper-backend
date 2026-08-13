@@ -43,6 +43,8 @@ class CreditLedgerTests(unittest.TestCase):
         maximum: int,
         expires_at: float | None = None,
         concurrency: int = 1,
+        five_hour_limit: int | None = None,
+        seven_day_limit: int | None = None,
     ) -> dict:
         token = f"agrn_{key}"
         return self.store.create_agent_run(
@@ -55,6 +57,8 @@ class CreditLedgerTests(unittest.TestCase):
             token_hash=hash_agent_run_token(token),
             token_expires_at=expires_at or time.time() + 3600,
             enforce=True,
+            five_hour_credit_milli=five_hour_limit,
+            seven_day_credit_milli=seven_day_limit,
         )
 
     def test_integer_conversion_rounds_once_per_run(self) -> None:
@@ -127,6 +131,32 @@ class CreditLedgerTests(unittest.TestCase):
             self.prepare_run("second-request", maximum=25_000)
         summary = self.store.credit_summary(self.user["id"])
         self.assertEqual(summary["reserved_milli"], 25_000)
+
+    def test_rolling_plan_windows_include_charged_and_reserved_credits(self) -> None:
+        self.grant(100_000, "rolling-window")
+        first = self.prepare_run(
+            "rolling-first", maximum=10_000, concurrency=2,
+            five_hour_limit=15_000, seven_day_limit=30_000,
+        )
+        self.store.settle_agent_run(
+            run_id=first["run"]["id"], charged_milli=10_000,
+            final_status="succeeded", duration_seconds=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "credit_5h_limit"):
+            self.prepare_run(
+                "rolling-over-5h", maximum=6_000, concurrency=2,
+                five_hour_limit=15_000, seven_day_limit=30_000,
+            )
+        second = self.prepare_run(
+            "rolling-reserved", maximum=5_000, concurrency=2,
+            five_hour_limit=15_000, seven_day_limit=30_000,
+        )
+        self.assertFalse(second["duplicate"])
+        with self.assertRaisesRegex(RuntimeError, "credit_5h_limit"):
+            self.prepare_run(
+                "rolling-counts-active", maximum=1_000, concurrency=2,
+                five_hour_limit=15_000, seven_day_limit=30_000,
+            )
 
     def test_simultaneous_runs_cannot_overdraw_the_same_balance(self) -> None:
         self.grant(25_000, "single-balance", source_type="trial")

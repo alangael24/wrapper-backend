@@ -916,20 +916,20 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(signup["tier"], "free")
         self.assertEqual(signup["tier_label"], "Free Trial")
         self.assertNotIn("subscription_id", signup)
-        self.assertEqual(signup["limits"]["5h"], 0.0)
-        self.assertEqual(signup["limits"]["week"], 0.0)
-        self.assertEqual(signup["limits"]["month"], 0.0)
+        self.assertEqual(signup["limits"]["5h"], 15.0)
+        self.assertEqual(signup["limits"]["week"], 30.0)
+        self.assertEqual(signup["limits"]["month"], 30.0)
         # El trial free sí puede usar modelos mientras tenga créditos.
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         status, body = ws.req("POST", "/v1/chat/completions",
                               {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
                               headers=headers)
         self.assertEqual(status, 200)
-        # /v1/usage refleja el tier y limites en cero
+        # /v1/usage refleja los límites de créditos del tier.
         status, usage = ws.req("GET", "/v1/usage", headers=headers)
         self.assertEqual(status, 200)
         self.assertEqual(usage["tier"], "free")
-        self.assertEqual(usage["windows"]["5h"]["limit_usd"], 0.0)
+        self.assertEqual(usage["windows"]["5h"]["limit_credits"], 15.0)
 
     def test_paid_tiers_require_verified_admin_transition(self):
         ws = self.ws
@@ -963,8 +963,8 @@ class TestBackend(unittest.TestCase):
         self.assertNotIn("subscription_id", pro_upgrade)
 
         for signup, expected_tier, expected_limit in (
-            (basic, "basic", 6.0),
-            (pro, "pro", 12.0),
+            (basic, "basic", 60.0),
+            (pro, "pro", 200.0),
         ):
             headers = {"Authorization": f"Bearer {signup['api_key']}"}
             status, me = ws.req("GET", "/v1/me", headers=headers)
@@ -1083,14 +1083,18 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(me["tier"], "basic")
         self.assertEqual(me["plan"]["label"], "Starter")
         self.assertEqual(me["plan"]["monthly_credit_milli"], 300_000)
+        self.assertEqual(me["plan"]["five_hour_credit_milli"], 60_000)
+        self.assertEqual(me["plan"]["seven_day_credit_milli"], 150_000)
         self.assertEqual(me["plan"]["max_concurrent_runs"], 1)
         status, me = ws.req("GET", "/v1/me", headers=pro_headers)
         self.assertEqual(me["tier"], "pro")
         self.assertEqual(me["plan"]["monthly_credit_milli"], 1_000_000)
+        self.assertEqual(me["limits"], {"5h": 200.0, "week": 500.0, "month": 1000.0})
         self.assertEqual(me["plan"]["max_concurrent_runs"], 2)
         status, me = ws.req("GET", "/v1/me", headers=business_headers)
         self.assertEqual(me["tier"], "business")
         self.assertEqual(me["plan"]["monthly_credit_milli"], 3_000_000)
+        self.assertEqual(me["limits"], {"5h": 600.0, "week": 1500.0, "month": 3000.0})
         self.assertEqual(me["plan"]["max_concurrent_runs"], 4)
 
     def test_admin_set_tier_changes_entitlement_without_provider_key(self):

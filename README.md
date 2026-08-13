@@ -21,12 +21,12 @@ desactivado por defecto.
 `basic` sigue siendo el identificador estable de API, pero se presenta como
 Starter. Un crédito representa $0.01 de costo variable normalizado.
 
-| Tier | Nombre | Precio | Créditos | Concurrencia |
-|---|---|---:|---:|---:|
-| `free` | Free Trial | $0 | 30 una sola vez, 30 días | 1 |
-| `basic` | Starter | $29/mes | 300/mes | 1 |
-| `pro` | Pro | $79/mes | 1,000/mes | 2 |
-| `business` | Business | $199/mes | 3,000/mes | 4 |
+| Tier | Nombre | Precio | 5 h | 7 días | Ciclo | Concurrencia |
+|---|---|---:|---:|---:|---:|---:|
+| `free` | Free Trial | $0 | 15 | 30 | 30 una sola vez, 30 días | 1 |
+| `basic` | Starter | $29/mes | 60 | 150 | 300 | 1 |
+| `pro` | Pro | $79/mes | 200 | 500 | 1,000 | 2 |
+| `business` | Business | $199/mes | 600 | 1,500 | 3,000 | 4 |
 
 - `POST /v1/signup` siempre crea `free`. Cualquier `tier` enviado por el
   cliente se ignora.

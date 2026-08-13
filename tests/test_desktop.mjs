@@ -338,7 +338,7 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
   assert.match(renderer, /Starter/);
   assert.match(renderer, /Business/);
   assert.match(oauth, /idempotency_key: randomUUID\(\)/);
-  assert.match(oauth, /max_credits: 25/);
+  assert.match(oauth, /max_credits: 15/);
 });
 
 test("deletes the signed-in account and local per-account state through isolated IPC", async () => {

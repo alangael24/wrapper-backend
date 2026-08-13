@@ -1660,6 +1660,8 @@ class Store:
         token_hash: str,
         token_expires_at: float,
         enforce: bool,
+        five_hour_credit_milli: int | None = None,
+        seven_day_credit_milli: int | None = None,
     ) -> dict:
         now = _now()
         with self._lock:
@@ -1680,6 +1682,26 @@ class Store:
                 ).fetchone()
                 if int(active["n"] or 0) >= max_concurrent_runs:
                     raise RuntimeError("credit_concurrency_limit")
+                if enforce:
+                    active_reserved = self._conn.execute(
+                        "SELECT COALESCE(SUM(reserved_milli),0) AS n FROM credit_reservations "
+                        "WHERE user_id=? AND status='active'",
+                        (user_id,),
+                    ).fetchone()
+                    reserved_milli = int(active_reserved["n"] or 0)
+                    for code, span, limit in (
+                        ("credit_5h_limit", 5 * 3600, five_hour_credit_milli),
+                        ("credit_7d_limit", 7 * 86400, seven_day_credit_milli),
+                    ):
+                        if limit is None:
+                            continue
+                        charged = self._conn.execute(
+                            "SELECT COALESCE(SUM(charged_credit_milli),0) AS n FROM agent_runs "
+                            "WHERE user_id=? AND created_at>=?",
+                            (user_id, now - span),
+                        ).fetchone()
+                        if int(charged["n"] or 0) + reserved_milli + max_credit_milli > limit:
+                            raise RuntimeError(code)
                 grants = self._conn.execute(
                     "SELECT * FROM credit_grants WHERE user_id=? AND remaining_milli>0 "
                     "AND starts_at<=? AND (expires_at IS NULL OR expires_at>?) "
@@ -2156,14 +2178,28 @@ class Store:
             "SELECT estimated_cost_usd, created_at, model FROM usage_events WHERE user_id=?",
             (user_id,),
         )
+        runs = self._q(
+            "SELECT charged_credit_milli,created_at FROM agent_runs "
+            "WHERE user_id=? AND charged_credit_milli>0",
+            (user_id,),
+        )
         limits = effective_limits(tier)
         spans = {"5h": 5 * 3600, "week": 7 * 86400, "month": 30 * 86400}
         by_model: dict[str, dict] = {}
         result: dict = {}
         for label, span in spans.items():
             spent = sum(e["estimated_cost_usd"] for e in events if now - e["created_at"] <= span)
+            spent_credits = sum(
+                int(run["charged_credit_milli"]) for run in runs
+                if now - run["created_at"] <= span
+            ) / 1_000
             requests = sum(1 for e in events if now - e["created_at"] <= span)
-            result[label] = {"limit_usd": limits[label], "spent_usd": round(spent, 6), "requests": requests}
+            result[label] = {
+                "limit_credits": limits[label],
+                "spent_credits": round(spent_credits, 3),
+                "spent_usd": round(spent, 6),
+                "requests": requests,
+            }
         for e in events:
             m = e["model"] or "unknown"
             agg = by_model.setdefault(m, {"requests": 0, "cost_usd": 0.0})
