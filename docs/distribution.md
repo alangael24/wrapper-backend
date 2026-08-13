@@ -29,14 +29,17 @@ Las Actions también admiten `workflow_dispatch` pero exigen que el tag ya exist
 
 `electron-builder.yml` produce:
 
-- macOS universal: DMG, PKG y ZIP, con Developer ID, hardened runtime y
-  notarización;
+- macOS universal: DMG y ZIP con Developer ID, hardened runtime y notarización;
+  PKG opcional con la identidad adicional Developer ID Installer;
 - Windows x64: NSIS EXE y AppX/MSIX-compatible, con Authenticode;
 - Linux x64: AppImage, deb y rpm;
 - metadatos de actualización, blockmaps y `SHA256SUMS.txt`.
 
 Un tag nuevo construye por defecto las plataformas que hoy tienen una cadena de
-confianza completa: macOS y Linux. El dispatch manual acepta
+confianza completa: macOS y Linux. En macOS, el canal de descarga directa genera
+DMG y ZIP firmados y notarizados. El PKG es opcional mediante `mac_pkg=true` y
+permanece fail-closed hasta configurar la identidad separada Developer ID
+Installer. El dispatch manual acepta
 `platforms=windows` para anexar Windows al mismo release únicamente cuando
 existan el PFX y el publisher. El job de Windows conserva
 `forceCodeSigning=true` y rechaza cualquier artefacto sin Authenticode; nunca se

@@ -15,6 +15,11 @@ on:
         default: available
         type: choice
         options: [available, windows, all]
+      mac_pkg:
+        description: Also build a PKG; requires a separate Developer ID Installer identity
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -43,6 +48,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
       WINDOWS_APPX_PUBLISHER: ${{ secrets.WINDOWS_APPX_PUBLISHER }}
+      MAC_PKG_ENABLED: ${{ inputs.mac_pkg || false }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -87,7 +93,9 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           test -n "$MAC_CSC_LINK" && test -n "$MAC_CSC_KEY_PASSWORD"
-          test -n "$MAC_INSTALLER_CSC_LINK" && test -n "$MAC_INSTALLER_CSC_KEY_PASSWORD"
+          if [ "$MAC_PKG_ENABLED" = true ]; then
+            test -n "$MAC_INSTALLER_CSC_LINK" && test -n "$MAC_INSTALLER_CSC_KEY_PASSWORD"
+          fi
           test -n "$APPLE_API_KEY_BASE64" && test -n "$APPLE_API_KEY_ID" && test -n "$APPLE_API_ISSUER"
           key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
           printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
@@ -97,8 +105,10 @@ jobs:
           echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
           echo "CSC_LINK=$MAC_CSC_LINK" >> "$GITHUB_ENV"
           echo "CSC_KEY_PASSWORD=$MAC_CSC_KEY_PASSWORD" >> "$GITHUB_ENV"
-          echo "CSC_INSTALLER_LINK=$MAC_INSTALLER_CSC_LINK" >> "$GITHUB_ENV"
-          echo "CSC_INSTALLER_KEY_PASSWORD=$MAC_INSTALLER_CSC_KEY_PASSWORD" >> "$GITHUB_ENV"
+          if [ "$MAC_PKG_ENABLED" = true ]; then
+            echo "CSC_INSTALLER_LINK=$MAC_INSTALLER_CSC_LINK" >> "$GITHUB_ENV"
+            echo "CSC_INSTALLER_KEY_PASSWORD=$MAC_INSTALLER_CSC_KEY_PASSWORD" >> "$GITHUB_ENV"
+          fi
       - name: Require Windows signing secrets
         if: runner.os == 'Windows'
         shell: pwsh
@@ -109,10 +119,26 @@ jobs:
           if (-not $env:WINDOWS_CSC_LINK -or -not $env:WINDOWS_CSC_KEY_PASSWORD -or -not $env:WINDOWS_APPX_PUBLISHER) { throw "Windows signing secrets are incomplete" }
           "CSC_LINK=$env:WINDOWS_CSC_LINK" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CSC_KEY_PASSWORD=$env:WINDOWS_CSC_KEY_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build signed distributables
+      - name: Build signed macOS distributables
+        if: runner.os == 'macOS'
+        shell: bash
         run: |
           pnpm build:desktop
-          pnpm exec electron-builder --${{ matrix.target }} --publish never -c.forceCodeSigning=${{ runner.os != 'Linux' }}
+          targets=(dmg zip)
+          if [ "$MAC_PKG_ENABLED" = true ]; then targets+=(pkg); fi
+          pnpm exec electron-builder --mac "${targets[@]}" --publish never -c.forceCodeSigning=true
+      - name: Build signed Windows distributables
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pnpm build:desktop
+          pnpm exec electron-builder --win --publish never -c.forceCodeSigning=true
+      - name: Build Linux distributables
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pnpm build:desktop
+          pnpm exec electron-builder --linux --publish never -c.forceCodeSigning=false
       - name: Launch packaged macOS application
         if: runner.os == 'macOS'
         shell: bash

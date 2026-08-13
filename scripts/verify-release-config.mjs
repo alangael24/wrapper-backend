@@ -110,7 +110,10 @@ if (!pythonLock.includes("--hash=sha256:")) {
   throw new Error("requirements.txt must be a hashed dependency lockfile");
 }
 if (!desktopReleaseWorkflow.includes("inputs.platforms == 'windows'")
-  || !desktopReleaseWorkflow.includes("forceCodeSigning=${{ runner.os != 'Linux' }}")
+  || !desktopReleaseWorkflow.includes("mac_pkg")
+  || !desktopReleaseWorkflow.includes("electron-builder --mac")
+  || !desktopReleaseWorkflow.includes("electron-builder --win --publish never -c.forceCodeSigning=true")
+  || !desktopReleaseWorkflow.includes("electron-builder --linux --publish never -c.forceCodeSigning=false")
   || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")
   || !desktopReleaseWorkflow.includes("attestations: write")) {
   throw new Error("Desktop release must append Windows only through its signed, checksum-preserving path");
