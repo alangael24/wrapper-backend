@@ -84,6 +84,14 @@ class TestReleaseReadinessGate(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("readiness request failed", result.stderr.lower())
 
+    def test_render_pi_launcher_disables_every_builtin_local_tool(self):
+        launcher = ROOT / "scripts" / "pi-render-safe"
+        self.assertTrue(os.access(launcher, os.X_OK))
+        source = launcher.read_text(encoding="utf-8")
+        self.assertIn("--no-builtin-tools", source)
+        self.assertIn("--no-context-files", source)
+        self.assertIn('exec "$script_dir/../node_modules/.bin/pi"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

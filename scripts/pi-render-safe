@@ -1,0 +1,12 @@
+#!/bin/sh
+# Render's container runtime does not expose the nested user namespaces needed
+# by Bubblewrap. Run Pi with the already scrubbed per-run environment, but keep
+# every built-in local filesystem/shell tool disabled. Only explicit extensions
+# selected by the backend can add capabilities.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/../node_modules/.bin/pi" \
+  --no-builtin-tools \
+  --no-context-files \
+  "$@"

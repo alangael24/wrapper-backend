@@ -347,6 +347,8 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store, max-age=0")
     handler.send_header("Pragma", "no-cache")
+    if getattr(handler, "close_connection", False):
+        handler.send_header("Connection", "close")
     request_id = getattr(handler, "request_id", "")
     if request_id:
         handler.send_header("X-Request-Id", request_id)
@@ -1017,6 +1019,11 @@ class Backend:
 
     # ---------- proxy ----------
     def handle_proxy(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+        # Chat completions may stream and authentication/budget checks run before
+        # reading the body. Never reuse that HTTP/1.1 connection: otherwise an
+        # early rejection can leave JSON bytes queued as a bogus next request.
+        if handler.command == "POST":
+            handler.close_connection = True
         principal = self.require_model_principal(handler)
         if not principal:
             return
@@ -1094,6 +1101,8 @@ class Backend:
                     handler.send_header(k, v)
                 handler.send_header("Cache-Control", "no-store, max-age=0")
                 handler.send_header("Pragma", "no-cache")
+                if handler.close_connection:
+                    handler.send_header("Connection", "close")
                 handler.send_header("X-Request-Id", handler.request_id)
                 handler.end_headers()
             except (BrokenPipeError, ConnectionResetError):
@@ -1138,6 +1147,8 @@ class Backend:
                 handler.send_header(k, v)
             handler.send_header("Cache-Control", "no-store, max-age=0")
             handler.send_header("Pragma", "no-cache")
+            if handler.close_connection:
+                handler.send_header("Connection", "close")
             handler.send_header("X-Request-Id", handler.request_id)
             handler.send_header("Content-Length", str(len(raw)))
             handler.end_headers()
@@ -1401,6 +1412,17 @@ class Backend:
             )
             return
         except PiHarnessError as e:
+            stderr_path = self.cfg.pi_runs_dir / run_id / "stderr.log"
+            try:
+                stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                stderr_tail = "<stderr unavailable>"
+            logging.error(
+                "Pi harness failure run_id=%s error=%s stderr_tail=%s",
+                run_id,
+                type(e).__name__,
+                stderr_tail,
+            )
             # A failure in our own harness must not consume customer credits.
             # The only exception is a model call that was explicitly stopped
             # because it reached the user's authorized run budget.

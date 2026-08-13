@@ -779,6 +779,18 @@ class TestBackend(unittest.TestCase):
         status, _ = self.ws.req("GET", "/v1/usage", headers={"Authorization": "Bearer wrong"})
         self.assertEqual(status, 401)
 
+    def test_rejected_model_post_closes_connection_before_unread_body_can_be_reused(self):
+        status, body, headers = self.ws.req(
+            "POST",
+            "/v1/chat/completions",
+            {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer wrong"},
+            include_headers=True,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "unauthorized")
+        self.assertEqual(headers.get("Connection"), "close")
+
     def test_json_responses_are_never_cacheable(self):
         status, body, headers = self.ws.req(
             "POST", "/v1/signup", {}, include_headers=True

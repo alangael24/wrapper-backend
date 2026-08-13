@@ -382,15 +382,22 @@ curl -X POST http://127.0.0.1:8787/v1/agent/run \
 ```
 
 El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
-El wrapper autentica al usuario pero firma la llamada a DeepSeek con la key del
-servidor; el consumo aparece en `/v1/usage`. Cada ejecución tiene un workspace
-y logs propios bajo `PI_RUNS_DIR`.
+El wrapper autentica al usuario y firma la llamada con la credencial server-side
+del proveedor efectivo (DeepSeek por defecto u OpenCode para cuentas internas
+autorizadas); el consumo aparece en `/v1/usage`. Cada ejecución tiene un
+workspace y logs propios bajo `PI_RUNS_DIR`.
 
-En producción Pi se ejecuta únicamente en Linux mediante el launcher
-Bubblewrap fail-closed. Instala `bubblewrap`, `socat` y `util-linux`, ejecuta
-`./scripts/setup-pi-sandbox.sh` y consulta el threat model y las pruebas
-negativas en [docs/pi-sandbox.md](docs/pi-sandbox.md). No existe fallback al
-binario de Pi sin aislamiento.
+En hosts Linux que permiten user namespaces, `scripts/pi-sandbox` mantiene el
+launcher Bubblewrap fail-closed. Instala `bubblewrap`, `socat` y `util-linux`,
+ejecuta `./scripts/setup-pi-sandbox.sh` y consulta el threat model y las pruebas
+negativas en [docs/pi-sandbox.md](docs/pi-sandbox.md).
+
+Render no permite los namespaces anidados que Bubblewrap necesita. La imagen de
+producción usa allí `scripts/pi-render-safe`: conserva el HOME/workspace efímero
+y el entorno sin secretos creado por el backend, desactiva todos los tools
+built-in de Pi (`bash`, `read`, `write`, `edit`, etc.) y admite únicamente las
+extensiones first-party seleccionadas por el servidor. Las operaciones de
+shell/archivos deben ejecutarse mediante la computadora aislada del bot.
 
 ## Conectores nativos de Pi
 
@@ -644,6 +651,7 @@ runtime se agrupan aquí por función.
 |---|---|---|
 | `PI_ENABLED` | `0` | Habilitar el endpoint de tareas de Pi |
 | `PI_BIN` | `./scripts/pi-sandbox` | Launcher Bubblewrap fail-closed; ejecuta el Pi real dentro del sandbox Linux |
+| `PI_BIN` en Render | `/app/scripts/pi-render-safe` | Launcher sin tools locales para hosts sin user namespaces; conserva solo extensiones autorizadas |
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
 | `PI_BACKEND_URL` | `http://127.0.0.1:$PORT` | URL que Pi usa para volver al wrapper |
 | `PI_RUNS_DIR` | `data/pi-runs` | Workspaces y logs por ejecución |
@@ -709,9 +717,9 @@ runtime se agrupan aquí por función.
 - Toda respuesta JSON usa `Cache-Control: no-store`; los errores 500 exponen
   solo `Internal server error` y un `request_id`, mientras la excepción completa
   permanece en los logs privados.
-- Pi puede ejecutar comandos y manipular archivos con los permisos del proceso
-  del backend. El endpoint viene desactivado; en producción debe correr en un
-  contenedor o sandbox por tarea, sin montar secretos ni el código del servidor.
+- El launcher Bubblewrap permite tools locales dentro de su sandbox. El launcher
+  de Render los desactiva por completo; shell y archivos se delegan a la
+  computadora aislada del bot mediante un grant efímero.
 - El subproceso de Pi recibe un entorno limpio: no hereda `ADMIN_TOKEN`,
   `WRAPPER_SECRET` ni las demás API keys del servidor.
 - `pi-chrome` nunca recibe el perfil real del operador. Cada ejecución obtiene
@@ -719,9 +727,9 @@ runtime se agrupan aquí por función.
   perfil se borra al finalizar. El arranque rechaza explícitamente el modo
   compartido.
 - El aislamiento de perfil evita compartir cookies, sesiones y almacenamiento
-  entre clientes. Pi todavía ejecuta con el usuario del sistema del backend;
-  para aislamiento fuerte entre tenants usa además un contenedor o usuario del
-  sistema distinto por tarea.
+  entre clientes. En Render, Pi comparte el usuario del contenedor pero no tiene
+  tools built-in ni recibe secretos; para tareas de sistema usa la computadora
+  aislada por usuario y bot.
 - Las computadoras persistentes sí conservan cookies, pero solo dentro de la
   sandbox privada de ese usuario y bot. El API key del proveedor nunca llega a
   Electron o Pi; cada ejecución recibe un grant revocable para un único bot y

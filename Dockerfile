@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=8787 \
     ENVIRONMENT=production \
-    PI_BIN=/app/scripts/pi-sandbox \
+    PI_BIN=/app/scripts/pi-render-safe \
     PI_CHROME_BIN=/usr/bin/chromium
 
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
@@ -42,7 +42,7 @@ COPY scripts ./scripts
 COPY run.sh README.md ./
 
 RUN set -eux; \
-    chmod 0755 run.sh scripts/pi-sandbox scripts/setup-pi-sandbox.sh; \
+    chmod 0755 run.sh scripts/pi-sandbox scripts/pi-render-safe scripts/setup-pi-sandbox.sh; \
     mkdir -p /app/data/pi-runs /app/data/.cache /app/data/.composio; \
     chown -R 10001:10001 /app/data
 
