@@ -616,10 +616,29 @@ actor APIClient {
         var streamedText = ""
 
         func decode(_ event: ServerSentEvent) throws -> (delta: String?, response: AgentRunResponse?) {
-            if event.name == "delta", let delta = try? decoder.decode(AgentStreamDelta.self, from: event.data) {
-                return (delta.text, nil)
+            if event.name == "delta" {
+                do { return (try decoder.decode(AgentStreamDelta.self, from: event.data).text, nil) }
+                catch {
+                    throw ServiceError(
+                        message: "Agent Genia recibió un fragmento de respuesta inválido.",
+                        code: "invalid_stream_delta",
+                        status: response.statusCode
+                    )
+                }
             } else if event.name == "done" {
-                return (nil, try decoder.decode(AgentRunResponse.self, from: event.data))
+                do { return (nil, try decoder.decode(AgentRunResponse.self, from: event.data)) }
+                catch {
+                    // A complete streamed answer remains usable even if an
+                    // optional final metadata field is malformed.
+                    if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return (nil, AgentRunResponse(answer: streamedText))
+                    }
+                    throw ServiceError(
+                        message: "Agent Genia recibió una respuesta final inválida.",
+                        code: "invalid_stream_response",
+                        status: response.statusCode
+                    )
+                }
             } else if event.name == "error", let failure = try? decoder.decode(AgentStreamFailure.self, from: event.data) {
                 throw ServiceError(message: failure.message, code: failure.type, status: failure.status)
             }
@@ -650,7 +669,11 @@ actor APIClient {
                 }
             }
         } catch let error as ServiceError {
-            throw error
+            if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                finalResponse = AgentRunResponse(answer: streamedText)
+            } else {
+                throw error
+            }
         } catch {
             if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 finalResponse = AgentRunResponse(answer: streamedText)

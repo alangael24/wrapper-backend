@@ -504,7 +504,16 @@ class _AgentEventStream:
     def send(self, event: str, payload: dict) -> None:
         if self.disconnected:
             return
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        # Keep the wire representation ASCII-only. Foundation's incremental
+        # line decoder can otherwise surface NSCocoaErrorDomain 4864 when an
+        # intermediary splits a multi-byte scalar across streamed buffers.
+        # JSONDecoder restores the original Unicode text from the escapes.
+        data = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
         frame = f"event: {event}\ndata: {data}\n\n".encode("utf-8")
         self._write(frame)
 
