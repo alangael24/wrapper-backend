@@ -1072,7 +1072,11 @@ class PiHarness:
                     # Give Chromium enough time to enter its process before Pi
                     # asks the bridge to authorize. This only affects explicit
                     # browser runs and avoids a startup race on busy hosts.
-                    time.sleep(0.1)
+                    time.sleep(0.25)
+                    if chrome_process.poll() is not None:
+                        raise PiHarnessError(
+                            "Chrome se cerró antes de que Pi pudiera autorizarlo"
+                        )
                 process = subprocess.Popen(
                     self._command(browser),
                     cwd=work_dir,

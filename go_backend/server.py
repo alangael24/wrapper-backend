@@ -634,6 +634,8 @@ class Backend:
         self._run_timings: dict[str, dict[str, float]] = {}
         self._run_provider_lock = threading.Lock()
         self._run_providers: dict[str, dict[str, Any]] = {}
+        self._run_principal_lock = threading.Lock()
+        self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -800,6 +802,38 @@ class Backend:
                 return self._run_providers.pop(run_id, None)
             return self._run_providers.get(run_id)
 
+    def _run_principal(
+        self,
+        token: str,
+        *,
+        value: tuple[dict[str, Any], dict[str, Any]] | None = None,
+        pop: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Cache one active run token inside the process that issued it.
+
+        Pi calls the model proxy almost immediately after ``/v1/agent/run``.
+        Re-querying Postgres to validate a token this process just created
+        added another cross-region round trip to every model call. The durable
+        database lookup remains the fallback for restarts and other replicas.
+        """
+        key = hash_agent_run_token(token)
+        with self._run_principal_lock:
+            if value is not None:
+                self._run_principals[key] = value
+                return value
+            if pop:
+                return self._run_principals.pop(key, None)
+            return self._run_principals.get(key)
+
+    def _forget_run_principals(self, user_id: str) -> None:
+        with self._run_principal_lock:
+            stale = [
+                key for key, (user, _run) in self._run_principals.items()
+                if user.get("id") == user_id
+            ]
+            for key in stale:
+                self._run_principals.pop(key, None)
+
     # ---------- auth helpers ----------
     def encrypt_secret(self, plaintext: str, key_id: str) -> bytes:
         """Encrypt a connector or identity secret with the active master key."""
@@ -903,7 +937,12 @@ class Backend:
         if not key:
             error_response(handler, 401, "Falta Authorization: Bearer <api_key>", "unauthorized")
             return None
-        user = self.store.get_user_by_api_key(key) or self.google_auth.authenticate(key)
+        # Token prefixes are disjoint. Avoid a guaranteed-miss Postgres query
+        # for every mobile request before checking the Agent Genia session.
+        if key.startswith("aga_"):
+            user = self.google_auth.authenticate(key)
+        else:
+            user = self.store.get_user_by_api_key(key)
         if not user:
             error_response(handler, 401, "Sesión o API key del wrapper inválida", "unauthorized")
             return None
@@ -917,7 +956,10 @@ class Backend:
         if not key:
             error_response(handler, 401, "Falta Authorization: Bearer <token>", "unauthorized")
             return None
-        run = self.store.get_agent_run_by_token(key)
+        cached = self._run_principal(key) if key.startswith("agrn_") else None
+        if cached is not None:
+            return cached
+        run = self.store.get_agent_run_by_token(key) if key.startswith("agrn_") else None
         if run:
             user = {
                 "id": run.get("principal_user_id") or run["user_id"],
@@ -935,7 +977,10 @@ class Backend:
             }
             if user.get("account_status") == "active":
                 return user, run
-        user = self.store.get_user_by_api_key(key) or self.google_auth.authenticate(key)
+        if key.startswith("aga_"):
+            user = self.google_auth.authenticate(key)
+        else:
+            user = self.store.get_user_by_api_key(key)
         if not user:
             error_response(handler, 401, "Sesión o token de ejecución inválido", "unauthorized")
             return None
@@ -1086,6 +1131,8 @@ class Backend:
             )
         ephemeral_grants = self.connectors.revoke_user(user["id"])
         pi_sessions_deleted = self.pi.forget_user(user["id"])
+        self.google_auth.forget_user(user["id"])
+        self._forget_run_principals(user["id"])
         result = self.store.delete_user_account(user["id"])
         json_response(
             handler,
@@ -1734,21 +1781,29 @@ class Backend:
         run_api_key = "agrn_" + secrets.token_urlsafe(48)
         try:
             plan = plan_for(tier)
-            prepared = self.store.create_agent_run(
-                user_id=user["id"],
-                idempotency_key=idempotency_key,
-                model=self.cfg.pi_model,
-                browser=browser,
-                max_credit_milli=max_credit_milli,
-                max_concurrent_runs=(
+            run_values = {
+                "user_id": user["id"],
+                "idempotency_key": idempotency_key,
+                "model": self.cfg.pi_model,
+                "browser": browser,
+                "max_credit_milli": max_credit_milli,
+                "max_concurrent_runs": (
                     self.cfg.pi_max_concurrent if unlimited else plan.max_concurrent_runs
                 ),
-                five_hour_credit_milli=plan.five_hour_credit_milli,
-                seven_day_credit_milli=plan.seven_day_credit_milli,
-                token_hash=hash_agent_run_token(run_api_key),
-                token_expires_at=time.time() + self.cfg.credits.reservation_ttl_seconds,
-                enforce=self.cfg.credits.mode == "enforce" and not unlimited,
-            )
+                "token_hash": hash_agent_run_token(run_api_key),
+                "token_expires_at": (
+                    time.time() + self.cfg.credits.reservation_ttl_seconds
+                ),
+            }
+            if unlimited:
+                prepared = self.store.create_unmetered_agent_run(**run_values)
+            else:
+                prepared = self.store.create_agent_run(
+                    **run_values,
+                    five_hour_credit_milli=plan.five_hour_credit_milli,
+                    seven_day_credit_milli=plan.seven_day_credit_milli,
+                    enforce=self.cfg.credits.mode == "enforce",
+                )
         except RuntimeError as exc:
             if str(exc) == "insufficient_credits":
                 error_response(handler, 402, "Créditos insuficientes", "insufficient_credits")
@@ -1776,6 +1831,7 @@ class Backend:
             return
         run = prepared["run"]
         run_id = run["id"]
+        self._run_principal(run_api_key, value=(user, run))
         started_at = time.monotonic()
         self._start_run_timing(run_id, request_started_at)
         self._mark_run_timing(run_id, "run_reserved_ms")
@@ -1792,6 +1848,24 @@ class Backend:
             self._run_timing_snapshot(run_id, pop=True)
 
         def settle(final_status: str, error_code: str | None = None) -> tuple[dict, dict]:
+            timing_warning = "timing:" + json.dumps(
+                self._run_timing_snapshot(run_id), separators=(",", ":")
+            )
+            if unlimited:
+                settled = self.store.settle_unmetered_agent_run(
+                    run_id=run_id,
+                    final_status=final_status,
+                    duration_seconds=max(0.0, time.monotonic() - started_at),
+                    error_code=error_code,
+                    warnings=[timing_warning],
+                )
+                return settled, {
+                    "mode": "unlimited",
+                    "reserved": 0.0,
+                    "charged": 0.0,
+                    "released": 0.0,
+                    "balance_after": None,
+                }
             llm_cost = self.store.agent_run_cost_microusd(run_id)
             run_state = self.store.get_agent_run(run_id) or run
             extra_cost = int(run_state.get("extra_cost_microusd") or 0)
@@ -1809,11 +1883,7 @@ class Backend:
                 final_status=final_status,
                 duration_seconds=max(0.0, time.monotonic() - started_at),
                 error_code=error_code,
-                warnings=[
-                    "timing:" + json.dumps(
-                        self._run_timing_snapshot(run_id), separators=(",", ":")
-                    )
-                ],
+                warnings=[timing_warning],
             )
             balance = self.store.credit_summary(user["id"], recent_limit=0)
             reserved = int(settled["reserved_credit_milli"])
@@ -1836,7 +1906,11 @@ class Backend:
                     connector_ids=connector_ids,
                     computer_id=bot_id if computer_enabled else None,
                 )
-            self.store.mark_agent_run_running(run_id)
+            # The optimized unlimited Postgres reservation inserts the run in
+            # ``running`` state in the same round trip. Metered/SQLite runs
+            # retain the explicit transition used by the credit ledger.
+            if not unlimited:
+                self.store.mark_agent_run_running(run_id)
             self._mark_run_timing(run_id, "pi_dispatch_ms")
 
             def on_text_delta(delta: str) -> None:
@@ -1935,6 +2009,7 @@ class Backend:
         finally:
             self.connectors.revoke(connector_run_token)
             self._run_provider(run_id, pop=True)
+            self._run_principal(run_api_key, pop=True)
         settled, credits = settle("succeeded")
         payload = result.as_dict()
         payload["run_id"] = run_id
@@ -1961,10 +2036,11 @@ class Backend:
             # already persisted server-side; putting the full accounting
             # payload in this frame made mobile clients decode unrelated
             # optional fields before they could accept the answer.
-            visible_answer = _partial_json_text(result.answer)
-            event_stream.done_text(
-                visible_answer if visible_answer is not None else result.answer
-            )
+            # Base64 keeps the terminal frame decoder-safe without throwing
+            # away the structured widget next to the visible text. The iOS UI
+            # has already streamed the human-readable ``text`` field and uses
+            # this raw envelope to install the final widget atomically.
+            event_stream.done_text(result.answer)
         else:
             json_response(handler, 200, payload)
         self._run_timing_snapshot(run_id, pop=True)
@@ -2156,6 +2232,8 @@ class Backend:
             error_response(handler, 409, "La cuenta esta deshabilitada", "account_disabled")
             return
         result = self.store.revoke_user_account(user_id)
+        self.google_auth.forget_user(user_id)
+        self._forget_run_principals(user_id)
         ephemeral_grants_revoked = self.connectors.revoke_user(user_id)
         pi_sessions_deleted = self.pi.forget_user(user_id)
         cleanup_errors: list[str] = []

@@ -31,6 +31,8 @@ final class AppModel {
     private var connectorRefreshTask: Task<ConnectorSnapshot, Error>?
     private var billingRefreshTask: Task<BillingSnapshot, Error>?
     private var agentWarmTasks: [UUID: Task<Bool, Never>] = [:]
+    private var persistenceTask: Task<Void, Never>?
+    private var persistenceRequested = false
     private var warmedBotUntil: [UUID: Date] = [:]
     private var lastConnectorRefresh = Date.distantPast
     private var lastBillingRefresh = Date.distantPast
@@ -107,6 +109,9 @@ final class AppModel {
         billingRefreshTask = nil
         for task in agentWarmTasks.values { task.cancel() }
         agentWarmTasks = [:]
+        persistenceTask?.cancel()
+        persistenceTask = nil
+        persistenceRequested = false
         warmedBotUntil = [:]
         lastConnectorRefresh = .distantPast
         lastBillingRefresh = .distantPast
@@ -133,6 +138,9 @@ final class AppModel {
     }
 
     private func clearAccountState() {
+        persistenceTask?.cancel()
+        persistenceTask = nil
+        persistenceRequested = false
         account = nil
         profile = nil
         bots = []
@@ -166,7 +174,8 @@ final class AppModel {
         )
         bots.append(bot)
         destination = .bot(bot.id)
-        await persist()
+        await persistLocalState(dirty: true)
+        schedulePersist()
         await prepareBot(botID: bot.id)
     }
 
@@ -186,7 +195,8 @@ final class AppModel {
         bots[index].color = botColors.contains(color) ? color : bots[index].color
         bots[index].shape = shape
         bots[index].notificationsEnabled = notificationsEnabled
-        await persist()
+        await persistLocalState(dirty: true)
+        schedulePersist()
     }
 
     func sendInitialMessageIfNeeded(botID: UUID) async {
@@ -262,7 +272,10 @@ final class AppModel {
             let installedIDs = Array(Set(selectedConnectorIDs).union(connectedIDs)).sorted()
             let changed = selectedConnectorIDs != installedIDs
             selectedConnectorIDs = installedIDs
-            if changed { await persist() }
+            if changed {
+                await persistLocalState(dirty: true)
+                schedulePersist()
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -292,7 +305,8 @@ final class AppModel {
             try await api.disconnectConnector(connectorID)
             selectedConnectorIDs.removeAll { $0 == connectorID }
             for index in bots.indices { bots[index].connectorIDs.removeAll { $0 == connectorID } }
-            await persist()
+            await persistLocalState(dirty: true)
+            schedulePersist()
             await refreshConnectors(force: true)
         } catch { report(error) }
     }
@@ -421,7 +435,8 @@ final class AppModel {
                     connectorPollingTask = nil
                     isBusy = false
                     browserRequest = nil
-                    await persist()
+                    await persistLocalState(dirty: true)
+                    schedulePersist()
                     await refreshConnectors(force: true)
                     return
                 }
@@ -452,32 +467,10 @@ final class AppModel {
         account = session.account
         profile = nil
         let cache = try await stateStore.load(accountID: session.account.id)
-        var state = cache.state
         accountStateRevision = cache.serverRevision
-        do {
-            let remote = try await api.accountState()
-            let shouldMigrateLocal = cache.dirty || (cache.serverRevision == 0 && hasUserState(cache.state))
-            state = shouldMigrateLocal ? mergeAccountStates(remote.state, cache.state) : remote.state
-            accountStateRevision = remote.revision
-            if shouldMigrateLocal {
-                let saved = try await api.saveAccountState(state, baseRevision: remote.revision)
-                state = saved.state
-                accountStateRevision = saved.revision
-            }
-            try await stateStore.save(
-                state, accountID: session.account.id,
-                serverRevision: accountStateRevision, dirty: false
-            )
-        } catch {
-            try await stateStore.save(
-                state, accountID: session.account.id,
-                serverRevision: accountStateRevision,
-                dirty: cache.dirty
-            )
-        }
-        bots = state.bots
-        selectedConnectorIDs = state.selectedConnectorIDs
-        if let active = state.activeBotID, bots.contains(where: { $0.id == active }) {
+        bots = cache.state.bots
+        selectedConnectorIDs = cache.state.selectedConnectorIDs
+        if let active = cache.state.activeBotID, bots.contains(where: { $0.id == active }) {
             destination = .bot(active)
         } else if let first = bots.first {
             destination = .bot(first.id)
@@ -487,10 +480,83 @@ final class AppModel {
         phase = .ready
         Task { [weak self] in
             guard let self else { return }
+            async let accountStateRefresh: Void = self.reconcileAccountState(
+                accountID: session.account.id,
+                cachedState: cache.state,
+                cachedDirty: cache.dirty
+            )
             async let profileRefresh: Void = self.refreshProfile(accountID: session.account.id)
             async let connectorRefresh: Void = self.refreshConnectors()
             async let billingRefresh: Void = self.refreshBilling()
-            _ = await (profileRefresh, connectorRefresh, billingRefresh)
+            _ = await (accountStateRefresh, profileRefresh, connectorRefresh, billingRefresh)
+        }
+    }
+
+    private func reconcileAccountState(
+        accountID: String,
+        cachedState: PersistedAccountState,
+        cachedDirty: Bool
+    ) async {
+        do {
+            let remote = try await api.accountState()
+            guard phase == .ready, account?.id == accountID else { return }
+            let live = currentState()
+            let hasLocalChanges = cachedDirty || live != cachedState
+            var resolved = hasLocalChanges
+                ? mergeAccountStates(remote.state, live)
+                : remote.state
+            var revision = remote.revision
+            if hasLocalChanges, resolved != remote.state {
+                do {
+                    let saved = try await api.saveAccountState(
+                        resolved, baseRevision: remote.revision
+                    )
+                    resolved = saved.state
+                    revision = saved.revision
+                } catch let service as ServiceError where service.status == 409 {
+                    let latest = try await api.accountState()
+                    resolved = mergeAccountStates(latest.state, currentState())
+                    let saved = try await api.saveAccountState(
+                        resolved, baseRevision: latest.revision
+                    )
+                    resolved = saved.state
+                    revision = saved.revision
+                }
+            }
+            guard !Task.isCancelled, phase == .ready, account?.id == accountID else { return }
+            // If another local mutation landed while reconciliation was in
+            // flight, keep it and let the serialized writer publish it next.
+            let latestLocal = currentState()
+            if latestLocal != live {
+                resolved = mergeAccountStates(resolved, latestLocal)
+                persistenceRequested = true
+            }
+            let currentDestination = destination
+            applyRemoteState(resolved)
+            switch currentDestination {
+            case let .some(.bot(id)) where bots.contains(where: { $0.id == id }):
+                destination = .bot(id)
+            case .some(.plugins):
+                destination = .plugins
+            case .some(.account):
+                destination = .account
+            default:
+                break
+            }
+            accountStateRevision = revision
+            try await stateStore.save(
+                currentState(), accountID: accountID,
+                serverRevision: revision, dirty: persistenceRequested
+            )
+            if persistenceRequested { schedulePersist() }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard phase == .ready, account?.id == accountID else { return }
+            // A free-tier host may be waking up. Keep local state available and
+            // use the conflict-aware writer as the retry path.
+            await persistLocalState(dirty: true)
+            schedulePersist()
         }
     }
 
@@ -525,6 +591,9 @@ final class AppModel {
                 id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
             ))
         }
+        // Make the outgoing turn crash-safe locally without blocking dispatch
+        // on the cross-region account-state API.
+        await persistLocalState(dirty: true)
         await awaitWarmAgentIfInFlight(botID: botID)
         do {
             let connectorIDs = initial
@@ -555,14 +624,14 @@ final class AppModel {
                 createdAt: createdAt
             )
             bots[index].messages = Array(bots[index].messages.suffix(200))
-            await persist()
+            await persistLocalState(dirty: true)
+            schedulePersist()
         } catch {
             if let index = bots.firstIndex(where: { $0.id == botID }) {
                 bots[index].messages.removeAll { $0.id == replyID }
             }
-            // Persist the user's message after a failed run too, but never
-            // delay dispatching the model request on account-state sync.
-            await persist()
+            await persistLocalState(dirty: true)
+            schedulePersist()
             report(error)
         }
     }
@@ -582,42 +651,92 @@ final class AppModel {
         )
     }
 
-    private func persist() async {
-        guard let account else { return }
+    private func currentState() -> PersistedAccountState {
         let activeBotID: UUID?
         if case let .bot(id) = destination { activeBotID = id } else { activeBotID = nil }
+        return PersistedAccountState(
+            bots: bots,
+            selectedConnectorIDs: selectedConnectorIDs,
+            activeBotID: activeBotID
+        )
+    }
+
+    private func persistLocalState(dirty: Bool) async {
+        guard let account else { return }
         do {
-            let local = PersistedAccountState(
-                    bots: bots,
-                    selectedConnectorIDs: selectedConnectorIDs,
-                    activeBotID: activeBotID
+            try await stateStore.save(
+                currentState(),
+                accountID: account.id,
+                serverRevision: accountStateRevision,
+                dirty: dirty
             )
+        } catch {
+            report(error)
+        }
+    }
+
+    private func schedulePersist() {
+        persistenceRequested = true
+        guard persistenceTask == nil else { return }
+        persistenceTask = Task { [weak self] in
+            guard let self else { return }
+            while self.persistenceRequested {
+                self.persistenceRequested = false
+                await self.persist()
+            }
+            self.persistenceTask = nil
+        }
+    }
+
+    private func persist() async {
+        guard let account else { return }
+        do {
+            let local = currentState()
             try await stateStore.save(
                 local, accountID: account.id,
                 serverRevision: accountStateRevision, dirty: true
             )
+            let saved: AccountStateSnapshot
             do {
-                let saved = try await api.saveAccountState(local, baseRevision: accountStateRevision)
-                applyRemoteState(saved.state)
-                accountStateRevision = saved.revision
+                saved = try await api.saveAccountState(local, baseRevision: accountStateRevision)
             } catch let service as ServiceError where service.status == 409 {
                 let remote = try await api.accountState()
                 let merged = mergeAccountStates(remote.state, local)
-                let saved = try await api.saveAccountState(merged, baseRevision: remote.revision)
+                saved = try await api.saveAccountState(merged, baseRevision: remote.revision)
+            }
+            guard !Task.isCancelled, self.account?.id == account.id else { return }
+            accountStateRevision = saved.revision
+            let current = currentState()
+            let finalState: PersistedAccountState
+            let remainsDirty: Bool
+            if current == local {
                 applyRemoteState(saved.state)
-                accountStateRevision = saved.revision
+                finalState = currentState()
+                remainsDirty = false
+            } else {
+                // A new turn arrived while the previous snapshot was in
+                // flight. Never overwrite it with the older server response;
+                // the serial persistence worker will send the newer state.
+                finalState = current
+                remainsDirty = true
+                persistenceRequested = true
             }
             try await stateStore.save(
-                PersistedAccountState(
-                    bots: bots,
-                    selectedConnectorIDs: selectedConnectorIDs,
-                    activeBotID: activeBotID
-                ),
+                finalState,
                 accountID: account.id,
                 serverRevision: accountStateRevision,
-                dirty: false
+                dirty: remainsDirty
             )
-        } catch { report(error) }
+        } catch is CancellationError {
+            return
+        } catch {
+            // The local state remains marked dirty and will be retried on the
+            // next mutation/activation. A transient sync failure must not
+            // interrupt chat with an unrelated modal alert.
+#if DEBUG
+            print("[AgentGenia.StateSync] \(error.localizedDescription)")
+#endif
+        }
     }
 
     private func applyRemoteState(_ state: PersistedAccountState) {
@@ -722,10 +841,6 @@ private actor AccountStateStore {
     }
 }
 
-private func hasUserState(_ state: PersistedAccountState) -> Bool {
-    state.onboardingCompleted || !state.bots.isEmpty || !state.selectedConnectorIDs.isEmpty
-}
-
 private func mergeAccountStates(
     _ server: PersistedAccountState,
     _ local: PersistedAccountState
@@ -745,7 +860,9 @@ private func mergeAccountStates(
             }
         }
         var merged = localBot
-        merged.connectorIDs = Array(Set(serverBot.connectorIDs + localBot.connectorIDs)).sorted()
+        // The device performing the conflict resolution owns mutable
+        // selections. Union would make disconnect/removal impossible forever.
+        merged.connectorIDs = Array(Set(localBot.connectorIDs)).sorted()
         merged.messages = Array(messages.values.sorted { $0.createdAt < $1.createdAt }.suffix(200))
         merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
         bots[localBot.id] = merged
@@ -758,9 +875,7 @@ private func mergeAccountStates(
     return PersistedAccountState(
         onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
         bots: mergedBots,
-        selectedConnectorIDs: Array(Set(
-            server.selectedConnectorIDs + local.selectedConnectorIDs
-        )).sorted(),
+        selectedConnectorIDs: Array(Set(local.selectedConnectorIDs)).sorted(),
         activeBotID: active
     )
 }
@@ -769,7 +884,7 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
     // Pi's warm session already retains the conversation. A short replay is
     // enough to recover context after a restart without resending a growing
     // transcript on every turn.
-    let history = bot.messages.suffix(8).map { message in
+    let history = bot.messages.suffix(4).map { message in
         "\(message.role == .user ? "Usuario" : bot.name): \(message.text)"
     }.joined(separator: "\n")
     let profile = [

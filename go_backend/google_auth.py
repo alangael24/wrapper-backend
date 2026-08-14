@@ -74,6 +74,8 @@ class GoogleAccountAuth:
         self.allow_secret_file = allow_secret_file
         self._rate: dict[str, _RateBucket] = defaultdict(_RateBucket)
         self._lock = threading.RLock()
+        self._access_cache: dict[str, tuple[float, dict]] = {}
+        self._access_cache_ttl_seconds = 30.0
         self._validate_configuration()
 
     @property
@@ -280,6 +282,9 @@ class GoogleAccountAuth:
                 status=401,
                 code="unauthorized",
             )
+        # Rotation revokes the previous access token. Do not let a short-lived
+        # hot-path cache keep accepting it after the durable session changed.
+        self.forget_user(str(account["user_id"]))
         return {
             "token": access_token,
             "refresh_token": next_refresh,
@@ -290,10 +295,41 @@ class GoogleAccountAuth:
     def authenticate(self, access_token: str) -> dict | None:
         if not access_token.startswith("aga_"):
             return None
-        return self.store.get_user_by_access_token(access_token)
+        cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+        with self._lock:
+            cached = self._access_cache.get(cache_key)
+            if cached is not None:
+                if cached[0] > now:
+                    return dict(cached[1])
+                self._access_cache.pop(cache_key, None)
+        user = self.store.get_user_by_access_token(access_token)
+        if user is None:
+            return None
+        token_seconds_left = max(
+            0.0, float(user.get("authenticated_until") or 0) - time.time()
+        )
+        expires = now + min(self._access_cache_ttl_seconds, token_seconds_left)
+        if expires > now:
+            with self._lock:
+                self._access_cache[cache_key] = (expires, dict(user))
+        return user
 
     def logout(self, access_token: str) -> bool:
+        cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._access_cache.pop(cache_key, None)
         return self.store.revoke_account_session(access_token)
+
+    def forget_user(self, user_id: str) -> None:
+        """Invalidate all cached sessions for an account after revocation."""
+        with self._lock:
+            stale = [
+                key for key, (_expires, user) in self._access_cache.items()
+                if str(user.get("id")) == user_id
+            ]
+            for key in stale:
+                self._access_cache.pop(key, None)
 
     def issue_session(self, *, account: dict, device_id: str) -> dict:
         """Issue the same opaque Agent Genia session for another verified IdP."""

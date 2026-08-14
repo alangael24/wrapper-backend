@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 import time
 
 from .tiers import TRIAL_CREDIT_MILLI
@@ -75,16 +76,23 @@ class CreditService:
         self.store = store
         self.config = config
         self._now = now
+        self._trial_users: set[str] = set()
+        self._trial_lock = threading.Lock()
 
     def ensure_trial(self, user_id: str) -> dict | None:
         if self.config.trial_credit_milli <= 0:
             return None
+        with self._trial_lock:
+            if user_id in self._trial_users:
+                return None
         source_key = f"trial:{user_id}"
         existing = self.store.get_credit_grant_by_source(source_key)
         if existing:
+            with self._trial_lock:
+                self._trial_users.add(user_id)
             return existing
         now = self._now()
-        return self.store.grant_credits(
+        granted = self.store.grant_credits(
             user_id=user_id,
             amount_milli=self.config.trial_credit_milli,
             source_type="trial",
@@ -93,6 +101,9 @@ class CreditService:
             expires_at=now + self.config.trial_ttl_days * 86_400,
             metadata={"ttl_days": self.config.trial_ttl_days},
         )
+        with self._trial_lock:
+            self._trial_users.add(user_id)
+        return granted
 
     def billable_milli(self, llm_cost_microusd: int, extra_cost_microusd: int = 0) -> int:
         return billable_credit_milli(

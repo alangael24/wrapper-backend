@@ -18,7 +18,18 @@ y versionado semántico para los clientes distribuidos.
 
 - Desktop, iOS y Android envían una clave de idempotencia y un máximo de
   créditos por trabajo; la facturación muestra el catálogo actual del backend.
-- El esquema de persistencia sube a la versión 11.
+- El esquema de persistencia sube a la versión 13.
+
+### Fixed
+
+- La ruta caliente de agentes ilimitados usa una sola reserva/liquidación SQL,
+  reutiliza la autenticación de cuenta y evita revalidar en PostgreSQL el token
+  efímero que el mismo proceso acaba de emitir.
+- iOS abre inmediatamente desde su estado local, reconcilia cambios entre
+  dispositivos en segundo plano y no bloquea el chat esperando esa escritura.
+- El streaming conserva widgets generados por el modelo, agrupa deltas para
+  reducir trabajo de UI y reintenta el precalentamiento idempotente tras un
+  corte transitorio de red.
 
 ## [1.0.1] - 2026-08-12
 

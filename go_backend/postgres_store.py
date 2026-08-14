@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import threading
+import time
 from contextlib import nullcontext
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .store import SCHEMA_VERSION, Store
+from .store import SCHEMA_VERSION, Store, new_id
 
 
 POSTGRES_WRITE_LOCK_ID = 6_913_322_107_743_045_083
@@ -170,6 +172,128 @@ class PostgresStore(Store):
         except Exception:
             self._conn.rollback()
             raise
+
+    def create_unmetered_agent_run(
+        self,
+        *,
+        user_id: str,
+        idempotency_key: str,
+        model: str,
+        browser: bool,
+        max_credit_milli: int,
+        max_concurrent_runs: int,
+        token_hash: str,
+        token_expires_at: float,
+    ) -> dict:
+        """Reserve an unlimited run in one Postgres round trip.
+
+        The regular credit path intentionally remains in ``Store``. Internal
+        unlimited accounts do not need grant scans or ledger allocations, and
+        doing those operations one statement at a time across regions added
+        several seconds before Pi could see a prompt.
+        """
+        now = time.time()
+        run_id = new_id("run")
+        reservation_id = new_id("rsv")
+        row = self._one(
+            "WITH locked AS MATERIALIZED ("
+            " SELECT pg_advisory_xact_lock(hashtextextended(?::text,0))"
+            "), existing AS MATERIALIZED ("
+            " SELECT ar.* FROM agent_runs ar,locked "
+            " WHERE ar.user_id=? AND ar.idempotency_key=?"
+            "), active AS MATERIALIZED ("
+            " SELECT COUNT(*)::bigint AS n FROM agent_runs ar,locked "
+            " WHERE ar.user_id=? AND ar.status IN ('reserved','running')"
+            "), inserted AS ("
+            " INSERT INTO agent_runs("
+            " id,user_id,idempotency_key,status,harness,model,browser,max_credit_milli,"
+            " reserved_credit_milli,created_at,heartbeat_at) "
+            " SELECT ?,?,?,'running','pi',?,?,?,0,?,? FROM active "
+            " WHERE active.n<? AND NOT EXISTS(SELECT 1 FROM existing) RETURNING *"
+            "), reservation AS ("
+            " INSERT INTO credit_reservations("
+            " id,user_id,run_id,reserved_milli,status,expires_at,created_at) "
+            " SELECT ?,user_id,id,0,'active',?,? FROM inserted RETURNING run_id"
+            "), token_inserted AS ("
+            " INSERT INTO agent_run_tokens(token_hash,user_id,run_id,expires_at,created_at) "
+            " SELECT ?,user_id,id,?,? FROM inserted RETURNING run_id"
+            ") SELECT 'duplicate' AS outcome,to_jsonb(existing) AS run FROM existing "
+            " UNION ALL SELECT 'inserted',to_jsonb(inserted) FROM inserted",
+            (
+                user_id,
+                user_id,
+                idempotency_key,
+                user_id,
+                run_id,
+                user_id,
+                idempotency_key,
+                model,
+                int(browser),
+                max_credit_milli,
+                now,
+                now,
+                max_concurrent_runs,
+                reservation_id,
+                token_expires_at,
+                now,
+                token_hash,
+                token_expires_at,
+                now,
+            ),
+        )
+        if row is None:
+            raise RuntimeError("credit_concurrency_limit")
+        return {
+            "duplicate": row["outcome"] == "duplicate",
+            "run": dict(row["run"]),
+        }
+
+    def settle_unmetered_agent_run(
+        self,
+        *,
+        run_id: str,
+        final_status: str,
+        duration_seconds: float | None,
+        error_code: str | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict:
+        """Finish an unlimited run and revoke its token in one statement."""
+        now = time.time()
+        row = self._one(
+            "WITH revoked AS ("
+            " UPDATE agent_run_tokens SET revoked_at=? "
+            " WHERE run_id=? AND revoked_at IS NULL RETURNING run_id"
+            "), reservation AS ("
+            " UPDATE credit_reservations SET charged_milli=0,status='settled',settled_at=? "
+            " WHERE run_id=? AND status='active' RETURNING run_id"
+            "), updated AS ("
+            " UPDATE agent_runs SET status=?,charged_credit_milli=0,"
+            " llm_cost_microusd=(SELECT COALESCE(SUM(estimated_cost_microusd),0) "
+            " FROM usage_events WHERE run_id=?),duration_seconds=?,error_code=?,"
+            " warnings_json=?,finished_at=?,heartbeat_at=? "
+            " WHERE id=? AND status IN ('reserved','running') RETURNING *"
+            ") SELECT to_jsonb(updated) AS run FROM updated",
+            (
+                now,
+                run_id,
+                now,
+                run_id,
+                final_status,
+                run_id,
+                duration_seconds,
+                error_code,
+                json.dumps(warnings or [], separators=(",", ":")),
+                now,
+                now,
+                run_id,
+            ),
+        )
+        if row is not None:
+            return dict(row["run"])
+        existing = self.get_agent_run(run_id)
+        if existing is None:
+            raise KeyError(run_id)
+        return existing
 
     def health(self) -> dict:
         try:

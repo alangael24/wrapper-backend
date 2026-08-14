@@ -1261,7 +1261,8 @@ class Store:
 
     def get_user_by_access_token(self, access_token: str) -> dict | None:
         row = self._one(
-            "SELECT u.*,gs.id AS provider_subscription_id,"
+            "SELECT u.*,s.access_expires_at AS authenticated_until,"
+            "gs.id AS provider_subscription_id,"
             "gs.api_key_enc AS provider_api_key_enc,gs.key_id AS provider_key_id,"
             "gs.key_version AS provider_key_version,gs.status AS provider_subscription_status,"
             "gs.assigned_user_id AS provider_assigned_user_id "
@@ -1934,6 +1935,36 @@ class Store:
                 self._conn.rollback()
                 raise
 
+    def create_unmetered_agent_run(
+        self,
+        *,
+        user_id: str,
+        idempotency_key: str,
+        model: str,
+        browser: bool,
+        max_credit_milli: int,
+        max_concurrent_runs: int,
+        token_hash: str,
+        token_expires_at: float,
+    ) -> dict:
+        """Create an unlimited/internal run without credit-ledger work.
+
+        SQLite keeps the regular implementation as the compatibility path.
+        Postgres overrides this with one server-side statement so production
+        does not pay a network round trip for every ledger operation.
+        """
+        return self.create_agent_run(
+            user_id=user_id,
+            idempotency_key=idempotency_key,
+            model=model,
+            browser=browser,
+            max_credit_milli=max_credit_milli,
+            max_concurrent_runs=max_concurrent_runs,
+            token_hash=token_hash,
+            token_expires_at=token_expires_at,
+            enforce=False,
+        )
+
     def mark_agent_run_running(self, run_id: str) -> None:
         now = _now()
         self._exec(
@@ -2075,6 +2106,25 @@ class Store:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def settle_unmetered_agent_run(
+        self,
+        *,
+        run_id: str,
+        final_status: str,
+        duration_seconds: float | None,
+        error_code: str | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict:
+        """Settle an unlimited/internal run without credit calculations."""
+        return self.settle_agent_run(
+            run_id=run_id,
+            charged_milli=0,
+            final_status=final_status,
+            duration_seconds=duration_seconds,
+            error_code=error_code,
+            warnings=warnings,
+        )
 
     def release_agent_run(
         self,

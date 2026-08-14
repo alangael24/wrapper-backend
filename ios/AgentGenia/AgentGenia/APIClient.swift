@@ -438,11 +438,24 @@ actor APIClient {
     }
 
     func warmAgent(botID: UUID) async throws {
-        let response: AgentWarmResponse = try await request(
-            "/v1/agent/warm",
-            method: "POST",
-            body: AgentWarmRequest(botID: botID.uuidString.lowercased())
-        )
+        let response: AgentWarmResponse
+        do {
+            response = try await request(
+                "/v1/agent/warm",
+                method: "POST",
+                body: AgentWarmRequest(botID: botID.uuidString.lowercased())
+            )
+        } catch let service as ServiceError where service.status == 0 {
+            // Warming is idempotent. Render can close the first connection
+            // while waking an idle service, so retry it once instead of
+            // leaving the first real message to pay the full cold start.
+            try await Task.sleep(for: .milliseconds(250))
+            response = try await request(
+                "/v1/agent/warm",
+                method: "POST",
+                body: AgentWarmRequest(botID: botID.uuidString.lowercased())
+            )
+        }
         guard response.ready else {
             throw ServiceError(
                 message: "El agente todavía no está listo.",
@@ -627,6 +640,8 @@ actor APIClient {
         var parser = ServerSentEventParser()
         var finalResponse: AgentRunResponse?
         var streamedText = ""
+        var pendingDelta = ""
+        var lastDeltaFlush = Date.distantPast
 
         func decode(_ event: ServerSentEvent) throws -> (delta: String?, response: AgentRunResponse?) {
             if event.name == "delta" {
@@ -677,7 +692,14 @@ actor APIClient {
                     let decoded = try decode(event)
                     if let delta = decoded.delta {
                         streamedText += delta
-                        await onDelta(delta)
+                        pendingDelta += delta
+                        if pendingDelta.count >= 24
+                            || Date().timeIntervalSince(lastDeltaFlush) >= 0.04 {
+                            let value = pendingDelta
+                            pendingDelta = ""
+                            lastDeltaFlush = Date()
+                            await onDelta(value)
+                        }
                     }
                     if let response = decoded.response {
                         finalResponse = response
@@ -688,7 +710,14 @@ actor APIClient {
                 let decoded = try decode(event)
                 if let delta = decoded.delta {
                     streamedText += delta
-                    await onDelta(delta)
+                    pendingDelta += delta
+                    if pendingDelta.count >= 24
+                        || Date().timeIntervalSince(lastDeltaFlush) >= 0.04 {
+                        let value = pendingDelta
+                        pendingDelta = ""
+                        lastDeltaFlush = Date()
+                        await onDelta(value)
+                    }
                 }
                 if let response = decoded.response {
                     finalResponse = response
@@ -706,6 +735,11 @@ actor APIClient {
             } else {
                 throw networkError(error, path: path)
             }
+        }
+        if !pendingDelta.isEmpty {
+            let value = pendingDelta
+            pendingDelta = ""
+            await onDelta(value)
         }
         if finalResponse == nil, !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // The final metadata frame can be lost when an intermediary closes

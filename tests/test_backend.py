@@ -156,7 +156,9 @@ class WrapperServer:
         self.backend.pi.backend_url = self.base
         self.backend.pi.connector_broker_url = self.base
         self.backend.pi.runs_dir = Path(self.cfg.db_path).parent / "pi-runs"
-        self.backend.pi.timeout_seconds = 5
+        # Process startup on loaded macOS/Linux CI runners can exceed five
+        # seconds even though the fake model itself is immediate.
+        self.backend.pi.timeout_seconds = 8
         if browser:
             fake_root = Path(self.cfg.db_path).parent / "fake-pi-chrome"
             fake_extension = fake_root / "index.ts"
@@ -518,6 +520,22 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(me["email"], "alan@example.com")
         self.assertEqual(me["tier"], "free")
+
+        # Mobile requests with the opaque account token use a bounded hot
+        # cache instead of paying one cross-region session lookup per endpoint.
+        original_lookup = self.ws.backend.store.get_user_by_access_token
+        with patch.object(
+            self.ws.backend.store,
+            "get_user_by_access_token",
+            wraps=original_lookup,
+        ) as lookup:
+            for _ in range(2):
+                status, _ = self.ws.req(
+                    "GET", "/v1/me",
+                    headers={"Authorization": f"Bearer {completed['token']}"},
+                )
+                self.assertEqual(status, 200)
+            self.assertEqual(lookup.call_count, 0)
 
         status, _ = self.ws.req(
             "POST",
@@ -1424,7 +1442,10 @@ class TestBackend(unittest.TestCase):
                     lines[1].removeprefix("data: ")
                 ).decode("utf-8")
         self.assertEqual("".join(deltas), "hola rápido")
-        self.assertEqual(final, "hola rápido")
+        self.assertEqual(
+            json.loads(final),
+            {"text": "hola rápido", "widget": None},
+        )
         run_id = next(
             json.loads(frame.splitlines()[1].removeprefix("data: "))["run_id"]
             for frame in frames

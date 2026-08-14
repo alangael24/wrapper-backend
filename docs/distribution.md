@@ -13,9 +13,9 @@ Actualiza de forma coordinada `package.json`, `MARKETING_VERSION` de iOS y
 accidente:
 
 ```text
-desktop-v1.0.1   → GitHub Release + canal electron-updater (macOS/Linux; Windows al añadir firma)
-ios-v1.0.1       → App Store Connect / TestFlight
-android-v1.0.1   → GitHub Release del AAB firmado; promoción posterior a Google Play
+desktop-v1.0.8   → GitHub Release + canal electron-updater (macOS/Linux; Windows al añadir firma)
+ios-v1.0.8       → App Store Connect / TestFlight
+android-v1.0.8   → GitHub Release del AAB firmado; promoción posterior a Google Play
 ```
 
 Los build numbers móviles se derivan determinísticamente de SemVer y una revisión
@@ -182,6 +182,8 @@ Las migraciones `20260813143000_deepseek_direct.sql` y
 añade wallets, grants, reservas, ledger, runs y tokens efímeros. Deben aplicarse
 antes de desplegar el binario; el verificador de release
 impide publicar si el historial local deja de coincidir con el historial remoto.
+Las migraciones posteriores de proveedor por cuenta y sincronización elevan el
+esquema vigente a la versión 13.
 
 Producción inicia con `CREDITS_MODE=shadow`. Antes de cambiar a `enforce`, valida
 7–14 días de costos reales, grants por periodo y liberación de reservas. Stripe
