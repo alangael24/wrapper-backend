@@ -1940,7 +1940,15 @@ class Backend:
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
         if event_stream:
-            event_stream.done(payload)
+            # The terminal frame is intentionally minimal and contains the
+            # same human-readable text emitted by `delta`. Runtime metadata is
+            # already persisted server-side; putting the full accounting
+            # payload in this frame made mobile clients decode unrelated
+            # optional fields before they could accept the answer.
+            visible_answer = _partial_json_text(result.answer)
+            event_stream.done({
+                "answer": visible_answer if visible_answer is not None else result.answer,
+            })
         else:
             json_response(handler, 200, payload)
         self._run_timing_snapshot(run_id, pop=True)

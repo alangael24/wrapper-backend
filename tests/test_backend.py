@@ -1421,20 +1421,24 @@ class TestBackend(unittest.TestCase):
             elif event == "done":
                 final = payload
         self.assertEqual("".join(deltas), "hola rápido")
-        self.assertEqual(
-            json.loads(final["answer"]),
-            {"text": "hola rápido", "widget": None},
+        self.assertEqual(final, {"answer": "hola rápido"})
+        run_id = next(
+            json.loads(frame.splitlines()[1].removeprefix("data: "))["run_id"]
+            for frame in frames
+            if frame.splitlines()[0] == "event: start"
         )
-        timings = final["timings"]
+        saved_run = self.ws.backend.store.get_agent_run(run_id)
+        timings = json.loads(saved_run["warnings_json"])[0]
+        self.assertTrue(timings.startswith("timing:"))
+        timing_payload = json.loads(timings.removeprefix("timing:"))
         for name in (
             "run_reserved_ms", "pi_dispatch_ms", "proxy_received_ms",
             "upstream_request_ms", "upstream_complete_ms", "pi_first_text_ms",
-            "pi_complete_ms", "response_ready_ms",
+            "pi_complete_ms",
         ):
-            self.assertIn(name, timings)
-        self.assertLessEqual(timings["upstream_request_ms"], timings["upstream_complete_ms"])
-        self.assertLessEqual(timings["pi_first_text_ms"], timings["pi_complete_ms"])
-        saved_run = self.ws.backend.store.get_agent_run(final["run_id"])
+            self.assertIn(name, timing_payload)
+        self.assertLessEqual(timing_payload["upstream_request_ms"], timing_payload["upstream_complete_ms"])
+        self.assertLessEqual(timing_payload["pi_first_text_ms"], timing_payload["pi_complete_ms"])
         warnings = json.loads(saved_run["warnings_json"])
         self.assertEqual(len(warnings), 1)
         self.assertTrue(warnings[0].startswith("timing:"))
