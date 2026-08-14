@@ -282,7 +282,10 @@ class Config:
         ).rstrip("/")
         self.pi_runs_dir = Path(os.environ.get("PI_RUNS_DIR", str(DEFAULT_PI_RUNS)))
         self.pi_model = os.environ.get("PI_MODEL", "deepseek-v4-flash")
-        self.pi_thinking = os.environ.get("PI_THINKING", "high")
+        # Fast is the product default. Complex computer/tool tasks can still
+        # deliberate inside the harness, but ordinary chat should not pay the
+        # latency of forcing maximum reasoning on every turn.
+        self.pi_thinking = os.environ.get("PI_THINKING", "low")
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
@@ -1947,6 +1950,11 @@ class Backend:
         payload["computer_enabled"] = computer_enabled
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
+        logging.info(
+            "agent timing run_id=%s timings=%s",
+            run_id,
+            json.dumps(payload["timings"], separators=(",", ":")),
+        )
         if event_stream:
             # The terminal frame is intentionally minimal and contains the
             # same human-readable text emitted by `delta`. Runtime metadata is

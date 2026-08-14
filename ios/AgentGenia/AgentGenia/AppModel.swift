@@ -229,6 +229,16 @@ final class AppModel {
         if ready { warmedBotUntil[botID] = Date().addingTimeInterval(10 * 60) }
     }
 
+    private func awaitWarmAgentIfInFlight(botID: UUID) async {
+        // The bot screen starts prewarming in the background. Reuse that work
+        // when it exists, but do not create a second HTTP request on Send: the
+        // agent run can start the same persistent Pi session itself.
+        guard let task = agentWarmTasks[botID] else { return }
+        let ready = await task.value
+        agentWarmTasks[botID] = nil
+        if ready { warmedBotUntil[botID] = Date().addingTimeInterval(10 * 60) }
+    }
+
     func refreshConnectors(force: Bool = false) async {
         if !force, Date().timeIntervalSince(lastConnectorRefresh) < Self.refreshFreshness { return }
         if let existing = connectorRefreshTask {
@@ -508,7 +518,6 @@ final class AppModel {
             bots[index].messages.append(BotMessage(
                 id: UUID(), role: .user, text: userText, widget: nil, createdAt: Date()
             ))
-            await persist()
         }
         let replyID = UUID()
         if let index = bots.firstIndex(where: { $0.id == botID }) {
@@ -516,7 +525,7 @@ final class AppModel {
                 id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
             ))
         }
-        await warmAgent(botID: botID)
+        await awaitWarmAgentIfInFlight(botID: botID)
         do {
             let connectorIDs = initial
                 ? []
@@ -551,6 +560,9 @@ final class AppModel {
             if let index = bots.firstIndex(where: { $0.id == botID }) {
                 bots[index].messages.removeAll { $0.id == replyID }
             }
+            // Persist the user's message after a failed run too, but never
+            // delay dispatching the model request on account-state sync.
+            await persist()
             report(error)
         }
     }
@@ -754,7 +766,10 @@ private func mergeAccountStates(
 }
 
 private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) -> String {
-    let history = bot.messages.suffix(20).map { message in
+    // Pi's warm session already retains the conversation. A short replay is
+    // enough to recover context after a restart without resending a growing
+    // transcript on every turn.
+    let history = bot.messages.suffix(8).map { message in
         "\(message.role == .user ? "Usuario" : bot.name): \(message.text)"
     }.joined(separator: "\n")
     let profile = [
