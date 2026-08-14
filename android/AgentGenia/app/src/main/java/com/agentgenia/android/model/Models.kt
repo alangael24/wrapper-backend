@@ -114,6 +114,20 @@ data class BillingSnapshot(
     val plans: Map<String, BillingPlan>,
 )
 
+data class WhatsAppStatus(
+    val configured: Boolean,
+    val connected: Boolean,
+    val displayName: String,
+    val phoneHint: String,
+    val activeBotId: String?,
+)
+
+data class WhatsAppLinkStart(
+    val code: String,
+    val expiresAt: Long,
+    val url: String,
+)
+
 enum class ComputerState { Disabled, Pulling, Running, Hibernated, Off, Error }
 
 data class ComputerSnapshot(

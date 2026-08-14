@@ -96,6 +96,7 @@ private struct DeleteAccountRequest: Encodable, Sendable {
 }
 
 private struct DeleteAccountResponse: Decodable, Sendable { let deleted: Bool }
+private struct WhatsAppUnlinkResponse: Decodable, Sendable { let disconnected: Bool }
 
 private struct AttemptStatusRequest: Encodable, Sendable {
     let attemptID: String
@@ -506,6 +507,24 @@ actor APIClient {
             "/v1/billing/portal", method: "POST", body: EmptyBody()
         )
         return try safeURL(response.portalURL, hosts: ["billing.stripe.com"])
+    }
+
+    func whatsAppStatus() async throws -> WhatsAppStatus {
+        try await request("/v1/whatsapp/status", body: Optional<EmptyBody>.none)
+    }
+
+    func startWhatsAppLink() async throws -> (WhatsAppLinkStart, URL) {
+        let response: WhatsAppLinkStart = try await request(
+            "/v1/whatsapp/link", method: "POST", body: EmptyBody()
+        )
+        return (response, try safeURL(response.url, hosts: ["wa.me"]))
+    }
+
+    func unlinkWhatsApp() async throws -> WhatsAppStatus {
+        let _: WhatsAppUnlinkResponse = try await request(
+            "/v1/whatsapp/unlink", method: "POST", body: EmptyBody()
+        )
+        return try await whatsAppStatus()
     }
 
     private func request<Response: Decodable & Sendable, Body: Encodable & Sendable>(

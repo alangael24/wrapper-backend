@@ -350,6 +350,34 @@ struct BillingSnapshot: Codable, Equatable, Sendable {
     let plans: [String: BillingPlan]
 }
 
+struct WhatsAppStatus: Codable, Equatable, Sendable {
+    let configured: Bool
+    let connected: Bool
+    let displayName: String
+    let phoneHint: String
+    let activeBotID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, connected
+        case displayName = "display_name"
+        case phoneHint = "phone_hint"
+        case activeBotID = "active_bot_id"
+    }
+}
+
+struct WhatsAppLinkStart: Codable, Equatable, Sendable {
+    let configured: Bool
+    let connected: Bool
+    let code: String
+    let expiresAt: Double
+    let url: String
+
+    enum CodingKeys: String, CodingKey {
+        case configured, connected, code, url
+        case expiresAt = "expires_at"
+    }
+}
+
 enum ComputerState: String, Codable, Sendable {
     case disabled, pulling, running, hibernated, off, error
 }
@@ -372,7 +400,7 @@ struct ComputerSnapshot: Codable, Equatable, Sendable {
 }
 
 struct BrowserRequest: Identifiable, Equatable {
-    enum Purpose: Equatable { case account, connector(String), billing, computer }
+    enum Purpose: Equatable { case account, connector(String), billing, whatsapp, computer }
     let id = UUID()
     let url: URL
     let purpose: Purpose

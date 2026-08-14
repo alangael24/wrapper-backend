@@ -11,6 +11,10 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   POST /v1/account/delete        Eliminar definitivamente la cuenta autenticada
   GET  /v1/account-state         Leer bots y preferencias sincronizados
   POST /v1/account-state         Guardar estado con control de revisión
+  POST /v1/whatsapp/link         Generar un enlace de vinculación de un solo uso
+  GET  /v1/whatsapp/status       Consultar la identidad de WhatsApp vinculada
+  POST /v1/whatsapp/unlink       Desvincular WhatsApp de la cuenta
+  GET|POST /v1/whatsapp/webhook  Verificación y eventos firmados de Meta
   GET  /v1/connectors            Catalogo y conexiones del usuario
   GET  /v1/connectors/<id>       Estado de una cuenta conectada
   POST /v1/connectors/start      Crear un Connect Link de Composio
@@ -52,6 +56,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import io
 import json
 import logging
 import os
@@ -108,6 +113,21 @@ from .tiers import (
     tier_label,
 )
 from .upstream import DEFAULT_UA, proxy_request
+from .whatsapp import (
+    WhatsAppCloudAPI,
+    WhatsAppConfig,
+    WhatsAppError,
+    parse_webhook_messages,
+    verify_webhook_signature,
+)
+from .whatsapp_agent import (
+    build_bot_prompt as build_whatsapp_bot_prompt,
+    create_bot_from_request,
+    extract_link_code,
+    parse_agent_answer as parse_whatsapp_agent_answer,
+    requested_bot,
+    wants_bot_list,
+)
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "wrapper.sqlite"
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "secret.key"
@@ -129,6 +149,7 @@ DEFAULT_OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
 MAX_BODY = 16 * 1024 * 1024
 MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
+MAX_WHATSAPP_WEBHOOK_BODY = 1024 * 1024
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database"})
@@ -354,6 +375,22 @@ class Config:
         self.public_legacy_signup_enabled = (
             os.environ.get("PUBLIC_LEGACY_SIGNUP_ENABLED", signup_default) == "1"
         )
+        self.whatsapp_enabled = os.environ.get("WHATSAPP_ENABLED", "0") == "1"
+        self.whatsapp_verify_token = (os.environ.get("WHATSAPP_VERIFY_TOKEN") or "").strip()
+        self.whatsapp_app_secret = (os.environ.get("WHATSAPP_APP_SECRET") or "").strip()
+        self.whatsapp_access_token = (os.environ.get("WHATSAPP_ACCESS_TOKEN") or "").strip()
+        self.whatsapp_phone_number_id = (
+            os.environ.get("WHATSAPP_PHONE_NUMBER_ID") or ""
+        ).strip()
+        self.whatsapp_public_number = re.sub(
+            r"\D", "", os.environ.get("WHATSAPP_PUBLIC_NUMBER") or ""
+        )
+        self.whatsapp_graph_version = (
+            os.environ.get("WHATSAPP_GRAPH_VERSION") or "v23.0"
+        ).strip()
+        self.whatsapp_link_ttl_seconds = int(
+            os.environ.get("WHATSAPP_LINK_TTL_SECONDS", "600")
+        )
 
 
 def validate_runtime_security(cfg: Config) -> None:
@@ -366,6 +403,19 @@ def validate_runtime_security(cfg: Config) -> None:
         raise UnsafeConfigurationError(
             "PI_SESSION_IDLE_SECONDS y PI_MAX_WARM_SESSIONS no son válidos"
         )
+    try:
+        WhatsAppConfig(
+            enabled=cfg.whatsapp_enabled,
+            verify_token=cfg.whatsapp_verify_token,
+            app_secret=cfg.whatsapp_app_secret,
+            access_token=cfg.whatsapp_access_token,
+            phone_number_id=cfg.whatsapp_phone_number_id,
+            public_number=cfg.whatsapp_public_number,
+            graph_version=cfg.whatsapp_graph_version,
+            link_ttl_seconds=cfg.whatsapp_link_ttl_seconds,
+        ).validate()
+    except ValueError as exc:
+        raise UnsafeConfigurationError(f"Configuración de WhatsApp inválida: {exc}") from exc
     if cfg.environment == "production":
         missing = [
             name
@@ -660,6 +710,17 @@ def connector_html_response(handler: BaseHTTPRequestHandler, status: int, body: 
     handler.wfile.write(body)
 
 
+def plain_text_response(handler: BaseHTTPRequestHandler, status: int, value: str) -> None:
+    body = value.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store, max-age=0")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 def account_deletion_html() -> bytes:
     return """<!doctype html><html lang='es'><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -674,6 +735,48 @@ a{display:inline-block;background:#171717;color:white;padding:13px 18px;border-r
 <p>Solo conservaremos información cuando una obligación legal, fiscal o antifraude lo requiera.</p></section></main></body></html>""".encode("utf-8")
 
 
+class _InternalAgentHandler:
+    """In-process JSON handler that reuses the public agent-run contract.
+
+    WhatsApp webhooks run asynchronously but must pass through the exact same
+    validation, credit reservation, connector grants, and durable result path
+    as desktop/mobile requests. The principal is an object reference set only
+    by Backend code; it cannot be supplied over HTTP.
+    """
+
+    def __init__(self, user: dict, payload: dict):
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.agentgenia_internal_user = user
+        self.command = "POST"
+        self.path = "/v1/agent/run"
+        self.headers = {"content-length": str(len(body)), "content-type": "application/json"}
+        self.rfile = io.BytesIO(body)
+        self.wfile = io.BytesIO()
+        self.client_address = ("127.0.0.1", 0)
+        self.request_id = "req_whatsapp_" + secrets.token_hex(8)
+        self.close_connection = False
+        self.status = 0
+        self.response_headers: dict[str, str] = {}
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, name: str, value: str) -> None:
+        self.response_headers[name.lower()] = value
+
+    def end_headers(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        try:
+            value = json.loads(self.wfile.getvalue())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("La ejecución interna devolvió JSON inválido") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("La ejecución interna devolvió una respuesta inválida")
+        return value
+
+
 class Backend:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -683,12 +786,25 @@ class Backend:
         self._run_providers: dict[str, dict[str, Any]] = {}
         self._run_principal_lock = threading.Lock()
         self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self._whatsapp_wake = threading.Event()
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         cfg.secret_file.parent.mkdir(parents=True, exist_ok=True)
         self.store = create_store(database_url=cfg.database_url, db_path=cfg.db_path)
         self.credits = CreditService(self.store, cfg.credits)
+        self.whatsapp = WhatsAppCloudAPI(
+            WhatsAppConfig(
+                enabled=cfg.whatsapp_enabled,
+                verify_token=cfg.whatsapp_verify_token,
+                app_secret=cfg.whatsapp_app_secret,
+                access_token=cfg.whatsapp_access_token,
+                phone_number_id=cfg.whatsapp_phone_number_id,
+                public_number=cfg.whatsapp_public_number,
+                graph_version=cfg.whatsapp_graph_version,
+                link_ttl_seconds=cfg.whatsapp_link_ttl_seconds,
+            )
+        )
         try:
             billing_config = BillingConfig.from_values(
                 enabled=cfg.stripe_enabled,
@@ -814,6 +930,12 @@ class Backend:
         )
         self._run_retention_once()
         threading.Thread(target=self._retention_loop, daemon=True).start()
+        if self.whatsapp.config.configured:
+            threading.Thread(
+                target=self._whatsapp_worker_loop,
+                name="agentgenia-whatsapp",
+                daemon=True,
+            ).start()
 
     def _run_retention_once(self) -> None:
         try:
@@ -993,6 +1115,9 @@ class Backend:
         return None
 
     def require_user(self, handler: BaseHTTPRequestHandler) -> dict | None:
+        internal_user = getattr(handler, "agentgenia_internal_user", None)
+        if isinstance(internal_user, dict) and internal_user.get("account_status") == "active":
+            return internal_user
         key = self.bearer(handler)
         if not key:
             error_response(handler, 401, "Falta Authorization: Bearer <api_key>", "unauthorized")
@@ -1278,6 +1403,409 @@ class Backend:
             return
         json_response(handler, 200, self._account_state_payload(row))
 
+    # ---------- canal oficial de WhatsApp ----------
+    def handle_whatsapp_link_start(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        if not self.whatsapp.config.configured:
+            error_response(handler, 503, "WhatsApp todavía no está habilitado", "whatsapp_unavailable")
+            return
+        if not self.store.consume_rate_limit(
+            f"whatsapp-link:{user['id']}", limit=5, window_seconds=600
+        ):
+            error_response(handler, 429, "Espera antes de generar otro enlace", "rate_limit")
+            return
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        raw = "".join(secrets.choice(alphabet) for _ in range(8))
+        code = f"AG-{raw[:4]}-{raw[4:]}"
+        expires_at = time.time() + self.whatsapp.config.link_ttl_seconds
+        self.store.create_whatsapp_link_code(
+            user_id=user["id"], code=code, expires_at=expires_at
+        )
+        json_response(handler, 201, {
+            "configured": True,
+            "connected": False,
+            "code": code,
+            "expires_at": expires_at,
+            "url": self.whatsapp.link_url(code),
+        })
+
+    def handle_whatsapp_status(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        link = self.store.get_whatsapp_link_for_user(user["id"])
+        json_response(handler, 200, {
+            "configured": self.whatsapp.config.configured,
+            "connected": bool(link),
+            "display_name": (link or {}).get("display_name") or "",
+            "phone_hint": (
+                f"••••{str(link['wa_user_id'])[-4:]}" if link else ""
+            ),
+            "active_bot_id": (link or {}).get("active_bot_id"),
+        })
+
+    def handle_whatsapp_unlink(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, {
+            "disconnected": self.store.delete_whatsapp_link(user["id"])
+        })
+
+    def handle_whatsapp_webhook_verification(
+        self, handler: BaseHTTPRequestHandler, query: dict[str, list[str]]
+    ) -> None:
+        mode = (query.get("hub.mode") or [""])[0]
+        token = (query.get("hub.verify_token") or [""])[0]
+        challenge = (query.get("hub.challenge") or [""])[0]
+        if (
+            not self.whatsapp.config.configured
+            or mode != "subscribe"
+            or not token
+            or not hmac.compare_digest(token, self.whatsapp.config.verify_token)
+            or not challenge
+        ):
+            plain_text_response(handler, 403, "Forbidden")
+            return
+        plain_text_response(handler, 200, challenge)
+
+    def handle_whatsapp_webhook(self, handler: BaseHTTPRequestHandler) -> None:
+        if not self.whatsapp.config.configured:
+            error_response(handler, 404, "Endpoint no disponible", "not_found")
+            return
+        body = self.read_body(handler, max_bytes=MAX_WHATSAPP_WEBHOOK_BODY)
+        if not verify_webhook_signature(
+            body,
+            handler.headers.get("X-Hub-Signature-256", ""),
+            self.whatsapp.config.app_secret,
+        ):
+            error_response(handler, 401, "Firma de webhook inválida", "invalid_signature")
+            return
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestBodyError("Webhook de WhatsApp inválido") from exc
+        accepted = 0
+        for message in parse_webhook_messages(payload):
+            if message["phone_number_id"] != self.whatsapp.config.phone_number_id:
+                continue
+            durable_payload = dict(message["payload"])
+            durable_payload["_agentgenia_display_name"] = message["display_name"]
+            if self.store.enqueue_whatsapp_message(
+                message_id=message["message_id"],
+                phone_number_id=message["phone_number_id"],
+                wa_user_id=message["wa_user_id"],
+                message_type=message["message_type"],
+                text=message["text"],
+                payload=durable_payload,
+            ):
+                accepted += 1
+        if accepted:
+            self._whatsapp_wake.set()
+        # Meta needs an immediate 2xx. Durable processing happens after this.
+        json_response(handler, 200, {"received": True, "accepted": accepted})
+
+    def _whatsapp_worker_loop(self) -> None:
+        while True:
+            try:
+                message = self.store.claim_whatsapp_message()
+                if message is None:
+                    self._whatsapp_wake.wait(2)
+                    self._whatsapp_wake.clear()
+                    continue
+                try:
+                    self._process_whatsapp_message(message)
+                except WhatsAppError as exc:
+                    logging.warning(
+                        "WhatsApp transport failure message_id=%s error=%s",
+                        message.get("message_id"),
+                        exc,
+                    )
+                    self.store.retry_whatsapp_message(
+                        message_id=message["message_id"], error=str(exc)
+                    )
+                except Exception as exc:
+                    logging.exception(
+                        "WhatsApp worker failure message_id=%s", message.get("message_id")
+                    )
+                    self.store.retry_whatsapp_message(
+                        message_id=message["message_id"], error=type(exc).__name__
+                    )
+            except Exception:
+                logging.exception("WhatsApp queue polling failed")
+                self._whatsapp_wake.wait(5)
+                self._whatsapp_wake.clear()
+
+    def _process_whatsapp_message(self, message: dict) -> None:
+        message_id = str(message["message_id"])
+        sender = str(message["wa_user_id"])
+        phone_number_id = str(message["phone_number_id"])
+        text = str(message.get("text") or "").strip()
+        try:
+            raw_payload = json.loads(message.get("payload_json") or "{}")
+        except json.JSONDecodeError:
+            raw_payload = {}
+        display_name = (
+            raw_payload.get("_agentgenia_display_name", "")
+            if isinstance(raw_payload, dict)
+            else ""
+        )
+        display_name = display_name if isinstance(display_name, str) else ""
+        link = self.store.get_whatsapp_link_for_sender(
+            wa_user_id=sender, phone_number_id=phone_number_id
+        )
+        code = extract_link_code(text)
+        if code:
+            if link:
+                answer = "Este WhatsApp ya está vinculado con tu cuenta de Agentgenia. Ya puedes pedirme una tarea."
+                outbound = self.whatsapp.send_text(
+                    to=sender, text=answer, reply_to_message_id=message_id
+                )
+                self.store.complete_whatsapp_message(
+                    message_id=message_id,
+                    status="succeeded",
+                    result_text=answer,
+                    outbound_message_id=outbound,
+                    user_id=link["user_id"],
+                )
+                return
+            link = self.store.consume_whatsapp_link_code(
+                code=code,
+                wa_user_id=sender,
+                phone_number_id=phone_number_id,
+                display_name=display_name,
+            )
+            if link:
+                answer = (
+                    "Listo: tu WhatsApp quedó vinculado con Agentgenia. "
+                    "Puedes pedirme que cree un agente, elegir uno por su nombre o asignarle una tarea."
+                )
+            else:
+                answer = "Ese código no es válido o ya expiró. Genera uno nuevo desde Agentgenia."
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id,
+                status="succeeded",
+                result_text=answer,
+                outbound_message_id=outbound,
+                user_id=(link or {}).get("user_id"),
+            )
+            return
+        if not link:
+            # Do not turn the public number into an unauthenticated general AI
+            # endpoint. Unlinked chatter is acknowledged by Meta but ignored.
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="ignored"
+            )
+            return
+        user_id = str(link["user_id"])
+        if message.get("message_type") not in {"text", "button", "interactive"}:
+            answer = (
+                "Por ahora este canal acepta mensajes de texto. "
+                "Las notas de voz, imágenes y documentos llegarán en una siguiente actualización."
+            )
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id,
+                status="succeeded",
+                result_text=answer,
+                outbound_message_id=outbound,
+                user_id=user_id,
+            )
+            return
+        if not text:
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="ignored", user_id=user_id
+            )
+            return
+
+        state_payload = self._account_state_payload(self.store.get_account_state(user_id))
+        state = state_payload["state"]
+        if wants_bot_list(text):
+            names = [bot["name"] for bot in state.get("bots", [])]
+            answer = (
+                "Tus agentes son:\n• " + "\n• ".join(names)
+                if names
+                else "Todavía no tienes agentes. Puedes decir: “Crea un agente para cotizaciones”."
+            )
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="succeeded", result_text=answer,
+                outbound_message_id=outbound, user_id=user_id,
+            )
+            return
+
+        created = create_bot_from_request(text)
+        if created:
+            created["id"] = "bot_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:16]
+
+            def add_created(current: dict) -> dict:
+                if not any(bot.get("id") == created["id"] for bot in current["bots"]):
+                    current["bots"].append(created)
+                current["activeBotId"] = created["id"]
+                current["onboardingCompleted"] = True
+                return current
+
+            self._mutate_whatsapp_state(user_id, add_created)
+            self.store.update_whatsapp_active_bot(user_id=user_id, bot_id=created["id"])
+            answer = (
+                f"Creé el agente “{created['name']}” y quedó seleccionado. "
+                "Ahora dime qué quieres que haga."
+            )
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="succeeded", result_text=answer,
+                outbound_message_id=outbound, user_id=user_id,
+            )
+            return
+
+        selected = requested_bot(state, text)
+        if selected:
+            self.store.update_whatsapp_active_bot(user_id=user_id, bot_id=selected["id"])
+            link["active_bot_id"] = selected["id"]
+        bot = selected or next(
+            (
+                item for item in state.get("bots", [])
+                if item.get("id") == (link.get("active_bot_id") or state.get("activeBotId"))
+            ),
+            None,
+        )
+        if bot is None and state.get("bots"):
+            bot = state["bots"][0]
+        if bot is None:
+            bot = create_bot_from_request("crea un agente")
+            if bot is None:
+                raise RuntimeError("No se pudo crear el agente inicial")
+            bot["id"] = "bot_wa_default_" + hashlib.sha256(user_id.encode()).hexdigest()[:12]
+
+            def add_default(current: dict) -> dict:
+                if not any(item.get("id") == bot["id"] for item in current["bots"]):
+                    current["bots"].append(bot)
+                current["activeBotId"] = bot["id"]
+                current["onboardingCompleted"] = True
+                return current
+
+            state = self._mutate_whatsapp_state(user_id, add_default)
+            bot = next(item for item in state["bots"] if item["id"] == bot["id"])
+            self.store.update_whatsapp_active_bot(user_id=user_id, bot_id=bot["id"])
+
+        normalized = " ".join(text.casefold().split())
+        switch_prefix = re.match(r"^(?:cambia|cambiar|usa|selecciona|habla con)\b", normalized)
+        if selected and switch_prefix and len(normalized.split()) <= len(selected["name"].split()) + 3:
+            answer = f"Listo. Ahora estás hablando con {selected['name']}."
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="succeeded", result_text=answer,
+                outbound_message_id=outbound, user_id=user_id,
+            )
+            return
+
+        prompt = build_whatsapp_bot_prompt(bot, text)
+        user_message_id = "msg_wu_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
+        assistant_message_id = "msg_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
+        self._append_whatsapp_state_message(
+            user_id=user_id,
+            bot_id=bot["id"],
+            message={
+                "id": user_message_id,
+                "role": "user",
+                "text": text,
+                "createdAt": self._whatsapp_timestamp(),
+            },
+        )
+        internal = _InternalAgentHandler(
+            self.store.get_user_by_id(user_id) or link,
+            {
+                "prompt": prompt,
+                "browser": False,
+                "computer": False,
+                "stream": False,
+                "bot_id": bot["id"],
+                "connector_ids": bot.get("connectorIds", []),
+                "idempotency_key": "whatsapp:" + hashlib.sha256(message_id.encode()).hexdigest(),
+            },
+        )
+        self.handle_agent_run(internal)  # exact same credits/harness path as every app
+        response = internal.json()
+        if internal.status != 200:
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            answer = (
+                "No pude completar esa tarea: "
+                + str(error.get("message") or "el agente no está disponible en este momento")
+            )
+        else:
+            answer = parse_whatsapp_agent_answer(str(response.get("answer") or ""))
+        self._append_whatsapp_state_message(
+            user_id=user_id,
+            bot_id=bot["id"],
+            message={
+                "id": assistant_message_id,
+                "role": "assistant",
+                "text": answer,
+                "createdAt": self._whatsapp_timestamp(),
+            },
+        )
+        outbound = self.whatsapp.send_text(
+            to=sender, text=answer, reply_to_message_id=message_id
+        )
+        self.store.complete_whatsapp_message(
+            message_id=message_id,
+            status="succeeded",
+            result_text=answer,
+            outbound_message_id=outbound,
+            user_id=user_id,
+        )
+
+    @staticmethod
+    def _whatsapp_timestamp() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _mutate_whatsapp_state(self, user_id: str, mutate) -> dict:
+        device_hash = hashlib.sha256(b"account-state-device|whatsapp-channel").hexdigest()
+        for _attempt in range(5):
+            payload = self._account_state_payload(self.store.get_account_state(user_id))
+            # JSON round-trip gives the mutator an isolated copy.
+            state = json.loads(json.dumps(payload["state"]))
+            next_state = normalize_account_state(mutate(state))
+            try:
+                saved = self.store.save_account_state(
+                    user_id=user_id,
+                    base_revision=payload["revision"],
+                    state_json=json.dumps(next_state, separators=(",", ":"), ensure_ascii=False),
+                    device_hash=device_hash,
+                )
+                return self._account_state_payload(saved)["state"]
+            except AccountStateConflict:
+                continue
+        raise RuntimeError("La cuenta cambió demasiadas veces mientras WhatsApp respondía")
+
+    def _append_whatsapp_state_message(
+        self, *, user_id: str, bot_id: str, message: dict
+    ) -> None:
+        def append(current: dict) -> dict:
+            for bot in current["bots"]:
+                if bot.get("id") != bot_id:
+                    continue
+                messages = bot.get("messages") if isinstance(bot.get("messages"), list) else []
+                if not any(item.get("id") == message["id"] for item in messages):
+                    bot["messages"] = (messages + [message])[-200:]
+                current["activeBotId"] = bot_id
+                return current
+            raise RuntimeError("El agente de WhatsApp ya no existe")
+        self._mutate_whatsapp_state(user_id, append)
+
     # ---------- connector accounts ----------
     def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -1430,6 +1958,9 @@ class Backend:
             and bool(pi.get("browser_auto_authorize"))
             and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN,
             "model_provider": bool(self.cfg.deepseek_api_key),
+            "whatsapp": (
+                not self.cfg.whatsapp_enabled or self.whatsapp.config.configured
+            ),
         }
         ready = all(checks.values()) if self.cfg.environment == "production" else checks["database"]
         return {
@@ -1442,6 +1973,10 @@ class Backend:
             "model_provider": {
                 "configured": bool(self.cfg.deepseek_api_key),
                 "base_url": self.cfg.deepseek_base_url,
+            },
+            "whatsapp": {
+                "enabled": self.cfg.whatsapp_enabled,
+                "configured": self.whatsapp.config.configured,
             },
         }
 
@@ -2595,6 +3130,16 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_account_state_get(self)
             elif self.command == "POST" and path == "/v1/account-state":
                 backend.handle_account_state_save(self)
+            elif self.command == "GET" and path == "/v1/whatsapp/webhook":
+                backend.handle_whatsapp_webhook_verification(self, query)
+            elif self.command == "POST" and path == "/v1/whatsapp/webhook":
+                backend.handle_whatsapp_webhook(self)
+            elif self.command == "POST" and path == "/v1/whatsapp/link":
+                backend.handle_whatsapp_link_start(self)
+            elif self.command == "GET" and path == "/v1/whatsapp/status":
+                backend.handle_whatsapp_status(self)
+            elif self.command == "POST" and path == "/v1/whatsapp/unlink":
+                backend.handle_whatsapp_unlink(self)
             elif self.command == "GET" and path == "/connections/complete":
                 html_response(self, 200, completion_html())
             elif path.startswith("/v1/connectors/native/setup/"):

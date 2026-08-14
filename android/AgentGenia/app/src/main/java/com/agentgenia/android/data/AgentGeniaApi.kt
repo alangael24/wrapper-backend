@@ -10,6 +10,8 @@ import com.agentgenia.android.model.BillingSubscription
 import com.agentgenia.android.model.ComputerSnapshot
 import com.agentgenia.android.model.ComputerState
 import com.agentgenia.android.model.ConnectorStatus
+import com.agentgenia.android.model.WhatsAppLinkStart
+import com.agentgenia.android.model.WhatsAppStatus
 import com.agentgenia.android.model.optNullableString
 import com.agentgenia.android.model.toAccountIdentity
 import com.agentgenia.android.model.toAccountSession
@@ -241,6 +243,25 @@ class AgentGeniaApi(
         return validateExternalUrl(url, setOf("billing.stripe.com"))
     }
 
+    suspend fun whatsAppStatus(): WhatsAppStatus {
+        val json = requestJson("/v1/whatsapp/status")
+        return json.toWhatsAppStatus()
+    }
+
+    suspend fun startWhatsAppLink(): WhatsAppLinkStart {
+        val json = requestJson("/v1/whatsapp/link", "POST", JSONObject())
+        return WhatsAppLinkStart(
+            code = json.getString("code"),
+            expiresAt = json.getDouble("expires_at").toLong(),
+            url = validateExternalUrl(json.getString("url"), setOf("wa.me")),
+        )
+    }
+
+    suspend fun unlinkWhatsApp(): WhatsAppStatus {
+        requestJson("/v1/whatsapp/unlink", "POST", JSONObject())
+        return whatsAppStatus()
+    }
+
     fun validateAuthorizationUrl(url: String, googleOnly: Boolean = false): String =
         validateExternalUrl(url, if (googleOnly) setOf("accounts.google.com") else null)
 
@@ -354,6 +375,14 @@ class AgentGeniaApi(
         }
         return uri.toASCIIString()
     }
+
+    private fun JSONObject.toWhatsAppStatus() = WhatsAppStatus(
+        configured = optBoolean("configured"),
+        connected = optBoolean("connected"),
+        displayName = optString("display_name"),
+        phoneHint = optString("phone_hint"),
+        activeBotId = optNullableString("active_bot_id"),
+    )
 
     private fun path(value: String) = java.net.URLEncoder.encode(value, Charsets.UTF_8.name()).replace("+", "%20")
     private fun query(value: String) = path(value)

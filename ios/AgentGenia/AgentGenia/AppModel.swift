@@ -16,6 +16,8 @@ final class AppModel {
     var selectedConnectorIDs: [String] = []
     var connectorStatuses: [String: ConnectorStatus] = [:]
     var billing: BillingSnapshot?
+    var whatsApp: WhatsAppStatus?
+    var whatsAppLinkCode = ""
     var destination: Destination?
     var browserRequest: BrowserRequest?
     var computer: ComputerSnapshot?
@@ -32,6 +34,7 @@ final class AppModel {
     private var connectorPollingTask: Task<Void, Never>?
     private var connectorRefreshTask: Task<ConnectorSnapshot, Error>?
     private var billingRefreshTask: Task<BillingSnapshot, Error>?
+    private var whatsAppPollingTask: Task<Void, Never>?
     private var agentWarmTasks: [UUID: Task<Bool, Never>] = [:]
     private var persistenceTask: Task<Void, Never>?
     private var persistenceRequested = false
@@ -109,6 +112,8 @@ final class AppModel {
         connectorRefreshTask = nil
         billingRefreshTask?.cancel()
         billingRefreshTask = nil
+        whatsAppPollingTask?.cancel()
+        whatsAppPollingTask = nil
         for task in agentWarmTasks.values { task.cancel() }
         agentWarmTasks = [:]
         persistenceTask?.cancel()
@@ -150,6 +155,8 @@ final class AppModel {
         selectedConnectorIDs = []
         connectorStatuses = [:]
         billing = nil
+        whatsApp = nil
+        whatsAppLinkCode = ""
         destination = nil
         browserRequest = nil
         browserPurpose = nil
@@ -359,6 +366,58 @@ final class AppModel {
         } catch { report(error) }
     }
 
+    func refreshWhatsApp() async {
+        do { whatsApp = try await api.whatsAppStatus() }
+        catch { report(error) }
+    }
+
+    func startWhatsAppLink() async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            let (started, url) = try await api.startWhatsAppLink()
+            whatsAppLinkCode = started.code
+            presentBrowser(url: url, purpose: .whatsapp)
+            pollWhatsApp(until: Date(timeIntervalSince1970: started.expiresAt))
+        } catch { report(error) }
+    }
+
+    func unlinkWhatsApp() async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            whatsAppPollingTask?.cancel()
+            whatsAppPollingTask = nil
+            whatsApp = try await api.unlinkWhatsApp()
+            whatsAppLinkCode = ""
+        } catch { report(error) }
+    }
+
+    private func pollWhatsApp(until expiresAt: Date) {
+        whatsAppPollingTask?.cancel()
+        whatsAppPollingTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, Date() < expiresAt {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, self.phase == .ready else { return }
+                do {
+                    let status = try await self.api.whatsAppStatus()
+                    self.whatsApp = status
+                    if status.connected {
+                        self.whatsAppLinkCode = ""
+                        self.browserRequest = nil
+                        self.browserPurpose = nil
+                        return
+                    }
+                } catch is CancellationError { return }
+                catch { continue }
+            }
+            if !Task.isCancelled { self.whatsAppLinkCode = "" }
+        }
+    }
+
     func loadComputer(botID: UUID) async {
         computerBotID = botID
         do { computer = try await api.computerStatus(botID: botID) }
@@ -406,6 +465,9 @@ final class AppModel {
         }
         if dismissedPurpose == .billing {
             Task { await refreshBilling(force: true) }
+        }
+        if dismissedPurpose == .whatsapp {
+            Task { await refreshWhatsApp() }
         }
     }
 
@@ -500,7 +562,8 @@ final class AppModel {
             async let profileRefresh: Void = self.refreshProfile(accountID: session.account.id)
             async let connectorRefresh: Void = self.refreshConnectors()
             async let billingRefresh: Void = self.refreshBilling()
-            _ = await (accountStateRefresh, profileRefresh, connectorRefresh, billingRefresh)
+            async let whatsAppRefresh: Void = self.refreshWhatsApp()
+            _ = await (accountStateRefresh, profileRefresh, connectorRefresh, billingRefresh, whatsAppRefresh)
         }
     }
 

@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .store import SCHEMA_VERSION, Store, new_id
+from .store import SCHEMA_VERSION, Store, hash_whatsapp_link_code, new_id
 
 
 def normalize_database_url(value: str) -> str:
@@ -165,6 +165,81 @@ class PostgresStore(Store):
         try:
             self._conn.execute(sql, params)
             self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def consume_whatsapp_link_code(
+        self,
+        *,
+        code: str,
+        wa_user_id: str,
+        phone_number_id: str,
+        display_name: str,
+    ) -> dict | None:
+        """Consume a link code under a row lock across multiple replicas."""
+        now = time.time()
+        code_hash = hash_whatsapp_link_code(code)
+        try:
+            row = self._conn.execute(
+                "SELECT c.*,u.account_status FROM whatsapp_link_codes c "
+                "JOIN users u ON u.id=c.user_id WHERE c.code_hash=? FOR UPDATE",
+                (code_hash,),
+            ).fetchone()
+            if (
+                row is None
+                or row["consumed_at"] is not None
+                or float(row["expires_at"]) <= now
+                or row["account_status"] != "active"
+            ):
+                self._conn.rollback()
+                return None
+            changed = self._conn.execute(
+                "UPDATE whatsapp_link_codes SET consumed_at=? "
+                "WHERE code_hash=? AND consumed_at IS NULL AND expires_at>?",
+                (now, code_hash, now),
+            )
+            if changed.rowcount != 1:
+                self._conn.rollback()
+                return None
+            user_id = row["user_id"]
+            self._conn.execute(
+                "DELETE FROM whatsapp_links WHERE user_id=? OR wa_user_id=?",
+                (user_id, wa_user_id),
+            )
+            self._conn.execute(
+                "INSERT INTO whatsapp_links(wa_user_id,user_id,phone_number_id,display_name,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (wa_user_id, user_id, phone_number_id, display_name[:120], now, now),
+            )
+            self._conn.commit()
+            return {
+                "user_id": user_id,
+                "wa_user_id": wa_user_id,
+                "phone_number_id": phone_number_id,
+                "display_name": display_name[:120],
+                "created_at": now,
+                "updated_at": now,
+            }
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def claim_whatsapp_message(self) -> dict | None:
+        """Atomically lease one webhook with SKIP LOCKED."""
+        now = time.time()
+        try:
+            row = self._conn.execute(
+                "WITH candidate AS ("
+                " SELECT message_id FROM whatsapp_messages WHERE status='pending' "
+                " AND next_attempt_at<=? ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+                ") UPDATE whatsapp_messages m SET status='processing',"
+                "attempts=m.attempts+1,updated_at=? FROM candidate "
+                "WHERE m.message_id=candidate.message_id RETURNING m.*",
+                (now, now),
+            ).fetchone()
+            self._conn.commit()
+            return dict(row) if row else None
         except Exception:
             self._conn.rollback()
             raise

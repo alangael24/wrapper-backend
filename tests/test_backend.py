@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import http.client
 import os
@@ -46,6 +48,18 @@ from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
 from go_backend.pi_harness import RUNTIME_AUTH_EXTENSION  # noqa: E402
 from go_backend.store import Store, new_id  # noqa: E402
+from go_backend.whatsapp import (  # noqa: E402
+    WhatsAppCloudAPI,
+    WhatsAppConfig,
+    parse_webhook_messages,
+    verify_webhook_signature,
+)
+from go_backend.whatsapp_agent import (  # noqa: E402
+    create_bot_from_request,
+    extract_link_code,
+    requested_bot,
+    wants_bot_list,
+)
 
 
 class MockUpstream(BaseHTTPRequestHandler):
@@ -139,6 +153,12 @@ class WrapperServer:
             "DAYTONA_SNAPSHOT", "COMPUTER_AUTO_STOP_MINUTES", "COMPUTER_AUTO_ARCHIVE_MINUTES",
             "COMPUTER_PREVIEW_TTL_SECONDS", "COMPUTER_VNC_PORT", "COMPUTER_VNC_RESOLUTION", "COMPUTER_BASIC_LIMIT",
             "COMPUTER_PRO_LIMIT",
+        ):
+            os.environ.pop(name, None)
+        for name in (
+            "WHATSAPP_ENABLED", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET",
+            "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_PUBLIC_NUMBER",
+            "WHATSAPP_GRAPH_VERSION", "WHATSAPP_LINK_TTL_SECONDS",
         ):
             os.environ.pop(name, None)
         self.cfg = Config()
@@ -394,7 +414,214 @@ class TestBackend(unittest.TestCase):
         }
         return auth
 
+    def configure_fake_whatsapp(self):
+        config = WhatsAppConfig(
+            enabled=True,
+            verify_token="verify-token-for-agentgenia-tests",
+            app_secret="app-secret-for-agentgenia-tests",
+            access_token="access-token-for-agentgenia-tests",
+            phone_number_id="123456789012345",
+            public_number="15551234567",
+            graph_version="v23.0",
+            link_ttl_seconds=600,
+        )
+        self.ws.backend.whatsapp = WhatsAppCloudAPI(config)
+        sent: list[dict] = []
+
+        def send_text(*, to, text, reply_to_message_id=None):
+            sent.append({
+                "to": to,
+                "text": text,
+                "reply_to_message_id": reply_to_message_id,
+            })
+            return f"wamid.outbound.{len(sent)}"
+
+        self.ws.backend.whatsapp.send_text = send_text
+        return config, sent
+
+    def whatsapp_payload(self, message_id: str, text: str, *, sender="15557654321"):
+        return {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "waba-test",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": {
+                            "display_phone_number": "+1 555 123 4567",
+                            "phone_number_id": "123456789012345",
+                        },
+                        "contacts": [{
+                            "profile": {"name": "Alan WhatsApp"},
+                            "wa_id": sender,
+                        }],
+                        "messages": [{
+                            "from": sender,
+                            "id": message_id,
+                            "timestamp": "1786680000",
+                            "text": {"body": text},
+                            "type": "text",
+                        }],
+                    },
+                }],
+            }],
+        }
+
+    def send_whatsapp_webhook(self, payload, app_secret):
+        body = json.dumps(payload).encode()
+        signature = "sha256=" + hmac.new(
+            app_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        return self.ws.req(
+            "POST",
+            "/v1/whatsapp/webhook",
+            payload,
+            headers={"X-Hub-Signature-256": signature},
+        )
+
     # ---------- pool / signup ----------
+    def test_whatsapp_helpers_verify_and_route_without_a_public_ai_endpoint(self):
+        config, _sent = self.configure_fake_whatsapp()
+        payload = self.whatsapp_payload("wamid.helper", "Mis agentes")
+        body = json.dumps(payload).encode()
+        signature = "sha256=" + hmac.new(
+            config.app_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        self.assertTrue(verify_webhook_signature(body, signature, config.app_secret))
+        self.assertFalse(verify_webhook_signature(body + b" ", signature, config.app_secret))
+        messages = parse_webhook_messages(payload)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "Mis agentes")
+        bsuid_payload = self.whatsapp_payload("wamid.bsuid", "hola")
+        bsuid_message = bsuid_payload["entry"][0]["changes"][0]["value"]["messages"][0]
+        bsuid_message["from"] = ""
+        bsuid_message["user_id"] = "bsuid_test_contact"
+        self.assertEqual(
+            parse_webhook_messages(bsuid_payload)[0]["wa_user_id"],
+            "bsuid_test_contact",
+        )
+        self.assertTrue(wants_bot_list("¿Cuáles son mis bots?"))
+        self.assertEqual(extract_link_code("Vincular Agentgenia ag-abcd-2345"), "AG-ABCD-2345")
+        created = create_bot_from_request("Crea un agente para preparar cotizaciones")
+        self.assertIsNotNone(created)
+        self.assertIn("cotizaciones", created["description"])
+        self.assertEqual(
+            requested_bot({"bots": [{"id": "sales", "name": "Ventas"}]}, "usa Ventas"),
+            {"id": "sales", "name": "Ventas"},
+        )
+
+    def test_whatsapp_link_is_one_time_and_messages_share_account_state_and_agent_path(self):
+        config, sent = self.configure_fake_whatsapp()
+        self.ws.enable_fake_pi()
+        user = self.new_user(tier="pro")
+        auth = {"Authorization": f"Bearer {user['api_key']}"}
+
+        status, initial = self.ws.req("GET", "/v1/whatsapp/status", headers=auth)
+        self.assertEqual(status, 200)
+        self.assertTrue(initial["configured"])
+        self.assertFalse(initial["connected"])
+
+        status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
+        self.assertEqual(status, 201)
+        self.assertRegex(started["code"], r"^AG-[A-Z2-9]{4}-[A-Z2-9]{4}$")
+        self.assertTrue(started["url"].startswith("https://wa.me/15551234567?"))
+
+        # Issuing a new code atomically invalidates the previous one and keeps
+        # a single live record even with a durable multi-replica store.
+        first_code = started["code"]
+        status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
+        self.assertEqual(status, 201)
+        self.assertNotEqual(started["code"], first_code)
+        codes = self.ws.backend.store._q(
+            "SELECT code_hash FROM whatsapp_link_codes WHERE user_id=?", (user["user_id"],)
+        )
+        self.assertEqual(len(codes), 1)
+
+        status, accepted = self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.link", f"Vincular Agentgenia {started['code']}"),
+            config.app_secret,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(accepted["accepted"], 1)
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertIn("quedó vinculado", sent[-1]["text"])
+
+        # Meta retries the same event; the durable inbox must not process it twice.
+        status, duplicate = self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.link", f"Vincular Agentgenia {started['code']}"),
+            config.app_secret,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(duplicate["accepted"], 0)
+        self.assertIsNone(self.ws.backend.store.claim_whatsapp_message())
+
+        status, linked = self.ws.req("GET", "/v1/whatsapp/status", headers=auth)
+        self.assertEqual(status, 200)
+        self.assertTrue(linked["connected"])
+        self.assertEqual(linked["display_name"], "Alan WhatsApp")
+        self.assertEqual(linked["phone_hint"], "••••4321")
+
+        # Creating from WhatsApp mutates the exact account state consumed by the apps.
+        status, queued = self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.create", "Crea un agente para preparar cotizaciones"),
+            config.app_secret,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(queued["accepted"], 1)
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        status, state = self.ws.req("GET", "/v1/account-state", headers=auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(state["state"]["bots"]), 1)
+        bot = state["state"]["bots"][0]
+        self.assertIn("cotizaciones", bot["description"])
+
+        status, queued = self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.task", "Prepara el resumen de hoy"),
+            config.app_secret,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(queued["accepted"], 1)
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertIn("fake-pi", sent[-1]["text"])
+        status, state = self.ws.req("GET", "/v1/account-state", headers=auth)
+        messages = state["state"]["bots"][0]["messages"]
+        self.assertEqual([item["role"] for item in messages[-2:]], ["user", "assistant"])
+        self.assertEqual(messages[-2]["text"], "Prepara el resumen de hoy")
+
+        status, result = self.ws.req("POST", "/v1/whatsapp/unlink", {}, headers=auth)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["disconnected"])
+
+    def test_whatsapp_webhook_rejects_invalid_signature_and_ignores_unlinked_chat(self):
+        config, sent = self.configure_fake_whatsapp()
+        payload = self.whatsapp_payload("wamid.unlinked", "hola")
+        status, result = self.ws.req(
+            "POST",
+            "/v1/whatsapp/webhook",
+            payload,
+            headers={"X-Hub-Signature-256": "sha256=" + "0" * 64},
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(result["error"]["type"], "invalid_signature")
+
+        status, accepted = self.send_whatsapp_webhook(payload, config.app_secret)
+        self.assertEqual(status, 200)
+        self.assertEqual(accepted["accepted"], 1)
+        message = self.ws.backend.store.claim_whatsapp_message()
+        self.ws.backend._process_whatsapp_message(message)
+        self.assertEqual(sent, [])
+        stored = self.ws.backend.store._one(
+            "SELECT status FROM whatsapp_messages WHERE message_id=?", ("wamid.unlinked",)
+        )
+        self.assertEqual(stored["status"], "ignored")
+
     def test_account_state_sync_is_account_scoped_versioned_and_validated(self):
         first = self.new_user(tier="free")
         second = self.new_user(tier="free")
@@ -1056,7 +1283,7 @@ class TestBackend(unittest.TestCase):
             set(body["checks"]),
             {
                 "database", "google_auth", "apple_auth", "stripe", "connectors",
-                "computers", "pi", "pi_chrome", "model_provider",
+                "computers", "pi", "pi_chrome", "model_provider", "whatsapp",
             },
         )
         self.assertFalse(all(body["checks"].values()))
@@ -1340,7 +1567,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 16)
+        self.assertEqual(migrated.health()["schema_version"], 17)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
@@ -2027,6 +2254,15 @@ class TestBackend(unittest.TestCase):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi(browser=True)
+        chrome_commands: list[list[str]] = []
+        original_chrome_command = self.ws.backend.pi._chrome_command
+
+        def capture_chrome_command(run_dir, companion):
+            command = original_chrome_command(run_dir, companion)
+            chrome_commands.append(command)
+            return command
+
+        self.ws.backend.pi._chrome_command = capture_chrome_command
 
         status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
         self.assertEqual(status, 200)
@@ -2088,18 +2324,16 @@ class TestBackend(unittest.TestCase):
             )
             bridge_ports.append(bridge_port)
 
-        launches = [
-            json.loads(line)
-            for line in self.ws.backend.pi.chrome_test_log.read_text().splitlines()
-        ]
-        self.assertEqual(len(launches), 2)
+        # Capture commands before Popen so this assertion cannot race the
+        # short-lived fake Chrome child on a loaded CI host.
+        self.assertEqual(len(chrome_commands), 2)
         profile_args = []
-        for launch, run_dir in zip(launches, run_dirs):
+        for command, run_dir in zip(chrome_commands, run_dirs):
             profile_arg = f"--user-data-dir={run_dir / 'chrome-profile'}"
             extension_arg = f"--load-extension={run_dir / 'chrome-extension'}"
-            self.assertIn(profile_arg, launch["argv"])
-            self.assertIn(extension_arg, launch["argv"])
-            self.assertFalse(launch["has_admin_token"])
+            self.assertIn(profile_arg, command)
+            self.assertIn(extension_arg, command)
+            self.assertNotIn("ADMIN_TOKEN", self.ws.backend.pi._chrome_env(run_dir))
             profile_args.append(profile_arg)
         self.assertNotEqual(profile_args[0], profile_args[1])
 

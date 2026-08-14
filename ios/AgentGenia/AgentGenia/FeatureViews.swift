@@ -210,6 +210,7 @@ private struct ConnectorRow: View {
 struct AccountView: View {
     @Environment(AppModel.self) private var model
     @State private var confirmsDeletion = false
+    @State private var confirmsWhatsAppUnlink = false
 
     var body: some View {
         List {
@@ -255,6 +256,39 @@ struct AccountView: View {
                     }
                 }
             }
+            if let whatsApp = model.whatsApp {
+                Section("WhatsApp") {
+                    if whatsApp.connected {
+                        LabeledContent(
+                            "Conectado",
+                            value: [whatsApp.displayName, whatsApp.phoneHint]
+                                .filter { !$0.isEmpty }.joined(separator: " · ")
+                        )
+                        Text("Usa los mismos agentes, conectores y créditos de esta cuenta.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Desconectar WhatsApp", role: .destructive) {
+                            confirmsWhatsAppUnlink = true
+                        }
+                        .disabled(model.isBusy)
+                    } else if whatsApp.configured {
+                        Button("Conectar WhatsApp") {
+                            Task { await model.startWhatsAppLink() }
+                        }
+                        .disabled(model.isBusy)
+                        Text("Escribe desde tu WhatsApp normal al número oficial de Agentgenia. No necesitas WhatsApp Business.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if !model.whatsAppLinkCode.isEmpty {
+                            LabeledContent("Código temporal", value: model.whatsAppLinkCode)
+                            Button("Ya lo envié") { Task { await model.refreshWhatsApp() } }
+                        }
+                    } else {
+                        Text("El canal oficial de WhatsApp todavía no está habilitado.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             Section {
                 Button("Cerrar sesión", role: .destructive) { Task { await model.signOut() } }
             }
@@ -272,8 +306,16 @@ struct AccountView: View {
             }
         }
         .navigationTitle("Cuenta")
-        .refreshable { await model.refreshBilling(force: true) }
-        .task { await model.refreshBilling() }
+        .refreshable {
+            async let billing: Void = model.refreshBilling(force: true)
+            async let whatsApp: Void = model.refreshWhatsApp()
+            _ = await (billing, whatsApp)
+        }
+        .task {
+            async let billing: Void = model.refreshBilling()
+            async let whatsApp: Void = model.refreshWhatsApp()
+            _ = await (billing, whatsApp)
+        }
         .confirmationDialog(
             "¿Eliminar tu cuenta definitivamente?",
             isPresented: $confirmsDeletion,
@@ -285,6 +327,16 @@ struct AccountView: View {
             Button("Cancelar", role: .cancel) {}
         } message: {
             Text("Esta acción no se puede deshacer.")
+        }
+        .confirmationDialog(
+            "¿Desconectar WhatsApp?",
+            isPresented: $confirmsWhatsAppUnlink,
+            titleVisibility: .visible
+        ) {
+            Button("Desconectar", role: .destructive) {
+                Task { await model.unlinkWhatsApp() }
+            }
+            Button("Cancelar", role: .cancel) {}
         }
     }
 }

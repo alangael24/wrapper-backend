@@ -35,6 +35,9 @@ const CHANNELS = Object.freeze({
   billingSnapshot: "desktop:billing-snapshot",
   startCheckout: "desktop:start-checkout",
   openBillingPortal: "desktop:open-billing-portal",
+  whatsappStatus: "desktop:whatsapp-status",
+  startWhatsappLink: "desktop:start-whatsapp-link",
+  unlinkWhatsapp: "desktop:unlink-whatsapp",
   computerStatus: "desktop:computer-status",
   ensureComputer: "desktop:ensure-computer",
   handBackComputer: "desktop:hand-back-computer",
@@ -483,6 +486,9 @@ function registerDesktopIpc(): void {
     return oauthController.startCheckout(tier);
   });
   ipcMain.handle(CHANNELS.openBillingPortal, () => oauthController.openBillingPortal());
+  ipcMain.handle(CHANNELS.whatsappStatus, () => oauthController.whatsAppStatus());
+  ipcMain.handle(CHANNELS.startWhatsappLink, () => oauthController.startWhatsAppLink());
+  ipcMain.handle(CHANNELS.unlinkWhatsapp, () => oauthController.unlinkWhatsApp());
   ipcMain.handle(CHANNELS.computerStatus, (_event, botId: unknown) => {
     if (typeof botId !== "string") throw new Error("Bot inválido.");
     return oauthController.computerStatus(botId);

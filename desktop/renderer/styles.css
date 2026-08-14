@@ -224,6 +224,14 @@ button { color: inherit; }
 .account-deletion-card small { max-width: 620px; color: #77777c; font-size: 10px; line-height: 1.5; }
 .account-deletion-card button { flex: 0 0 auto; margin-left: auto; }
 .account-deletion-card button:disabled { cursor: wait; opacity: .6; }
+.whatsapp-account-card { display: flex; align-items: center; gap: 16px; margin-top: 26px; border: 1px solid #cde8d5; border-radius: 20px; background: #f7fff9; padding: 20px 22px; }
+.whatsapp-badge { display: grid; place-items: center; flex: 0 0 44px; width: 44px; height: 44px; border-radius: 50%; background: #20b967; color: white; font-size: 11px; font-weight: 800; letter-spacing: -.04em; }
+.whatsapp-account-copy { display: grid; min-width: 0; gap: 5px; }
+.whatsapp-account-copy strong { color: #153e27; font-size: 13px; }
+.whatsapp-account-copy small { max-width: 680px; color: #66746a; font-size: 10px; line-height: 1.5; }
+.whatsapp-account-copy code { width: fit-content; border: 1px solid #b9ddc4; border-radius: 8px; background: white; padding: 6px 9px; color: #126437; font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
+.whatsapp-account-actions { display: flex; align-items: center; flex: 0 0 auto; gap: 10px; margin-left: auto; }
+.whatsapp-notice { margin: 8px 2px 0; color: #237444; font-size: 10px; }
 .billing-notice { margin: 18px 0 0; border-radius: 13px; background: #e8f5ed; padding: 13px 15px; color: #17653f; font-size: 11px; }
 .bot-builder-view, .bot-detail-view, .bot-chat-view { display: flex; flex-direction: column; height: 100%; }
 .bot-chat-view { position: relative; }
@@ -496,6 +504,8 @@ button:disabled { cursor: wait; }
   .billing-plan { min-height: 0; }
   .account-deletion-card { align-items: stretch; flex-direction: column; }
   .account-deletion-card button { margin-left: 0; }
+  .whatsapp-account-card { align-items: stretch; flex-direction: column; }
+  .whatsapp-account-actions { margin-left: 0; }
 }
 
 @media (max-width: 760px) {

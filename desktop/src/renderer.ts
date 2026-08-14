@@ -48,6 +48,7 @@ import {
   type TeachCapture,
   type TeachEntryPoint,
   type TeachRecordingStatus,
+  type WhatsAppStatus,
   createBotWorkflow,
   createBotProfile,
   initialAppState,
@@ -127,6 +128,12 @@ let billing = emptyBillingSnapshot();
 let billingLoaded = false;
 let billingBusy = false;
 let billingNotice = "";
+let whatsApp = emptyWhatsAppStatus();
+let whatsAppLoaded = false;
+let whatsAppBusy = false;
+let whatsAppNotice = "";
+let whatsAppLinkCode = "";
+let whatsAppPollTimer = 0;
 let agentBusyBotId = "";
 let pendingUserMessage = "";
 let streamingAssistantText = "";
@@ -172,6 +179,7 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("beforeunload", () => {
   removeAgentDeltaListener();
+  if (whatsAppPollTimer) window.clearTimeout(whatsAppPollTimer);
   if (!teachStatus.botId) return;
   cleanupTeachMedia();
   void desktopApi.discardTeachRecording(teachStatus.botId);
@@ -455,6 +463,12 @@ async function signOutAccount(): Promise<void> {
     computerSnapshot = idleComputerSnapshot();
     computerLoadedBotId = "";
     computerBusy = false;
+    whatsApp = emptyWhatsAppStatus();
+    whatsAppLoaded = false;
+    whatsAppNotice = "";
+    whatsAppLinkCode = "";
+    if (whatsAppPollTimer) window.clearTimeout(whatsAppPollTimer);
+    whatsAppPollTimer = 0;
     closeBotSettings();
     activeView = "connectors";
   } catch (error) {
@@ -658,6 +672,7 @@ function renderBilling(): void {
             ${renderBillingPlan("pro", billing.plans.pro.name, billing.plans.pro.amount, "Para trabajo intensivo", planBenefits(billing.plans.pro), tier)}
             ${renderBillingPlan("business", billing.plans.business.name, billing.plans.business.amount, "Para equipos en crecimiento", planBenefits(billing.plans.business), tier)}
           </div>
+          ${renderWhatsAppCard()}
           <section class="account-deletion-card">
             <span><strong>Eliminar cuenta y datos</strong><small>Cancela la suscripción, desconecta tus herramientas y borra permanentemente tus bots, sesiones y datos.</small></span>
             <button class="danger-action" type="button" data-delete-account ${accountAuthBusy ? "disabled" : ""}>${accountAuthBusy ? "Eliminando…" : "Eliminar cuenta"}</button>
@@ -674,10 +689,36 @@ function renderBilling(): void {
     if (connections.account.connected) await refreshBilling();
   });
   document.querySelector("[data-open-billing-portal]")?.addEventListener("click", () => void openBillingPortal());
+  document.querySelector("[data-connect-whatsapp]")?.addEventListener("click", () => void startWhatsAppLink());
+  document.querySelector("[data-refresh-whatsapp]")?.addEventListener("click", () => void refreshWhatsApp());
+  document.querySelector("[data-unlink-whatsapp]")?.addEventListener("click", () => void unlinkWhatsApp());
   document.querySelector("[data-delete-account]")?.addEventListener("click", () => void deleteAccount());
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-select-plan]")) {
     button.addEventListener("click", () => void startCheckout(button.dataset.selectPlan as "basic" | "pro" | "business"));
   }
+}
+
+function renderWhatsAppCard(): string {
+  const title = whatsApp.connected
+    ? `WhatsApp conectado${whatsApp.displayName ? ` · ${escapeHtml(whatsApp.displayName)}` : ""}`
+    : "Usa tus agentes desde WhatsApp";
+  const detail = whatsApp.connected
+    ? `${escapeHtml(whatsApp.phoneHint)} · Los mensajes usan los mismos bots, conectores y créditos de esta cuenta.`
+    : "Escríbele al número oficial de Agentgenia desde tu WhatsApp normal. No necesitas una cuenta de WhatsApp Business.";
+  const action = whatsApp.connected
+    ? `<button class="secondary-action" type="button" data-unlink-whatsapp ${whatsAppBusy ? "disabled" : ""}>Desconectar</button>`
+    : !whatsAppLoaded
+      ? '<button class="secondary-action" type="button" disabled>Cargando…</button>'
+      : whatsApp.configured
+        ? `<button class="primary-action compact" type="button" data-connect-whatsapp ${whatsAppBusy ? "disabled" : ""}>${whatsAppBusy ? "Abriendo…" : "Conectar WhatsApp"}</button>`
+        : '<button class="secondary-action" type="button" disabled>Próximamente</button>';
+  return `
+    <section class="whatsapp-account-card">
+      <span class="whatsapp-badge" aria-hidden="true">WA</span>
+      <span class="whatsapp-account-copy"><strong>${title}</strong><small>${detail}</small>${whatsAppLinkCode ? `<code>${escapeHtml(whatsAppLinkCode)}</code>` : ""}</span>
+      <span class="whatsapp-account-actions">${action}${whatsAppLinkCode && !whatsApp.connected ? '<button class="topbar-link" type="button" data-refresh-whatsapp>Ya lo envié</button>' : ""}</span>
+    </section>
+    ${whatsAppNotice ? `<p class="whatsapp-notice">${escapeHtml(whatsAppNotice)}</p>` : ""}`;
 }
 
 function planBenefits(plan: BillingSnapshot["plans"]["basic"]): string[] {
@@ -709,6 +750,10 @@ async function deleteAccount(): Promise<void> {
     computerSnapshot = idleComputerSnapshot();
     computerLoadedBotId = "";
     computerBusy = false;
+    whatsApp = emptyWhatsAppStatus();
+    whatsAppLoaded = false;
+    whatsAppNotice = "";
+    whatsAppLinkCode = "";
     closeBotSettings();
     activeView = "connectors";
   } catch (error) {
@@ -759,12 +804,109 @@ async function refreshBilling(): Promise<void> {
   transientError = "";
   render();
   try {
-    billing = await desktopApi.billingSnapshot();
+    const [nextBilling, nextWhatsApp] = await Promise.all([
+      desktopApi.billingSnapshot(),
+      desktopApi.whatsAppStatus().catch(() => emptyWhatsAppStatus())
+    ]);
+    billing = nextBilling;
+    whatsApp = nextWhatsApp;
+    whatsAppLoaded = true;
     billingLoaded = true;
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
     billingBusy = false;
+  }
+  render();
+}
+
+async function refreshWhatsApp(): Promise<void> {
+  if (!connections.account.connected || whatsAppBusy) return;
+  whatsAppBusy = true;
+  transientError = "";
+  render();
+  try {
+    whatsApp = await desktopApi.whatsAppStatus();
+    whatsAppLoaded = true;
+    if (whatsApp.connected) {
+      whatsAppLinkCode = "";
+      whatsAppNotice = "Listo. Este WhatsApp ya puede hablar con tus agentes.";
+      if (whatsAppPollTimer) window.clearTimeout(whatsAppPollTimer);
+      whatsAppPollTimer = 0;
+    }
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    whatsAppBusy = false;
+  }
+  render();
+}
+
+async function startWhatsAppLink(): Promise<void> {
+  if (!connections.account.connected || whatsAppBusy) return;
+  whatsAppBusy = true;
+  transientError = "";
+  whatsAppNotice = "";
+  render();
+  try {
+    const started = await desktopApi.startWhatsAppLink();
+    whatsApp = started;
+    whatsAppLoaded = true;
+    whatsAppLinkCode = started.code;
+    whatsAppNotice = "Abrimos WhatsApp con un código de un solo uso. Envía el mensaje preparado para terminar.";
+    scheduleWhatsAppPoll(0, started.expiresAt);
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    whatsAppBusy = false;
+  }
+  render();
+}
+
+function scheduleWhatsAppPoll(attempt: number, expiresAt: number): void {
+  if (whatsAppPollTimer) window.clearTimeout(whatsAppPollTimer);
+  if (attempt >= 150 || Date.now() / 1000 >= expiresAt) {
+    whatsAppPollTimer = 0;
+    whatsAppNotice = "El código expiró. Puedes generar uno nuevo cuando quieras.";
+    whatsAppLinkCode = "";
+    render();
+    return;
+  }
+  whatsAppPollTimer = window.setTimeout(async () => {
+    if (activeView !== "billing" || document.visibilityState === "hidden") {
+      scheduleWhatsAppPoll(attempt + 1, expiresAt);
+      return;
+    }
+    try {
+      whatsApp = await desktopApi.whatsAppStatus();
+      whatsAppLoaded = true;
+      if (whatsApp.connected) {
+        whatsAppPollTimer = 0;
+        whatsAppLinkCode = "";
+        whatsAppNotice = "Listo. Este WhatsApp ya puede hablar con tus agentes.";
+        render();
+        return;
+      }
+    } catch {}
+    scheduleWhatsAppPoll(attempt + 1, expiresAt);
+  }, 2_000);
+}
+
+async function unlinkWhatsApp(): Promise<void> {
+  if (!whatsApp.connected || whatsAppBusy) return;
+  if (!window.confirm("¿Desconectar este WhatsApp de Agentgenia?")) return;
+  whatsAppBusy = true;
+  transientError = "";
+  render();
+  try {
+    whatsApp = await desktopApi.unlinkWhatsApp();
+    whatsAppLoaded = true;
+    whatsAppLinkCode = "";
+    whatsAppNotice = "WhatsApp quedó desconectado de esta cuenta.";
+  } catch (error) {
+    transientError = errorMessage(error);
+  } finally {
+    whatsAppBusy = false;
   }
   render();
 }
@@ -1900,11 +2042,22 @@ function emptyBillingSnapshot(): BillingSnapshot {
   };
 }
 
+function emptyWhatsAppStatus(): WhatsAppStatus {
+  return {
+    configured: false,
+    connected: false,
+    displayName: "",
+    phoneHint: "",
+    activeBotId: null
+  };
+}
+
 function createPreviewApi(): DesktopApi {
   const previewMode = new URLSearchParams(window.location.search).get("preview");
   let previewState = initialAppState();
   let previewConnections = emptyConnectionSnapshot();
   let previewBilling = { ...emptyBillingSnapshot(), configured: true };
+  let previewWhatsApp: WhatsAppStatus = { ...emptyWhatsAppStatus(), configured: true };
   let previewComputer: BotComputerSnapshot = {
     ...idleComputerSnapshot("preview-bot"),
     configured: true,
@@ -1955,6 +2108,19 @@ function createPreviewApi(): DesktopApi {
       previewBilling = { ...previewBilling, tier };
     },
     async openBillingPortal() {},
+    async whatsAppStatus() { return structuredClone(previewWhatsApp); },
+    async startWhatsAppLink() {
+      previewWhatsApp = { ...previewWhatsApp, configured: true };
+      return {
+        ...structuredClone(previewWhatsApp),
+        code: "AG-DEMO-2345",
+        expiresAt: Math.floor(Date.now() / 1000) + 600
+      };
+    },
+    async unlinkWhatsApp() {
+      previewWhatsApp = { ...emptyWhatsAppStatus(), configured: true };
+      return structuredClone(previewWhatsApp);
+    },
     async computerStatus(botId) {
       return structuredClone({ ...previewComputer, bot_id: botId });
     },

@@ -51,7 +51,11 @@ import java.util.Currency
 @Composable
 fun AccountScreen(state: AppUiState, model: AppViewModel) {
     var confirmsDeletion by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { model.refreshBilling() }
+    var confirmsWhatsAppUnlink by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        model.refreshBilling()
+        model.refreshWhatsApp()
+    }
     if (confirmsDeletion) {
         AlertDialog(
             onDismissRequest = { confirmsDeletion = false },
@@ -68,11 +72,28 @@ fun AccountScreen(state: AppUiState, model: AppViewModel) {
             },
         )
     }
+    if (confirmsWhatsAppUnlink) {
+        AlertDialog(
+            onDismissRequest = { confirmsWhatsAppUnlink = false },
+            title = { Text("¿Desconectar WhatsApp?") },
+            text = { Text("Este número dejará de poder hablar con los agentes de esta cuenta.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmsWhatsAppUnlink = false
+                    model.unlinkWhatsApp()
+                }) { Text("Desconectar", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmsWhatsAppUnlink = false }) { Text("Cancelar") } },
+        )
+    }
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Cuenta", fontWeight = FontWeight.Bold) },
-                actions = { IconButton(onClick = model::refreshBilling) { Icon(Icons.Default.Refresh, "Actualizar") } },
+                actions = { IconButton(onClick = {
+                    model.refreshBilling()
+                    model.refreshWhatsApp()
+                }) { Icon(Icons.Default.Refresh, "Actualizar") } },
             )
         },
     ) { padding ->
@@ -134,6 +155,45 @@ fun AccountScreen(state: AppUiState, model: AppViewModel) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+            item { Text("WhatsApp", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        val whatsApp = state.whatsApp
+                        when {
+                            whatsApp == null -> Text("Consultando el canal oficial…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            whatsApp.connected -> {
+                                Text("WhatsApp conectado", fontWeight = FontWeight.Bold)
+                                Text(
+                                    listOf(whatsApp.displayName, whatsApp.phoneHint).filter { it.isNotBlank() }.joinToString(" · "),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text("Usa los mismos agentes, conectores y créditos de esta cuenta.")
+                                OutlinedButton(
+                                    onClick = { confirmsWhatsAppUnlink = true },
+                                    enabled = !state.busy,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) { Text("Desconectar WhatsApp") }
+                            }
+                            whatsApp.configured -> {
+                                Text("Usa tus agentes desde WhatsApp", fontWeight = FontWeight.Bold)
+                                Text(
+                                    "Escribe desde tu WhatsApp normal al número oficial de Agentgenia. No necesitas WhatsApp Business.",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Button(onClick = model::startWhatsAppLink, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
+                                    Text("Conectar WhatsApp")
+                                }
+                                if (state.whatsAppLinkCode.isNotEmpty()) {
+                                    Text("Código temporal: ${state.whatsAppLinkCode}", fontWeight = FontWeight.SemiBold)
+                                    TextButton(onClick = model::refreshWhatsApp) { Text("Ya lo envié") }
+                                }
+                            }
+                            else -> Text("El canal oficial de WhatsApp todavía no está habilitado.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             }
             item {

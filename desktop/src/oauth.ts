@@ -10,7 +10,9 @@ import type {
   BotComputerSnapshot,
   BotWorkflowDraft,
   ConnectorConnectionSnapshot,
-  ConnectorConnectionStatus
+  ConnectorConnectionStatus,
+  WhatsAppLinkStart,
+  WhatsAppStatus
 } from "./contracts";
 import { CONNECTOR_CATALOG, normalizeAppState } from "./contracts";
 
@@ -192,6 +194,18 @@ export class DesktopOAuthController {
 
   openBillingPortal(signal?: AbortSignal): Promise<void> {
     return this.client.openBillingPortal(signal);
+  }
+
+  whatsAppStatus(signal?: AbortSignal): Promise<WhatsAppStatus> {
+    return this.client.whatsAppStatus(signal);
+  }
+
+  startWhatsAppLink(signal?: AbortSignal): Promise<WhatsAppLinkStart> {
+    return this.client.startWhatsAppLink(signal);
+  }
+
+  unlinkWhatsApp(signal?: AbortSignal): Promise<WhatsAppStatus> {
+    return this.client.unlinkWhatsApp(signal);
   }
 
   computerStatus(botId: string, signal?: AbortSignal): Promise<BotComputerSnapshot> {
@@ -511,6 +525,30 @@ class WrapperServiceClient {
   async openBillingPortal(signal?: AbortSignal): Promise<void> {
     const result = await this.authorizedJson("/v1/billing/portal", { method: "POST", signal });
     await this.options.openExternal(safeStripeUrl(stringValue(result.portal_url), "billing.stripe.com"));
+  }
+
+  async whatsAppStatus(signal?: AbortSignal): Promise<WhatsAppStatus> {
+    return parseWhatsAppStatus(await this.authorizedJson("/v1/whatsapp/status", { signal }));
+  }
+
+  async startWhatsAppLink(signal?: AbortSignal): Promise<WhatsAppLinkStart> {
+    const result = await this.authorizedJson("/v1/whatsapp/link", {
+      method: "POST",
+      signal
+    });
+    const status = parseWhatsAppStatus(result);
+    const code = stringValue(result.code);
+    const expiresAt = numberValue(result.expires_at);
+    if (!code || expiresAt <= Date.now() / 1000) {
+      throw new Error("El servicio devolvió un enlace de WhatsApp inválido.");
+    }
+    await this.options.openExternal(safeWhatsAppUrl(stringValue(result.url)));
+    return { ...status, code, expiresAt };
+  }
+
+  async unlinkWhatsApp(signal?: AbortSignal): Promise<WhatsAppStatus> {
+    await this.authorizedJson("/v1/whatsapp/unlink", { method: "POST", signal });
+    return this.whatsAppStatus(signal);
   }
 
   private async authorizedJson(
@@ -890,6 +928,20 @@ function parseAccountStateSnapshot(value: Record<string, unknown>): AccountState
   };
 }
 
+function parseWhatsAppStatus(value: Record<string, unknown>): WhatsAppStatus {
+  const activeBotId = value.active_bot_id;
+  if (activeBotId !== null && activeBotId !== undefined && typeof activeBotId !== "string") {
+    throw new Error("El servicio devolvió un enlace de WhatsApp inválido.");
+  }
+  return {
+    configured: value.configured === true,
+    connected: value.connected === true,
+    displayName: stringValue(value.display_name),
+    phoneHint: stringValue(value.phone_hint),
+    activeBotId: typeof activeBotId === "string" && activeBotId ? activeBotId : null
+  };
+}
+
 function parseComputerSnapshot(value: Record<string, unknown>): BotComputerSnapshot {
   const state = stringValue(value.state);
   if (!["disabled", "pulling", "running", "hibernated", "off", "error"].includes(state)) {
@@ -927,6 +979,20 @@ function safeStripeUrl(value: string, expectedHost: string): string {
   const url = new URL(value);
   if (url.protocol !== "https:" || url.hostname !== expectedHost || url.username || url.password) {
     throw new Error("El servicio devolvió una URL de Stripe insegura.");
+  }
+  return url.toString();
+}
+
+function safeWhatsAppUrl(value: string): string {
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:"
+    || url.hostname !== "wa.me"
+    || url.username
+    || url.password
+    || !/^\/[0-9]{7,15}$/.test(url.pathname)
+  ) {
+    throw new Error("El servicio devolvió una URL de WhatsApp insegura.");
   }
   return url.toString();
 }

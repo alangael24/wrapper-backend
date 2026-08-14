@@ -163,6 +163,19 @@ export interface BillingPlan {
   max_concurrent_runs: number;
 }
 
+export interface WhatsAppStatus {
+  configured: boolean;
+  connected: boolean;
+  displayName: string;
+  phoneHint: string;
+  activeBotId: string | null;
+}
+
+export interface WhatsAppLinkStart extends WhatsAppStatus {
+  code: string;
+  expiresAt: number;
+}
+
 export interface BotProfile {
   id: string;
   name: string;
@@ -296,6 +309,9 @@ export interface DesktopApi {
   billingSnapshot(): Promise<BillingSnapshot>;
   startCheckout(tier: "basic" | "pro" | "business"): Promise<void>;
   openBillingPortal(): Promise<void>;
+  whatsAppStatus(): Promise<WhatsAppStatus>;
+  startWhatsAppLink(): Promise<WhatsAppLinkStart>;
+  unlinkWhatsApp(): Promise<WhatsAppStatus>;
   computerStatus(botId: string): Promise<BotComputerSnapshot>;
   ensureComputer(botId: string, botName: string): Promise<BotComputerSnapshot>;
   handBackComputer(botId: string): Promise<BotComputerSnapshot>;

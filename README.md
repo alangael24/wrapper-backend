@@ -12,6 +12,11 @@ Las tareas completas se ejecutan con **Pi** en modo RPC. DeepSeek V4 se mantiene
 como modelo principal y Pi conserva herramientas, conectores y pi-chrome. Por el
 momento el producto es text-only: no se incluye un puente de visión.
 
+El canal oficial de WhatsApp permite que una cuenta vinculada use esos mismos
+bots desde un WhatsApp personal, sin instalar otro producto ni duplicar el
+harness. Los mensajes entrantes pasan por el mismo estado de cuenta, wallet,
+Pi y permisos de conectores que Electron/iOS/Android.
+
 El backend base requiere Python, `cryptography` y `psycopg` con su pool cuando usa
 Supabase/Postgres; Pi es una dependencia opcional de Node.js y viene
 desactivado por defecto.
@@ -65,7 +70,9 @@ webhooks se ejecutan dentro de transacciones. La versión 11 añade el ledger de
 créditos, runs, allocations, tokens efímeros y costo entero en microUSD. La
 versión 13 añade el estado versionado por cuenta para sincronizar bots,
 conversaciones, personalización, workflows y selección de conectores entre
-Electron e iOS sin compartir archivos locales entre usuarios.
+Electron e iOS sin compartir archivos locales entre usuarios. La versión 17
+añade códigos de vínculo hasheados, identidades de WhatsApp y un inbox
+durable/idempotente para webhooks de Meta.
 
 En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
 `WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de
@@ -283,6 +290,38 @@ el navegador aislado y los conectores autorizados del bot. Esta función no
 modifica `go_backend/pi_harness.py` ni comparte el perfil original grabado: si
 la tarea necesita una sesión web, el usuario debe autorizarla en el perfil
 temporal de esa ejecución o usar un conector OAuth.
+
+### Canal oficial de WhatsApp
+
+Agentgenia usa WhatsApp Business Platform únicamente como transporte del número
+oficial. El cliente final escribe desde su WhatsApp normal. En **Plan y
+facturación → WhatsApp**, la app genera un código aleatorio de diez minutos y
+abre `wa.me` con el mensaje preparado. El backend guarda solo el hash, lo
+consume una vez y liga una identidad de WhatsApp a una sola cuenta activa.
+
+Después del vínculo, frases como “mis agentes”, “usa Ventas”, “crea un agente
+para cotizaciones” o una tarea normal se enrutan contra el estado canónico de la
+cuenta. Crear y conversar desde WhatsApp aparece también en las apps. El número
+público no es un chatbot sin autenticación: mensajes que no contienen un código
+válido y no provienen de una cuenta ligada se ignoran.
+
+Meta firma cada POST con `X-Hub-Signature-256`. El servidor valida el cuerpo
+crudo, guarda el `message_id` antes de devolver 200 y procesa después mediante
+una cola PostgreSQL/SQLite. Así, reintentos, reinicios y varias réplicas no
+duplican tareas. El MVP acepta texto, botones y respuestas interactivas; notas
+de voz, documentos, campañas salientes y grupos no están habilitados. No se usa
+automatización de WhatsApp Web ni sesiones personales compartidas.
+
+Para habilitarlo en Meta Developers:
+
+1. Añade el producto WhatsApp a una app de Agentgenia y asigna un número.
+2. Configura el callback `https://TU-BACKEND/v1/whatsapp/webhook` y usa el mismo
+   valor privado en Meta y `WHATSAPP_VERIFY_TOKEN`.
+3. Guarda el App Secret, access token server-side, Phone Number ID y número E.164
+   en las variables `WHATSAPP_*`; nunca se incluyen en una app cliente.
+4. Aplica `20260814120000_whatsapp_channel.sql` y establece
+   `WHATSAPP_ENABLED=1` solo cuando todas las credenciales estén presentes.
+5. Completa la verificación, permisos y revisión de Meta antes de distribuirlo.
 
 ### Login con Google
 
@@ -536,6 +575,7 @@ recursos facturables huérfanos.
 | GET/POST | `/v1/connectors/native/setup/<attempt_id>` | Formulario de un solo uso para un adaptador first-party |
 | POST | `/v1/signup` | Crea un usuario `free`; no acepta decisiones de tier ni asigna capacidad |
 | POST | `/v1/billing/webhook` | Webhook que exige una firma `Stripe-Signature` válida |
+| GET/POST | `/v1/whatsapp/webhook` | Challenge y eventos firmados del número oficial de Meta |
 | GET | `/healthz` | Liveness del proceso y estado resumido de dependencias |
 | GET | `/readyz` | Readiness real; responde 503 si PostgreSQL/esquema no están listos |
 
@@ -563,6 +603,9 @@ proviene del flujo de signup.
 | GET | `/v1/billing` | Estado de plan y suscripción del usuario autenticado |
 | POST | `/v1/billing/checkout` | Abre Checkout con `{tier:"basic"|"pro"|"business"}`; el servidor fija el price ID |
 | POST | `/v1/billing/portal` | Crea una sesión del Customer Portal para el customer ligado al usuario |
+| GET | `/v1/whatsapp/status` | Estado seguro del vínculo, sin exponer el teléfono completo |
+| POST | `/v1/whatsapp/link` | Genera un código hasheado de un solo uso y un enlace `wa.me` |
+| POST | `/v1/whatsapp/unlink` | Elimina la identidad de WhatsApp ligada a la cuenta |
 | GET | `/v1/credits` | Plan, saldo disponible/reservado, ciclo y actividad reciente |
 | GET | `/v1/models` | Catálogo de modelos del proveedor configurado |
 | POST | `/v1/chat/completions` | Proxy OpenAI-compatible (stream y no-stream) |
@@ -648,6 +691,19 @@ runtime se agrupan aquí por función.
 | `ACCOUNT_REFRESH_TTL_SECONDS` | `2592000` | Vida del refresh token |
 | `ACCOUNT_AUTH_ATTEMPT_TTL_SECONDS` | `600` | Vida del intento OAuth |
 | `WRAPPER_SERVICE_URL` | producción | Backend utilizado por Electron |
+
+### WhatsApp
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `WHATSAPP_ENABLED` | `0` | Habilita el canal oficial y su worker durable |
+| `WHATSAPP_VERIFY_TOKEN` | vacío | Secreto compartido para el challenge de Meta |
+| `WHATSAPP_APP_SECRET` | vacío | App Secret usado para validar `X-Hub-Signature-256` |
+| `WHATSAPP_ACCESS_TOKEN` | vacío | Token server-side para enviar mensajes por Cloud API |
+| `WHATSAPP_PHONE_NUMBER_ID` | vacío | ID del número configurado en Meta |
+| `WHATSAPP_PUBLIC_NUMBER` | vacío | E.164 sin `+`, usado solo para construir `wa.me` |
+| `WHATSAPP_GRAPH_VERSION` | `v23.0` | Versión explícita de Graph API |
+| `WHATSAPP_LINK_TTL_SECONDS` | `600` | Vida del código; rango 120–3600 segundos |
 
 ### Stripe
 
@@ -749,6 +805,9 @@ runtime se agrupan aquí por función.
   en `WRAPPER_SECRET_PREVIOUS_JSON` para descifrado y rotación perezosa.
 - OAuth y consentimientos se persisten con identificadores hasheados. Los
   resultados se consultan por POST y se consumen atómicamente una sola vez.
+- Los códigos de WhatsApp también se almacenan hasheados y se consumen dentro
+  de una transacción. Cada webhook se autentica por HMAC sobre el cuerpo crudo,
+  se deduplica por `message_id` y nunca entrega tokens de Meta a los clientes.
 - Toda respuesta JSON usa `Cache-Control: no-store`; los errores 500 exponen
   solo `Internal server error` y un `request_id`, mientras la excepción completa
   permanece en los logs privados.

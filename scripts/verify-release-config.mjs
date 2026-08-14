@@ -135,6 +135,8 @@ if (!androidReleaseWorkflow.includes("if: inputs.publish_to_play == true")
 for (const key of [
   "DATABASE_URL", "WRAPPER_SECRET", "ADMIN_TOKEN", "DEEPSEEK_API_KEY",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URI",
+  "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET", "WHATSAPP_ACCESS_TOKEN",
+  "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_PUBLIC_NUMBER",
   "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_BASE64",
   "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_STARTER_PRICE_ID",
   "STRIPE_PRO_PRICE_ID", "STRIPE_BUSINESS_PRICE_ID", "COMPOSIO_API_KEY",
@@ -159,6 +161,8 @@ const expectedMigrations = [
   ["20260814045554_production_audit_hardening.sql", 14],
   ["20260814052000_distributed_rate_limits.sql", 15],
   ["20260814070000_run_recovery_and_retention.sql", 16],
+  ["20260814120000_whatsapp_channel.sql", 17],
+  ["20260814123000_whatsapp_channel_rls.sql", 17],
 ];
 const migrationContents = await Promise.all(
   expectedMigrations.map(([name]) => readFile(`supabase/migrations/${name}`, "utf8")),

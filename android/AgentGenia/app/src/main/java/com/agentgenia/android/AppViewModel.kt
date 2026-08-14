@@ -18,6 +18,8 @@ import com.agentgenia.android.model.ConnectorCatalog
 import com.agentgenia.android.model.ConnectorStatus
 import com.agentgenia.android.model.MessageRole
 import com.agentgenia.android.model.PersistedAccountState
+import com.agentgenia.android.model.WhatsAppStatus
+import kotlinx.coroutines.Job
 import com.agentgenia.android.model.parseAgentAnswer
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -39,6 +41,8 @@ data class AppUiState(
     val selectedConnectorIds: List<String> = emptyList(),
     val connectorStatuses: Map<String, ConnectorStatus> = emptyMap(),
     val billing: BillingSnapshot? = null,
+    val whatsApp: WhatsAppStatus? = null,
+    val whatsAppLinkCode: String = "",
     val section: MainSection = MainSection.Agents,
     val selectedBotId: String? = null,
     val runningBotIds: Set<String> = emptySet(),
@@ -57,6 +61,7 @@ class AppViewModel(
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
+    private var whatsAppPollingJob: Job? = null
 
     init { bootstrap() }
 
@@ -71,6 +76,8 @@ class AppViewModel(
     fun clearError() = _state.update { it.copy(error = null) }
 
     fun signOut() = viewModelScope.launch {
+        whatsAppPollingJob?.cancel()
+        whatsAppPollingJob = null
         api.signOut()
         _state.value = AppUiState(phase = AppPhase.SignedOut)
     }
@@ -89,7 +96,10 @@ class AppViewModel(
         _state.update { it.copy(section = section) }
         when (section) {
             MainSection.Plugins -> refreshConnectors()
-            MainSection.Account -> refreshBilling()
+            MainSection.Account -> {
+                refreshBilling()
+                refreshWhatsApp()
+            }
             else -> Unit
         }
     }
@@ -188,6 +198,37 @@ class AppViewModel(
         _state.update { it.copy(externalUrl = api.portalUrl()) }
     }
 
+    fun refreshWhatsApp() = viewModelScope.launch {
+        runCatching { api.whatsAppStatus() }
+            .onSuccess { status -> _state.update { it.copy(whatsApp = status) } }
+            .onFailure(::report)
+    }
+
+    fun startWhatsAppLink() = launchBusy {
+        val started = api.startWhatsAppLink()
+        _state.update { it.copy(externalUrl = started.url, whatsAppLinkCode = started.code) }
+        whatsAppPollingJob?.cancel()
+        whatsAppPollingJob = viewModelScope.launch {
+            while (System.currentTimeMillis() / 1_000 < started.expiresAt) {
+                delay(2_000)
+                val status = runCatching { api.whatsAppStatus() }.getOrNull() ?: continue
+                _state.update { it.copy(whatsApp = status) }
+                if (status.connected) {
+                    _state.update { it.copy(whatsAppLinkCode = "") }
+                    return@launch
+                }
+            }
+            _state.update { it.copy(whatsAppLinkCode = "") }
+        }
+    }
+
+    fun unlinkWhatsApp() = launchBusy {
+        whatsAppPollingJob?.cancel()
+        whatsAppPollingJob = null
+        val status = api.unlinkWhatsApp()
+        _state.update { it.copy(whatsApp = status, whatsAppLinkCode = "") }
+    }
+
     fun loadComputer(botId: String) = viewModelScope.launch {
         _state.update { it.copy(computerBotId = botId) }
         runCatching { api.computerStatus(botId) }
@@ -247,19 +288,22 @@ class AppViewModel(
         )
         val connectors = viewModelScope.async { runCatching { api.connectors() } }
         val billing = viewModelScope.async { runCatching { api.billing() }.getOrNull() }
+        val whatsApp = viewModelScope.async { runCatching { api.whatsAppStatus() }.getOrNull() }
         val connectorResult = connectors.await()
         val billingValue = billing.await()
+        val whatsAppValue = whatsApp.await()
         connectorResult
             .onSuccess(::applyConnectorSnapshot)
             .onFailure { error ->
                 _state.update {
                     it.copy(
                         billing = billingValue,
+                        whatsApp = whatsAppValue,
                         error = "No pudimos actualizar los conectores; conservamos tu configuración local. ${userMessage(error)}",
                     )
                 }
             }
-        if (connectorResult.isSuccess) _state.update { it.copy(billing = billingValue) }
+        if (connectorResult.isSuccess) _state.update { it.copy(billing = billingValue, whatsApp = whatsAppValue) }
     }
 
     private fun applyConnectorSnapshot(statuses: List<ConnectorStatus>) {

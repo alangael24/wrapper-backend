@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -285,6 +285,42 @@ CREATE TABLE IF NOT EXISTS agent_run_tokens (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS whatsapp_link_codes (
+  code_hash   TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  expires_at  REAL NOT NULL,
+  consumed_at REAL,
+  created_at  REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS whatsapp_links (
+  wa_user_id      TEXT PRIMARY KEY,
+  user_id         TEXT UNIQUE NOT NULL,
+  phone_number_id TEXT NOT NULL,
+  display_name    TEXT NOT NULL DEFAULT '',
+  active_bot_id   TEXT,
+  created_at      REAL NOT NULL,
+  updated_at      REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+  message_id          TEXT PRIMARY KEY,
+  user_id             TEXT,
+  phone_number_id     TEXT NOT NULL,
+  wa_user_id          TEXT NOT NULL,
+  message_type        TEXT NOT NULL,
+  text                 TEXT NOT NULL DEFAULT '',
+  payload_json         TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'pending',
+  attempts             INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at      REAL NOT NULL DEFAULT 0,
+  result_text          TEXT NOT NULL DEFAULT '',
+  outbound_message_id  TEXT,
+  last_error           TEXT NOT NULL DEFAULT '',
+  created_at           REAL NOT NULL,
+  updated_at           REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
@@ -321,6 +357,16 @@ CREATE INDEX IF NOT EXISTS idx_credit_grants_user_expiry
   ON credit_grants(user_id, expires_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created
   ON credit_ledger(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_link_codes_user
+  ON whatsapp_link_codes(user_id, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_whatsapp_link_code_user
+  ON whatsapp_link_codes(user_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_links_user
+  ON whatsapp_links(user_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_pending
+  ON whatsapp_messages(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_user
+  ON whatsapp_messages(user_id, created_at);
 """
 
 
@@ -352,6 +398,10 @@ def _hash_ephemeral(kind: str, value: str) -> str:
 
 def hash_agent_run_token(token: str) -> str:
     return _hash_ephemeral("run-token", token)
+
+
+def hash_whatsapp_link_code(code: str) -> str:
+    return _hash_ephemeral("whatsapp-link", code.strip().upper())
 
 
 class Store:
@@ -1055,6 +1105,235 @@ class Store:
         if saved is None:
             raise RuntimeError("No se pudo guardar el estado de la cuenta")
         return dict(saved)
+
+    # ---------- canal oficial de WhatsApp ----------
+    def create_whatsapp_link_code(
+        self, *, user_id: str, code: str, expires_at: float
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "DELETE FROM whatsapp_link_codes WHERE expires_at<=?",
+                    (now,),
+                )
+                self._conn.execute(
+                    "INSERT INTO whatsapp_link_codes(code_hash,user_id,expires_at,created_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                    "code_hash=excluded.code_hash,expires_at=excluded.expires_at,"
+                    "consumed_at=NULL,created_at=excluded.created_at",
+                    (hash_whatsapp_link_code(code), user_id, expires_at, now),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def consume_whatsapp_link_code(
+        self,
+        *,
+        code: str,
+        wa_user_id: str,
+        phone_number_id: str,
+        display_name: str,
+    ) -> dict | None:
+        now = _now()
+        code_hash = hash_whatsapp_link_code(code)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT c.*,u.account_status FROM whatsapp_link_codes c "
+                    "JOIN users u ON u.id=c.user_id WHERE c.code_hash=?",
+                    (code_hash,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["consumed_at"] is not None
+                    or float(row["expires_at"]) <= now
+                    or row["account_status"] != "active"
+                ):
+                    self._conn.rollback()
+                    return None
+                changed = self._conn.execute(
+                    "UPDATE whatsapp_link_codes SET consumed_at=? "
+                    "WHERE code_hash=? AND consumed_at IS NULL AND expires_at>?",
+                    (now, code_hash, now),
+                )
+                if changed.rowcount != 1:
+                    self._conn.rollback()
+                    return None
+                user_id = row["user_id"]
+                # One personal WhatsApp identity per account in the MVP. A
+                # fresh, authenticated code deliberately replaces an older link.
+                self._conn.execute(
+                    "DELETE FROM whatsapp_links WHERE user_id=? OR wa_user_id=?",
+                    (user_id, wa_user_id),
+                )
+                self._conn.execute(
+                    "INSERT INTO whatsapp_links(wa_user_id,user_id,phone_number_id,display_name,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (wa_user_id, user_id, phone_number_id, display_name[:120], now, now),
+                )
+                self._conn.commit()
+                return {
+                    "user_id": user_id,
+                    "wa_user_id": wa_user_id,
+                    "phone_number_id": phone_number_id,
+                    "display_name": display_name[:120],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_whatsapp_link_for_user(self, user_id: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM whatsapp_links WHERE user_id=?", (user_id,)
+        )
+        return dict(row) if row else None
+
+    def get_whatsapp_link_for_sender(
+        self, *, wa_user_id: str, phone_number_id: str
+    ) -> dict | None:
+        row = self._one(
+            "SELECT l.*,u.account_status,u.tier,u.model_provider_override,u.subscription_id,"
+            "u.unlimited_usage FROM whatsapp_links l JOIN users u ON u.id=l.user_id "
+            "WHERE l.wa_user_id=? AND l.phone_number_id=? AND u.account_status='active'",
+            (wa_user_id, phone_number_id),
+        )
+        return dict(row) if row else None
+
+    def update_whatsapp_active_bot(self, *, user_id: str, bot_id: str | None) -> None:
+        self._exec(
+            "UPDATE whatsapp_links SET active_bot_id=?,updated_at=? WHERE user_id=?",
+            (bot_id, _now(), user_id),
+        )
+
+    def delete_whatsapp_link(self, user_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM whatsapp_links WHERE user_id=?", (user_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM whatsapp_link_codes WHERE user_id=?", (user_id,)
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
+    def enqueue_whatsapp_message(
+        self,
+        *,
+        message_id: str,
+        phone_number_id: str,
+        wa_user_id: str,
+        message_type: str,
+        text: str,
+        payload: dict,
+    ) -> bool:
+        now = _now()
+        link = self.get_whatsapp_link_for_sender(
+            wa_user_id=wa_user_id, phone_number_id=phone_number_id
+        )
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO whatsapp_messages("
+                "message_id,user_id,phone_number_id,wa_user_id,message_type,text,payload_json,"
+                "status,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?,?) "
+                "ON CONFLICT(message_id) DO NOTHING",
+                (
+                    message_id,
+                    link["user_id"] if link else None,
+                    phone_number_id,
+                    wa_user_id,
+                    message_type[:40],
+                    text[:20_000],
+                    json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return bool(cursor.rowcount)
+
+    def claim_whatsapp_message(self) -> dict | None:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM whatsapp_messages WHERE status='pending' "
+                    "AND next_attempt_at<=? ORDER BY created_at LIMIT 1",
+                    (now,),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return None
+                changed = self._conn.execute(
+                    "UPDATE whatsapp_messages SET status='processing',attempts=attempts+1,updated_at=? "
+                    "WHERE message_id=? AND status='pending'",
+                    (now, row["message_id"]),
+                )
+                if changed.rowcount != 1:
+                    self._conn.rollback()
+                    return None
+                claimed = self._conn.execute(
+                    "SELECT * FROM whatsapp_messages WHERE message_id=?",
+                    (row["message_id"],),
+                ).fetchone()
+                self._conn.commit()
+                return dict(claimed) if claimed else None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def complete_whatsapp_message(
+        self,
+        *,
+        message_id: str,
+        status: str,
+        result_text: str = "",
+        outbound_message_id: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        if status not in {"succeeded", "ignored"}:
+            raise ValueError("estado final de WhatsApp inválido")
+        self._exec(
+            "UPDATE whatsapp_messages SET status=?,result_text=?,outbound_message_id=?,"
+            "user_id=COALESCE(?,user_id),last_error='',updated_at=? WHERE message_id=?",
+            (
+                status,
+                result_text[:20_000],
+                outbound_message_id,
+                user_id,
+                _now(),
+                message_id,
+            ),
+        )
+
+    def retry_whatsapp_message(
+        self, *, message_id: str, error: str, maximum_attempts: int = 3
+    ) -> None:
+        row = self._one(
+            "SELECT attempts FROM whatsapp_messages WHERE message_id=?", (message_id,)
+        )
+        attempts = int(row["attempts"]) if row else maximum_attempts
+        terminal = attempts >= maximum_attempts
+        delay = min(300, 5 * (2 ** max(0, attempts - 1)))
+        self._exec(
+            "UPDATE whatsapp_messages SET status=?,next_attempt_at=?,last_error=?,updated_at=? "
+            "WHERE message_id=?",
+            (
+                "failed" if terminal else "pending",
+                _now() if terminal else _now() + delay,
+                error[:500],
+                _now(),
+                message_id,
+            ),
+        )
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,
@@ -2557,6 +2836,13 @@ class Store:
                     "account_identity_tokens": (
                         "DELETE FROM account_identity_tokens WHERE expires_at<=?", (current,)
                     ),
+                    "whatsapp_link_codes": (
+                        "DELETE FROM whatsapp_link_codes WHERE expires_at<=?", (current,)
+                    ),
+                    "whatsapp_messages": (
+                        "DELETE FROM whatsapp_messages WHERE created_at<=?",
+                        (current - 90 * 86400,),
+                    ),
                     "account_sessions": (
                         "DELETE FROM account_sessions WHERE refresh_expires_at<=? "
                         "OR (revoked_at IS NOT NULL AND revoked_at<=?)",
@@ -2579,6 +2865,13 @@ class Store:
                 for name, (sql, params) in statements.items():
                     cursor = self._conn.execute(sql, params)
                     counts[name] = max(0, int(cursor.rowcount or 0))
+                # A process can stop after claiming a webhook. Return only
+                # genuinely abandoned work to the durable queue.
+                self._conn.execute(
+                    "UPDATE whatsapp_messages SET status='pending',next_attempt_at=?,updated_at=? "
+                    "WHERE status='processing' AND updated_at<=?",
+                    (current, current, current - 3600),
+                )
                 self._conn.commit()
                 return counts
             except Exception:

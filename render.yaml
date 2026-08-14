@@ -45,6 +45,22 @@ services:
         sync: false
       - key: GOOGLE_OAUTH_REDIRECT_URI
         sync: false
+      - key: WHATSAPP_ENABLED
+        value: "0"
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_PUBLIC_NUMBER
+        sync: false
+      - key: WHATSAPP_GRAPH_VERSION
+        value: v23.0
+      - key: WHATSAPP_LINK_TTL_SECONDS
+        value: "600"
       - key: APPLE_CLIENT_ID
         value: com.agentgenia.ios
       - key: APPLE_TEAM_ID

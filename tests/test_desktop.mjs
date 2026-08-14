@@ -357,6 +357,28 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
   assert.match(oauth, /max_credits: 15/);
 });
 
+test("links the signed-in account to official WhatsApp without exposing server secrets", async () => {
+  const [main, preload, oauth, renderer, styles] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/renderer/styles.css", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /desktop:start-whatsapp-link/);
+  assert.match(main, /desktop:unlink-whatsapp/);
+  assert.match(preload, /startWhatsAppLink/);
+  assert.doesNotMatch(preload, /WHATSAPP_ACCESS_TOKEN|WHATSAPP_APP_SECRET|WHATSAPP_VERIFY_TOKEN/);
+  assert.match(oauth, /"\/v1\/whatsapp\/link"/);
+  assert.match(oauth, /"\/v1\/whatsapp\/status"/);
+  assert.match(oauth, /safeWhatsAppUrl/);
+  assert.match(oauth, /url\.hostname !== "wa\.me"/);
+  assert.match(renderer, /Usa tus agentes desde WhatsApp/);
+  assert.match(renderer, /No necesitas una cuenta de WhatsApp Business/);
+  assert.match(renderer, /scheduleWhatsAppPoll/);
+  assert.match(styles, /\.whatsapp-account-card/);
+});
+
 test("deletes the signed-in account and local per-account state through isolated IPC", async () => {
   const [main, preload, oauth, renderer] = await Promise.all([
     readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
