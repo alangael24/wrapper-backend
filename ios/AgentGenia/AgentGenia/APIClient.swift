@@ -625,6 +625,19 @@ actor APIClient {
                         status: response.statusCode
                     )
                 }
+            } else if event.name == "done64" {
+                let encoded = String(decoding: event.data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let decodedData = Data(base64Encoded: encoded),
+                      let answer = String(data: decodedData, encoding: .utf8)
+                else {
+                    throw ServiceError(
+                        message: "Agent Genia recibió una respuesta final inválida.",
+                        code: "invalid_stream_response",
+                        status: response.statusCode
+                    )
+                }
+                return (nil, AgentRunResponse(answer: answer))
             } else if event.name == "done" {
                 do { return (nil, try decoder.decode(AgentRunResponse.self, from: event.data)) }
                 catch {

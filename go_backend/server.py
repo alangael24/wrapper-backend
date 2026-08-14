@@ -48,6 +48,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -534,6 +535,13 @@ class _AgentEventStream:
     def done(self, payload: dict) -> None:
         self._heartbeat_stop.set()
         self.send("done", payload)
+        self.finish()
+
+    def done_text(self, answer: str) -> None:
+        """Finish with an ASCII payload that requires no JSON decoder."""
+        self._heartbeat_stop.set()
+        encoded = base64.b64encode(answer.encode("utf-8")).decode("ascii")
+        self._write(f"event: done64\ndata: {encoded}\n\n".encode("ascii"))
         self.finish()
 
     def finish(self) -> None:
@@ -1946,9 +1954,9 @@ class Backend:
             # payload in this frame made mobile clients decode unrelated
             # optional fields before they could accept the answer.
             visible_answer = _partial_json_text(result.answer)
-            event_stream.done({
-                "answer": visible_answer if visible_answer is not None else result.answer,
-            })
+            event_stream.done_text(
+                visible_answer if visible_answer is not None else result.answer
+            )
         else:
             json_response(handler, 200, payload)
         self._run_timing_snapshot(run_id, pop=True)

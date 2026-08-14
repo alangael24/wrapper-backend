@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import http.client
 import os
@@ -1408,20 +1409,22 @@ class TestBackend(unittest.TestCase):
         text = body.decode("utf-8")
         self.assertIn("event: start", text)
         self.assertIn("event: delta", text)
-        self.assertIn("event: done", text)
+        self.assertIn("event: done64", text)
         frames = [frame for frame in text.split("\n\n") if frame]
         deltas = []
         final = None
         for frame in frames:
             lines = frame.splitlines()
             event = lines[0].removeprefix("event: ")
-            payload = json.loads(lines[1].removeprefix("data: "))
             if event == "delta":
+                payload = json.loads(lines[1].removeprefix("data: "))
                 deltas.append(payload["text"])
-            elif event == "done":
-                final = payload
+            elif event == "done64":
+                final = base64.b64decode(
+                    lines[1].removeprefix("data: ")
+                ).decode("utf-8")
         self.assertEqual("".join(deltas), "hola rápido")
-        self.assertEqual(final, {"answer": "hola rápido"})
+        self.assertEqual(final, "hola rápido")
         run_id = next(
             json.loads(frame.splitlines()[1].removeprefix("data: "))["run_id"]
             for frame in frames
