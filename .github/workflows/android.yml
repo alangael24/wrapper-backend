@@ -34,7 +34,7 @@ jobs:
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - name: Test, lint, and assemble from clean checkout
         working-directory: android/AgentGenia
-        run: ./gradlew clean testDebugUnitTest lintDebug assembleDebug
+        run: ./gradlew clean testDebugUnitTest lintDebug lintRelease assembleDebug bundleRelease
 
   instrumented-tests:
     needs: debug-build

@@ -608,6 +608,8 @@ Bearer = `ADMIN_TOKEN`:
 - Un run estándar autoriza hasta 25 créditos; deep work puede autorizar hasta 50.
 - `CREDITS_MODE=shadow` calcula y muestra sin bloquear ni descontar. Cambia a
   `enforce` después de validar producción para reservar, cobrar y detener runs.
+- Stripe live exige `CREDITS_MODE=enforce`; producción se niega a arrancar en
+  modo `shadow` para impedir consumo sin saldo efectivo.
 - `/v1/usage` conserva las ventanas históricas una versión; ya no gobiernan el acceso.
 
 ## Configuración (env)
@@ -705,6 +707,7 @@ runtime se agrupan aquí por función.
 | Variable | Default | Descripción |
 |---|---|---|
 | `COMPUTERS_ENABLED` | `0` | Habilita una sandbox Daytona persistente por `(usuario, bot)` |
+| `EXTERNAL_WRITES_ENABLED` | `0` | Debe seguir apagado: escrituras, shell y efectos externos requieren aprobación humana por operación |
 | `DAYTONA_API_KEY` | vacío | Credencial server-side; obligatoria si la función está habilitada |
 | `DAYTONA_API_URL` | vacío | Endpoint alternativo de Daytona |
 | `DAYTONA_TARGET` | vacío | Target o región opcional |

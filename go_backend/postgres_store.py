@@ -13,9 +13,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .store import SCHEMA_VERSION, Store, new_id
 
 
-POSTGRES_WRITE_LOCK_ID = 6_913_322_107_743_045_083
-
-
 def normalize_database_url(value: str) -> str:
     """Validate a Postgres URL and require TLS for non-loopback hosts."""
     raw = value.strip()
@@ -31,9 +28,9 @@ def normalize_database_url(value: str) -> str:
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     sslmode = query.get("sslmode", "").lower()
     if not loopback:
-        if sslmode in {"disable", "allow", "prefer"}:
-            raise ValueError("DATABASE_URL remoto debe verificar TLS")
-        query.setdefault("sslmode", "require")
+        if sslmode and sslmode != "verify-full":
+            raise ValueError("DATABASE_URL remoto debe usar sslmode=verify-full")
+        query.setdefault("sslmode", "verify-full")
     return urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
     )
@@ -60,11 +57,7 @@ class _PooledConnectionCompat:
     def execute(self, sql: str, params: tuple = ()) -> Any:
         connection = self._connection()
         if sql.strip().upper() == "BEGIN IMMEDIATE":
-            cursor = connection.execute("BEGIN")
-            connection.execute(
-                "SELECT pg_advisory_xact_lock(%s)", (POSTGRES_WRITE_LOCK_ID,)
-            )
-            return cursor
+            return connection.execute("BEGIN")
         return connection.execute(_postgres_sql(sql), params)
 
     def _finish(self, *, commit: bool) -> None:
@@ -102,6 +95,9 @@ class PostgresStore(Store):
 
         def configure(connection: Any) -> None:
             connection.execute("SET search_path TO agentgenia, public")
+            connection.execute("SET statement_timeout TO '30s'")
+            connection.execute("SET lock_timeout TO '5s'")
+            connection.execute("SET idle_in_transaction_session_timeout TO '30s'")
             connection.commit()
 
         self._path = "postgres"

@@ -211,11 +211,14 @@ class DaytonaComputerProvider:
                 "size_bytes": size_bytes,
             }
         if operation == "click":
+            double = arguments.get("double", False)
+            if not isinstance(double, bool):
+                raise ComputerError(400, "double debe ser true o false", "bad_computer_arguments")
             result = computer.mouse.click(
                 _int_arg(arguments, "x", 0, 10000),
                 _int_arg(arguments, "y", 0, 10000),
                 _choice_arg(arguments, "button", {"left", "right", "middle"}, "left"),
-                bool(arguments.get("double", False)),
+                double,
                 request_timeout=30,
             )
             return _model_dict(result)
@@ -353,7 +356,13 @@ class ComputerManager:
         self.store = store
         self.config = config
         self.provider = provider or (DaytonaComputerProvider(config) if config.configured else None)
-        self._lock = threading.RLock()
+        self._locks_guard = threading.Lock()
+        self._locks: dict[tuple[str, str], threading.RLock] = {}
+
+    def _bot_lock(self, user_id: str, bot_id: str) -> threading.RLock:
+        key = (user_id, bot_id)
+        with self._locks_guard:
+            return self._locks.setdefault(key, threading.RLock())
 
     @property
     def configured(self) -> bool:
@@ -398,7 +407,9 @@ class ComputerManager:
             raise ComputerError(503, "Las computadoras no están configuradas", "computers_disabled")
         bot_id = _bot_id(bot_id)
         bot_name = (bot_name or "Bot").strip()[:60]
-        with self._lock:
+        # Different users/bots provision in parallel; duplicate ensures for the
+        # same persistent computer remain serialized.
+        with self._bot_lock(user_id, bot_id):
             try:
                 row = self.store.claim_bot_computer(
                     user_id,
@@ -506,7 +517,11 @@ class ComputerManager:
             raise ComputerError(400, "arguments debe ser un objeto JSON", "bad_computer_arguments")
         import json
 
-        if len(json.dumps(arguments, ensure_ascii=False).encode("utf-8")) > MAX_COMPUTER_ARGUMENTS_BYTES:
+        try:
+            encoded_arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ComputerError(400, "arguments no es JSON válido", "bad_computer_arguments") from exc
+        if len(encoded_arguments) > MAX_COMPUTER_ARGUMENTS_BYTES:
             raise ComputerError(413, "arguments excede 64 KiB", "computer_arguments_too_large")
         if operation == "status":
             return {"operation": operation, "result": self.status(user_id=user_id, bot_id=bot_id)}
@@ -528,7 +543,7 @@ class ComputerManager:
         payload = {"operation": operation, "computer": snapshot, "result": result}
         if operation != "screenshot":
             try:
-                if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_COMPUTER_RESULT_BYTES:
+                if len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")) > MAX_COMPUTER_RESULT_BYTES:
                     raise ComputerError(502, "El resultado excede el límite", "computer_result_too_large")
             except (TypeError, ValueError) as exc:
                 raise ComputerError(502, "El resultado no es serializable", "computer_provider_error") from exc
@@ -610,8 +625,8 @@ def _provider_not_found(error: Exception) -> bool:
     ):
         if value == 404:
             return True
-    message = str(error).lower()
-    return "404" in message or "not found" in message or "no encontrado" in message
+    message = str(error).lower().strip()
+    return bool(re.search(r"(?:^|\b)(?:http\s*)?404(?:\b|$).*(?:not found|no encontrado)", message))
 
 
 def _text_arg(arguments: dict[str, Any], name: str, limit: int) -> str:

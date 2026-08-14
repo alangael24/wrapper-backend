@@ -18,7 +18,13 @@ struct SafariView: UIViewControllerRepresentable {
 struct ComputerViewer: UIViewRepresentable {
     let url: URL
 
-    func makeCoordinator() -> Coordinator { Coordinator(origin: url.scheme.map { "\($0)://\(url.host ?? "")" } ?? "") }
+    func makeCoordinator() -> Coordinator { Coordinator(origin: Self.origin(of: url)) }
+
+    private static func origin(of url: URL) -> String {
+        let scheme = url.scheme == "wss" ? "https" : (url.scheme ?? "")
+        let defaultPort = scheme == "https" ? 443 : nil
+        return "\(scheme)://\(url.host ?? ""):\(url.port ?? defaultPort ?? -1)"
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -51,7 +57,7 @@ struct ComputerViewer: UIViewRepresentable {
             guard let url = navigationAction.request.url,
                   url.scheme == "https" || url.scheme == "wss"
             else { decisionHandler(.cancel); return }
-            let nextOrigin = url.scheme.map { "\($0 == "wss" ? "https" : $0)://\(url.host ?? "")" } ?? ""
+            let nextOrigin = ComputerViewer.origin(of: url)
             decisionHandler(nextOrigin == origin ? .allow : .cancel)
         }
     }

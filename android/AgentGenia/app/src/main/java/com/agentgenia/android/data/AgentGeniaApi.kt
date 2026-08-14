@@ -53,9 +53,9 @@ class AgentGeniaApi(
     private val jsonType = "application/json; charset=utf-8".toMediaType()
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(180, TimeUnit.SECONDS)
+        .readTimeout(1_800, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
-        .callTimeout(190, TimeUnit.SECONDS)
+        .callTimeout(1_810, TimeUnit.SECONDS)
         .build()
     private val sessionMutex = Mutex()
     @Volatile private var session: AccountSession? = null
@@ -173,7 +173,7 @@ class AgentGeniaApi(
             JSONObject()
                 .put("prompt", prompt)
                 .put("browser", false)
-                .put("computer", true)
+                .put("computer", false)
                 .put("bot_id", botId)
                 .put("connector_ids", JSONArray(connectorIds))
                 .put("max_credits", 15)
@@ -337,7 +337,9 @@ class AgentGeniaApi(
         val uri = runCatching { URI(value) }.getOrNull()
             ?: throw IllegalArgumentException("API_BASE_URL inválida")
         val local = uri.scheme == "http" && uri.host in setOf("localhost", "127.0.0.1", "::1")
-        require((uri.scheme == "https" || local) && uri.userInfo == null) { "API_BASE_URL debe ser HTTPS o loopback" }
+        require((uri.scheme == "https" || local) && uri.userInfo == null && (uri.path.isNullOrEmpty() || uri.path == "/")) {
+            "API_BASE_URL debe ser HTTPS o loopback y no admite subpaths"
+        }
         return okhttp3.HttpUrl.Builder()
             .scheme(uri.scheme).host(uri.host).apply { if (uri.port != -1) port(uri.port) }.build()
     }

@@ -60,10 +60,17 @@ class SecureStore(private val context: Context) {
     fun readAccountState(accountId: String): PersistedAccountState {
         val file = accountFile(accountId)
         if (!file.exists()) return PersistedAccountState()
-        return runCatching {
+        return try {
             val encrypted = file.readBytes()
             JSONObject(decrypt(encrypted, accountAad(accountId)).decodeToString()).toPersistedAccountState()
-        }.getOrElse { PersistedAccountState() }
+        } catch (error: Throwable) {
+            val quarantine = File(file.parentFile, "${file.name}.corrupt.${System.currentTimeMillis()}")
+            file.copyTo(quarantine, overwrite = false)
+            throw IllegalStateException(
+                "Los datos locales están dañados y se conservaron para recuperación; no se sobrescribirán.",
+                error,
+            )
+        }
     }
 
     fun writeAccountState(accountId: String, state: PersistedAccountState) {
@@ -72,6 +79,7 @@ class SecureStore(private val context: Context) {
         val temporary = File(file.parentFile, "${file.name}.tmp")
         val encrypted = encrypt(state.toJson().toString().encodeToByteArray(), accountAad(accountId))
         temporary.writeBytes(encrypted)
+        if (file.exists()) file.copyTo(File(file.parentFile, "${file.name}.bak"), overwrite = true)
         if (!temporary.renameTo(file)) {
             file.writeBytes(encrypted)
             temporary.delete()

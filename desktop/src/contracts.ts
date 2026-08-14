@@ -249,10 +249,11 @@ export interface BotQuestionOption {
 }
 
 export interface AppState {
-  version: 1;
+  version: 2;
   onboardingCompleted: boolean;
   selectedConnectorIds: string[];
   bots: BotProfile[];
+  deletedBotIds: string[];
   activeBotId: string | null;
 }
 
@@ -318,10 +319,11 @@ export interface DesktopApi {
 
 export function initialAppState(): AppState {
   return {
-    version: 1,
+    version: 2,
     onboardingCompleted: false,
     selectedConnectorIds: [],
     bots: [],
+    deletedBotIds: [],
     activeBotId: null
   };
 }
@@ -332,17 +334,21 @@ export function normalizeAppState(value: unknown): AppState {
   const validConnectorIds = new Set(CONNECTOR_CATALOG.map((item) => item.id));
   const selectedConnectorIds = uniqueStrings(value.selectedConnectorIds)
     .filter((id) => validConnectorIds.has(id));
+  const deletedBotIds = uniqueStrings(value.deletedBotIds).slice(-200);
+  const deleted = new Set(deletedBotIds);
   const bots = Array.isArray(value.bots)
     ? value.bots.slice(0, 100).map(normalizeBot).filter((bot): bot is BotProfile => Boolean(bot))
+      .filter((bot) => !deleted.has(bot.id))
     : [];
   const activeBotId = typeof value.activeBotId === "string" && bots.some((bot) => bot.id === value.activeBotId)
     ? value.activeBotId
     : bots[0]?.id ?? null;
   return {
-    version: 1,
+    version: 2,
     onboardingCompleted: value.onboardingCompleted === true,
     selectedConnectorIds,
     bots,
+    deletedBotIds,
     activeBotId
   };
 }

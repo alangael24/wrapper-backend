@@ -27,10 +27,11 @@ class AccountStateError(ValueError):
 
 def empty_account_state() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "onboardingCompleted": False,
         "selectedConnectorIds": [],
         "bots": [],
+        "deletedBotIds": [],
         "activeBotId": None,
     }
 
@@ -39,24 +40,29 @@ def normalize_account_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AccountStateError("state debe ser un objeto JSON")
     selected = _connector_ids(value.get("selectedConnectorIds"))
+    deleted_bot_ids = _bounded_ids(value.get("deletedBotIds"), 200, "state.deletedBotIds")
+    deleted = set(deleted_bot_ids)
     bots = []
     seen: set[str] = set()
     raw_bots = value.get("bots")
     if raw_bots is not None and not isinstance(raw_bots, list):
         raise AccountStateError("state.bots debe ser una lista")
-    for raw in (raw_bots or [])[:100]:
+    if len(raw_bots or []) > 100:
+        raise AccountStateError("state.bots admite como máximo 100 elementos")
+    for raw in (raw_bots or []):
         bot = _bot(raw)
-        if bot and bot["id"] not in seen:
+        if bot and bot["id"] not in seen and bot["id"] not in deleted:
             seen.add(bot["id"])
             bots.append(bot)
     active = _text(value.get("activeBotId"), 100)
     if active not in seen:
         active = bots[0]["id"] if bots else None
     state = {
-        "version": 1,
+        "version": 2,
         "onboardingCompleted": value.get("onboardingCompleted") is True,
         "selectedConnectorIds": selected,
         "bots": bots,
+        "deletedBotIds": deleted_bot_ids,
         "activeBotId": active,
     }
     encoded = json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -78,6 +84,8 @@ def _bot(value: Any) -> dict[str, Any] | None:
     name = " ".join(_text(value.get("name"), 60).split())
     if not bot_id or not name:
         return None
+    _require_text_limit(value.get("title"), 100, "bot.title")
+    _require_text_limit(value.get("description"), 600, "bot.description")
     color = _text(value.get("color"), 7).lower()
     shape = _text(value.get("shape"), 20).lower()
     return {
@@ -99,8 +107,10 @@ def _bot(value: Any) -> dict[str, Any] | None:
 def _messages(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
+    if len(value) > 200:
+        raise AccountStateError("bot.messages admite como máximo 200 elementos")
     result = []
-    for item in value[-200:]:
+    for item in value:
         if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
             continue
         text = _text(item.get("text"), 20_000, multiline=True)
@@ -155,8 +165,10 @@ def _widget(value: Any) -> dict[str, Any] | None:
 def _workflows(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
+    if len(value) > 50:
+        raise AccountStateError("bot.workflows admite como máximo 50 elementos")
     result = []
-    for item in value[-50:]:
+    for item in value:
         if not isinstance(item, dict):
             continue
         workflow_id = _text(item.get("id"), 100)
@@ -198,6 +210,21 @@ def _connector_ids(value: Any) -> list[str]:
     return result
 
 
+def _bounded_ids(value: Any, limit: int, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > limit:
+        raise AccountStateError(f"{field} admite como máximo {limit} elementos")
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        item = _text(raw, 100)
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
 def _avatar(value: Any) -> str:
     if not isinstance(value, str) or len(value) > 700_000:
         return ""
@@ -212,6 +239,11 @@ def _text(value: Any, limit: int, *, multiline: bool = False) -> str:
     if not multiline:
         normalized = normalized.replace("\n", " ")
     return normalized[:limit]
+
+
+def _require_text_limit(value: Any, limit: int, field: str) -> None:
+    if isinstance(value, str) and len(value) > limit:
+        raise AccountStateError(f"{field} admite como máximo {limit} caracteres")
 
 
 def _date(value: Any, *, allow_empty: bool = False) -> str:
@@ -237,7 +269,7 @@ def _date(value: Any, *, allow_empty: bool = False) -> str:
         except (ValueError, OSError, OverflowError):
             parsed = None
     if parsed is None:
-        parsed = datetime.now(timezone.utc)
+        raise AccountStateError("Fecha inválida en el estado de cuenta")
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

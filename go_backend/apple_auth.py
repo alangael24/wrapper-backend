@@ -17,9 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import defaultdict, deque
 from pathlib import Path
-import threading
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -84,8 +82,6 @@ class AppleAccountAuth:
         self._jwks: dict[str, Any] = {}
         self._jwks_expires_at = 0.0
         self._private_key: ec.EllipticCurvePrivateKey | None = None
-        self._rate: dict[str, deque[float]] = defaultdict(deque)
-        self._rate_lock = threading.RLock()
         self._validate_configuration()
 
     @property
@@ -145,6 +141,13 @@ class AppleAccountAuth:
         subject = claims["sub"]
         email_value = claims.get("email")
         email = email_value if isinstance(email_value, str) and "@" in email_value else None
+        email_verified = claims.get("email_verified")
+        if email and email_verified not in {True, "true"}:
+            raise AppleAuthError(
+                "Apple no confirmó el correo de la identidad.",
+                status=401,
+                code="apple_email_unverified",
+            )
         token_hash = hashlib.sha256(("apple-identity|" + identity_token).encode()).hexdigest()
         try:
             account = self.store.get_or_create_federated_account(
@@ -181,28 +184,10 @@ class AppleAccountAuth:
         return self.session_issuer.issue_session(account=account, device_id=device_id)
 
     def _check_rate(self, key: str, *, limit: int) -> None:
-        now = time.monotonic()
-        with self._rate_lock:
-            if len(self._rate) > 10_000 and key not in self._rate:
-                stale = [name for name, bucket in self._rate.items() if not bucket or bucket[-1] <= now - 60]
-                for name in stale:
-                    self._rate.pop(name, None)
-                if len(self._rate) > 10_000:
-                    raise AppleAuthError(
-                        "Demasiados intentos de acceso. Espera un minuto.",
-                        status=429,
-                        code="rate_limit",
-                    )
-            bucket = self._rate[key]
-            while bucket and bucket[0] <= now - 60:
-                bucket.popleft()
-            if len(bucket) >= limit:
-                raise AppleAuthError(
-                    "Demasiados intentos de acceso. Espera un minuto.",
-                    status=429,
-                    code="rate_limit",
-                )
-            bucket.append(now)
+        if not self.store.consume_rate_limit(f"apple-auth:{key}", limit=limit, window_seconds=60):
+            raise AppleAuthError(
+                "Demasiados intentos de acceso. Espera un minuto.", status=429, code="rate_limit"
+            )
 
     def revoke_user(self, user_id: str) -> bool:
         credential = self.store.get_account_provider_credential(user_id, "apple")

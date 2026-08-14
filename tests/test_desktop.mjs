@@ -76,7 +76,7 @@ test("normalizes connector selection and persisted bot state", () => {
       createdAt: "2026-08-11T00:00:00.000Z"
     }]
   });
-  assert.equal(state.version, 1);
+  assert.equal(state.version, 2);
   assert.deepEqual(state.selectedConnectorIds, ["github"]);
   assert.equal(state.bots[0].name, "Mi bot");
   assert.deepEqual(state.bots[0].connectorIds, ["github"]);

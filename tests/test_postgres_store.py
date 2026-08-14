@@ -8,12 +8,16 @@ class PostgresStoreConfigurationTests(unittest.TestCase):
         normalized = normalize_database_url(
             "postgresql://agent:secret@db.example.com:5432/postgres"
         )
-        self.assertIn("sslmode=require", normalized)
+        self.assertIn("sslmode=verify-full", normalized)
 
     def test_rejects_weak_remote_tls_and_non_postgres_schemes(self):
         with self.assertRaises(ValueError):
             normalize_database_url(
                 "postgresql://agent:secret@db.example.com/postgres?sslmode=disable"
+            )
+        with self.assertRaises(ValueError):
+            normalize_database_url(
+                "postgresql://agent:secret@db.example.com/postgres?sslmode=require"
             )
         with self.assertRaises(ValueError):
             normalize_database_url("https://db.example.com/postgres")

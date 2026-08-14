@@ -13,6 +13,7 @@ import urllib.request
 from urllib.parse import urljoin
 
 UPSTREAM_TIMEOUT = 900
+MAX_UPSTREAM_BODY = 16 * 1024 * 1024
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -21,6 +22,26 @@ HOP_BY_HOP = {
 
 DEFAULT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward provider credentials through an HTTP redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _read_limited(response, limit: int = MAX_UPSTREAM_BODY) -> bytes:
+    declared = response.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise ValueError("Upstream response too large")
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("Upstream response too large")
+    return data
 
 
 def build_request(method: str, base_url: str, path: str, headers: dict, body: bytes | None):
@@ -134,9 +155,14 @@ def proxy_request(
     hdrs["Authorization"] = f"Bearer {api_key}"
     req = build_request(method, base_url, path, hdrs, body)
     try:
-        resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        resp = _OPENER.open(req, timeout=UPSTREAM_TIMEOUT)
     except urllib.error.HTTPError as e:
-        err_body = e.read()
+        try:
+            err_body = _read_limited(e)
+        except ValueError:
+            err_body = json.dumps(
+                {"error": {"message": "Upstream response too large", "type": "upstream_error"}}
+            ).encode()
         usage = parse_usage_from_body(err_body) if not is_stream(headers) else (None, Usage())
         return e.code, dict(e.headers), err_body, usage[1]
     except urllib.error.URLError:
@@ -171,7 +197,13 @@ def proxy_request(
             resp.close()
         return status, out_headers, None, usage
 
-    body_data = resp.read()
+    try:
+        body_data = _read_limited(resp)
+    except ValueError:
+        resp.close()
+        return 502, {"content-type": "application/json"}, json.dumps(
+            {"error": {"message": "Upstream response too large", "type": "upstream_error"}}
+        ).encode(), Usage()
     resp.close()
     m, usage = parse_usage_from_body(body_data)
     return status, out_headers, body_data, usage

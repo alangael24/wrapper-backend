@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -171,6 +171,13 @@ CREATE TABLE IF NOT EXISTS connector_auth_attempts (
   created_at             REAL NOT NULL,
   updated_at             REAL NOT NULL,
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+  scope_hash TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  request_count INTEGER NOT NULL CHECK(request_count > 0),
+  expires_at REAL NOT NULL,
+  PRIMARY KEY(scope_hash, window_start)
 );
 CREATE TABLE IF NOT EXISTS account_identity_tokens (
   token_hash TEXT PRIMARY KEY,
@@ -569,6 +576,24 @@ class Store:
             "(consumed_at IS NOT NULL AND consumed_at<?)",
             (cutoff, cutoff),
         )
+        self._exec("DELETE FROM rate_limit_buckets WHERE expires_at<?", (_now(),))
+
+    def consume_rate_limit(self, scope: str, *, limit: int, window_seconds: int) -> bool:
+        if limit < 1 or window_seconds < 1:
+            raise ValueError("rate limit inválido")
+        now = _now()
+        window_start = int(now // window_seconds) * window_seconds
+        scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        with self._lock:
+            row = self._conn.execute(
+                "INSERT INTO rate_limit_buckets(scope_hash,window_start,request_count,expires_at) "
+                "VALUES(?,?,1,?) ON CONFLICT(scope_hash,window_start) DO UPDATE SET "
+                "request_count=rate_limit_buckets.request_count+1,expires_at=excluded.expires_at "
+                "RETURNING request_count",
+                (scope_hash, window_start, window_start + window_seconds * 2),
+            ).fetchone()
+            self._conn.commit()
+        return bool(row and int(row["request_count"]) <= limit)
 
     def create_account_auth_attempt(
         self,
@@ -2226,7 +2251,9 @@ class Store:
         subscription = self._one(
             "SELECT stripe_subscription_id,tier,stripe_price_id,status,cancel_at_period_end,"
             "current_period_end,last_stripe_event_created,updated_at FROM billing_subscriptions "
-            "WHERE user_id=? ORDER BY updated_at DESC LIMIT 1",
+            "WHERE user_id=? ORDER BY "
+            "CASE WHEN status IN ('active','trialing','past_due') THEN 0 ELSE 1 END,"
+            "last_stripe_event_created DESC,updated_at DESC LIMIT 1",
             (user_id,),
         )
         result = dict(subscription) if subscription else None
@@ -2381,7 +2408,18 @@ class Store:
                             allow_increase=True,
                         )
                 elif tier_action == "free":
-                    self._transition_user_tier_locked(user_id, "free")
+                    replacement = self._conn.execute(
+                        "SELECT tier FROM billing_subscriptions WHERE user_id=? "
+                        "AND stripe_subscription_id<>? "
+                        "AND status IN ('active','trialing','past_due') "
+                        "ORDER BY last_stripe_event_created DESC,updated_at DESC LIMIT 1",
+                        (user_id, stripe_subscription_id or ""),
+                    ).fetchone()
+                    if replacement:
+                        self._transition_user_tier_locked(user_id, replacement["tier"])
+                        tier_action = "keep"
+                    else:
+                        self._transition_user_tier_locked(user_id, "free")
 
                 self._conn.execute(
                     "INSERT INTO stripe_events("
@@ -2404,37 +2442,56 @@ class Store:
         from .tiers import effective_limits
 
         now = _now()
-        events = self._q(
-            "SELECT estimated_cost_usd, created_at, model FROM usage_events WHERE user_id=?",
-            (user_id,),
-        )
-        runs = self._q(
-            "SELECT charged_credit_milli,created_at FROM agent_runs "
-            "WHERE user_id=? AND charged_credit_milli>0",
-            (user_id,),
-        )
         limits = effective_limits(tier)
         spans = {"5h": 5 * 3600, "week": 7 * 86400, "month": 30 * 86400}
-        by_model: dict[str, dict] = {}
+        cutoffs = {label: now - span for label, span in spans.items()}
+        event_totals = self._one(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN estimated_cost_usd ELSE 0 END),0) AS cost_5h,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN estimated_cost_usd ELSE 0 END),0) AS cost_week,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN estimated_cost_usd ELSE 0 END),0) AS cost_month,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END),0) AS requests_5h,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END),0) AS requests_week,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END),0) AS requests_month "
+            "FROM usage_events WHERE user_id=? AND created_at>=?",
+            (
+                cutoffs["5h"], cutoffs["week"], cutoffs["month"],
+                cutoffs["5h"], cutoffs["week"], cutoffs["month"],
+                user_id, cutoffs["month"],
+            ),
+        )
+        run_totals = self._one(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN charged_credit_milli ELSE 0 END),0) AS credits_5h,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN charged_credit_milli ELSE 0 END),0) AS credits_week,"
+            "COALESCE(SUM(CASE WHEN created_at>=? THEN charged_credit_milli ELSE 0 END),0) AS credits_month "
+            "FROM agent_runs WHERE user_id=? AND charged_credit_milli>0 AND created_at>=?",
+            (cutoffs["5h"], cutoffs["week"], cutoffs["month"], user_id, cutoffs["month"]),
+        )
+        model_rows = self._q(
+            "SELECT COALESCE(model,'unknown') AS model,COUNT(*) AS requests,"
+            "COALESCE(SUM(estimated_cost_usd),0) AS cost_usd "
+            "FROM usage_events WHERE user_id=? AND created_at>=? GROUP BY COALESCE(model,'unknown')",
+            (user_id, cutoffs["month"]),
+        )
+        by_model = {
+            row["model"]: {
+                "requests": int(row["requests"]),
+                "cost_usd": round(float(row["cost_usd"]), 6),
+            }
+            for row in model_rows
+        }
         result: dict = {}
-        for label, span in spans.items():
-            spent = sum(e["estimated_cost_usd"] for e in events if now - e["created_at"] <= span)
-            spent_credits = sum(
-                int(run["charged_credit_milli"]) for run in runs
-                if now - run["created_at"] <= span
-            ) / 1_000
-            requests = sum(1 for e in events if now - e["created_at"] <= span)
+        for label in spans:
+            spent = float(event_totals[f"cost_{label}"] if event_totals else 0)
+            spent_credits = int(run_totals[f"credits_{label}"] if run_totals else 0) / 1_000
+            requests = int(event_totals[f"requests_{label}"] if event_totals else 0)
             result[label] = {
                 "limit_credits": limits[label],
                 "spent_credits": round(spent_credits, 3),
                 "spent_usd": round(spent, 6),
                 "requests": requests,
             }
-        for e in events:
-            m = e["model"] or "unknown"
-            agg = by_model.setdefault(m, {"requests": 0, "cost_usd": 0.0})
-            agg["requests"] += 1
-            agg["cost_usd"] = round(agg["cost_usd"] + e["estimated_cost_usd"], 6)
         return {"user_id": user_id, "windows": result, "by_model": by_model}
 
     def usage_all(self) -> dict:
@@ -2445,3 +2502,44 @@ class Store:
             "FROM usage_events ORDER BY created_at DESC LIMIT 500"
         )
         return {"events": [dict(r) for r in events]}
+
+    def purge_expired_ephemeral_data(self, now: float | None = None) -> dict[str, int]:
+        """Apply the documented retention policy to credentials that no longer work."""
+        current = _now() if now is None else now
+        revoked_session_cutoff = current - 30 * 86400
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                counts: dict[str, int] = {}
+                statements = {
+                    "account_auth_attempts": (
+                        "DELETE FROM account_auth_attempts WHERE expires_at<=?", (current,)
+                    ),
+                    "connector_auth_attempts": (
+                        "DELETE FROM connector_auth_attempts WHERE expires_at<=?", (current,)
+                    ),
+                    "rate_limit_buckets": (
+                        "DELETE FROM rate_limit_buckets WHERE expires_at<=?", (current,)
+                    ),
+                    "account_identity_tokens": (
+                        "DELETE FROM account_identity_tokens WHERE expires_at<=?", (current,)
+                    ),
+                    "account_sessions": (
+                        "DELETE FROM account_sessions WHERE refresh_expires_at<=? "
+                        "OR (revoked_at IS NOT NULL AND revoked_at<=?)",
+                        (current, revoked_session_cutoff),
+                    ),
+                    "agent_run_tokens": (
+                        "DELETE FROM agent_run_tokens WHERE expires_at<=? "
+                        "OR (revoked_at IS NOT NULL AND revoked_at<=?)",
+                        (current, revoked_session_cutoff),
+                    ),
+                }
+                for name, (sql, params) in statements.items():
+                    cursor = self._conn.execute(sql, params)
+                    counts[name] = max(0, int(cursor.rowcount or 0))
+                self._conn.commit()
+                return counts
+            except Exception:
+                self._conn.rollback()
+                raise

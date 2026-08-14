@@ -7,6 +7,7 @@ on:
       - ".dockerignore"
       - "Dockerfile"
       - "render.yaml"
+      - "supabase/migrations/**"
       - "go_backend/**"
       - "extensions/**"
       - "scripts/**"
@@ -23,6 +24,7 @@ on:
       - ".dockerignore"
       - "Dockerfile"
       - "render.yaml"
+      - "supabase/migrations/**"
       - "go_backend/**"
       - "extensions/**"
       - "scripts/**"
@@ -37,7 +39,53 @@ permissions:
   contents: read
 
 jobs:
+  postgres-migrations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agentgenia_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agentgenia_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: agentgenia_ci
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Apply every production migration from an empty PostgreSQL 17 database
+        run: |
+          for migration in supabase/migrations/*.sql; do
+            echo "Applying $migration"
+            psql -v ON_ERROR_STOP=1 -f "$migration"
+          done
+      - name: Assert production schema and Business entitlement
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          insert into agentgenia.users(id,name,email,api_key_hash,tier,created_at)
+          values ('ci_business','CI','ci@example.com','ci_hash','business',extract(epoch from now()));
+          insert into agentgenia.billing_subscriptions(
+            stripe_subscription_id,user_id,tier,status,updated_at
+          ) values ('sub_ci_business','ci_business','business','active',extract(epoch from now()));
+          do $$ begin
+            if (select v from agentgenia.kv where k='schema_version') <> '15' then
+              raise exception 'unexpected schema version';
+            end if;
+          end $$;
+          SQL
+
   tests:
+    needs: postgres-migrations
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:

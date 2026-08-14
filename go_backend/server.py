@@ -60,7 +60,6 @@ import secrets
 import sys
 import threading
 import time
-from collections import defaultdict, deque
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -92,6 +91,7 @@ from .pi_harness import (
     CHROME_ISOLATION_PER_RUN,
     PiHarness,
     PiHarnessBusy,
+    PiHarnessCancelled,
     PiHarnessError,
     PiHarnessTimeout,
     PiHarnessUsageError,
@@ -126,11 +126,14 @@ DEFAULT_PI_CONNECTOR_EXTENSION = (
 )
 DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com"
 DEFAULT_OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
-MAX_BODY = 160 * 1024 * 1024  # 160 MB
+MAX_BODY = 16 * 1024 * 1024
 MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
+READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database"})
+READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
+READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
 
 # OpenAI-compatible routes exposed by the wrapper.
 UPSTREAM_PATHS = {
@@ -171,6 +174,22 @@ def validate_pi_chrome_security(chrome_isolation: str) -> None:
             "PI_CHROME_ISOLATION debe ser 'per_run'. Los perfiles Chrome compartidos "
             "estan prohibidos en este backend multiusuario."
         )
+
+
+def _validate_service_url(value: str, label: str, *, allowed_hosts: set[str] | None = None) -> None:
+    try:
+        parsed = urlparse(value)
+    except ValueError as exc:
+        raise UnsafeConfigurationError(f"{label} no es una URL válida") from exc
+    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (
+        not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback))
+        or (allowed_hosts is not None and parsed.hostname not in allowed_hosts)
+    ):
+        raise UnsafeConfigurationError(f"{label} no apunta a un destino permitido")
 
 
 class Config:
@@ -319,6 +338,7 @@ class Config:
             "PI_CHROME_ISOLATION", CHROME_ISOLATION_PER_RUN
         ).strip().lower()
         self.computers_enabled = os.environ.get("COMPUTERS_ENABLED", "0") == "1"
+        self.external_writes_enabled = os.environ.get("EXTERNAL_WRITES_ENABLED", "0") == "1"
         self.daytona_api_key = (os.environ.get("DAYTONA_API_KEY") or "").strip()
         self.daytona_api_url = (os.environ.get("DAYTONA_API_URL") or "").strip()
         self.daytona_target = (os.environ.get("DAYTONA_TARGET") or "").strip()
@@ -368,10 +388,37 @@ def validate_runtime_security(cfg: Config) -> None:
             raise UnsafeConfigurationError(
                 "Faltan variables obligatorias en producción: " + ", ".join(missing)
             )
+        if cfg.admin_token and len(cfg.admin_token) < 32:
+            raise UnsafeConfigurationError("ADMIN_TOKEN debe tener al menos 32 caracteres en producción")
+        if cfg.stripe_enabled and cfg.stripe_live_mode and cfg.credits.mode != "enforce":
+            raise UnsafeConfigurationError(
+                "CREDITS_MODE=enforce es obligatorio con Stripe live"
+            )
+        if cfg.external_writes_enabled:
+            raise UnsafeConfigurationError(
+                "EXTERNAL_WRITES_ENABLED no puede activarse en producción hasta que exista aprobación humana por operación"
+            )
+        _validate_service_url(
+            cfg.deepseek_base_url,
+            "DEEPSEEK_BASE_URL",
+            allowed_hosts={"api.deepseek.com"},
+        )
+        _validate_service_url(
+            cfg.opencode_base_url,
+            "OPENCODE_BASE_URL",
+            allowed_hosts={"opencode.ai"},
+        )
+        _validate_service_url(
+            cfg.pi_backend_url,
+            "PI_BACKEND_URL",
+            allowed_hosts={"localhost", "127.0.0.1", "::1"},
+        )
+        if cfg.daytona_api_url:
+            _validate_service_url(cfg.daytona_api_url, "DAYTONA_API_URL")
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
-    body = json.dumps(obj).encode()
+    body = json.dumps(obj, allow_nan=False).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
@@ -686,8 +733,6 @@ class Backend:
             secret_versions=cfg.wrapper_secret_versions,
             allow_secret_file=cfg.environment != "production",
         )
-        self._signup_rate: dict[str, deque[float]] = defaultdict(deque)
-        self._signup_rate_lock = threading.RLock()
         self.connectors = ConnectorBroker(
             default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
         )
@@ -767,6 +812,20 @@ class Backend:
             chrome_binary=cfg.pi_chrome_bin,
             chrome_isolation=cfg.pi_chrome_isolation,
         )
+        self._run_retention_once()
+        threading.Thread(target=self._retention_loop, daemon=True).start()
+
+    def _run_retention_once(self) -> None:
+        try:
+            self.store.purge_expired_ephemeral_data()
+            self.pi.purge_expired_runs()
+        except Exception:
+            logging.exception("Retention maintenance failed")
+
+    def _retention_loop(self) -> None:
+        while True:
+            time.sleep(6 * 3600)
+            self._run_retention_once()
 
     def _start_run_timing(self, run_id: str, started_at: float) -> None:
         with self._run_timing_lock:
@@ -1329,16 +1388,10 @@ class Backend:
         })
 
     def _check_signup_rate(self, remote_key: str) -> None:
-        now = time.monotonic()
-        with self._signup_rate_lock:
-            bucket = self._signup_rate[remote_key]
-            while bucket and bucket[0] <= now - 60:
-                bucket.popleft()
-            if len(bucket) >= 20:
-                raise GoogleAuthError(
-                    "Demasiadas altas. Espera un minuto.", status=429, code="rate_limit"
-                )
-            bucket.append(now)
+        if not self.store.consume_rate_limit(f"signup:{remote_key}", limit=20, window_seconds=60):
+            raise GoogleAuthError(
+                "Demasiadas altas. Espera un minuto.", status=429, code="rate_limit"
+            )
 
     def readiness(self) -> dict:
         database = self.store.health()
@@ -1476,6 +1529,28 @@ class Backend:
                 error_response(handler, 503, str(exc), "model_unavailable")
                 return
         body = self.read_body(handler)
+
+        # DeepSeek's user identifier is security-sensitive provider metadata.
+        # Never let a client choose or share another account's cache/scheduling bucket.
+        if body and path == "/chat/completions":
+            try:
+                provider_body = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RequestBodyError("JSON inválido para el proveedor") from exc
+            if not isinstance(provider_body, dict):
+                raise RequestBodyError("El body del proveedor debe ser un objeto JSON")
+            secret = (self.cfg.wrapper_secret or "development-only").encode("utf-8")
+            provider_body["user_id"] = hmac.new(
+                secret,
+                str(user["id"]).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            body = json.dumps(
+                provider_body,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
 
         ua = handler.headers.get("user-agent", "")
         headers = {
@@ -1715,6 +1790,14 @@ class Backend:
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
             return
+        if computer_requested and not unlimited and not has_model_access(tier):
+            error_response(
+                handler,
+                402,
+                "Tu plan no incluye una computadora persistente",
+                "computer_upgrade_required",
+            )
+            return
         if bot_id is not None and (
             not isinstance(bot_id, str)
             or not bot_id.strip()
@@ -1928,6 +2011,7 @@ class Backend:
                     f"{user['id']}\0{bot_id}" if bot_id is not None else None
                 ),
                 on_text_delta=on_text_delta,
+                is_cancelled=(lambda: bool(event_stream and event_stream.disconnected)),
             )
             self._mark_run_timing(run_id, "pi_complete_ms")
         except ConnectorBrokerError as e:
@@ -1947,6 +2031,10 @@ class Backend:
                 duration_seconds=max(0.0, time.monotonic() - started_at),
             )
             agent_error(429, str(e), "pi_busy")
+            return
+        except PiHarnessCancelled as e:
+            _settled, _credits = settle("cancelled", "client_disconnected")
+            agent_error(499, str(e), "client_disconnected")
             return
         except PiHarnessUsageError as e:
             error_code = "pi_timeout" if isinstance(e, PiHarnessTimeout) else "pi_task_error"
@@ -2115,11 +2203,25 @@ class Backend:
         if not token:
             return
         body = self.read_json(handler) or {}
+        operation = body.get("operation")
+        if (
+            not self.cfg.external_writes_enabled
+            and isinstance(operation, str)
+            and operation not in READ_ONLY_CONNECTOR_OPERATIONS
+            and not operation.startswith(READ_ONLY_CONNECTOR_PREFIXES)
+        ):
+            error_response(
+                handler,
+                409,
+                "Esta operación requiere una aprobación humana específica",
+                "operation_approval_required",
+            )
+            return
         try:
             result = self.connectors.execute(
                 token=token,
                 connector_id=body.get("connector_id"),
-                operation=body.get("operation"),
+                operation=operation,
                 arguments=body.get("arguments", {}),
             )
         except ConnectorBrokerError as e:
@@ -2133,10 +2235,19 @@ class Backend:
             return
         user_id, bot_id = self.connectors.computer(token)
         body = self.read_json(handler) or {}
+        operation = body.get("operation")
+        if not self.cfg.external_writes_enabled and operation not in READ_ONLY_COMPUTER_OPERATIONS:
+            error_response(
+                handler,
+                409,
+                "Esta operación de computadora requiere aprobación humana específica",
+                "operation_approval_required",
+            )
+            return
         result = self.computers.execute(
             user_id=user_id,
             bot_id=bot_id,
-            operation=body.get("operation"),
+            operation=operation,
             arguments=body.get("arguments", {}),
         )
         json_response(handler, 200, result)
@@ -2144,7 +2255,15 @@ class Backend:
     # ---------- body helpers ----------
     def read_body(self, handler: BaseHTTPRequestHandler, *, max_bytes: int = MAX_BODY) -> bytes:
         transfer_encoding = handler.headers.get("transfer-encoding", "").lower()
-        if "chunked" in (part.strip() for part in transfer_encoding.split(",")):
+        content_length = handler.headers.get("content-length")
+        encodings = [part.strip() for part in transfer_encoding.split(",") if part.strip()]
+        if encodings and encodings != ["chunked"]:
+            handler.close_connection = True
+            raise RequestBodyError("Transfer-Encoding no soportado")
+        if encodings and content_length is not None:
+            handler.close_connection = True
+            raise RequestBodyError("Content-Length y Transfer-Encoding no pueden combinarse")
+        if encodings == ["chunked"]:
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -2178,13 +2297,22 @@ class Backend:
                     raise RequestBodyError("Chunk incompleto")
                 chunks.append(chunk)
             return b"".join(chunks)
-        length = handler.headers.get("content-length")
-        if length and length.isdigit():
-            n = int(length)
+        if content_length is not None:
+            if not content_length.isdigit():
+                handler.close_connection = True
+                raise RequestBodyError("Content-Length inválido")
+            n = int(content_length)
             if n > max_bytes:
                 handler.close_connection = True
                 raise RequestBodyTooLarge(f"Body mayor a {max_bytes} bytes")
-            return handler.rfile.read(n)
+            body = handler.rfile.read(n)
+            if len(body) != n:
+                handler.close_connection = True
+                raise RequestBodyError("Body incompleto")
+            return body
+        if handler.command in {"POST", "PUT", "PATCH"}:
+            handler.close_connection = True
+            raise RequestBodyError("Content-Length es obligatorio")
         return b""
 
     def read_json(
@@ -2366,6 +2494,10 @@ class Backend:
 class Handler(BaseHTTPRequestHandler):
     backend: Backend
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
 
     def log_message(self, fmt, *args):
         status = args[1] if len(args) > 1 else "unknown"
@@ -2557,6 +2689,33 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Bound the number of active request threads instead of growing without limit."""
+
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, max_workers: int = 32, **kwargs):
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+
 def serve(cfg: Config) -> None:
     validate_runtime_security(cfg)
     if not cfg.admin_token:
@@ -2564,7 +2723,7 @@ def serve(cfg: Config) -> None:
         logging.warning("ADMIN_TOKEN efímero generado para desarrollo; no se imprimirá")
     backend = Backend(cfg)
     Handler.backend = backend
-    httpd = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
+    httpd = BoundedThreadingHTTPServer((cfg.host, cfg.port), Handler)
     print(f"[server] wrapper backend v{__version__} escuchando en http://{cfg.host}:{cfg.port}")
     print(f"[server] model provider: DeepSeek ({cfg.deepseek_base_url})")
     database_backend = "postgres" if cfg.database_url else f"sqlite:{cfg.db_path}"

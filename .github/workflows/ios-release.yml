@@ -47,8 +47,11 @@ jobs:
         run: |
           git fetch --no-tags origin main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main || { echo "Release tag is not reachable from main"; exit 1; }
-      - name: Select newest installed Xcode
-        run: sudo xcode-select --switch "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+      - name: Select the pinned Xcode toolchain
+        run: |
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version | grep -F 'Xcode 16.4'
       - name: Require App Store signing secrets
         env:
           IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}

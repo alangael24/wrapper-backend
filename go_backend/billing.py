@@ -241,6 +241,18 @@ class StripeClient:
         encoded_id = urllib.parse.quote(subscription_id, safe="")
         return self._get(f"/subscriptions/{encoded_id}")
 
+    def list_subscriptions(self, customer_id: str) -> list[dict]:
+        query = urllib.parse.urlencode({"customer": customer_id, "status": "all", "limit": "100"})
+        payload = self._get(f"/subscriptions?{query}")
+        data = payload.get("data")
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise StripeApiError(
+                "Stripe devolvió una lista de suscripciones inválida",
+                status=502,
+                code="invalid_stripe_subscriptions",
+            )
+        return data
+
     def cancel_subscription(self, subscription_id: str, *, idempotency_key: str) -> dict:
         encoded_id = urllib.parse.quote(subscription_id, safe="")
         return self._delete(
@@ -509,6 +521,30 @@ class BillingService:
             "tier_action": tier_action,
         })
 
+    def _refresh_deactivation_from_stripe(self, action: dict[str, Any]) -> None:
+        """Never revoke a customer while another paid subscription is authoritative."""
+        customer_id = action.get("customer_id")
+        if not customer_id:
+            return
+        current_id = action.get("stripe_subscription_id")
+        candidates: list[tuple[str, str, str]] = []
+        for subscription in self.client.list_subscriptions(customer_id):
+            subscription_id = _string(subscription.get("id"))
+            status = _string(subscription.get("status")) or "unknown"
+            price_id = _price_from_subscription(subscription)
+            tier = self.config.price_tiers.get(price_id or "")
+            metadata_user = _string(_metadata(subscription).get("user_id"))
+            if (
+                subscription_id
+                and subscription_id != current_id
+                and status in ACTIVE_STATUSES | GRACE_STATUSES
+                and tier in PAID_TIERS
+                and (not action.get("user_id") or not metadata_user or metadata_user == action["user_id"])
+            ):
+                candidates.append((subscription_id, tier, status))
+        if candidates:
+            action["tier_action"] = "keep"
+
     def process_webhook(self, payload: bytes, signature_header: str) -> dict:
         self._require_enabled()
         event = verify_webhook_signature(
@@ -580,6 +616,8 @@ class BillingService:
             })
         if action["tier_action"] == "activate":
             self._refresh_activation_from_stripe(action)
+        elif action["tier_action"] == "free":
+            self._refresh_deactivation_from_stripe(action)
         tier = action.get("tier")
         if action.get("tier_action") == "activate" and tier in PAID_TIERS:
             action["grant_credit_milli"] = PLANS[tier].monthly_credit_milli

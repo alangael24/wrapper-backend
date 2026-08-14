@@ -11,14 +11,11 @@ import base64
 import hashlib
 import json
 import secrets
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +33,6 @@ class GoogleAuthError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.code = code
-
-
-@dataclass
-class _RateBucket:
-    timestamps: deque[float] = field(default_factory=deque)
 
 
 class GoogleAccountAuth:
@@ -72,10 +64,6 @@ class GoogleAccountAuth:
         self.key_version = key_version
         self.secret_versions = secret_versions or {}
         self.allow_secret_file = allow_secret_file
-        self._rate: dict[str, _RateBucket] = defaultdict(_RateBucket)
-        self._lock = threading.RLock()
-        self._access_cache: dict[str, tuple[float, dict]] = {}
-        self._access_cache_ttl_seconds = 30.0
         self._validate_configuration()
 
     @property
@@ -295,41 +283,16 @@ class GoogleAccountAuth:
     def authenticate(self, access_token: str) -> dict | None:
         if not access_token.startswith("aga_"):
             return None
-        cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
-        now = time.monotonic()
-        with self._lock:
-            cached = self._access_cache.get(cache_key)
-            if cached is not None:
-                if cached[0] > now:
-                    return dict(cached[1])
-                self._access_cache.pop(cache_key, None)
-        user = self.store.get_user_by_access_token(access_token)
-        if user is None:
-            return None
-        token_seconds_left = max(
-            0.0, float(user.get("authenticated_until") or 0) - time.time()
-        )
-        expires = now + min(self._access_cache_ttl_seconds, token_seconds_left)
-        if expires > now:
-            with self._lock:
-                self._access_cache[cache_key] = (expires, dict(user))
-        return user
+        # Positive auth caches are intentionally avoided: revocation/logout on
+        # one replica must be visible immediately to every other replica.
+        return self.store.get_user_by_access_token(access_token)
 
     def logout(self, access_token: str) -> bool:
-        cache_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
-        with self._lock:
-            self._access_cache.pop(cache_key, None)
         return self.store.revoke_account_session(access_token)
 
     def forget_user(self, user_id: str) -> None:
-        """Invalidate all cached sessions for an account after revocation."""
-        with self._lock:
-            stale = [
-                key for key, (_expires, user) in self._access_cache.items()
-                if str(user.get("id")) == user_id
-            ]
-            for key in stale:
-                self._access_cache.pop(key, None)
+        """Kept for callers; sessions are always checked in shared storage."""
+        _ = user_id
 
     def issue_session(self, *, account: dict, device_id: str) -> dict:
         """Issue the same opaque Agent Genia session for another verified IdP."""
@@ -423,33 +386,12 @@ class GoogleAccountAuth:
             raise GoogleAuthError("device_id inválido", code="invalid_request")
 
     def _check_rate(self, key: str, *, limit: int, window_seconds: int) -> None:
-        now = time.monotonic()
-        with self._lock:
-            if len(self._rate) > 10_000:
-                stale = [
-                    bucket_key
-                    for bucket_key, bucket_value in self._rate.items()
-                    if not bucket_value.timestamps
-                    or bucket_value.timestamps[-1] <= now - 3600
-                ]
-                for bucket_key in stale:
-                    self._rate.pop(bucket_key, None)
-                if len(self._rate) > 10_000 and key not in self._rate:
-                    raise GoogleAuthError(
-                        "Demasiados intentos. Espera un minuto.",
-                        status=429,
-                        code="rate_limit",
-                    )
-            bucket = self._rate[key].timestamps
-            while bucket and bucket[0] <= now - window_seconds:
-                bucket.popleft()
-            if len(bucket) >= limit:
-                raise GoogleAuthError(
-                    "Demasiados intentos. Espera un minuto.",
-                    status=429,
-                    code="rate_limit",
-                )
-            bucket.append(now)
+        if not self.store.consume_rate_limit(
+            f"google-auth:{key}", limit=limit, window_seconds=window_seconds
+        ):
+            raise GoogleAuthError(
+                "Demasiados intentos. Espera un minuto.", status=429, code="rate_limit"
+            )
 
     def _fail(self, id_hash: str, message: str) -> None:
         self.store.fail_account_auth_attempt(id_hash=id_hash, message=message)

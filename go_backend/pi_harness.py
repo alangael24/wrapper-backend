@@ -42,6 +42,10 @@ class PiHarnessTimeout(PiHarnessUsageError):
     """La tarea consumió recursos pero no terminó antes de su deadline."""
 
 
+class PiHarnessCancelled(PiHarnessUsageError):
+    """El cliente cerró la ejecución antes de recibir el resultado final."""
+
+
 @dataclass
 class PiRunResult:
     run_id: str
@@ -258,6 +262,7 @@ class PiHarness:
         connector_run_token: str | None = None,
         conversation_key: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> PiRunResult:
         if not self.enabled:
             raise PiHarnessError("El harness de Pi esta desactivado (PI_ENABLED=0)")
@@ -287,6 +292,7 @@ class PiHarness:
                     connector_run_token=connector_run_token,
                     conversation_key=conversation_key,
                     on_text_delta=on_text_delta,
+                    is_cancelled=is_cancelled,
                 )
             return self._run(
                 run_id=run_id,
@@ -295,6 +301,7 @@ class PiHarness:
                 browser=browser,
                 connector_run_token=connector_run_token,
                 on_text_delta=on_text_delta,
+                is_cancelled=is_cancelled,
             )
         finally:
             self._slots.release()
@@ -836,6 +843,7 @@ class PiHarness:
         connector_run_token: str | None,
         conversation_key: str,
         on_text_delta: Callable[[str], None] | None,
+        is_cancelled: Callable[[], bool] | None,
     ) -> PiRunResult:
         session = self._acquire_warm_session(conversation_key)
         run_dir = self.runs_dir / run_id
@@ -935,6 +943,13 @@ class PiHarness:
             send({"id": f"agent-task-{run_id}", "type": "prompt", "message": prompt})
             with event_path.open("w", encoding="utf-8") as event_log:
                 while deadline is None or time.monotonic() < deadline:
+                    if is_cancelled and is_cancelled():
+                        try:
+                            send({"type": "abort"})
+                        except (BrokenPipeError, OSError):
+                            pass
+                        fatal = True
+                        raise PiHarnessCancelled("La ejecución fue cancelada por el cliente")
                     wait = 0.5 if deadline is None else min(
                         0.5, max(0.0, deadline - time.monotonic())
                     )
@@ -1075,6 +1090,23 @@ class PiHarness:
         shutil.rmtree(self.runs_dir / "sessions" / owner_key, ignore_errors=True)
         return len(sessions)
 
+    def purge_expired_runs(self, *, max_age_seconds: int = 7 * 86400) -> int:
+        """Delete completed one-shot run artifacts after a short, explicit TTL."""
+        cutoff = time.time() - max(3600, max_age_seconds)
+        removed = 0
+        if not self.runs_dir.is_dir():
+            return 0
+        for path in self.runs_dir.iterdir():
+            if not path.is_dir() or path.name == "sessions":
+                continue
+            try:
+                if path.stat().st_mtime <= cutoff:
+                    shutil.rmtree(path)
+                    removed += 1
+            except OSError:
+                continue
+        return removed
+
     def _run(
         self,
         *,
@@ -1084,6 +1116,7 @@ class PiHarness:
         browser: bool,
         connector_run_token: str | None,
         on_text_delta: Callable[[str], None] | None,
+        is_cancelled: Callable[[], bool] | None,
     ) -> PiRunResult:
         run_dir = self.runs_dir / run_id
         config_dir = run_dir / "config"
@@ -1190,6 +1223,12 @@ class PiHarness:
 
             try:
                 while deadline is None or time.monotonic() < deadline:
+                    if is_cancelled and is_cancelled():
+                        try:
+                            send({"type": "abort"})
+                        except (BrokenPipeError, OSError):
+                            pass
+                        raise PiHarnessCancelled("La ejecución fue cancelada por el cliente")
                     wait = 0.5 if deadline is None else min(0.5, max(0.0, deadline - time.monotonic()))
                     try:
                         line = events.get(timeout=wait)

@@ -5,7 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeployTrigger: checksPass
-    healthCheckPath: /platformz
+    healthCheckPath: /readyz
     envVars:
       - key: ENVIRONMENT
         value: production
@@ -14,7 +14,7 @@ services:
       - key: PORT
         value: 8787
       - key: CREDITS_MODE
-        value: shadow
+        value: enforce
       - key: CREDIT_LLM_MULTIPLIER_BPS
         value: "12500"
       - key: CREDIT_DISPLAY_INCREMENT_MILLI
@@ -86,7 +86,9 @@ services:
       - key: COMPOSIO_TOOLKIT_OVERRIDES_JSON
         value: "{}"
       - key: COMPUTERS_ENABLED
-        value: "1"
+        value: "0"
+      - key: EXTERNAL_WRITES_ENABLED
+        value: "0"
       - key: DAYTONA_API_KEY
         sync: false
       - key: PI_ENABLED

@@ -7,6 +7,7 @@ import json
 import http.client
 import os
 import sqlite3
+import socket
 import sys
 import tempfile
 import threading
@@ -433,9 +434,22 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(saved["revision"], 1)
-        self.assertEqual(saved["state"]["version"], 1)
+        self.assertEqual(saved["state"]["version"], 2)
         self.assertEqual(saved["state"]["selectedConnectorIds"], ["github"])
         self.assertEqual(saved["state"]["bots"][0]["name"], "Research bot")
+
+        deleted_state = {
+            **saved["state"],
+            "deletedBotIds": ["bot-one"],
+        }
+        status, deleted = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": 1, "device_id": device_id, "state": deleted_state},
+            headers=first_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["state"]["deletedBotIds"], ["bot-one"])
+        self.assertEqual(deleted["state"]["bots"], [])
 
         status, other = self.ws.req("GET", "/v1/account-state", headers=second_headers)
         self.assertEqual(status, 200)
@@ -444,16 +458,16 @@ class TestBackend(unittest.TestCase):
         stale_state = {**saved["state"], "activeBotId": None}
         status, conflict = self.ws.req(
             "POST", "/v1/account-state",
-            {"base_revision": 0, "device_id": device_id, "state": stale_state},
+            {"base_revision": 1, "device_id": device_id, "state": stale_state},
             headers=first_headers,
         )
         self.assertEqual(status, 409)
         self.assertEqual(conflict["error"]["type"], "account_state_conflict")
-        self.assertEqual(conflict["current"]["revision"], 1)
+        self.assertEqual(conflict["current"]["revision"], 2)
 
         status, invalid = self.ws.req(
             "POST", "/v1/account-state",
-            {"base_revision": 1, "device_id": "not-a-device", "state": state},
+            {"base_revision": 2, "device_id": "not-a-device", "state": state},
             headers=first_headers,
         )
         self.assertEqual(status, 400)
@@ -521,8 +535,8 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(me["email"], "alan@example.com")
         self.assertEqual(me["tier"], "free")
 
-        # Mobile requests with the opaque account token use a bounded hot
-        # cache instead of paying one cross-region session lookup per endpoint.
+        # Every replica checks shared session storage so logout/revocation is
+        # immediately visible across the fleet.
         original_lookup = self.ws.backend.store.get_user_by_access_token
         with patch.object(
             self.ws.backend.store,
@@ -535,7 +549,7 @@ class TestBackend(unittest.TestCase):
                     headers={"Authorization": f"Bearer {completed['token']}"},
                 )
                 self.assertEqual(status, 200)
-            self.assertEqual(lookup.call_count, 0)
+            self.assertEqual(lookup.call_count, 2)
 
         status, _ = self.ws.req(
             "POST",
@@ -828,10 +842,13 @@ class TestBackend(unittest.TestCase):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         status, body = ws.req("POST", "/v1/chat/completions",
-                              {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}]},
+                              {"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "hi"}], "user_id": "client-controlled"},
                               headers=headers)
         self.assertEqual(status, 200)
         self.assertEqual(body["choices"][0]["message"]["content"], "hola")
+        upstream_payload = json.loads(MockUpstream.requests[-1][3])
+        self.assertRegex(upstream_payload["user_id"], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(upstream_payload["user_id"], "client-controlled")
         # uso registrado
         status, usage = ws.req("GET", "/v1/usage", headers=headers)
         self.assertEqual(usage["windows"]["5h"]["requests"], 1)
@@ -882,6 +899,46 @@ class TestBackend(unittest.TestCase):
         connection.close()
         self.assertEqual(response.status, 200)
         self.assertEqual(body["choices"][0]["message"]["content"], "hola")
+
+    def test_free_agent_run_cannot_allocate_a_computer(self):
+        signup = self.new_user(tier="free")
+        status, body = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "abre una computadora",
+                "computer": True,
+                "bot_id": "bot_free",
+                "connector_ids": [],
+                "max_credits": 1,
+                "idempotency_key": "free-computer-denied",
+            },
+            headers={"Authorization": f"Bearer {signup['api_key']}"},
+        )
+        self.assertEqual(status, 402)
+        self.assertEqual(body["error"]["type"], "computer_upgrade_required")
+        self.assertIsNone(self.ws.backend.store.get_bot_computer(signup["user_id"], "bot_free"))
+
+    def test_invalid_content_length_closes_connection_without_processing_followup(self):
+        host, port = self.ws.httpd.server_address
+        with socket.create_connection((host, port), timeout=5) as connection:
+            connection.sendall(
+                b"POST /v1/signup HTTP/1.1\r\n"
+                + f"Host: {host}:{port}\r\n".encode()
+                + b"Content-Type: application/json\r\n"
+                + b"Content-Length: invalid\r\n\r\n"
+                + b"{}GET /healthz HTTP/1.1\r\n"
+                + f"Host: {host}:{port}\r\n\r\n".encode()
+            )
+            received = bytearray()
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                received.extend(chunk)
+        response = bytes(received)
+        self.assertIn(b" 400 ", response)
+        self.assertEqual(response.count(b"HTTP/1.1"), 1)
 
     def test_shadow_credits_replace_rolling_usage_block(self):
         ws = self.ws
@@ -1283,7 +1340,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 13)
+        self.assertEqual(migrated.health()["schema_version"], 15)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
@@ -1654,6 +1711,19 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["result"]["items"][0]["name"], "wrapper-backend")
         self.assertEqual(adapter.calls, [(user["id"], "search_repositories", {"query": "wrapper"})])
+
+        status, body = self.ws.req(
+            "POST",
+            "/v1/internal/connectors/execute",
+            {
+                "connector_id": "github",
+                "operation": "create_issue",
+                "arguments": {"title": "must require approval"},
+            },
+            headers=internal_headers,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "operation_approval_required")
 
         status, body = self.ws.req(
             "POST",

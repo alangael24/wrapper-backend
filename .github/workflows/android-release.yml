@@ -51,6 +51,7 @@ jobs:
       BUILD_REVISION: ${{ inputs.build_revision || '0' }}
       PUBLISH_TO_PLAY: ${{ inputs.publish_to_play || false }}
       ATTEST_EXISTING_RELEASE: ${{ inputs.attest_existing_release || false }}
+      ANDROID_RELEASE_CERT_SHA256: ${{ secrets.ANDROID_RELEASE_CERT_SHA256 }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -83,6 +84,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
         run: |
           test -n "$KEYSTORE_BASE64" && test -n "$STORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+          test -n "$ANDROID_RELEASE_CERT_SHA256"
           keystore="$RUNNER_TEMP/agentgenia-upload.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
           chmod 600 "$keystore"
@@ -90,6 +92,9 @@ jobs:
           echo "AGENTGENIA_RELEASE_STORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
           echo "AGENTGENIA_RELEASE_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
           echo "AGENTGENIA_RELEASE_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          actual_fingerprint="$(keytool -list -v -keystore "$keystore" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" | awk -F': ' '/SHA256:/{gsub(":", "", $2); print tolower($2); exit}')"
+          expected_fingerprint="$(printf '%s' "$ANDROID_RELEASE_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+          test -n "$actual_fingerprint" && test "$actual_fingerprint" = "$expected_fingerprint"
       - name: Verify release tag matches versionName
         run: |
           version="$(awk -F '"' '/versionName =/ {print $2; exit}' android/AgentGenia/app/build.gradle.kts)"
@@ -115,7 +120,7 @@ jobs:
       - name: Test, lint, and build signed AAB
         if: inputs.attest_existing_release != true
         working-directory: android/AgentGenia
-        run: ./gradlew clean testDebugUnitTest lintDebug assembleDebug bundleRelease
+        run: ./gradlew clean testDebugUnitTest lintDebug lintRelease assembleDebug bundleRelease
       - name: Download and verify the immutable release AAB
         if: inputs.attest_existing_release == true
         run: |

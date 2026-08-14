@@ -319,7 +319,11 @@ class WrapperServiceClient {
     const authorizeUrl = safeAuthorizationUrl(stringValue(started.authorize_url));
     await this.options.openExternal(authorizeUrl);
     const attemptId = stringValue(started.attempt_id);
-    for (let attempt = 0; attempt < ACCOUNT_AUTH_ATTEMPTS; attempt += 1) {
+    const expiresInSeconds = numberValue(started.expires_in);
+    const maxAttempts = expiresInSeconds > 0
+      ? Math.max(1, Math.ceil(expiresInSeconds * 1_000 / OAUTH_POLL_MS))
+      : ACCOUNT_AUTH_ATTEMPTS;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const result = await this.publicJson("/v1/account-auth/status", {
         method: "POST",
         body: { attempt_id: attemptId, device_id: deviceId },
@@ -670,16 +674,11 @@ class WrapperServiceClient {
       }
       if (buffer.trim()) processFrame(buffer);
     } catch (error) {
-      if (
-        !streamedText.trim()
-        || error instanceof WrapperHttpError
-        || signal?.aborted
-      ) throw error;
+      throw error;
     } finally {
       reader.releaseLock();
     }
     if (finalResponse) return finalResponse;
-    if (streamedText.trim()) return { answer: streamedText };
     throw new Error("La conexión terminó antes de recibir la respuesta final.");
   }
 

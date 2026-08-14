@@ -12,6 +12,7 @@ final class AppModel {
     var account: AccountIdentity?
     var profile: AccountProfile?
     var bots: [BotProfile] = []
+    private var deletedBotIDs: [UUID] = []
     var selectedConnectorIDs: [String] = []
     var connectorStatuses: [String: ConnectorStatus] = [:]
     var billing: BillingSnapshot?
@@ -145,6 +146,7 @@ final class AppModel {
         account = nil
         profile = nil
         bots = []
+        deletedBotIDs = []
         selectedConnectorIDs = []
         connectorStatuses = [:]
         billing = nil
@@ -160,6 +162,10 @@ final class AppModel {
 
     func createBot() async {
         guard account != nil else { return }
+        guard bots.count < 100 else {
+            alertMessage = "Puedes tener como máximo 100 bots. Elimina uno antes de crear otro."
+            return
+        }
         let index = bots.count
         let bot = BotProfile(
             id: UUID(),
@@ -174,6 +180,7 @@ final class AppModel {
             createdAt: Date()
         )
         bots.append(bot)
+        deletedBotIDs.removeAll { $0 == bot.id }
         destination = .bot(bot.id)
         await persistLocalState(dirty: true)
         schedulePersist()
@@ -192,7 +199,7 @@ final class AppModel {
         guard let index = bots.firstIndex(where: { $0.id == id }) else { return }
         bots[index].name = clean(name, maximum: 60, fallback: "Nuevo bot")
         bots[index].title = clean(title, maximum: 120)
-        bots[index].description = clean(description, maximum: 1_000)
+        bots[index].description = clean(description, maximum: 600)
         bots[index].color = botColors.contains(color) ? color : bots[index].color
         bots[index].shape = shape
         bots[index].notificationsEnabled = notificationsEnabled
@@ -473,6 +480,7 @@ final class AppModel {
         let cache = try await stateStore.load(accountID: session.account.id)
         accountStateRevision = cache.serverRevision
         bots = cache.state.bots
+        deletedBotIDs = cache.state.deletedBotIDs
         selectedConnectorIDs = cache.state.selectedConnectorIDs
         if let active = cache.state.activeBotID, bots.contains(where: { $0.id == active }) {
             destination = .bot(active)
@@ -618,7 +626,7 @@ final class AppModel {
                 prompt: prompt,
                 botID: botID,
                 connectorIDs: connectorIDs,
-                computer: !initial,
+                computer: false,
                 onDelta: { [weak self] delta in
                     await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
                 }
@@ -671,6 +679,7 @@ final class AppModel {
         if case let .bot(id) = destination { activeBotID = id } else { activeBotID = nil }
         return PersistedAccountState(
             bots: bots,
+            deletedBotIDs: deletedBotIDs,
             selectedConnectorIDs: selectedConnectorIDs,
             activeBotID: activeBotID
         )
@@ -755,7 +764,9 @@ final class AppModel {
     }
 
     private func applyRemoteState(_ state: PersistedAccountState) {
-        bots = state.bots
+        deletedBotIDs = Array(state.deletedBotIDs.suffix(200))
+        let deleted = Set(deletedBotIDs)
+        bots = state.bots.filter { !deleted.contains($0.id) }
         selectedConnectorIDs = state.selectedConnectorIDs
         if let active = state.activeBotID, bots.contains(where: { $0.id == active }) {
             destination = .bot(active)
@@ -860,6 +871,8 @@ private func mergeAccountStates(
     _ server: PersistedAccountState,
     _ local: PersistedAccountState
 ) -> PersistedAccountState {
+    let deletedBotIDs = Array(Set(server.deletedBotIDs + local.deletedBotIDs)).suffix(200)
+    let deleted = Set(deletedBotIDs)
     var bots = Dictionary(uniqueKeysWithValues: server.bots.map { ($0.id, $0) })
     for localBot in local.bots {
         guard let serverBot = bots[localBot.id] else {
@@ -882,7 +895,7 @@ private func mergeAccountStates(
         merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
         bots[localBot.id] = merged
     }
-    let mergedBots = Array(bots.values.sorted { $0.createdAt < $1.createdAt }.prefix(100))
+    let mergedBots = Array(bots.values.filter { !deleted.contains($0.id) }.sorted { $0.createdAt < $1.createdAt }.suffix(100))
     let availableIDs = Set(mergedBots.map(\.id))
     let active = local.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
         ?? server.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
@@ -890,6 +903,7 @@ private func mergeAccountStates(
     return PersistedAccountState(
         onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
         bots: mergedBots,
+        deletedBotIDs: Array(deletedBotIDs),
         selectedConnectorIDs: Array(Set(local.selectedConnectorIDs)).sorted(),
         activeBotID: active
     )

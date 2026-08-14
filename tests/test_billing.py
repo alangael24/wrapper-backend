@@ -65,6 +65,12 @@ class FakeStripeClient:
         self.retrieve_calls.append(subscription_id)
         return self.subscriptions[subscription_id]
 
+    def list_subscriptions(self, customer_id: str):
+        return [
+            value for value in self.subscriptions.values()
+            if value.get("customer") == customer_id
+        ]
+
     def cancel_subscription(self, subscription_id: str, *, idempotency_key: str):
         self.cancel_calls.append((subscription_id, idempotency_key))
         return {"id": subscription_id, "status": "canceled"}

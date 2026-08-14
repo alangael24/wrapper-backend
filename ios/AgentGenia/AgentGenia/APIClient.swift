@@ -8,7 +8,8 @@ enum AppEnvironment {
         let bundleValue = Bundle.main.object(forInfoDictionaryKey: "AgentGeniaAPIBaseURL") as? String
         let value = processValue ?? bundleValue ?? "https://agentgenia-api.onrender.com"
         guard let url = URL(string: value),
-              (url.scheme == "https" || (url.scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(url.host)))
+              (url.scheme == "https" || (url.scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(url.host))),
+              url.path.isEmpty || url.path == "/"
         else { preconditionFailure("AgentGeniaAPIBaseURL debe ser HTTPS o loopback") }
         return url
     }()
@@ -669,11 +670,6 @@ actor APIClient {
             } else if event.name == "done" {
                 do { return (nil, try decoder.decode(AgentRunResponse.self, from: event.data)) }
                 catch {
-                    // A complete streamed answer remains usable even if an
-                    // optional final metadata field is malformed.
-                    if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        return (nil, AgentRunResponse(answer: streamedText))
-                    }
                     throw ServiceError(
                         message: "Agent Genia recibió una respuesta final inválida.",
                         code: "invalid_stream_response",
@@ -724,29 +720,14 @@ actor APIClient {
                 }
             }
         } catch let error as ServiceError {
-            if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                finalResponse = AgentRunResponse(answer: streamedText)
-            } else {
-                throw error
-            }
+            throw error
         } catch {
-            if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                finalResponse = AgentRunResponse(answer: streamedText)
-            } else {
-                throw networkError(error, path: path)
-            }
+            throw networkError(error, path: path)
         }
         if !pendingDelta.isEmpty {
             let value = pendingDelta
             pendingDelta = ""
             await onDelta(value)
-        }
-        if finalResponse == nil, !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // The final metadata frame can be lost when an intermediary closes
-            // an otherwise successful SSE response. Preserve the text already
-            // delivered to the user instead of deleting it and showing a false
-            // connection failure.
-            finalResponse = AgentRunResponse(answer: streamedText)
         }
         guard let finalResponse else {
             throw ServiceError(

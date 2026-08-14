@@ -69,6 +69,7 @@ data class PersistedAccountState(
     val bots: List<BotProfile> = emptyList(),
     val selectedConnectorIds: List<String> = emptyList(),
     val activeBotId: String? = null,
+    val deletedBotIds: List<String> = emptyList(),
 )
 
 data class ConnectorDefinition(
@@ -157,16 +158,19 @@ fun JSONObject.toAccountSession() = AccountSession(
 
 fun PersistedAccountState.toJson() = JSONObject()
     .put("bots", JSONArray().also { array -> bots.forEach { array.put(it.toJson()) } })
+    .put("deletedBotIds", JSONArray(deletedBotIds))
     .put("selectedConnectorIds", JSONArray(selectedConnectorIds))
     .put("activeBotId", activeBotId ?: JSONObject.NULL)
 
 fun JSONObject.toPersistedAccountState(): PersistedAccountState {
     val botArray = optJSONArray("bots") ?: JSONArray()
     val selected = optJSONArray("selectedConnectorIds") ?: JSONArray()
+    val deleted = optJSONArray("deletedBotIds") ?: JSONArray()
     return PersistedAccountState(
         bots = List(botArray.length()) { botArray.getJSONObject(it).toBotProfile() },
         selectedConnectorIds = List(selected.length()) { selected.getString(it) },
         activeBotId = optNullableString("activeBotId"),
+        deletedBotIds = List(deleted.length()) { deleted.getString(it) }.takeLast(200),
     )
 }
 

@@ -96,6 +96,10 @@ class AppViewModel(
     fun createBot() {
         val current = _state.value
         if (current.account == null) return
+        if (current.bots.size >= 100) {
+            _state.update { it.copy(error = "Puedes tener como máximo 100 bots. Elimina uno antes de crear otro.") }
+            return
+        }
         val index = current.bots.size
         val shape = BotShape.entries[index % BotShape.entries.size]
         val created = BotProfile(
@@ -131,7 +135,7 @@ class AppViewModel(
             bot.copy(
                 name = clean(name, 60, "Nuevo bot"),
                 title = clean(title, 120),
-                description = clean(description, 1_000),
+                description = clean(description, 600),
                 color = color.takeIf(BOT_COLORS::contains) ?: bot.color,
                 shape = shape,
                 notificationsEnabled = notifications,
@@ -240,12 +244,21 @@ class AppViewModel(
                 ?: persisted.bots.firstOrNull()?.id,
             section = MainSection.Agents,
         )
-        val connectors = viewModelScope.async { runCatching { api.connectors() }.getOrDefault(emptyList()) }
+        val connectors = viewModelScope.async { runCatching { api.connectors() } }
         val billing = viewModelScope.async { runCatching { api.billing() }.getOrNull() }
-        val connectorValues = connectors.await()
+        val connectorResult = connectors.await()
         val billingValue = billing.await()
-        applyConnectorSnapshot(connectorValues)
-        _state.update { it.copy(billing = billingValue) }
+        connectorResult
+            .onSuccess(::applyConnectorSnapshot)
+            .onFailure { error ->
+                _state.update {
+                    it.copy(
+                        billing = billingValue,
+                        error = "No pudimos actualizar los conectores; conservamos tu configuración local. ${userMessage(error)}",
+                    )
+                }
+            }
+        if (connectorResult.isSuccess) _state.update { it.copy(billing = billingValue) }
     }
 
     private fun applyConnectorSnapshot(statuses: List<ConnectorStatus>) {

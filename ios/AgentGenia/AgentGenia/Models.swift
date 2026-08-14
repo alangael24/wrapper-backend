@@ -156,14 +156,16 @@ enum BotShape: String, Codable, CaseIterable, Sendable {
 }
 
 struct PersistedAccountState: Codable, Equatable, Sendable {
-    var version: Int = 1
+    var version: Int = 2
     var onboardingCompleted: Bool = true
     var bots: [BotProfile] = []
+    var deletedBotIDs: [UUID] = []
     var selectedConnectorIDs: [String] = []
     var activeBotID: UUID?
 
     enum CodingKeys: String, CodingKey {
         case version, onboardingCompleted, bots
+        case deletedBotIDs = "deletedBotIds"
         case selectedConnectorIDs = "selectedConnectorIds"
         case activeBotID = "activeBotId"
         case legacySelectedConnectorIDs = "selectedConnectorIDs"
@@ -171,15 +173,17 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
     }
 
     init(
-        version: Int = 1,
+        version: Int = 2,
         onboardingCompleted: Bool = true,
         bots: [BotProfile] = [],
+        deletedBotIDs: [UUID] = [],
         selectedConnectorIDs: [String] = [],
         activeBotID: UUID? = nil
     ) {
         self.version = version
         self.onboardingCompleted = onboardingCompleted
         self.bots = bots
+        self.deletedBotIDs = deletedBotIDs
         self.selectedConnectorIDs = selectedConnectorIDs
         self.activeBotID = activeBotID
     }
@@ -189,6 +193,7 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
         version = try values.decodeIfPresent(Int.self, forKey: .version) ?? 1
         onboardingCompleted = try values.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         bots = try values.decodeIfPresent([BotProfile].self, forKey: .bots) ?? []
+        deletedBotIDs = Array((try values.decodeIfPresent([UUID].self, forKey: .deletedBotIDs) ?? []).suffix(200))
         selectedConnectorIDs = try values.decodeIfPresent([String].self, forKey: .selectedConnectorIDs)
             ?? values.decodeIfPresent([String].self, forKey: .legacySelectedConnectorIDs)
             ?? []
@@ -198,9 +203,10 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
 
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encode(1, forKey: .version)
+        try values.encode(2, forKey: .version)
         try values.encode(onboardingCompleted, forKey: .onboardingCompleted)
         try values.encode(bots, forKey: .bots)
+        try values.encode(deletedBotIDs, forKey: .deletedBotIDs)
         try values.encode(selectedConnectorIDs, forKey: .selectedConnectorIDs)
         try values.encodeIfPresent(activeBotID, forKey: .activeBotID)
     }

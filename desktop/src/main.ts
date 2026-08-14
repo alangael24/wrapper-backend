@@ -69,7 +69,8 @@ class DesktopStateStore {
 
   constructor(
     private readonly accountsDirectory: string,
-    private readonly remote: DesktopOAuthController
+    private readonly remote: DesktopOAuthController,
+    private readonly secureStorage: typeof safeStorage
   ) {}
 
   async activateAccount(
@@ -92,13 +93,15 @@ class DesktopStateStore {
     }
     if (this.syncPromise) await this.syncPromise;
     const scope = createHash("sha256").update(accountId).digest("hex");
-    const nextFilePath = path.join(this.accountsDirectory, `${scope}.json`);
+    const nextFilePath = path.join(this.accountsDirectory, `${scope}.bin`);
+    const previousPlaintextPath = path.join(this.accountsDirectory, `${scope}.json`);
     let loaded: AppState | null = null;
     let loadedRevision = 0;
     let loadedDirty = false;
     let migratedLegacyFilePath = "";
     try {
-      const parsed: unknown = JSON.parse(await readFile(nextFilePath, "utf8"));
+      if (!this.secureStorage.isEncryptionAvailable()) throw new Error("El almacenamiento seguro del sistema no está disponible.");
+      const parsed: unknown = JSON.parse(this.secureStorage.decryptString(await readFile(nextFilePath)));
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "state" in parsed) {
         const envelope = parsed as Record<string, unknown>;
         loaded = normalizeAppState(envelope.state);
@@ -112,6 +115,16 @@ class DesktopStateStore {
         loaded = normalizeAppState(parsed);
       }
     } catch {}
+    if (!loaded) {
+      try {
+        const parsed: unknown = JSON.parse(await readFile(previousPlaintextPath, "utf8"));
+        const envelope = parsed as Record<string, unknown>;
+        loaded = normalizeAppState(envelope && "state" in envelope ? envelope.state : parsed);
+        loadedRevision = typeof envelope.serverRevision === "number" ? Math.max(0, envelope.serverRevision) : 0;
+        loadedDirty = envelope.dirty === true;
+        migratedLegacyFilePath = previousPlaintextPath;
+      } catch {}
+    }
     if (!loaded && options.legacyFilePath) {
       try {
         loaded = normalizeAppState(JSON.parse(await readFile(options.legacyFilePath, "utf8")));
@@ -221,13 +234,17 @@ class DesktopStateStore {
 
   private async persist(snapshot: AppState): Promise<void> {
     if (!this.filePath) return;
+    if (!this.secureStorage.isEncryptionAvailable()) {
+      throw new Error("Desbloquea la sesión del sistema para guardar tus conversaciones.");
+    }
     await mkdir(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify({
+    const cleartext = `${JSON.stringify({
       state: snapshot,
       serverRevision: this.revision,
       dirty: this.dirty
-    }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    }, null, 2)}\n`;
+    await writeFile(temporaryPath, this.secureStorage.encryptString(cleartext), { mode: 0o600 });
     await rename(temporaryPath, this.filePath);
   }
 
@@ -295,6 +312,8 @@ function hasUserState(state: AppState): boolean {
 }
 
 function mergeAppStates(server: AppState, local: AppState): AppState {
+  const deletedBotIds = [...new Set([...server.deletedBotIds, ...local.deletedBotIds])].slice(-200);
+  const deletedBots = new Set(deletedBotIds);
   const bots = new Map(server.bots.map((bot) => [bot.id, bot]));
   for (const localBot of local.bots) {
     const serverBot = bots.get(localBot.id);
@@ -321,18 +340,19 @@ function mergeAppStates(server: AppState, local: AppState): AppState {
       workflows: [...workflows.values()].slice(-50)
     });
   }
-  const mergedBots = [...bots.values()].slice(0, 100);
+  const mergedBots = [...bots.values()].filter((bot) => !deletedBots.has(bot.id)).slice(0, 100);
   const activeBotId = local.activeBotId && mergedBots.some((bot) => bot.id === local.activeBotId)
     ? local.activeBotId
     : server.activeBotId;
   return normalizeAppState({
-    version: 1,
+    version: 2,
     onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
     selectedConnectorIds: normalizeConnectorIds([
       ...server.selectedConnectorIds,
       ...local.selectedConnectorIds
     ]),
     bots: mergedBots,
+    deletedBotIds,
     activeBotId
   });
 }
@@ -493,6 +513,7 @@ function registerDesktopIpc(): void {
     }));
   });
   ipcMain.handle(CHANNELS.createBot, (_event, draft: BotDraft) => stateStore.update((state) => {
+    if (state.bots.length >= 100) throw new Error("Puedes tener como máximo 100 bots. Elimina uno antes de crear otro.");
     const bot = createBotProfile(draft, state.selectedConnectorIds, randomUUID());
     return { ...state, bots: [...state.bots, bot], activeBotId: bot.id, onboardingCompleted: true };
   }));
@@ -530,7 +551,7 @@ function registerDesktopIpc(): void {
       buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
       connectorIds,
       {
-        computer: true,
+        computer: false,
         botId,
         onDelta: (text) => {
           if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
@@ -733,6 +754,9 @@ function registerDesktopIpc(): void {
       return {
         ...state,
         bots,
+        deletedBotIds: removed
+          ? [...new Set([...state.deletedBotIds, removed.id])].slice(-200)
+          : state.deletedBotIds,
         activeBotId: state.activeBotId === botId ? bots[0]?.id ?? null : state.activeBotId
       };
     });
@@ -1029,7 +1053,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     shell,
     appVersion: app.getVersion()
   });
-  stateStore = new DesktopStateStore(path.join(userDataPath, "accounts"), oauthController);
+  stateStore = new DesktopStateStore(path.join(userDataPath, "accounts"), oauthController, safeStorage);
   teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   const startupAccountId = await oauthController.accountId();
   await stateStore.activateAccount(startupAccountId, {
