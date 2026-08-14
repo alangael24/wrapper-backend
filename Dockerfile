@@ -31,6 +31,11 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     python -m venv "$VIRTUAL_ENV"
 
+# Supabase's pooler uses its private 2021 CA. Trust the pinned public root so
+# libpq can keep sslmode=verify-full instead of weakening certificate checks.
+COPY certificates/supabase-prod-ca-2021.crt /usr/local/share/ca-certificates/supabase-prod-ca-2021.crt
+RUN update-ca-certificates
+
 WORKDIR /app
 COPY requirements.txt package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
