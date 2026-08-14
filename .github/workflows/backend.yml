@@ -63,6 +63,13 @@ jobs:
       PGDATABASE: agentgenia_ci
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create Supabase compatibility roles
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          create role anon nologin;
+          create role authenticated nologin;
+          create role service_role nologin;
+          SQL
       - name: Apply every production migration from an empty PostgreSQL 17 database
         run: |
           for migration in supabase/migrations/*.sql; do

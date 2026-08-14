@@ -10,7 +10,7 @@ val releaseStoreFile = releaseSecret("AGENTGENIA_RELEASE_STORE_FILE")
 val releaseStorePassword = releaseSecret("AGENTGENIA_RELEASE_STORE_PASSWORD")
 val releaseKeyAlias = releaseSecret("AGENTGENIA_RELEASE_KEY_ALIAS")
 val releaseKeyPassword = releaseSecret("AGENTGENIA_RELEASE_KEY_PASSWORD")
-val releaseVersionCode = releaseSecret("AGENTGENIA_VERSION_CODE")?.toIntOrNull() ?: 8
+val releaseVersionCode = releaseSecret("AGENTGENIA_VERSION_CODE")?.toIntOrNull() ?: 11
 android {
     namespace = "com.agentgenia.android"
     compileSdk = 36
@@ -20,7 +20,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = releaseVersionCode
-        versionName = "1.0.8"
+        versionName = "1.1.1"
 
         buildConfigField("String", "API_BASE_URL", "\"https://agentgenia-api.onrender.com\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

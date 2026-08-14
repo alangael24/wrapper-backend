@@ -34,7 +34,10 @@ jobs:
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
       - name: Test, lint, and assemble from clean checkout
         working-directory: android/AgentGenia
-        run: ./gradlew clean testDebugUnitTest lintDebug lintRelease assembleDebug bundleRelease
+        # Production signing is deliberately fail-closed and belongs to the
+        # release workflow, which imports the expected certificate. Normal CI
+        # still compiles/tests Debug and performs static analysis of Release.
+        run: ./gradlew clean testDebugUnitTest lintDebug lintRelease assembleDebug
 
   instrumented-tests:
     needs: debug-build

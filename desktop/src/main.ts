@@ -135,7 +135,11 @@ class DesktopStateStore {
     this.filePath = nextFilePath;
     this.state = loaded ?? initialAppState();
     this.revision = loadedRevision;
-    this.dirty = loadedDirty;
+    // A legacy plaintext snapshot has never been acknowledged by the remote
+    // account-state service. This must remain dirty even when startup skips
+    // the network, otherwise the first remote refresh can replace the local
+    // bots instead of uploading them.
+    this.dirty = loadedDirty || Boolean(migratedLegacyFilePath);
     this.generation = 0;
     if (options.loadRemote !== false) {
       try {

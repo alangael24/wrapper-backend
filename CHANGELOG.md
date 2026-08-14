@@ -5,6 +5,16 @@ y versionado semántico para los clientes distribuidos.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-14
+
+### Fixed
+
+- Desktop replaces the legacy 1.1.0 client that could block logout while
+  disconnecting obsolete providers and never synchronized bots with the
+  account-scoped backend state.
+- Existing plaintext Desktop bots migrate once into the encrypted per-account
+  cache and then synchronize across Desktop, iOS and Android.
+
 ### Added
 
 - Wallet de créditos entero y auditable con grants, reservas atómicas por run,

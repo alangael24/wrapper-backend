@@ -300,6 +300,7 @@ test("isolates desktop bot state by signed-in account and clears the signed-out 
   ]);
   assert.match(main, /createHash\("sha256"\)\.update\(accountId\)/);
   assert.match(main, /path\.join\(userDataPath, "accounts"\)/);
+  assert.match(main, /this\.dirty = loadedDirty \|\| Boolean\(migratedLegacyFilePath\)/);
   assert.match(main, /await stateStore\.activateAccount\(null\)/);
   assert.match(main, /claimGuest: wasSignedOut/);
   assert.match(main, /desktop-state\.json\.migrated|\$\{migratedLegacyFilePath\}\.migrated/);
