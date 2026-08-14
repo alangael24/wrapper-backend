@@ -230,51 +230,21 @@ jobs:
         with:
           pattern: desktop-release-*
           path: artifacts
-      - name: Include existing platform assets in the combined checksum
+      - name: Require an immutable new release and build combined checksums
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms || 'available' }}
         run: |
-          roots=(artifacts)
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            mkdir -p existing-artifacts
-            gh release download "$RELEASE_TAG" --dir existing-artifacts
-            rm -f existing-artifacts/SHA256SUMS.txt
-            case "$RELEASE_PLATFORMS" in
-              available)
-                find existing-artifacts -type f \( -name 'Agent-Genia-*-mac-*' -o -name 'Agent-Genia-*-linux-*' -o -name 'latest-mac.yml' -o -name 'latest-linux.yml' \) -delete
-                ;;
-              windows)
-                find existing-artifacts -type f \( -name 'Agent-Genia-*-win-*' -o -name 'latest.yml' \) -delete
-                ;;
-              all)
-                find existing-artifacts -type f \( -name 'Agent-Genia-*' -o -name 'latest*.yml' \) -delete
-                ;;
-            esac
-            roots+=(existing-artifacts)
+            echo "Release $RELEASE_TAG already exists and is immutable" >&2
+            exit 1
           fi
-          node scripts/checksums.mjs "${roots[@]}"
+          node scripts/checksums.mjs artifacts
       - name: Stage and atomically publish the GitHub release
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms || 'available' }}
         run: |
           mapfile -d '' files < <(find artifacts -type f -print0)
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
-            find artifacts -type f -exec basename {} \; | sort -u > "$RUNNER_TEMP/new-asset-names.txt"
-            gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
-              selected=false
-              case "$RELEASE_PLATFORMS:$name" in
-                available:Agent-Genia-*-mac-*|available:Agent-Genia-*-linux-*|available:latest-mac.yml|available:latest-linux.yml) selected=true ;;
-                windows:Agent-Genia-*-win-*|windows:latest.yml) selected=true ;;
-                all:Agent-Genia-*|all:latest*.yml) selected=true ;;
-              esac
-              if [ "$selected" = true ] && ! grep -Fqx "$name" "$RUNNER_TEMP/new-asset-names.txt"; then
-                gh release delete-asset "$RELEASE_TAG" "$name" --yes
-              fi
-            done
-          else
-            gh release create "$RELEASE_TAG" "${files[@]}" --draft --verify-tag --generate-notes --title "Agent Genia ${RELEASE_TAG#desktop-v}"
-          fi
+          gh release create "$RELEASE_TAG" "${files[@]}" --draft --verify-tag --generate-notes --title "Agent Genia ${RELEASE_TAG#desktop-v}"
           gh release edit "$RELEASE_TAG" --draft=false --latest
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:

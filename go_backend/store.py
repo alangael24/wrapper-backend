@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -212,6 +212,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   duration_seconds      REAL,
   error_code            TEXT,
   warnings_json         TEXT NOT NULL DEFAULT '[]',
+  result_json           TEXT,
   created_at            REAL NOT NULL,
   started_at            REAL,
   finished_at           REAL,
@@ -450,6 +451,11 @@ class Store:
                         "UPDATE usage_events SET estimated_cost_microusd="
                         "CAST(ROUND(estimated_cost_usd * 1000000) AS INTEGER)"
                     )
+            run_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(agent_runs)")
+            }
+            if "result_json" not in run_columns:
+                self._conn.execute("ALTER TABLE agent_runs ADD COLUMN result_json TEXT")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_run "
                 "ON usage_events(run_id, created_at)"
@@ -701,6 +707,18 @@ class Store:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def get_account_auth_attempt(self, attempt_id: str, device_id: str) -> dict | None:
+        """Read an attempt without consuming its one-time result."""
+        row = self._one(
+            "SELECT * FROM account_auth_attempts WHERE id_hash=? AND device_id_hash=? "
+            "AND consumed_at IS NULL",
+            (
+                _hash_ephemeral("oauth-attempt", attempt_id),
+                _hash_ephemeral("oauth-device", device_id),
+            ),
+        )
+        return dict(row) if row else None
 
     def create_connector_auth_attempt(
         self,
@@ -2002,6 +2020,21 @@ class Store:
         row = self._one("SELECT * FROM agent_runs WHERE id=?", (run_id,))
         return dict(row) if row else None
 
+    def get_agent_run_for_user(self, run_id: str, user_id: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM agent_runs WHERE id=? AND user_id=?", (run_id, user_id)
+        )
+        return dict(row) if row else None
+
+    def save_agent_run_result(self, run_id: str, payload: dict) -> None:
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 1_000_000:
+            raise ValueError("El resultado durable excede 1 MB")
+        self._exec(
+            "UPDATE agent_runs SET result_json=? WHERE id=? AND status='succeeded'",
+            (encoded, run_id),
+        )
+
     def get_agent_run_by_token(self, token: str) -> dict | None:
         now = _now()
         row = self._one(
@@ -2534,12 +2567,44 @@ class Store:
                         "OR (revoked_at IS NOT NULL AND revoked_at<=?)",
                         (current, revoked_session_cutoff),
                     ),
+                    "stripe_events": (
+                        "DELETE FROM stripe_events WHERE processed_at<=?",
+                        (current - 400 * 86400,),
+                    ),
+                    "usage_events": (
+                        "DELETE FROM usage_events WHERE created_at<=?",
+                        (current - 400 * 86400,),
+                    ),
                 }
                 for name, (sql, params) in statements.items():
                     cursor = self._conn.execute(sql, params)
                     counts[name] = max(0, int(cursor.rowcount or 0))
                 self._conn.commit()
                 return counts
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def expire_past_due_entitlements(
+        self, *, now: float | None = None, grace_seconds: int = 7 * 86400
+    ) -> int:
+        """Downgrade accounts whose most recent paid state exceeded grace."""
+        current = _now() if now is None else now
+        cutoff = current - max(0, grace_seconds)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    "SELECT DISTINCT b.user_id FROM billing_subscriptions b "
+                    "WHERE b.status='past_due' AND b.updated_at<=? "
+                    "AND NOT EXISTS (SELECT 1 FROM billing_subscriptions active "
+                    "WHERE active.user_id=b.user_id AND active.status IN ('active','trialing'))",
+                    (cutoff,),
+                ).fetchall()
+                for row in rows:
+                    self._transition_user_tier_locked(row["user_id"], "free")
+                self._conn.commit()
+                return len(rows)
             except Exception:
                 self._conn.rollback()
                 raise

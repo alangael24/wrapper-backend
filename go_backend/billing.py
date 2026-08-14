@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -384,8 +385,13 @@ class BillingService:
                 status=409,
                 code="subscription_already_active",
             )
-        bucket = int(time.time() // 3600)
-        idempotency_key = hashlib.sha256(f"checkout|{user['id']}|{tier}|{bucket}".encode()).hexdigest()
+        # Never recycle a canceled/expired Checkout Session merely because the
+        # customer retries in the same hour. Stripe still deduplicates the
+        # individual request, while every explicit user intent gets a nonce.
+        checkout_intent = secrets.token_urlsafe(24)
+        idempotency_key = hashlib.sha256(
+            f"checkout|{user['id']}|{tier}|{checkout_intent}".encode()
+        ).hexdigest()
         session = self.client.create_checkout_session(
             user_id=user["id"],
             email=user.get("email"),

@@ -417,6 +417,7 @@ actor APIClient {
         prompt: String,
         botID: UUID,
         connectorIDs: [String],
+        idempotencyKey: String,
         computer: Bool = true,
         onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> AgentRunResponse {
@@ -427,7 +428,7 @@ actor APIClient {
             botID: botID.uuidString.lowercased(),
             connectorIDs: connectorIDs,
             maxCredits: 15,
-            idempotencyKey: UUID().uuidString.lowercased(),
+            idempotencyKey: idempotencyKey,
             stream: true
         )
         return try await streamAgent(

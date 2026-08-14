@@ -217,6 +217,7 @@ export class DesktopOAuthController {
       browser?: boolean;
       computer?: boolean;
       botId?: string;
+      idempotencyKey?: string;
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
@@ -435,6 +436,7 @@ class WrapperServiceClient {
       browser?: boolean;
       computer?: boolean;
       botId?: string;
+      idempotencyKey?: string;
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
@@ -446,7 +448,7 @@ class WrapperServiceClient {
       bot_id: options.botId ?? "",
       connector_ids: connectorIds,
       max_credits: 15,
-      idempotency_key: randomUUID(),
+      idempotency_key: options.idempotencyKey ?? randomUUID(),
       stream: true
     }, options.signal, options.onDelta);
   }
@@ -705,12 +707,19 @@ class WrapperServiceClient {
 
 class DeviceIdentityStore {
   private readonly filePath: string;
+  private pending: Promise<string> | null = null;
 
   constructor(private readonly options: { safeStorage: SafeStorage; userDataPath: string }) {
     this.filePath = path.join(options.userDataPath, "secrets", "agent-genia-device.bin");
   }
 
   async getOrCreate(): Promise<string> {
+    if (this.pending) return this.pending;
+    this.pending = this.loadOrCreate().finally(() => { this.pending = null; });
+    return this.pending;
+  }
+
+  private async loadOrCreate(): Promise<string> {
     if (!this.options.safeStorage.isEncryptionAvailable()) throw new Error("Desbloquea la sesión del sistema para iniciar sesión.");
     try {
       const existing = this.options.safeStorage.decryptString(await readFile(this.filePath));
@@ -724,6 +733,7 @@ class DeviceIdentityStore {
   }
 
   async clear(): Promise<void> {
+    await this.pending?.catch(() => undefined);
     await rm(this.filePath, { force: true });
   }
 }

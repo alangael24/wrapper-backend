@@ -326,6 +326,7 @@ class NativeConnectorGateway:
             raise ConnectorBrokerError(400, "Campos de conexion invalidos", "bad_connector_credentials")
         try:
             _build_base_url(definition, credentials, resolve=False)
+            self._validate_credentials(definition, credentials)
             key_id = f"connector:{attempt['user_id']}:{attempt['connector_id']}"
             encrypted = encrypt_api_key(
                 json.dumps(credentials, separators=(",", ":"), ensure_ascii=False),
@@ -336,7 +337,7 @@ class NativeConnectorGateway:
                 secret_versions=self.secret_versions,
                 allow_secret_file=self.allow_secret_file,
             )
-        except (ValueError, CryptoError) as exc:
+        except (ValueError, CryptoError, ConnectorBrokerError) as exc:
             return self.setup_html(attempt_id, error=str(exc))
         label = credentials.get("account_label") or CONNECTOR_CATALOG[attempt["connector_id"]]["name"]
         self.store.upsert_connector_credentials(
@@ -382,6 +383,39 @@ class NativeConnectorGateway:
         if definition is None or spec is None:
             raise ConnectorBrokerError(404, "Operacion first-party no encontrada", "connector_operation_not_found")
         credentials = self._credentials(user_id, connector_id)
+        return self._execute_with_credentials(definition, spec, credentials, arguments)
+
+    def _validate_credentials(
+        self, definition: NativeDefinition, credentials: dict[str, str]
+    ) -> None:
+        probe = next(
+            (
+                operation for operation in definition.operations.values()
+                if operation.method == "GET" and not _path_markers(operation.path)
+            ),
+            None,
+        )
+        if probe is None:
+            # Providers whose useful reads require a resource identifier still
+            # expose an authenticated API root. A 2xx response is required;
+            # 401/403/404 never marks the account connected.
+            probe = Operation("GET", "")
+        try:
+            self._execute_with_credentials(definition, probe, credentials, {})
+        except ConnectorBrokerError as exc:
+            raise ConnectorBrokerError(
+                400,
+                "No pudimos validar esas credenciales con el proveedor",
+                "connector_credentials_rejected",
+            ) from exc
+
+    @staticmethod
+    def _execute_with_credentials(
+        definition: NativeDefinition,
+        spec: Operation,
+        credentials: dict[str, str],
+        arguments: dict[str, Any],
+    ) -> Any:
         base_url = _build_base_url(definition, credentials)
         args = dict(arguments)
         path = spec.path

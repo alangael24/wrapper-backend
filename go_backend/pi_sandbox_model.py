@@ -28,7 +28,10 @@ AUDIT_FILENAME = "sandbox-audit.json"
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 HTTP_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
 
-MAX_REQUEST_BODY = 16 * 1024 * 1024
+# Vision is intentionally disabled in the current product, so capability
+# requests are JSON/text. Keep the aggregate worst case bounded even when all
+# proxy slots are occupied (64 * 2 MiB = 128 MiB).
+MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_REQUEST_TARGET_BYTES = 8 * 1024
 MAX_PROXY_CONNECTIONS = 64
 PROXY_TIMEOUT_SECONDS = 3600

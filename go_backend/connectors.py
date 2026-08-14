@@ -441,7 +441,15 @@ class ConnectorBroker:
             raise ConnectorBrokerError(400, "Operacion no permitida para el conector", "bad_connector_operation")
         if not isinstance(arguments, dict):
             raise ConnectorBrokerError(400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
-        if len(json.dumps(arguments, ensure_ascii=False).encode("utf-8")) > MAX_CONNECTOR_ARGUMENTS_BYTES:
+        try:
+            encoded_arguments = json.dumps(
+                arguments, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ConnectorBrokerError(
+                400, "arguments contiene valores JSON inválidos", "bad_connector_arguments"
+            ) from exc
+        if len(encoded_arguments) > MAX_CONNECTOR_ARGUMENTS_BYTES:
             raise ConnectorBrokerError(413, "arguments excede 64 KiB", "connector_arguments_too_large")
 
         adapter = self._adapter_for(connector_id)
@@ -463,7 +471,9 @@ class ConnectorBroker:
             raise ConnectorBrokerError(502, "El proveedor rechazo la operacion", "connector_upstream_error") from exc
         payload = {"connector_id": connector_id, "operation": operation, "result": result}
         try:
-            result_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            result_size = len(
+                json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            )
         except (TypeError, ValueError) as exc:
             raise ConnectorBrokerError(
                 502, "El adaptador devolvio un resultado no serializable", "connector_adapter_error"

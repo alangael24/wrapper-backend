@@ -351,7 +351,7 @@ test("opens Stripe Checkout and the customer portal only through isolated IPC", 
   assert.match(renderer, /data-open-billing-portal/);
   assert.match(renderer, /Starter/);
   assert.match(renderer, /Business/);
-  assert.match(oauth, /idempotency_key: randomUUID\(\)/);
+  assert.match(oauth, /idempotency_key: options\.idempotencyKey \?\? randomUUID\(\)/);
   assert.match(oauth, /max_credits: 15/);
 });
 

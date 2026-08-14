@@ -547,12 +547,32 @@ function registerDesktopIpc(): void {
       ...before.selectedConnectorIds,
       ...bot.connectorIds
     ]);
+    const turnId = initial ? `initial-${botId}` : randomUUID();
+    if (!initial) {
+      const createdAt = new Date().toISOString();
+      await stateStore.update((current) => ({
+        ...current,
+        bots: current.bots.map((item) => item.id === botId
+          ? {
+            ...item,
+            messages: [...item.messages, {
+              id: turnId,
+              role: "user" as const,
+              text: prompt,
+              createdAt
+            }].slice(-200)
+          }
+          : item),
+        activeBotId: botId
+      }));
+    }
     const result = await oauthController.runAgent(
       buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
       connectorIds,
       {
         computer: false,
         botId,
+        idempotencyKey: turnId,
         onDelta: (text) => {
           if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
         }
@@ -566,7 +586,6 @@ function registerDesktopIpc(): void {
       if (index < 0) throw new Error("El bot se eliminó mientras trabajaba.");
       const messages = [
         ...current.bots[index].messages,
-        ...(!initial ? [{ id: randomUUID(), role: "user" as const, text: prompt, createdAt: now }] : []),
         {
           id: randomUUID(),
           role: "assistant" as const,

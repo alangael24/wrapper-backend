@@ -331,15 +331,16 @@ class AppViewModel(
         val original = _state.value.bots.firstOrNull { it.id == botId } ?: return@launch
         if (botId in _state.value.runningBotIds) return@launch
         _state.update { it.copy(runningBotIds = it.runningBotIds + botId) }
+        val turnId = if (initial) "initial-$botId" else UUID.randomUUID().toString()
         if (!initial) mutateBot(botId, persistAfter = false) { bot ->
-            bot.copy(messages = (bot.messages + BotMessage(role = MessageRole.User, text = userText)).takeLast(200))
+            bot.copy(messages = (bot.messages + BotMessage(id = turnId, role = MessageRole.User, text = userText)).takeLast(200))
         }
         persist()
         try {
             val current = _state.value
             val connectors = (current.selectedConnectorIds + original.connectorIds).distinct().sorted()
             val prompt = buildBotPrompt(original.copy(connectorIds = connectors), userText, initial)
-            val generated = parseAgentAnswer(api.runAgent(prompt, botId, connectors))
+            val generated = parseAgentAnswer(api.runAgent(prompt, botId, connectors, turnId))
             if (generated.text.isBlank()) throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)
             mutateBot(botId, persistAfter = false) { bot ->
                 bot.copy(messages = (bot.messages + BotMessage(

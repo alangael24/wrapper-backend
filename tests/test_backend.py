@@ -1340,7 +1340,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 15)
+        self.assertEqual(migrated.health()["schema_version"], 16)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
@@ -1446,6 +1446,22 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(result["usage"]["llm_cost_usd"], 0.000002)
         self.assertGreaterEqual(result["usage"]["duration_seconds"], 0)
         self.assertEqual(result["credits"]["charged"], 0.1)
+
+        status, replay = self.ws.req(
+            "POST", "/v1/agent/run",
+            {"prompt": "prueba end to end", "idempotency_key": "pi-e2e-run"},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["run_id"], result["run_id"])
+        self.assertEqual(replay["answer"], result["answer"])
+
+        status, recovered = self.ws.req(
+            "GET", f"/v1/agent/runs/{result['run_id']}", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered["result"]["answer"], result["answer"])
 
         upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream_calls), 1)
@@ -1876,10 +1892,21 @@ class TestBackend(unittest.TestCase):
             self.assertIn("Conectar Nooks", page)
             self.assertIn('type="password"', page)
 
-            complete_page = native.submit(
-                started["attempt_id"],
-                {"access_token": "nooks-api-super-secret", "account_label": "Ventas"},
-            ).decode()
+            with (
+                patch(
+                    "go_backend.native_connectors.socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ),
+                patch(
+                    "go_backend.native_connectors._request_json",
+                    return_value={"data": []},
+                ) as credential_probe,
+            ):
+                complete_page = native.submit(
+                    started["attempt_id"],
+                    {"access_token": "nooks-api-super-secret", "account_label": "Ventas"},
+                ).decode()
+            credential_probe.assert_called_once()
             self.assertIn("Cuenta conectada", complete_page)
             row = store.get_connector_credentials(alice["id"], "nooks")
             self.assertIsNotNone(row)

@@ -145,9 +145,13 @@ class GoogleAccountAuth:
 
     def status(self, *, attempt_id: str, device_id: str) -> dict:
         self._validate_device_id(device_id)
-        attempt = self.store.consume_account_auth_attempt(attempt_id, device_id)
+        attempt = self.store.get_account_auth_attempt(attempt_id, device_id)
         if attempt is None:
             raise GoogleAuthError("Intento de acceso no encontrado", status=404, code="not_found")
+        if float(attempt.get("expires_at") or 0) <= time.time() and attempt["status"] not in {"complete", "error"}:
+            attempt = self.store.consume_account_auth_attempt(attempt_id, device_id)
+            if attempt is None:
+                raise GoogleAuthError("Intento de acceso no encontrado", status=404, code="not_found")
         if attempt["status"] == "complete" and attempt.get("result_enc"):
             try:
                 raw = decrypt_api_key(
@@ -169,8 +173,12 @@ class GoogleAccountAuth:
                 ) from exc
             if not account or account.get("account_status") != "active":
                 raise GoogleAuthError("La cuenta está deshabilitada", status=403, code="account_disabled")
+            claimed = self.store.consume_account_auth_attempt(attempt_id, device_id)
+            if claimed is None:
+                raise GoogleAuthError("Intento de acceso ya consumido", status=404, code="not_found")
             return {"status": "complete", **self._create_session(account=account, device_id=device_id)}
         if attempt["status"] == "error":
+            self.store.consume_account_auth_attempt(attempt_id, device_id)
             return {"status": "error", "message": attempt.get("message") or "No fue posible iniciar sesión."}
         return {"status": "pending"}
 

@@ -166,7 +166,9 @@ class AgentGeniaApi(
         requestJson("/v1/connectors/disconnect", "POST", JSONObject().put("connector_id", connectorId))
     }
 
-    suspend fun runAgent(prompt: String, botId: String, connectorIds: List<String>): String {
+    suspend fun runAgent(
+        prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
+    ): String {
         val json = requestJson(
             "/v1/agent/run",
             "POST",
@@ -177,7 +179,7 @@ class AgentGeniaApi(
                 .put("bot_id", botId)
                 .put("connector_ids", JSONArray(connectorIds))
                 .put("max_credits", 15)
-                .put("idempotency_key", UUID.randomUUID().toString()),
+                .put("idempotency_key", idempotencyKey),
         )
         return json.optString("answer")
     }

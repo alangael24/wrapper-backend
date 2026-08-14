@@ -81,8 +81,9 @@ if (!/linux:\s+[\s\S]*?executableName: agent-genia/u.test(builder)) {
 for (const [key, value] of [
   ["PUBLIC_LEGACY_SIGNUP_ENABLED", "0"],
   ["STRIPE_ENABLED", "1"],
-  ["CREDITS_MODE", "shadow"],
-  ["COMPUTERS_ENABLED", "1"],
+  ["CREDITS_MODE", "enforce"],
+  ["COMPUTERS_ENABLED", "0"],
+  ["EXTERNAL_WRITES_ENABLED", "0"],
   ["PI_ENABLED", "1"],
   ["PI_MAX_CONCURRENT", "4"],
   ["PI_CHROME_AUTO_AUTHORIZE", "1"],
@@ -96,8 +97,8 @@ if (!/key: PI_CHROME_ISOLATION\s+value: per_run/u.test(render)) {
 if (!render.includes("autoDeployTrigger: checksPass")) {
   throw new Error("Render must wait for GitHub CI before deploying");
 }
-if (!render.includes("healthCheckPath: /platformz")) {
-  throw new Error("Render must use the database-only platform health check");
+if (!render.includes("healthCheckPath: /readyz")) {
+  throw new Error("Render must gate traffic on full production readiness");
 }
 if (!backendWorkflow.includes("pip-audit --require-hashes --disable-pip -r requirements.txt")) {
   throw new Error("Backend CI must audit the complete hashed Python lockfile");
@@ -117,8 +118,10 @@ if (!desktopReleaseWorkflow.includes("inputs.platforms == 'windows'")
   || !desktopReleaseWorkflow.includes("--universal --publish never")
   || !desktopReleaseWorkflow.includes("electron-builder --win --publish never -c.forceCodeSigning=true")
   || !desktopReleaseWorkflow.includes("electron-builder --linux --publish never -c.forceCodeSigning=false")
-  || !desktopReleaseWorkflow.includes("existing-artifacts/SHA256SUMS.txt")
-  || !desktopReleaseWorkflow.includes("gh release delete-asset")
+  || !desktopReleaseWorkflow.includes("already exists and is immutable")
+  || !desktopReleaseWorkflow.includes("gh release create")
+  || desktopReleaseWorkflow.includes("gh release delete-asset")
+  || desktopReleaseWorkflow.includes("--clobber")
   || !desktopReleaseWorkflow.includes("attestations: write")) {
   throw new Error("Desktop release must append Windows only through its signed, checksum-preserving path");
 }
@@ -143,22 +146,27 @@ for (const key of [
 }
 
 const expectedMigrations = [
-  "20260812020006_agentgenia_private_schema.sql",
-  "20260812092839_connector_credentials.sql",
-  "20260812174201_bot_computers.sql",
-  "20260812174212_stripe_event_ordering.sql",
-  "20260812180737_production_security_hardening.sql",
-  "20260813032540_apple_identity_tokens.sql",
-  "20260813143000_deepseek_direct.sql",
-  "20260813190000_credit_ledger.sql",
+  ["20260812020006_agentgenia_private_schema.sql", 4],
+  ["20260812092839_connector_credentials.sql", 5],
+  ["20260812174201_bot_computers.sql", 6],
+  ["20260812174212_stripe_event_ordering.sql", 7],
+  ["20260812180737_production_security_hardening.sql", 8],
+  ["20260813032540_apple_identity_tokens.sql", 9],
+  ["20260813143000_deepseek_direct.sql", 10],
+  ["20260813190000_credit_ledger.sql", 11],
+  ["20260813200000_account_model_provider_override.sql", 12],
+  ["20260813224341_account_state_sync.sql", 13],
+  ["20260814045554_production_audit_hardening.sql", 14],
+  ["20260814052000_distributed_rate_limits.sql", 15],
+  ["20260814070000_run_recovery_and_retention.sql", 16],
 ];
 const migrationContents = await Promise.all(
-  expectedMigrations.map((name) => readFile(`supabase/migrations/${name}`, "utf8")),
+  expectedMigrations.map(([name]) => readFile(`supabase/migrations/${name}`, "utf8")),
 );
 for (const [index, contents] of migrationContents.entries()) {
-  const expectedVersion = index + 4;
+  const [name, expectedVersion] = expectedMigrations[index];
   if (!contents.includes(`values ('schema_version', '${expectedVersion}')`)) {
-    throw new Error(`${expectedMigrations[index]} must set schema_version=${expectedVersion}`);
+    throw new Error(`${name} must set schema_version=${expectedVersion}`);
   }
 }
 for (const file of workflowFiles) {

@@ -589,23 +589,13 @@ final class AppModel {
 
     private func runAgent(botID: UUID, userText: String, initial: Bool) async {
         guard !runningBotIDs.contains(botID), let source = bots.first(where: { $0.id == botID }) else { return }
-        // Give an in-flight response time to finish when the user briefly
-        // backgrounds the app.  A regular foreground URLSession may otherwise
-        // be suspended immediately and surface a misleading connection error.
-        let backgroundTask = UIApplication.shared.beginBackgroundTask(
-            withName: "AgentGeniaAgentRun"
-        )
-        defer {
-            if backgroundTask != .invalid {
-                UIApplication.shared.endBackgroundTask(backgroundTask)
-            }
-        }
         runningBotIDs.insert(botID)
         defer { runningBotIDs.remove(botID) }
         let prompt = buildBotPrompt(bot: source, userText: userText, initial: initial)
+        let turnID = initial ? "initial-\(botID.uuidString.lowercased())" : UUID().uuidString.lowercased()
         if !initial, let index = bots.firstIndex(where: { $0.id == botID }) {
             bots[index].messages.append(BotMessage(
-                id: UUID(), role: .user, text: userText, widget: nil, createdAt: Date()
+                id: UUID(uuidString: turnID) ?? UUID(), role: .user, text: userText, widget: nil, createdAt: Date()
             ))
         }
         let replyID = UUID()
@@ -622,15 +612,28 @@ final class AppModel {
             let connectorIDs = initial
                 ? []
                 : Array(Set(selectedConnectorIDs + source.connectorIDs)).sorted()
-            let response = try await api.runAgent(
-                prompt: prompt,
-                botID: botID,
-                connectorIDs: connectorIDs,
-                computer: false,
-                onDelta: { [weak self] delta in
-                    await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
-                }
+            let agentTask = Task {
+                try await api.runAgent(
+                    prompt: prompt,
+                    botID: botID,
+                    connectorIDs: connectorIDs,
+                    idempotencyKey: turnID,
+                    computer: false,
+                    onDelta: { [weak self] delta in
+                        await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
+                    }
+                )
+            }
+            let backgroundTask = UIApplication.shared.beginBackgroundTask(
+                withName: "AgentGeniaAgentRun",
+                expirationHandler: { agentTask.cancel() }
             )
+            defer {
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                }
+            }
+            let response = try await agentTask.value
             let generated = parseAgentAnswer(response.answer)
             guard !generated.text.isEmpty,
                   let index = bots.firstIndex(where: { $0.id == botID }),

@@ -818,6 +818,7 @@ class Backend:
     def _run_retention_once(self) -> None:
         try:
             self.store.purge_expired_ephemeral_data()
+            self.store.expire_past_due_entitlements()
             self.pi.purge_expired_runs()
         except Exception:
             logging.exception("Retention maintenance failed")
@@ -1300,6 +1301,11 @@ class Backend:
         user = self.require_user(handler)
         if not user:
             return
+        if not self.store.consume_rate_limit(
+            f"connector-start:{user['id']}", limit=20, window_seconds=60
+        ):
+            error_response(handler, 429, "Demasiadas conexiones nuevas", "rate_limit")
+            return
         body = self.read_json(handler) or {}
         connector_id = body.get("connector_id")
         if not isinstance(connector_id, str):
@@ -1721,6 +1727,32 @@ class Backend:
         )
         json_response(handler, 200, status)
 
+    def handle_agent_run_status(
+        self, handler: BaseHTTPRequestHandler, run_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        run = self.store.get_agent_run_for_user(run_id, user["id"])
+        if not run:
+            error_response(handler, 404, "Ejecución no encontrada", "run_not_found")
+            return
+        result = None
+        if run.get("result_json"):
+            try:
+                result = json.loads(run["result_json"])
+            except (TypeError, json.JSONDecodeError):
+                logging.exception("Invalid durable agent result run_id=%s", run_id)
+        json_response(handler, 200, {
+            "run_id": run_id,
+            "status": run.get("status"),
+            "error_code": run.get("error_code"),
+            "created_at": run.get("created_at"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("finished_at"),
+            "result": result,
+        })
+
     def handle_agent_warm(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
         if not user:
@@ -1753,6 +1785,11 @@ class Backend:
         request_started_at = time.monotonic()
         user = self.require_user(handler)
         if not user:
+            return
+        if not self.store.consume_rate_limit(
+            f"agent-run:{user['id']}", limit=30, window_seconds=60
+        ):
+            error_response(handler, 429, "Demasiadas ejecuciones", "rate_limit")
             return
         tier = user.get("tier") or DEFAULT_TIER
         unlimited = self.unlimited_usage(user)
@@ -1906,6 +1943,19 @@ class Backend:
             raise
         if prepared["duplicate"]:
             existing = prepared["run"]
+            if existing.get("status") == "succeeded" and existing.get("result_json"):
+                try:
+                    recovered = json.loads(existing["result_json"])
+                except (TypeError, json.JSONDecodeError):
+                    recovered = None
+                if isinstance(recovered, dict):
+                    if stream_requested:
+                        recovered_stream = _AgentEventStream(handler)
+                        recovered_stream.start(existing["id"])
+                        recovered_stream.done_text(str(recovered.get("answer") or ""))
+                    else:
+                        json_response(handler, 200, recovered)
+                    return
             error_response(
                 handler, 409,
                 f"La ejecución ya existe: {existing['id']} ({existing['status']})",
@@ -2113,6 +2163,7 @@ class Backend:
         payload["computer_enabled"] = computer_enabled
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
+        self.store.save_agent_run_result(run_id, payload)
         logging.info(
             "agent timing run_id=%s timings=%s",
             run_id,
@@ -2143,6 +2194,11 @@ class Backend:
     def handle_computer_ensure(self, handler: BaseHTTPRequestHandler, bot_id: str) -> None:
         user = self.require_user(handler)
         if not user:
+            return
+        if not self.store.consume_rate_limit(
+            f"computer-ensure:{user['id']}", limit=10, window_seconds=60
+        ):
+            error_response(handler, 429, "Demasiadas solicitudes de computadora", "rate_limit")
             return
         tier = user.get("tier") or DEFAULT_TIER
         if not has_model_access(tier):
@@ -2585,6 +2641,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_warm(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
+            elif self.command == "GET" and path.startswith("/v1/agent/runs/"):
+                backend.handle_agent_run_status(self, path.rsplit("/", 1)[-1])
             elif path.startswith("/v1/computers/"):
                 parts = path.strip("/").split("/")
                 bot_id = parts[2] if len(parts) >= 3 else ""
