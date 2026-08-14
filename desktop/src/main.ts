@@ -25,6 +25,7 @@ import { AccountStateConflictError, DesktopOAuthController, safeComputerViewerUr
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
+  refreshAccountState: "desktop:refresh-account-state",
   connectionSnapshot: "desktop:connection-snapshot",
   signIn: "desktop:sign-in",
   signOut: "desktop:sign-out",
@@ -42,7 +43,9 @@ const CHANNELS = Object.freeze({
   saveConnectors: "desktop:save-connectors",
   createBot: "desktop:create-bot",
   updateBot: "desktop:update-bot",
+  warmBotAgent: "desktop:warm-bot-agent",
   runBotAgent: "desktop:run-bot-agent",
+  agentDelta: "desktop:agent-delta",
   getTeachRecordingStatus: "desktop:get-teach-recording-status",
   startTeachRecording: "desktop:start-teach-recording",
   stopTeachRecording: "desktop:stop-teach-recording",
@@ -57,8 +60,12 @@ class DesktopStateStore {
   private state: AppState = initialAppState();
   private filePath: string | null = null;
   private writes: Promise<void> = Promise.resolve();
+  private syncPromise: Promise<void> | null = null;
+  private syncRetryTimer: NodeJS.Timeout | null = null;
+  private syncRetryMs = 1_000;
   private revision = 0;
   private dirty = false;
+  private generation = 0;
 
   constructor(
     private readonly accountsDirectory: string,
@@ -67,17 +74,23 @@ class DesktopStateStore {
 
   async activateAccount(
     accountId: string | null,
-    options: { claimGuest?: boolean; legacyFilePath?: string } = {}
+    options: { claimGuest?: boolean; legacyFilePath?: string; loadRemote?: boolean } = {}
   ): Promise<AppState> {
     await this.writes;
+    if (this.syncRetryTimer) clearTimeout(this.syncRetryTimer);
+    this.syncRetryTimer = null;
     const guestState = structuredClone(this.state);
     if (!accountId) {
+      // An in-flight upload is generation/file scoped and cannot mutate this
+      // signed-out view. Do not make logout wait on a slow or sleeping API.
       this.filePath = null;
       this.state = initialAppState();
       this.revision = 0;
       this.dirty = false;
+      this.generation = 0;
       return structuredClone(this.state);
     }
+    if (this.syncPromise) await this.syncPromise;
     const scope = createHash("sha256").update(accountId).digest("hex");
     const nextFilePath = path.join(this.accountsDirectory, `${scope}.json`);
     let loaded: AppState | null = null;
@@ -110,16 +123,19 @@ class DesktopStateStore {
     this.state = loaded ?? initialAppState();
     this.revision = loadedRevision;
     this.dirty = loadedDirty;
-    try {
-      const server = await this.remote.loadAccountState();
-      const shouldMergeLocal = Boolean(loaded && hasUserState(loaded) && (loadedRevision === 0 || loadedDirty));
-      this.state = shouldMergeLocal ? mergeAppStates(server.state, loaded!) : server.state;
-      this.revision = server.revision;
-      this.dirty = shouldMergeLocal;
-      if (shouldMergeLocal) await this.syncRemote();
-    } catch (error) {
-      this.dirty = this.dirty || (this.revision === 0 && hasUserState(this.state));
-      console.error(`[account-state] No fue posible cargar el estado remoto: ${errorMessage(error)}`);
+    this.generation = 0;
+    if (options.loadRemote !== false) {
+      try {
+        const server = await this.remote.loadAccountState();
+        const shouldMergeLocal = Boolean(loaded && hasUserState(loaded) && (loadedRevision === 0 || loadedDirty));
+        this.state = shouldMergeLocal ? mergeAppStates(server.state, loaded!) : server.state;
+        this.revision = server.revision;
+        this.dirty = shouldMergeLocal;
+        if (shouldMergeLocal) await this.syncRemote();
+      } catch (error) {
+        this.dirty = this.dirty || (this.revision === 0 && hasUserState(this.state));
+        console.error(`[account-state] No fue posible cargar el estado remoto: ${errorMessage(error)}`);
+      }
     }
     if (loaded || hasUserState(this.state)) {
       await this.persist(this.state);
@@ -134,20 +150,45 @@ class DesktopStateStore {
     return structuredClone(this.state);
   }
 
+  async refreshRemote(): Promise<AppState> {
+    await this.writes;
+    if (!this.filePath) return this.snapshot();
+    if (this.syncPromise) await this.syncPromise;
+    const server = await this.remote.loadAccountState();
+    let result = structuredClone(this.state);
+    this.writes = this.writes.then(async () => {
+      if (!this.filePath || server.revision <= this.revision) {
+        result = structuredClone(this.state);
+        return;
+      }
+      if (this.dirty) {
+        this.state = mergeAppStates(server.state, this.state);
+        this.dirty = true;
+        this.generation += 1;
+      } else {
+        this.state = server.state;
+        this.dirty = false;
+      }
+      this.revision = server.revision;
+      await this.persist(this.state);
+      result = structuredClone(this.state);
+    });
+    await this.writes;
+    if (this.dirty) this.scheduleRemoteSync();
+    return result;
+  }
+
   async update(mutator: (current: AppState) => AppState): Promise<AppState> {
     let result = structuredClone(this.state);
     this.writes = this.writes.then(async () => {
       this.state = normalizeAppState(mutator(structuredClone(this.state)));
       this.dirty = true;
+      this.generation += 1;
       await this.persist(this.state);
-      try {
-        await this.syncRemote();
-      } catch (error) {
-        console.error(`[account-state] No fue posible sincronizar el cambio: ${errorMessage(error)}`);
-      }
       result = structuredClone(this.state);
     });
     await this.writes;
+    this.scheduleRemoteSync();
     return result;
   }
 
@@ -166,11 +207,14 @@ class DesktopStateStore {
 
   async deleteActiveAccount(): Promise<AppState> {
     await this.writes;
+    if (this.syncRetryTimer) clearTimeout(this.syncRetryTimer);
+    this.syncRetryTimer = null;
     const accountFilePath = this.filePath;
     this.filePath = null;
     this.state = initialAppState();
     this.revision = 0;
     this.dirty = false;
+    this.generation = 0;
     if (accountFilePath) await rm(accountFilePath, { force: true });
     return structuredClone(this.state);
   }
@@ -188,23 +232,61 @@ class DesktopStateStore {
   }
 
   private async syncRemote(): Promise<void> {
-    if (!this.filePath || !this.dirty) return;
-    try {
-      const saved = await this.remote.saveAccountState(this.state, this.revision);
-      this.state = saved.state;
-      this.revision = saved.revision;
-      this.dirty = false;
-      await this.persist(this.state);
-    } catch (error) {
-      if (!(error instanceof AccountStateConflictError)) throw error;
-      this.state = mergeAppStates(error.current.state, this.state);
-      this.revision = error.current.revision;
-      const saved = await this.remote.saveAccountState(this.state, this.revision);
-      this.state = saved.state;
-      this.revision = saved.revision;
-      this.dirty = false;
-      await this.persist(this.state);
+    while (this.filePath && this.dirty) {
+      await this.writes;
+      const filePath = this.filePath;
+      const generation = this.generation;
+      const snapshot = structuredClone(this.state);
+      const revision = this.revision;
+      let saved: Awaited<ReturnType<DesktopOAuthController["saveAccountState"]>>;
+      try {
+        saved = await this.remote.saveAccountState(snapshot, revision);
+      } catch (error) {
+        if (!(error instanceof AccountStateConflictError)) throw error;
+        this.writes = this.writes.then(async () => {
+          if (this.filePath !== filePath) return;
+          this.state = mergeAppStates(error.current.state, this.state);
+          this.revision = error.current.revision;
+          this.dirty = true;
+          this.generation += 1;
+          await this.persist(this.state);
+        });
+        await this.writes;
+        continue;
+      }
+      this.writes = this.writes.then(async () => {
+        if (this.filePath !== filePath) return;
+        this.revision = saved.revision;
+        if (this.generation === generation) {
+          this.state = saved.state;
+          this.dirty = false;
+        }
+        await this.persist(this.state);
+      });
+      await this.writes;
     }
+  }
+
+  private scheduleRemoteSync(delayMs = 0): void {
+    if (!this.filePath || !this.dirty || this.syncPromise || this.syncRetryTimer) return;
+    if (delayMs > 0) {
+      this.syncRetryTimer = setTimeout(() => {
+        this.syncRetryTimer = null;
+        this.scheduleRemoteSync();
+      }, delayMs);
+      this.syncRetryTimer.unref();
+      return;
+    }
+    this.syncPromise = this.syncRemote()
+      .then(() => { this.syncRetryMs = 1_000; })
+      .catch((error) => {
+        console.error(`[account-state] No fue posible sincronizar el cambio: ${errorMessage(error)}`);
+        this.syncRetryMs = Math.min(this.syncRetryMs * 2, 30_000);
+      })
+      .finally(() => {
+        this.syncPromise = null;
+        if (this.dirty) this.scheduleRemoteSync(this.syncRetryMs);
+      });
   }
 }
 
@@ -305,8 +387,14 @@ app.on("second-instance", () => {
 
 function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.bootstrap, () => stateStore.snapshot());
+  ipcMain.handle(CHANNELS.refreshAccountState, () => stateStore.refreshRemote());
   ipcMain.handle(CHANNELS.connectionSnapshot, async () => {
     const connections = await oauthController.snapshot();
+    if (connections.account.connected) {
+      await stateStore.refreshRemote().catch((error) => {
+        console.error(`[account-state] No fue posible refrescar el estado remoto: ${errorMessage(error)}`);
+      });
+    }
     await stateStore.reconcileConnections(connections);
     return connections;
   });
@@ -321,9 +409,10 @@ function registerDesktopIpc(): void {
     activeTeachRecording = null;
     issuedComputerViewerUrls.clear();
     computerWindow?.close();
-    const connections = await oauthController.signOut();
+    // Flush or safely retain the account-scoped state while the access token
+    // still exists. Clearing OAuth first made dirty state wait on a doomed 401.
     await stateStore.activateAccount(null);
-    return connections;
+    return oauthController.signOut();
   });
   ipcMain.handle(CHANNELS.deleteAccount, async () => {
     activeTeachRecording = null;
@@ -415,8 +504,12 @@ function registerDesktopIpc(): void {
     bots[index] = updateBotProfile(bots[index], patch ?? {});
     return { ...state, bots, activeBotId: botId };
   }));
+  ipcMain.handle(CHANNELS.warmBotAgent, async (_event, botId: unknown) => {
+    if (typeof botId !== "string") throw new Error("Bot inválido.");
+    await oauthController.warmAgent(botId);
+  });
   ipcMain.handle(CHANNELS.runBotAgent, async (
-    _event,
+    event,
     botId: unknown,
     promptValue: unknown,
     initialValue?: unknown
@@ -436,7 +529,13 @@ function registerDesktopIpc(): void {
     const result = await oauthController.runAgent(
       buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
       connectorIds,
-      { computer: true, botId }
+      {
+        computer: true,
+        botId,
+        onDelta: (text) => {
+          if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
+        }
+      }
     );
     const generated = parseAgentAnswer(result.answer);
     if (!generated.text) throw new Error("El agente no devolvió una respuesta.");
@@ -755,7 +854,7 @@ function buildBotPrompt(
   userPrompt: string,
   initial: boolean
 ): string {
-  const history = bot.messages.slice(-20).map((message) => (
+  const history = bot.messages.slice(-4).map((message) => (
     `${message.role === "user" ? "Usuario" : bot.name}: ${message.text}`
   )).join("\n");
   const profile = [
@@ -934,12 +1033,12 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   const startupAccountId = await oauthController.accountId();
   await stateStore.activateAccount(startupAccountId, {
-    ...(startupAccountId ? { legacyFilePath: path.join(userDataPath, "desktop-state.json") } : {})
+    ...(startupAccountId ? { legacyFilePath: path.join(userDataPath, "desktop-state.json") } : {}),
+    // Open from the encrypted local cache immediately. The renderer refreshes
+    // the account in the background, so a sleeping Render service cannot hold
+    // the native window hostage during launch.
+    loadRemote: false
   });
-  if (startupAccountId) {
-    const connections = await oauthController.snapshot().catch(() => null);
-    if (connections) await stateStore.reconcileConnections(connections);
-  }
   registerDesktopIpc();
   configureDisplayMedia();
   createWindow();

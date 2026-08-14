@@ -1,8 +1,9 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { BotDraft, BotPatch, DesktopApi, TeachCapture, TeachEntryPoint } from "./contracts";
+import type { AgentStreamDelta, BotDraft, BotPatch, DesktopApi, TeachCapture, TeachEntryPoint } from "./contracts";
 
 const api: DesktopApi = Object.freeze({
   bootstrap: () => ipcRenderer.invoke("desktop:bootstrap"),
+  refreshAccountState: () => ipcRenderer.invoke("desktop:refresh-account-state"),
   connectionSnapshot: () => ipcRenderer.invoke("desktop:connection-snapshot"),
   signIn: () => ipcRenderer.invoke("desktop:sign-in"),
   signOut: () => ipcRenderer.invoke("desktop:sign-out"),
@@ -22,9 +23,15 @@ const api: DesktopApi = Object.freeze({
   ),
   createBot: (draft: BotDraft) => ipcRenderer.invoke("desktop:create-bot", draft),
   updateBot: (botId: string, patch: BotPatch) => ipcRenderer.invoke("desktop:update-bot", botId, patch),
+  warmBotAgent: (botId: string) => ipcRenderer.invoke("desktop:warm-bot-agent", botId),
   runBotAgent: (botId: string, prompt: string, initial?: boolean) => (
     ipcRenderer.invoke("desktop:run-bot-agent", botId, prompt, initial)
   ),
+  onAgentDelta: (listener: (delta: AgentStreamDelta) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, delta: AgentStreamDelta): void => listener(delta);
+    ipcRenderer.on("desktop:agent-delta", handler);
+    return () => ipcRenderer.removeListener("desktop:agent-delta", handler);
+  },
   getTeachRecordingStatus: () => ipcRenderer.invoke("desktop:get-teach-recording-status"),
   startTeachRecording: (botId: string, entryPoint: TeachEntryPoint) => (
     ipcRenderer.invoke("desktop:start-teach-recording", botId, entryPoint)

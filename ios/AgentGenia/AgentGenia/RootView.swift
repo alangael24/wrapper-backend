@@ -229,6 +229,7 @@ private struct BotSidebarRow: View {
 
 private struct BotView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     let botID: UUID
     @State private var message = ""
     @State private var showingSettings = false
@@ -264,6 +265,10 @@ private struct BotView: View {
                 .sheet(isPresented: $showingSettings) { BotSettingsView(botID: botID) }
                 .sheet(isPresented: $showingComputer) { ComputerPanel(botID: botID) }
                 .task(id: botID) { await model.prepareBot(botID: botID) }
+                .onChange(of: scenePhase) { _, phase in
+                    guard phase == .active else { return }
+                    Task { await model.prepareBot(botID: botID) }
+                }
             } else {
                 ContentUnavailableView("Bot no encontrado", systemImage: "exclamationmark.circle")
             }

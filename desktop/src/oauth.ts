@@ -213,9 +213,19 @@ export class DesktopOAuthController {
   runAgent(
     prompt: string,
     connectorIds: string[],
-    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+    options: {
+      browser?: boolean;
+      computer?: boolean;
+      botId?: string;
+      signal?: AbortSignal;
+      onDelta?: (text: string) => void;
+    } = {}
   ): Promise<Record<string, unknown>> {
     return this.client.runAgent(prompt, connectorIds, options);
+  }
+
+  warmAgent(botId: string, signal?: AbortSignal): Promise<void> {
+    return this.client.warmAgent(botId, signal);
   }
 
   teachWorkflow(botName: string, frames: string[], durationMs: number, signal?: AbortSignal): Promise<BotWorkflowDraft> {
@@ -284,6 +294,7 @@ class ManagedConnectorAccount {
 
 class WrapperServiceClient {
   private session: { token: string; expiresAt: number } | null = null;
+  private refreshPromise: Promise<{ token: string; expiresAt: number }> | null = null;
 
   constructor(private readonly options: {
     baseUrl: string;
@@ -404,24 +415,36 @@ class WrapperServiceClient {
     return this.authorizedJson("/v1/connectors/disconnect", { method: "POST", body: { connector_id: connectorId }, signal });
   }
 
+  async warmAgent(botId: string, signal?: AbortSignal): Promise<void> {
+    const result = await this.authorizedJson("/v1/agent/warm", {
+      method: "POST",
+      body: { bot_id: botId },
+      signal
+    });
+    if (result.ready !== true) throw new Error("El agente todavía no está listo.");
+  }
+
   runAgent(
     prompt: string,
     connectorIds: string[],
-    options: { browser?: boolean; computer?: boolean; botId?: string; signal?: AbortSignal } = {}
+    options: {
+      browser?: boolean;
+      computer?: boolean;
+      botId?: string;
+      signal?: AbortSignal;
+      onDelta?: (text: string) => void;
+    } = {}
   ): Promise<Record<string, unknown>> {
-    return this.authorizedJson("/v1/agent/run", {
-      method: "POST",
-      body: {
-        prompt,
-        browser: options.browser === true,
-        computer: options.computer === true,
-        bot_id: options.botId ?? "",
-        connector_ids: connectorIds,
-        max_credits: 15,
-        idempotency_key: randomUUID()
-      },
-      signal: options.signal
-    });
+    return this.authorizedAgentStream({
+      prompt,
+      browser: options.browser === true,
+      computer: options.computer === true,
+      bot_id: options.botId ?? "",
+      connector_ids: connectorIds,
+      max_credits: 15,
+      idempotency_key: randomUUID(),
+      stream: true
+    }, options.signal, options.onDelta);
   }
 
   async teachWorkflow(
@@ -484,12 +507,22 @@ class WrapperServiceClient {
     await this.options.openExternal(safeStripeUrl(stringValue(result.portal_url), "billing.stripe.com"));
   }
 
-  private async authorizedJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
+  private async authorizedJson(
+    route: string,
+    request: JsonRequestOptions = {},
+    canRefresh = true
+  ): Promise<Record<string, unknown>> {
     const session = await this.getSession(request.signal);
-    return this.publicJson(route, {
-      ...request,
-      headers: { ...request.headers, Authorization: `Bearer ${session.token}` }
-    });
+    try {
+      return await this.publicJson(route, {
+        ...request,
+        headers: { ...request.headers, Authorization: `Bearer ${session.token}` }
+      });
+    } catch (error) {
+      if (!(error instanceof WrapperHttpError) || error.status !== 401 || !canRefresh) throw error;
+      await this.refreshSession(request.signal);
+      return this.authorizedJson(route, request, false);
+    }
   }
 
   private async getSession(signal?: AbortSignal): Promise<{ token: string; expiresAt: number }> {
@@ -503,6 +536,23 @@ class WrapperServiceClient {
     if (stored.expiresAt - SESSION_REFRESH_SKEW_MS > Date.now()) {
       this.session = { token: stored.token, expiresAt: stored.expiresAt };
       return this.session;
+    }
+    return this.refreshSession(signal);
+  }
+
+  private async refreshSession(signal?: AbortSignal): Promise<{ token: string; expiresAt: number }> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshSessionOnce(signal).finally(() => { this.refreshPromise = null; });
+    }
+    return withSignal(this.refreshPromise, signal);
+  }
+
+  private async refreshSessionOnce(signal?: AbortSignal): Promise<{ token: string; expiresAt: number }> {
+    const stored = await this.options.accountStore.get();
+    if (!stored) {
+      const error = new Error("Primero inicia sesión en Agent Genia.");
+      error.name = "AccountRequiredError";
+      throw error;
     }
     const deviceId = await this.options.deviceStore.getOrCreate();
     const refreshed = await this.publicJson("/v1/account-auth/refresh", {
@@ -520,6 +570,117 @@ class WrapperServiceClient {
     await this.options.accountStore.set(next);
     this.session = { token: next.token, expiresAt: next.expiresAt };
     return this.session;
+  }
+
+  private async authorizedAgentStream(
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    onDelta?: (text: string) => void,
+    canRefresh = true
+  ): Promise<Record<string, unknown>> {
+    const session = await this.getSession(signal);
+    throwIfAborted(signal);
+    let response: Response;
+    try {
+      response = await fetch(`${this.options.baseUrl}/v1/agent/run`, {
+        method: "POST",
+        headers: {
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.token}`
+        },
+        body: JSON.stringify(body),
+        signal
+      });
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : "No fue posible conectar con Agent Genia.");
+    }
+    if (response.status === 401 && canRefresh) {
+      await this.refreshSession(signal);
+      return this.authorizedAgentStream(body, signal, onDelta, false);
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const nested = isRecord(payload.error) ? payload.error : {};
+      throw new WrapperHttpError(
+        typeof nested.message === "string" ? nested.message : `Agent Genia respondió HTTP ${response.status}.`,
+        response.status,
+        payload
+      );
+    }
+    if (!response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+      return response.json() as Promise<Record<string, unknown>>;
+    }
+    if (!response.body) throw new Error("Agent Genia no devolvió un flujo de respuesta.");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let streamedText = "";
+    let finalResponse: Record<string, unknown> | null = null;
+
+    const processFrame = (frame: string): void => {
+      let eventName = "message";
+      const data: string[] = [];
+      for (const rawLine of frame.split(/\r?\n/)) {
+        if (!rawLine || rawLine.startsWith(":")) continue;
+        const separator = rawLine.indexOf(":");
+        const field = separator < 0 ? rawLine : rawLine.slice(0, separator);
+        const value = separator < 0 ? "" : rawLine.slice(separator + 1).replace(/^ /, "");
+        if (field === "event") eventName = value;
+        else if (field === "data") data.push(value);
+      }
+      const payload = data.join("\n");
+      if (eventName === "delta") {
+        const parsed = JSON.parse(payload) as Record<string, unknown>;
+        const text = stringValue(parsed.text);
+        if (text) {
+          streamedText += text;
+          onDelta?.(text);
+        }
+      } else if (eventName === "done64") {
+        const answer = Buffer.from(payload.trim(), "base64").toString("utf8");
+        if (!answer) throw new Error("Agent Genia devolvió una respuesta final inválida.");
+        finalResponse = { answer };
+      } else if (eventName === "done") {
+        const parsed = JSON.parse(payload) as Record<string, unknown>;
+        finalResponse = parsed;
+      } else if (eventName === "error") {
+        const parsed = JSON.parse(payload) as Record<string, unknown>;
+        throw new WrapperHttpError(
+          stringValue(parsed.message) || "Agent Genia no pudo completar la tarea.",
+          numberValue(parsed.status) || 502,
+          parsed
+        );
+      }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let boundary: RegExpMatchArray | null;
+        while ((boundary = buffer.match(/\r?\n\r?\n/))) {
+          const index = boundary.index ?? 0;
+          const frame = buffer.slice(0, index);
+          buffer = buffer.slice(index + boundary[0].length);
+          if (frame.trim()) processFrame(frame);
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) processFrame(buffer);
+    } catch (error) {
+      if (
+        !streamedText.trim()
+        || error instanceof WrapperHttpError
+        || signal?.aborted
+      ) throw error;
+    } finally {
+      reader.releaseLock();
+    }
+    if (finalResponse) return finalResponse;
+    if (streamedText.trim()) return { answer: streamedText };
+    throw new Error("La conexión terminó antes de recibir la respuesta final.");
   }
 
   private async publicJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
@@ -787,8 +948,21 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
 function withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   throwIfAborted(signal);
-  return Promise.race([
-    promise,
-    new Promise<T>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
-  ]);
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason ?? new DOMException("La operación fue cancelada.", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
 }

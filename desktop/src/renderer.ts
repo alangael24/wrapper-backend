@@ -121,12 +121,16 @@ let avatarEditorTab: "bot" | "generate" | "upload" = "bot";
 let connections: ConnectorConnectionSnapshot = emptyConnectionSnapshot();
 let authBusyConnectorId = "";
 let accountAuthBusy = false;
+let accountStateRefreshBusy = false;
+let connectionRefreshBusy = false;
 let billing = emptyBillingSnapshot();
 let billingLoaded = false;
 let billingBusy = false;
 let billingNotice = "";
 let agentBusyBotId = "";
 let pendingUserMessage = "";
+let streamingAssistantText = "";
+let streamRenderPending = false;
 let teachStatus = idleTeachStatus();
 let teachRecorder: MediaRecorder | null = null;
 let teachStream: MediaStream | null = null;
@@ -146,11 +150,28 @@ let computerLoadedBotId = "";
 let computerBusy = false;
 const botMessageDrafts = new Map<string, string>();
 const settingsSaveTimers = new Map<string, number>();
+const agentWarmTasks = new Map<string, Promise<boolean>>();
+const warmedBotUntil = new Map<string, number>();
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
+const removeAgentDeltaListener = desktopApi.onAgentDelta(({ botId, text }) => {
+  if (!text || botId !== agentBusyBotId) return;
+  streamingAssistantText = (streamingAssistantText + text).slice(0, 20_000);
+  if (streamRenderPending) return;
+  streamRenderPending = true;
+  window.setTimeout(() => {
+    streamRenderPending = false;
+    if (botId === agentBusyBotId) render();
+  }, 40);
+});
 
 void initialize();
+window.addEventListener("focus", () => void resumeActiveBot());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void resumeActiveBot();
+});
 window.addEventListener("beforeunload", () => {
+  removeAgentDeltaListener();
   if (!teachStatus.botId) return;
   cleanupTeachMedia();
   void desktopApi.discardTeachRecording(teachStatus.botId);
@@ -158,12 +179,10 @@ window.addEventListener("beforeunload", () => {
 
 async function initialize(): Promise<void> {
   try {
-    [state, connections, teachStatus] = await Promise.all([
+    [state, teachStatus] = await Promise.all([
       desktopApi.bootstrap(),
-      desktopApi.connectionSnapshot(),
       desktopApi.getTeachRecordingStatus()
     ]);
-    if (connections.account.connected) state = await desktopApi.bootstrap();
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
     const preview = new URLSearchParams(window.location.search).get("preview");
@@ -188,9 +207,62 @@ async function initialize(): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
+  // Network discovery is intentionally detached from first paint. A cold
+  // deployment may take seconds to wake, but the cached Desktop UI remains
+  // usable and updates as soon as the account snapshot arrives.
+  void refreshConnections();
   const activeBotId = state.activeBotId ?? state.bots[0]?.id ?? "";
-  if (activeView === "bot-detail" && activeBotId) void refreshComputerStatus(activeBotId);
+  if (activeView === "bot-detail" && activeBotId) {
+    void warmBotAgent(activeBotId);
+    void refreshComputerStatus(activeBotId);
+  }
   window.setInterval(() => void refreshTeachStatus(), 1_000);
+  window.setInterval(() => {
+    if (document.visibilityState === "visible") void refreshAccountState();
+  }, 30_000);
+}
+
+async function resumeActiveBot(): Promise<void> {
+  if (connections.account.connected) await refreshAccountState();
+  else await refreshConnections();
+  const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
+  if (activeView === "bot-detail" && botId) void warmBotAgent(botId);
+}
+
+async function refreshConnections(): Promise<void> {
+  if (connectionRefreshBusy || accountAuthBusy) return;
+  connectionRefreshBusy = true;
+  try {
+    connections = await desktopApi.connectionSnapshot();
+    state = await desktopApi.bootstrap();
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
+    if (activeView !== "plugins" && activeView !== "billing") {
+      activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
+    }
+    render();
+    const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
+    if (connections.account.connected && activeView === "bot-detail" && botId) void warmBotAgent(botId);
+  } catch {
+    // Keep rendering the encrypted local cache and retry on focus.
+  } finally {
+    connectionRefreshBusy = false;
+  }
+}
+
+async function refreshAccountState(): Promise<void> {
+  if (!connections.account.connected || accountStateRefreshBusy) return;
+  accountStateRefreshBusy = true;
+  try {
+    state = await desktopApi.refreshAccountState();
+    selectedConnectorIds = new Set(state.selectedConnectorIds);
+    if (activeView === "bot-detail" && !state.bots.length) activeView = "bot-builder";
+    render();
+  } catch {
+    // Offline refresh is best-effort. Local state remains authoritative until
+    // the next focus/interval retry and user actions continue to work.
+  } finally {
+    accountStateRefreshBusy = false;
+  }
 }
 
 function render(): void {
@@ -364,6 +436,10 @@ async function signInAccount(): Promise<void> {
     accountAuthBusy = false;
   }
   render();
+  const activeBot = state.bots.find((bot) => bot.id === state.activeBotId);
+  if (connections.account.connected && activeBot && !activeBot.messages.length) {
+    void initializeBotConversation(activeBot.id);
+  }
 }
 
 async function signOutAccount(): Promise<void> {
@@ -374,6 +450,8 @@ async function signOutAccount(): Promise<void> {
     connections = await desktopApi.signOut();
     state = await desktopApi.bootstrap();
     selectedConnectorIds = new Set();
+    agentWarmTasks.clear();
+    warmedBotUntil.clear();
     computerSnapshot = idleComputerSnapshot();
     computerLoadedBotId = "";
     computerBusy = false;
@@ -879,7 +957,9 @@ function renderReadyBot(bot: BotProfile): void {
           <div class="conversation-empty">${renderBotAvatar(bot, "large")}<strong>${escapeHtml(bot.name)} está listo</strong><span>Escríbele qué necesitas y generará su respuesta con el modelo.</span></div>
         `}
         ${agentBusyBotId === bot.id && pendingUserMessage ? `<div class="chat-bubble user-bubble">${escapeHtml(pendingUserMessage)}</div>` : ""}
-        ${agentBusyBotId === bot.id ? '<div class="assistant-bubble agent-thinking"><i></i><i></i><i></i></div>' : ""}
+        ${agentBusyBotId === bot.id && streamingAssistantText
+          ? `<div class="chat-bubble assistant-bubble">${escapeHtml(streamingAssistantText).replace(/\n/g, "<br />")}</div>`
+          : agentBusyBotId === bot.id ? '<div class="assistant-bubble agent-thinking"><i></i><i></i><i></i></div>' : ""}
         ${renderError()}
       </div>
       ${workflowPanelOpen ? renderWorkflowPanel(bot) : ""}
@@ -1021,6 +1101,7 @@ function bindBotChat(bot: BotProfile): void {
   const form = document.querySelector<HTMLFormElement>(".message-composer");
   const input = form?.elements.namedItem("message") as HTMLInputElement | null;
   input?.addEventListener("input", () => botMessageDrafts.set(bot.id, input.value));
+  input?.addEventListener("focus", () => void warmBotAgent(bot.id));
   form?.addEventListener("submit", (event) => {
     event.preventDefault();
     const message = input?.value.trim() ?? "";
@@ -1092,29 +1173,41 @@ function renderGeneratedQuestion(message: BotProfile["messages"][number], active
 }
 
 async function initializeBotConversation(botId: string): Promise<void> {
-  if (agentBusyBotId) return;
+  if (agentBusyBotId || !connections.account.connected) return;
   agentBusyBotId = botId;
   pendingUserMessage = "";
+  streamingAssistantText = "";
   transientError = "";
   render();
   try {
+    await warmBotAgent(botId);
     state = await desktopApi.runBotAgent(botId, "", true);
   } catch (error) {
     transientError = errorMessage(error);
   } finally {
     agentBusyBotId = "";
     pendingUserMessage = "";
+    streamingAssistantText = "";
     render();
     void refreshComputerStatus(botId);
   }
 }
 
 async function sendBotMessage(botId: string, message: string): Promise<void> {
+  if (!connections.account.connected) {
+    botMessageDrafts.set(botId, message);
+    transientError = "Inicia sesión en Agent Genia para enviar mensajes.";
+    render();
+    return;
+  }
   agentBusyBotId = botId;
   pendingUserMessage = message;
+  streamingAssistantText = "";
   transientError = "";
   render();
   try {
+    const warming = agentWarmTasks.get(botId);
+    if (warming) await warming;
     state = await desktopApi.runBotAgent(botId, message);
   } catch (error) {
     botMessageDrafts.set(botId, message);
@@ -1122,6 +1215,7 @@ async function sendBotMessage(botId: string, message: string): Promise<void> {
   } finally {
     agentBusyBotId = "";
     pendingUserMessage = "";
+    streamingAssistantText = "";
     render();
     void refreshComputerStatus(botId);
   }
@@ -1680,7 +1774,26 @@ async function selectBot(botId: string): Promise<void> {
     transientError = errorMessage(error);
   }
   render();
-  if (state.activeBotId === botId) void refreshComputerStatus(botId);
+  if (state.activeBotId === botId) {
+    void warmBotAgent(botId);
+    void refreshComputerStatus(botId);
+  }
+}
+
+async function warmBotAgent(botId: string): Promise<boolean> {
+  if (!connections.account.connected || !botId) return false;
+  if ((warmedBotUntil.get(botId) ?? 0) > Date.now()) return true;
+  const existing = agentWarmTasks.get(botId);
+  if (existing) return existing;
+  const task = desktopApi.warmBotAgent(botId)
+    .then(() => {
+      warmedBotUntil.set(botId, Date.now() + 10 * 60_000);
+      return true;
+    })
+    .catch(() => false)
+    .finally(() => agentWarmTasks.delete(botId));
+  agentWarmTasks.set(botId, task);
+  return task;
 }
 
 function closeBotSettings(): void {
@@ -1803,6 +1916,7 @@ function createPreviewApi(): DesktopApi {
     : idleTeachStatus();
   return {
     async bootstrap() { return structuredClone(previewState); },
+    async refreshAccountState() { return structuredClone(previewState); },
     async connectionSnapshot() { return structuredClone(previewConnections); },
     async signIn() {
       previewConnections = { ...previewConnections, account: { connected: true, required: true, email: "demo@example.com", name: "Demo" } };
@@ -1883,6 +1997,7 @@ function createPreviewApi(): DesktopApi {
       previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },
+    async warmBotAgent() {},
     async runBotAgent(botId, prompt, initial = false) {
       const now = new Date().toISOString();
       const bots = previewState.bots.map((bot) => bot.id === botId ? {
@@ -1908,6 +2023,7 @@ function createPreviewApi(): DesktopApi {
       previewState = { ...previewState, bots, activeBotId: botId };
       return structuredClone(previewState);
     },
+    onAgentDelta() { return () => {}; },
     async getTeachRecordingStatus() { return structuredClone(previewTeachStatus); },
     async startTeachRecording(botId, entryPoint) {
       const bot = previewState.bots.find((item) => item.id === botId);

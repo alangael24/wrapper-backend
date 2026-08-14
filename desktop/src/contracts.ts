@@ -278,8 +278,14 @@ export interface BotPatch {
   notificationsEnabled?: boolean;
 }
 
+export interface AgentStreamDelta {
+  botId: string;
+  text: string;
+}
+
 export interface DesktopApi {
   bootstrap(): Promise<AppState>;
+  refreshAccountState(): Promise<AppState>;
   connectionSnapshot(): Promise<ConnectorConnectionSnapshot>;
   signIn(): Promise<ConnectorConnectionSnapshot>;
   signOut(): Promise<ConnectorConnectionSnapshot>;
@@ -297,7 +303,9 @@ export interface DesktopApi {
   saveConnectors(connectorIds: string[], onboardingCompleted?: boolean): Promise<AppState>;
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;
+  warmBotAgent(botId: string): Promise<void>;
   runBotAgent(botId: string, prompt: string, initial?: boolean): Promise<AppState>;
+  onAgentDelta(listener: (delta: AgentStreamDelta) => void): () => void;
   getTeachRecordingStatus(): Promise<TeachRecordingStatus>;
   startTeachRecording(botId: string, entryPoint: TeachEntryPoint): Promise<TeachRecordingStatus>;
   stopTeachRecording(botId: string, capture: TeachCapture): Promise<AppState>;
