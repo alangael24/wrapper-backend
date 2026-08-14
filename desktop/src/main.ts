@@ -86,6 +86,13 @@ class DesktopStateStore {
       // signed-out view. Do not make logout wait on a slow or sleeping API.
       this.filePath = null;
       this.state = initialAppState();
+      if (options.legacyFilePath) {
+        try {
+          this.state = normalizeAppState(JSON.parse(
+            await readFile(options.legacyFilePath, "utf8")
+          ));
+        } catch {}
+      }
       this.revision = 0;
       this.dirty = false;
       this.generation = 0;
@@ -1080,7 +1087,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   teachRecordingsDirectory = path.join(userDataPath, "teach-recordings");
   const startupAccountId = await oauthController.accountId();
   await stateStore.activateAccount(startupAccountId, {
-    ...(startupAccountId ? { legacyFilePath: path.join(userDataPath, "desktop-state.json") } : {}),
+    legacyFilePath: path.join(userDataPath, "desktop-state.json"),
     // Open from the encrypted local cache immediately. The renderer refreshes
     // the account in the background, so a sleeping Render service cannot hold
     // the native window hostage during launch.
