@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Observation
+import UIKit
 
 @MainActor
 @Observable
@@ -212,9 +213,12 @@ final class AppModel {
     }
 
     func prepareBot(botID: UUID) async {
-        async let warming: Void = warmAgent(botID: botID)
+        // A new bot used to prewarm and send its initial turn concurrently.
+        // Both requests target the same isolated Pi session, so the first
+        // message could race the warm-up and fail with pi_busy (or pay another
+        // cold start).  Make readiness explicit before the first turn.
+        await warmAgent(botID: botID)
         await sendInitialMessageIfNeeded(botID: botID)
-        _ = await warming
     }
 
     private func warmAgent(botID: UUID) async {
@@ -577,6 +581,17 @@ final class AppModel {
 
     private func runAgent(botID: UUID, userText: String, initial: Bool) async {
         guard !runningBotIDs.contains(botID), let source = bots.first(where: { $0.id == botID }) else { return }
+        // Give an in-flight response time to finish when the user briefly
+        // backgrounds the app.  A regular foreground URLSession may otherwise
+        // be suspended immediately and surface a misleading connection error.
+        let backgroundTask = UIApplication.shared.beginBackgroundTask(
+            withName: "AgentGeniaAgentRun"
+        )
+        defer {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+            }
+        }
         runningBotIDs.insert(botID)
         defer { runningBotIDs.remove(botID) }
         let prompt = buildBotPrompt(bot: source, userText: userText, initial: initial)

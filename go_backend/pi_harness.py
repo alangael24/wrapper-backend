@@ -593,7 +593,10 @@ class PiHarness:
         if session_id is None:
             command.append("--no-session")
         else:
-            command.extend(["--session-id", session_id])
+            # The wrapper owns durable bot history.  Keep Pi's process and
+            # deterministic in-memory session id, but never reload or append
+            # an unbounded JSONL transcript on disk.
+            command.extend(["--no-session", "--session-id", session_id])
             if RUNTIME_AUTH_EXTENSION.is_file():
                 command.extend(["--extension", str(RUNTIME_AUTH_EXTENSION.resolve())])
         connector_extension = self._resolved_connector_extension()
@@ -878,6 +881,56 @@ class PiHarness:
             def send(payload: dict[str, Any]) -> None:
                 process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 process.stdin.flush()
+
+            # Keep the expensive Pi process hot, but do not let its internal
+            # transcript grow without bound.  The product prompt already
+            # carries the bot profile and a compact recent-history window, so
+            # a fresh RPC session per turn is deterministic across process
+            # restarts and avoids duplicate/exponential context growth.
+            reset_id = f"reset-{run_id}"
+            send({"id": reset_id, "type": "new_session"})
+            while deadline is None or time.monotonic() < deadline:
+                wait = 0.5 if deadline is None else min(
+                    0.5, max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    line = events.get(timeout=wait)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        fatal = True
+                        raise PiHarnessError(
+                            "La sesión de Pi se cerró mientras preparaba el contexto"
+                        )
+                    continue
+                if line is None:
+                    fatal = True
+                    raise PiHarnessError(
+                        "La sesión de Pi se cerró mientras preparaba el contexto"
+                    )
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "extension_ui_request":
+                    send({
+                        "type": "extension_ui_response",
+                        "id": event.get("id"),
+                        "cancelled": True,
+                    })
+                    continue
+                if event.get("type") != "response" or event.get("id") != reset_id:
+                    continue
+                if not event.get("success") or (event.get("data") or {}).get("cancelled"):
+                    fatal = True
+                    raise PiHarnessError(
+                        str(event.get("error") or "Pi no pudo preparar un contexto limpio")
+                    )
+                break
+            else:
+                fatal = True
+                raise PiHarnessTimeout(
+                    f"Pi excedio el timeout de {self.timeout_seconds}s al preparar el contexto"
+                )
 
             send({"id": f"agent-task-{run_id}", "type": "prompt", "message": prompt})
             with event_path.open("w", encoding="utf-8") as event_log:

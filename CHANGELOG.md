@@ -30,6 +30,9 @@ y versionado semántico para los clientes distribuidos.
 - El streaming conserva widgets generados por el modelo, agrupa deltas para
   reducir trabajo de UI y reintenta el precalentamiento idempotente tras un
   corte transitorio de red.
+- Cada turno reutiliza el proceso Pi caliente con un contexto interno efímero y
+  acotado; iOS evita la carrera entre warm-up/primer mensaje y solicita tiempo
+  de ejecución al pasar brevemente a segundo plano.
 
 ## [1.0.1] - 2026-08-12
 

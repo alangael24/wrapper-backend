@@ -28,6 +28,7 @@ def runtime_credentials():
 
 
 connector_token = runtime_credentials().get("connector_run_token")
+session_generation = 0
 if connector_token and not runtime_auth_file:
     connector_request = urllib.request.Request(
         os.environ["PI_CONNECTOR_BROKER_URL"] + "/v1/internal/connectors/catalog",
@@ -41,6 +42,16 @@ if connector_token and not runtime_auth_file:
 
 for line in sys.stdin:
     command = json.loads(line)
+    if command.get("type") == "new_session":
+        session_generation += 1
+        print(json.dumps({
+            "id": command.get("id"),
+            "type": "response",
+            "command": "new_session",
+            "success": True,
+            "data": {"cancelled": False},
+        }), flush=True)
+        continue
     if command.get("type") == "get_state":
         print(json.dumps({
             "id": command.get("id"),
@@ -92,7 +103,8 @@ for line in sys.stdin:
     with urllib.request.urlopen(request, timeout=5) as response:
         completion = json.load(response)
     upstream_text = completion["choices"][0]["message"]["content"]
-    answer_text = f"fake-pi uso {model}: {upstream_text}"
+    session_label = f" sesion {session_generation}" if session_generation else ""
+    answer_text = f"fake-pi{session_label} uso {model}: {upstream_text}"
     if command.get("message") == "__stream_json__":
         answer_text = json.dumps(
             {"text": "hola rápido", "widget": None}, ensure_ascii=False

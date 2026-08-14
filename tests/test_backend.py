@@ -1501,10 +1501,12 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(process_ids[0], process_ids[1])
         self.assertNotEqual(results[0]["run_id"], results[1]["run_id"])
+        self.assertIn("fake-pi sesion 1", results[0]["answer"])
+        self.assertIn("fake-pi sesion 2", results[1]["answer"])
         session = next(iter(self.ws.backend.pi._sessions.values()))
         command = self.ws.backend.pi._command(False, session_id=session.session_id)
         self.assertIn("--session-id", command)
-        self.assertNotIn("--no-session", command)
+        self.assertIn("--no-session", command)
         self.assertIn(str(RUNTIME_AUTH_EXTENSION.resolve()), command)
         credentials = json.loads(session.auth_file.read_text(encoding="utf-8"))
         self.assertEqual(credentials, {"run_api_key": "", "connector_run_token": ""})
