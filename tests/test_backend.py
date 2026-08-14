@@ -1403,6 +1403,8 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn("text/event-stream", response_headers["Content-Type"])
+        self.assertEqual(response_headers["Transfer-Encoding"], "chunked")
+        self.assertNotEqual(response_headers.get("Connection", "").lower(), "close")
         text = body.decode("utf-8")
         self.assertIn("event: start", text)
         self.assertIn("event: delta", text)

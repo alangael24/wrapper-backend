@@ -459,17 +459,21 @@ class _AgentEventStream:
         self.visible_sent = ""
         self.started = False
         self.disconnected = False
+        self.finished = False
         self._write_lock = threading.Lock()
         self._heartbeat_stop = threading.Event()
 
     def start(self, run_id: str) -> None:
-        self.handler.close_connection = True
+        self.handler.close_connection = False
         self.handler.send_response(200)
         self.handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.handler.send_header("Cache-Control", "no-store, no-cache, max-age=0")
         self.handler.send_header("Pragma", "no-cache")
         self.handler.send_header("X-Accel-Buffering", "no")
-        self.handler.send_header("Connection", "close")
+        # HTTP/1.1 requires an explicit body delimiter for a persistent stream.
+        # Relying on connection-close made Render/Cloudflare surface a normal
+        # SSE completion as URLError.networkConnectionLost (-1005) on iOS.
+        self.handler.send_header("Transfer-Encoding", "chunked")
         request_id = getattr(self.handler, "request_id", "")
         if request_id:
             self.handler.send_header("X-Request-Id", request_id)
@@ -485,11 +489,13 @@ class _AgentEventStream:
             self._write(b": keep-alive\n\n")
 
     def _write(self, frame: bytes) -> None:
-        if self.disconnected:
+        if self.disconnected or self.finished:
             return
         try:
             with self._write_lock:
+                self.handler.wfile.write(f"{len(frame):X}\r\n".encode("ascii"))
                 self.handler.wfile.write(frame)
+                self.handler.wfile.write(b"\r\n")
                 self.handler.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.disconnected = True
@@ -512,12 +518,27 @@ class _AgentEventStream:
         self.send("delta", {"text": next_delta})
 
     def error(self, status: int, message: str, code: str) -> None:
-        self.send("error", {"status": status, "message": message, "type": code})
         self._heartbeat_stop.set()
+        self.send("error", {"status": status, "message": message, "type": code})
+        self.finish()
 
     def done(self, payload: dict) -> None:
-        self.send("done", payload)
         self._heartbeat_stop.set()
+        self.send("done", payload)
+        self.finish()
+
+    def finish(self) -> None:
+        if self.disconnected or self.finished:
+            return
+        try:
+            with self._write_lock:
+                self.handler.wfile.write(b"0\r\n\r\n")
+                self.handler.wfile.flush()
+                self.finished = True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.disconnected = True
+        finally:
+            self._heartbeat_stop.set()
 
 
 def error_response(

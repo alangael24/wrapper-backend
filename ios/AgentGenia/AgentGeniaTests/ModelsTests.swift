@@ -31,4 +31,26 @@ final class ModelsTests: XCTestCase {
         let identifiers = ConnectorDefinition.catalog.map(\.id)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)
     }
+
+    func testServerSentEventParserFlushesDoneFrameAtEOF() throws {
+        var parser = ServerSentEventParser()
+        XCTAssertNil(parser.consume(line: "event: done"))
+        XCTAssertNil(parser.consume(line: "data: {\"answer\":\"hola\"}"))
+
+        let frame = try XCTUnwrap(parser.finish())
+        XCTAssertEqual(frame.name, "done")
+        XCTAssertEqual(String(decoding: frame.data, as: UTF8.self), "{\"answer\":\"hola\"}")
+        XCTAssertNil(parser.finish())
+    }
+
+    func testServerSentEventParserIgnoresHeartbeatAndEmitsOnBlankLine() throws {
+        var parser = ServerSentEventParser()
+        XCTAssertNil(parser.consume(line: ": keep-alive"))
+        XCTAssertNil(parser.consume(line: "event: delta"))
+        XCTAssertNil(parser.consume(line: "data: {\"text\":\"hola\"}"))
+
+        let frame = try XCTUnwrap(parser.consume(line: ""))
+        XCTAssertEqual(frame.name, "delta")
+        XCTAssertEqual(String(decoding: frame.data, as: UTF8.self), "{\"text\":\"hola\"}")
+    }
 }

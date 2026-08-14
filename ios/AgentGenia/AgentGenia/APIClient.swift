@@ -151,6 +151,54 @@ private struct AgentStreamFailure: Decodable, Sendable {
     let type: String
 }
 
+struct ServerSentEvent: Equatable, Sendable {
+    let name: String
+    let data: Data
+}
+
+struct ServerSentEventParser: Sendable {
+    private var eventName = "message"
+    private var dataLines: [String] = []
+
+    mutating func consume(line: String) -> ServerSentEvent? {
+        if line.isEmpty {
+            return emitPendingEvent()
+        }
+        if line.hasPrefix(":") {
+            return nil
+        }
+        if line.hasPrefix("event:") {
+            eventName = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        } else if line.hasPrefix("data:") {
+            var value = String(line.dropFirst(5))
+            if value.first == " " { value.removeFirst() }
+            dataLines.append(value)
+        }
+        return nil
+    }
+
+    /// AsyncLineSequence is allowed to finish without yielding a final empty
+    /// line. Flush the last frame at EOF so a valid `event: done` is not lost
+    /// when an HTTP proxy closes the response immediately after its payload.
+    mutating func finish() -> ServerSentEvent? {
+        emitPendingEvent()
+    }
+
+    private mutating func emitPendingEvent() -> ServerSentEvent? {
+        guard !dataLines.isEmpty else {
+            eventName = "message"
+            return nil
+        }
+        let frame = ServerSentEvent(
+            name: eventName,
+            data: Data(dataLines.joined(separator: "\n").utf8)
+        )
+        eventName = "message"
+        dataLines.removeAll(keepingCapacity: true)
+        return frame
+    }
+}
+
 private struct ComputerEnsureRequest: Encodable, Sendable {
     let botName: String
     enum CodingKeys: String, CodingKey { case botName = "bot_name" }
@@ -563,32 +611,59 @@ actor APIClient {
             }
         }
 
-        var eventName = "message"
-        var dataLines: [String] = []
+        var parser = ServerSentEventParser()
         var finalResponse: AgentRunResponse?
+        var streamedText = ""
+
+        func decode(_ event: ServerSentEvent) throws -> (delta: String?, response: AgentRunResponse?) {
+            if event.name == "delta", let delta = try? decoder.decode(AgentStreamDelta.self, from: event.data) {
+                return (delta.text, nil)
+            } else if event.name == "done" {
+                return (nil, try decoder.decode(AgentRunResponse.self, from: event.data))
+            } else if event.name == "error", let failure = try? decoder.decode(AgentStreamFailure.self, from: event.data) {
+                throw ServiceError(message: failure.message, code: failure.type, status: failure.status)
+            }
+            return (nil, nil)
+        }
+
         do {
             for try await line in bytes.lines {
-                if line.isEmpty {
-                    let payload = Data(dataLines.joined(separator: "\n").utf8)
-                    if eventName == "delta", let delta = try? decoder.decode(AgentStreamDelta.self, from: payload) {
-                        await onDelta(delta.text)
-                    } else if eventName == "done" {
-                        finalResponse = try decoder.decode(AgentRunResponse.self, from: payload)
-                    } else if eventName == "error", let failure = try? decoder.decode(AgentStreamFailure.self, from: payload) {
-                        throw ServiceError(message: failure.message, code: failure.type, status: failure.status)
+                if let event = parser.consume(line: line) {
+                    let decoded = try decode(event)
+                    if let delta = decoded.delta {
+                        streamedText += delta
+                        await onDelta(delta)
                     }
-                    eventName = "message"
-                    dataLines.removeAll(keepingCapacity: true)
-                } else if line.hasPrefix("event:") {
-                    eventName = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
-                } else if line.hasPrefix("data:") {
-                    dataLines.append(line.dropFirst(5).trimmingCharacters(in: .whitespaces))
+                    if let response = decoded.response {
+                        finalResponse = response
+                    }
+                }
+            }
+            if let event = parser.finish() {
+                let decoded = try decode(event)
+                if let delta = decoded.delta {
+                    streamedText += delta
+                    await onDelta(delta)
+                }
+                if let response = decoded.response {
+                    finalResponse = response
                 }
             }
         } catch let error as ServiceError {
             throw error
         } catch {
-            throw networkError(error, path: path)
+            if !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                finalResponse = AgentRunResponse(answer: streamedText)
+            } else {
+                throw networkError(error, path: path)
+            }
+        }
+        if finalResponse == nil, !streamedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // The final metadata frame can be lost when an intermediary closes
+            // an otherwise successful SSE response. Preserve the text already
+            // delivered to the user instead of deleting it and showing a false
+            // connection failure.
+            finalResponse = AgentRunResponse(answer: streamedText)
         }
         guard let finalResponse else {
             throw ServiceError(
