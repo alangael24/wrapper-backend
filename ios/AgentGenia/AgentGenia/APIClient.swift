@@ -161,16 +161,29 @@ struct ServerSentEventParser: Sendable {
     private var dataLines: [String] = []
 
     mutating func consume(line: String) -> ServerSentEvent? {
-        if line.isEmpty {
+        // AsyncLineSequence normally removes CRLF, but intermediaries are
+        // allowed to leave the carriage return attached to the yielded line.
+        let normalized = line.last == "\r" ? String(line.dropLast()) : line
+        if normalized.isEmpty {
             return emitPendingEvent()
         }
-        if line.hasPrefix(":") {
+        if normalized.hasPrefix(":") {
             return nil
         }
-        if line.hasPrefix("event:") {
-            eventName = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-        } else if line.hasPrefix("data:") {
-            var value = String(line.dropFirst(5))
+        if normalized.hasPrefix("event:") {
+            let nextEventName = String(normalized.dropFirst(6))
+                .trimmingCharacters(in: .whitespaces)
+            // Some HTTP stacks do not yield empty lines from an incremental
+            // response. Seeing the next event is therefore also an explicit
+            // boundary for the pending one.
+            if !dataLines.isEmpty {
+                let pending = emitPendingEvent()
+                eventName = nextEventName
+                return pending
+            }
+            eventName = nextEventName
+        } else if normalized.hasPrefix("data:") {
+            var value = String(normalized.dropFirst(5))
             if value.first == " " { value.removeFirst() }
             dataLines.append(value)
         }

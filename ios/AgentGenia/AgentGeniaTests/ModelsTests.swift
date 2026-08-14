@@ -53,4 +53,29 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(frame.name, "delta")
         XCTAssertEqual(String(decoding: frame.data, as: UTF8.self), "{\"text\":\"hola\"}")
     }
+
+    func testServerSentEventParserUsesNextEventAsBoundaryWithoutBlankLine() throws {
+        var parser = ServerSentEventParser()
+        XCTAssertNil(parser.consume(line: "event: start"))
+        XCTAssertNil(parser.consume(line: "data: {\"run_id\":\"run-1\"}"))
+
+        let start = try XCTUnwrap(parser.consume(line: "event: done64"))
+        XCTAssertEqual(start.name, "start")
+        XCTAssertEqual(String(decoding: start.data, as: UTF8.self), "{\"run_id\":\"run-1\"}")
+
+        XCTAssertNil(parser.consume(line: "data: aG9sYQ=="))
+        let done = try XCTUnwrap(parser.finish())
+        XCTAssertEqual(done.name, "done64")
+        XCTAssertEqual(String(decoding: done.data, as: UTF8.self), "aG9sYQ==")
+    }
+
+    func testServerSentEventParserAcceptsCarriageReturnBlankLine() throws {
+        var parser = ServerSentEventParser()
+        XCTAssertNil(parser.consume(line: "event: delta\r"))
+        XCTAssertNil(parser.consume(line: "data: {\"text\":\"hola\"}\r"))
+
+        let frame = try XCTUnwrap(parser.consume(line: "\r"))
+        XCTAssertEqual(frame.name, "delta")
+        XCTAssertEqual(String(decoding: frame.data, as: UTF8.self), "{\"text\":\"hola\"}")
+    }
 }
