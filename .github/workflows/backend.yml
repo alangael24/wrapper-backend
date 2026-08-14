@@ -69,6 +69,7 @@ jobs:
           create role anon nologin;
           create role authenticated nologin;
           create role service_role nologin;
+          create role agentgenia_app nologin;
           SQL
       - name: Apply every production migration from an empty PostgreSQL 17 database
         run: |
