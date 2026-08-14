@@ -34,7 +34,7 @@ RUN set -eux; \
 # Supabase's pooler uses its private 2021 CA. Trust the pinned public root so
 # libpq can keep sslmode=verify-full instead of weakening certificate checks.
 COPY certificates/supabase-prod-ca-2021.crt /usr/local/share/ca-certificates/supabase-prod-ca-2021.crt
-RUN update-ca-certificates
+RUN /usr/sbin/update-ca-certificates
 
 WORKDIR /app
 COPY requirements.txt package.json pnpm-lock.yaml pnpm-workspace.yaml ./
