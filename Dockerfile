@@ -17,7 +17,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8787 \
     ENVIRONMENT=production \
     PI_BIN=/app/scripts/pi-render-safe \
-    PI_CHROME_BIN=/usr/bin/chromium
+    PI_CHROME_BIN=/usr/bin/chromium \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
 
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules

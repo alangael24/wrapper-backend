@@ -121,10 +121,12 @@ class PostgresStore(Store):
             open=False,
             name="agentgenia-wrapper",
         )
+        # Create the compatibility facade before opening/waiting on the pool.
+        # That makes cleanup safe even when the very first TLS connection fails.
+        self._conn = _PooledConnectionCompat(self._pool)
         self._pool.open()
         try:
             self._pool.wait(timeout=10)
-            self._conn = _PooledConnectionCompat(self._pool)
             row = self._conn.execute(
                 "SELECT v FROM agentgenia.kv WHERE k='schema_version'"
             ).fetchone()
@@ -387,8 +389,12 @@ class PostgresStore(Store):
             }
 
     def close(self) -> None:
-        self._conn.close()
-        self._pool.close()
+        connection = getattr(self, "_conn", None)
+        if connection is not None:
+            connection.close()
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            pool.close()
 
 
 def create_store(*, database_url: str | None, db_path: Any) -> Store:

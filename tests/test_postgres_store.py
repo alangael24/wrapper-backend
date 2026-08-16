@@ -4,6 +4,10 @@ from go_backend.postgres_store import PostgresStore, _postgres_sql, normalize_da
 
 
 class PostgresStoreConfigurationTests(unittest.TestCase):
+    def test_close_is_safe_after_partial_initialization(self):
+        store = PostgresStore.__new__(PostgresStore)
+        store.close()
+
     def test_remote_database_requires_tls(self):
         normalized = normalize_database_url(
             "postgresql://agent:secret@db.example.com:5432/postgres"
