@@ -507,6 +507,7 @@ class WrapperServiceClient {
       execution_mode: options.executionMode ?? "agent",
       chat_prompt: options.chatPrompt ?? "",
       user_message: options.userMessage ?? "",
+      client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       max_credits: 15,
       idempotency_key: options.idempotencyKey ?? randomUUID(),
       stream: true

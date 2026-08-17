@@ -2476,6 +2476,66 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(google["connected"])
         self.assertEqual(google["account"], "alan@example.com")
 
+    def test_google_calendar_create_uses_pinned_tool_and_normalized_schema(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("google-calendar-create")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        result = gateway.execute(
+            user_id,
+            "google-workspace",
+            "create_calendar_event",
+            {
+                "title": "Demo de Agent Genia",
+                "startTime": "2026-08-18T15:00:00",
+                "timeZone": "America/Denver",
+                "duration_minutes": 90,
+            },
+        )
+
+        self.assertEqual(result["items"][0]["name"], "wrapper-backend")
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_CREATE_EVENT",
+            {
+                "summary": "Demo de Agent Genia",
+                "start_datetime": "2026-08-18T15:00:00",
+                "timezone": "America/Denver",
+                "event_duration_hour": 1,
+                "event_duration_minutes": 30,
+                "calendar_id": "primary",
+            },
+        )])
+
+    def test_google_calendar_create_rejects_natural_language_before_upstream(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("google-calendar-invalid")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        with self.assertRaises(ConnectorBrokerError) as error:
+            gateway.execute(
+                user_id,
+                "google-workspace",
+                "create_calendar_event",
+                {
+                    "start_datetime": "manana a las 3",
+                    "timezone": "MST",
+                },
+            )
+
+        self.assertEqual(error.exception.code, "bad_connector_arguments")
+        self.assertIn("ISO 8601", str(error.exception))
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [])
+
     def test_composio_gateway_fails_closed_without_private_auth_config(self):
         gateway = ComposioConnectorGateway(
             client=FakeComposioClient(), store=self.ws.backend.store

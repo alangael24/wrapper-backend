@@ -180,6 +180,7 @@ class AgentGeniaApi(
                 .put("execution_mode", executionMode)
                 .put("chat_prompt", chatPrompt)
                 .put("user_message", userMessage)
+                .put("client_timezone", java.time.ZoneId.systemDefault().id)
                 .put("browser", false)
                 .put("computer", false)
                 .put("bot_id", botId)

@@ -625,7 +625,7 @@ proviene del flujo de signup.
 | GET | `/v1/usage` | Compatibilidad temporal: reporting histórico y saldo de créditos |
 | GET | `/v1/me` | Usuario, plan y saldo de créditos |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta chat directo o Pi con `{prompt, execution_mode?:"agent"|"auto"|"chat", chat_prompt?:string, user_message?:string, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}` |
+| POST | `/v1/agent/run` | Ejecuta chat directo o Pi con `{prompt, execution_mode?:"agent"|"auto"|"chat", chat_prompt?:string, user_message?:string, client_timezone?:string, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}`; `client_timezone` usa un identificador IANA como `America/Denver` para resolver fechas relativas |
 | POST | `/v1/agent/warm` | Inicia en segundo plano la sesión aislada de Pi para `{bot_id}` sin llamar al modelo ni consumir créditos |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
 | POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |

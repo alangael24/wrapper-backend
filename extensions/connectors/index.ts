@@ -77,6 +77,33 @@ interface SearchMatch {
   connected: boolean;
   operations: string[];
   tool: string;
+  operation_guidance?: Record<string, unknown>;
+}
+
+const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
+  create_calendar_event: {
+    arguments: {
+      start_datetime: "ISO 8601 exacto, por ejemplo 2026-08-18T15:00:00; no uses texto como 'manana'",
+      timezone: "Zona IANA exacta recibida en el contexto, por ejemplo America/Denver",
+      summary: "Titulo del evento",
+      end_datetime: "ISO 8601 exacto; alternativamente usa event_duration_hour/event_duration_minutes",
+      event_duration_hour: "Horas de duracion",
+      event_duration_minutes: "Minutos de duracion",
+      calendar_id: "Usa primary salvo que el usuario indique otro calendario",
+      attendees: "Lista opcional de emails",
+    },
+    rule: "No afirmes que el evento fue creado hasta que esta herramienta responda sin error. Si falla por argumentos, corrige y reintenta.",
+  },
+});
+
+function providerArgumentDescription(id: string): string {
+  if (id !== "google-workspace") return "Argumentos JSON de la operacion";
+  return [
+    "Argumentos JSON de la operacion.",
+    "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
+    "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
+    "Nunca pases fechas naturales como 'tomorrow' o 'manana'.",
+  ].join(" ");
 }
 
 function provider(id: string, name: string, capabilities: string): {
@@ -212,7 +239,9 @@ export default function connectorExtension(pi: ExtensionAPI): void {
           minLength: 1,
           maxLength: 80,
         }),
-        arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Argumentos JSON de la operacion" })),
+        arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+          description: providerArgumentDescription(item.id),
+        })),
       }),
       async execute(_toolCallId, params, signal) {
         try {
@@ -310,6 +339,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
             connected: match.connected,
             operations: match.operations,
             tool,
+            ...(match.id === "google-workspace" ? { operation_guidance: GOOGLE_WORKSPACE_GUIDANCE } : {}),
           }] : [];
         });
         if (computerAvailable && wantsComputer) {

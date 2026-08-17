@@ -124,6 +124,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     let executionMode: String
     let chatPrompt: String
     let userMessage: String
+    let clientTimezone: String
     let browser: Bool
     let computer: Bool
     let botID: String
@@ -134,6 +135,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
         case executionMode = "execution_mode"; case chatPrompt = "chat_prompt"; case userMessage = "user_message"
+        case clientTimezone = "client_timezone"
         case botID = "bot_id"; case connectorIDs = "connector_ids"
         case maxCredits = "max_credits"; case idempotencyKey = "idempotency_key"
         case stream
@@ -448,6 +450,7 @@ actor APIClient {
             executionMode: executionMode,
             chatPrompt: chatPrompt,
             userMessage: userMessage,
+            clientTimezone: TimeZone.current.identifier,
             browser: false,
             computer: computer,
             botID: botID.uuidString.lowercased(),

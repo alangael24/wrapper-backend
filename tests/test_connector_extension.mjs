@@ -36,7 +36,7 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
             name: "Google Workspace",
             description: "Gmail y Calendar.",
             keywords: ["gmail", "calendar"],
-            operations: ["search_email"],
+            operations: ["search_email", "create_calendar_event"],
             connected: true,
           },
         ],
@@ -100,6 +100,17 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     assert.deepEqual(activeTools, ["read", "connector_search", "connector_github"]);
     assert.doesNotMatch(activeTools.join(" "), /connector_google_workspace/);
 
+    const calendarSearch = await tools.get("connector_search").execute(
+      "calendar-search", { query: "Google Calendar evento" }, undefined,
+    );
+    assert.equal(calendarSearch.isError, undefined);
+    const calendarMatches = JSON.parse(calendarSearch.content[0].text);
+    assert.equal(calendarMatches[0].operation_guidance.create_calendar_event.arguments.timezone.includes("IANA"), true);
+    assert.match(
+      tools.get("connector_google_workspace").parameters.properties.arguments.description,
+      /start_datetime ISO 8601 exacto/,
+    );
+
     const result = await tools.get("connector_github").execute(
       "github-call",
       { operation: "search_repositories", arguments: { query: "wrapper" } },
@@ -112,7 +123,9 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     );
     assert.equal(computerSearch.isError, undefined);
     assert.match(computerSearch.content[0].text, /Agent Computer/);
-    assert.deepEqual(activeTools, ["read", "connector_search", "connector_github", "computer"]);
+    assert.deepEqual(activeTools, [
+      "read", "connector_search", "connector_github", "connector_google_workspace", "computer",
+    ]);
 
     const screenshot = await tools.get("computer").execute(
       "computer-call", { operation: "screenshot", arguments: {} }, undefined,
@@ -120,15 +133,16 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     assert.equal(screenshot.isError, undefined);
     assert.deepEqual(screenshot.content[1], { type: "image", data: "aW1hZ2U=", mimeType: "image/jpeg" });
 
-    assert.equal(requests.length, 4);
+    assert.equal(requests.length, 5);
     assert.ok(requests.every((request) => request.token === "test-run-token"));
-    assert.deepEqual(requests[1].body, {
+    assert.deepEqual(requests[2].body, {
       connector_id: "github",
       operation: "search_repositories",
       arguments: { query: "wrapper" },
     });
-    assert.equal(requests[2].url, "/v1/internal/connectors/catalog");
-    assert.deepEqual(requests[3].body, { operation: "screenshot", arguments: {} });
+    assert.equal(requests[1].url, "/v1/internal/connectors/catalog");
+    assert.equal(requests[3].url, "/v1/internal/connectors/catalog");
+    assert.deepEqual(requests[4].body, { operation: "screenshot", arguments: {} });
   } finally {
     delete process.env.PI_CONNECTOR_BROKER_URL;
     delete process.env.PI_CONNECTOR_RUN_TOKEN;

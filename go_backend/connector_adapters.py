@@ -17,6 +17,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .connectors import CONNECTOR_CATALOG, ConnectorBrokerError
 from .native_connectors import NativeConnectorGateway
@@ -81,6 +82,18 @@ COMPOSIO_TOOLKITS: dict[str, str] = {
     "shopify": "shopify",
     "woocommerce": "woocommerce",
 }
+
+# Tool Router search is useful for broad discovery, but write operations must
+# not depend on whichever result happens to rank first. These slugs are pinned
+# to the public Composio action documented for the corresponding Agent Genia
+# operation.
+COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
+    ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
+}
+
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?$"
+)
 
 # Estos proveedores no tienen una app administrada estable para todos los
 # proyectos. Se habilitan solo cuando el servidor recibe un ac_... propio.
@@ -432,24 +445,47 @@ class ComposioConnectorGateway:
             return self.native_gateway.execute(user_id, connector_id, operation, arguments)  # type: ignore[union-attr]
         session = self._session(user_id, connector_id)
         try:
-            search = session.search(
-                query=(
-                    f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
-                    f"operation '{operation.replace('_', ' ')}'."
-                )
+            normalized_arguments = _normalize_operation_arguments(
+                connector_id, operation, arguments
             )
-            results = list(getattr(search, "results", []) or [])
-            slugs = list(getattr(results[0], "primary_tool_slugs", []) or []) if results else []
-            if not slugs:
-                raise ConnectorBrokerError(
-                    404,
-                    "No encontramos una operacion compatible en el toolkit",
-                    "connector_operation_not_found",
+            slug = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
+            if not slug:
+                search = session.search(
+                    query=(
+                        f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
+                        f"operation '{operation.replace('_', ' ')}'."
+                    )
                 )
-            result = session.execute(slugs[0], arguments=arguments)
+                results = list(getattr(search, "results", []) or [])
+                slugs = list(getattr(results[0], "primary_tool_slugs", []) or []) if results else []
+                if not slugs:
+                    raise ConnectorBrokerError(
+                        404,
+                        "No encontramos una operacion compatible en el toolkit",
+                        "connector_operation_not_found",
+                    )
+                slug = slugs[0]
+            logging.info(
+                "Executing connector operation connector=%s operation=%s tool=%s",
+                connector_id,
+                operation,
+                slug,
+            )
+            result = session.execute(slug, arguments=normalized_arguments)
             error = getattr(result, "error", None)
             if error:
-                raise ConnectorBrokerError(502, str(error)[:500], "connector_upstream_error")
+                logging.warning(
+                    "Connector provider rejected operation connector=%s operation=%s tool=%s: %s",
+                    connector_id,
+                    operation,
+                    slug,
+                    error,
+                )
+                raise ConnectorBrokerError(
+                    502,
+                    "El proveedor rechazo la operacion",
+                    "connector_upstream_error",
+                )
             return _json_value(getattr(result, "data", result))
         except ConnectorBrokerError:
             raise
@@ -678,6 +714,91 @@ def _requires_connect_link(exc: Exception) -> bool:
         return True
     message = str(exc).lower()
     return "no longer supported" in message and "connected_accounts/link" in message
+
+
+def _normalize_operation_arguments(
+    connector_id: str,
+    operation: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate friendly aliases into the exact schema of pinned actions."""
+    if (connector_id, operation) != ("google-workspace", "create_calendar_event"):
+        return arguments
+
+    normalized = dict(arguments)
+    aliases = {
+        "summary": ("title", "name", "subject"),
+        "start_datetime": ("start", "start_time", "startTime", "startDateTime"),
+        "end_datetime": ("end", "end_time", "endTime", "endDateTime"),
+        "timezone": ("time_zone", "timeZone"),
+        "calendar_id": ("calendar", "calendarId"),
+    }
+    for canonical, alternatives in aliases.items():
+        if canonical not in normalized:
+            for alias in alternatives:
+                if alias in normalized:
+                    normalized[canonical] = normalized[alias]
+                    break
+        for alias in alternatives:
+            normalized.pop(alias, None)
+
+    start = normalized.get("start_datetime")
+    if not isinstance(start, str) or not _ISO_DATETIME_RE.fullmatch(start.strip()):
+        raise ConnectorBrokerError(
+            400,
+            "create_calendar_event requiere start_datetime en ISO 8601 exacto "
+            "(por ejemplo 2026-08-18T15:00:00), no texto como 'manana a las 3'",
+            "bad_connector_arguments",
+        )
+    normalized["start_datetime"] = start.strip()
+
+    end = normalized.get("end_datetime")
+    if end is not None:
+        if not isinstance(end, str) or not _ISO_DATETIME_RE.fullmatch(end.strip()):
+            raise ConnectorBrokerError(
+                400,
+                "end_datetime debe usar ISO 8601 exacto",
+                "bad_connector_arguments",
+            )
+        normalized["end_datetime"] = end.strip()
+
+    timezone_name = normalized.get("timezone")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        raise ConnectorBrokerError(
+            400,
+            "create_calendar_event requiere timezone IANA, por ejemplo America/Denver",
+            "bad_connector_arguments",
+        )
+    timezone_name = timezone_name.strip()
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConnectorBrokerError(
+            400,
+            "timezone debe ser una zona IANA valida, por ejemplo America/Denver",
+            "bad_connector_arguments",
+        ) from exc
+    normalized["timezone"] = timezone_name
+
+    duration = normalized.pop("duration_minutes", None)
+    if duration is not None:
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+            raise ConnectorBrokerError(
+                400,
+                "duration_minutes debe ser un numero positivo",
+                "bad_connector_arguments",
+            )
+        whole_minutes = int(duration)
+        normalized.setdefault("event_duration_hour", whole_minutes // 60)
+        normalized.setdefault("event_duration_minutes", whole_minutes % 60)
+
+    if "end_datetime" not in normalized and not any(
+        key in normalized for key in ("event_duration_hour", "event_duration_minutes")
+    ):
+        normalized["event_duration_hour"] = 1
+        normalized["event_duration_minutes"] = 0
+    normalized.setdefault("calendar_id", "primary")
+    return normalized
 
 
 def _upstream_error(exc: Exception, fallback: str) -> ConnectorBrokerError:

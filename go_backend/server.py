@@ -66,10 +66,12 @@ import sys
 import threading
 import time
 import httpx
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import __version__
 from .apple_auth import AppleAccountAuth, AppleAuthError
@@ -2783,6 +2785,7 @@ class Backend:
         execution_mode = body.get("execution_mode", "agent")
         chat_prompt = body.get("chat_prompt", "")
         user_message = body.get("user_message", "")
+        client_timezone = body.get("client_timezone")
         bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
         idempotency_key = body.get("idempotency_key")
@@ -2810,6 +2813,17 @@ class Backend:
         if not isinstance(user_message, str) or len(user_message) > 20_000:
             error_response(handler, 400, "user_message no es válido", "bad_user_message")
             return
+        local_timezone = None
+        if client_timezone is not None:
+            if not isinstance(client_timezone, str) or not client_timezone.strip() or len(client_timezone) > 100:
+                error_response(handler, 400, "client_timezone no es válido", "bad_client_timezone")
+                return
+            client_timezone = client_timezone.strip()
+            try:
+                local_timezone = ZoneInfo(client_timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                error_response(handler, 400, "client_timezone no es una zona IANA válida", "bad_client_timezone")
+                return
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
             return
@@ -2907,6 +2921,20 @@ class Backend:
                     "la herramienta o falló, dilo claramente: nunca inventes correos, "
                     "eventos, archivos, registros ni acciones completadas."
                 )
+                if local_timezone is not None:
+                    local_now = datetime.now(timezone.utc).astimezone(local_timezone)
+                    connector_context += (
+                        " Fecha y hora local del dispositivo: "
+                        f"{local_now.isoformat(timespec='seconds')}; zona IANA: "
+                        f"{client_timezone}. Para acciones de calendario convierte "
+                        "fechas relativas a ISO 8601 exacto usando esta zona."
+                    )
+                else:
+                    connector_context += (
+                        " El dispositivo no envió su zona horaria. Para una acción "
+                        "de calendario con hora local, pregunta la zona IANA al "
+                        "usuario en vez de asumir UTC."
+                    )
                 if "No hay conectores seleccionados." in effective_prompt:
                     effective_prompt = effective_prompt.replace(
                         "No hay conectores seleccionados.", connector_context, 1
