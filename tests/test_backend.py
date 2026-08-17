@@ -2192,6 +2192,39 @@ class TestBackend(unittest.TestCase):
         self.assertIn("fake-pi", result["answer"])
         self.assertEqual(len(self.ws.backend.pi._sessions), 1)
 
+    def test_auto_execution_routes_natural_spanish_email_requests_to_pi(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        for index, message in enumerate((
+            "¿Puedes checar mis correos?",
+            "Muéstrame qué llegó a mi bandeja",
+            "Dime cuáles son mis emails recientes",
+        )):
+            status, result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": f"Usa las herramientas configuradas. Usuario: {message}",
+                    "chat_prompt": "No uses esta ruta directa.",
+                    "user_message": message,
+                    "execution_mode": "auto",
+                    "bot_id": "bot-correo-natural",
+                    "idempotency_key": f"pi-natural-email-{index}",
+                },
+                headers=headers,
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(result["execution_path"], "pi")
+
+    def test_google_connector_catalog_contains_spanish_search_terms(self):
+        keywords = CONNECTOR_CATALOG["google-workspace"]["keywords"]
+        self.assertIn("correo", keywords)
+        self.assertIn("correos", keywords)
+        self.assertIn("calendario", keywords)
+
     def test_pi_sessions_are_separated_by_account_and_bot(self):
         first = self.new_user()
         second = self.new_user()
@@ -2713,6 +2746,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual([item["id"] for item in catalog["connectors"]], ["google-workspace"])
         prompt = self.upstream_payloads("/v1/chat/completions")[-1]["messages"][0]["content"]
         self.assertIn("Google Workspace (google-workspace)", prompt)
+        self.assertIn("nunca inventes correos", prompt)
         self.assertNotIn("No hay conectores seleccionados.", prompt)
         status, account_state = self.ws.req(
             "GET", "/v1/account-state", headers=headers

@@ -2556,14 +2556,16 @@ class Backend:
         # lookup or computer action keeps the full Pi/tool path. Ordinary
         # conversation, explanation and drafting take the direct path.
         tool_intent = re.compile(
-            r"(?:https?://|\b(?:abre|busca|consulta|revisa|lee|descarga|sube|"
+            r"(?:https?://|\b(?:abre|busca|consulta|revisa|revisar|checa|checar|"
+            r"comprueba|verifica|mira|mu[eé]strame|dime\s+(?:qu[eé]|cu[aá]l(?:es)?|si)|lee|descarga|sube|"
             r"env[ií]a|manda|publica|actualiza|modifica|elimina|borra|crea\s+(?:un\s+)?"
             r"(?:issue|ticket|evento|archivo|carpeta|tarea|documento)|agenda|programa|"
             r"reserva|compra|conecta|instala|ejecuta|corre|inicia\s+sesi[oó]n|"
             r"open|search|look\s+up|check|review|read|download|upload|send|post|"
             r"update|edit|delete|remove|schedule|book|buy|connect|install|run|"
             r"log\s+in|create\s+(?:an?\s+)?(?:issue|ticket|event|file|folder|task|document)|"
-            r"gmail|calendar|slack|notion|github|jira|drive|dropbox|shopify|stripe|"
+            r"gmail|correo(?:s)?|email(?:s)?|bandeja|calendar|calendario|agenda|"
+            r"slack|notion|github|jira|drive|dropbox|shopify|stripe|crm|salesforce|"
             r"computadora|navegador|browser|archivo|terminal|shell)\b)",
             re.IGNORECASE,
         )
@@ -2899,7 +2901,11 @@ class Backend:
                 connector_context = (
                     "Conectores autenticados disponibles para esta ejecución: "
                     f"{connector_names}. Cuando la tarea los necesite, usa "
-                    "connector_search y después la herramienta activada."
+                    "connector_search y después la herramienta activada. Para "
+                    "consultar o modificar datos externos debes basar la respuesta "
+                    "en el resultado exitoso de esa herramienta. Si no ejecutaste "
+                    "la herramienta o falló, dilo claramente: nunca inventes correos, "
+                    "eventos, archivos, registros ni acciones completadas."
                 )
                 if "No hay conectores seleccionados." in effective_prompt:
                     effective_prompt = effective_prompt.replace(

@@ -42,7 +42,11 @@ CONNECTOR_CATALOG: dict[str, dict[str, Any]] = {
             "google-workspace",
             "Google Workspace",
             "Gmail, Calendar, Drive, Contacts y Sheets.",
-            ("google", "gmail", "email", "calendar", "drive", "contacts", "sheets"),
+            (
+                "google", "gmail", "email", "emails", "correo", "correos",
+                "bandeja", "calendar", "calendario", "agenda", "drive",
+                "contacts", "contactos", "sheets", "hojas",
+            ),
             (
                 "search_email", "read_email", "draft_email", "list_calendar_events",
                 "create_calendar_event", "search_drive", "read_drive_file",
