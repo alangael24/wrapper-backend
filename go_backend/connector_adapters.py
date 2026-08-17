@@ -9,6 +9,7 @@ los tokens OAuth de cada usuario.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import threading
@@ -110,6 +111,7 @@ class ComposioConnectorGateway:
         self._attempt_ttl_seconds = max(60, min(int(attempt_ttl_seconds), 1800))
         self.store = store
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
+        self._managed_auth_configs: dict[str, bool] = {}
         self._lock = threading.RLock()
         self.client = client
         self.native_gateway = native_gateway
@@ -235,16 +237,10 @@ class ComposioConnectorGateway:
         try:
             auth_config = self._auth_config(connector_id, description["toolkit"])
             if auth_config:
-                # A private Auth Config belongs to Agent Genia.  Using the
-                # connected-accounts endpoint returns the provider's OAuth URL
-                # directly for redirectable schemes instead of first showing
-                # Composio's hosted Connect Link page.  Managed Auth must keep
-                # using session.authorize(), because Composio requires its
-                # explicit hosted consent step for those shared OAuth apps.
-                request = self.client.connected_accounts.initiate(
-                    user_id,
-                    auth_config,
-                    **({"callback_url": callback_url} if callback_url else {}),
+                request = self._authorize_with_auth_config(
+                    user_id=user_id,
+                    auth_config=auth_config,
+                    callback_url=callback_url,
                 )
             else:
                 session = self._session(user_id, connector_id)
@@ -428,6 +424,56 @@ class ComposioConnectorGateway:
     def _auth_config(self, connector_id: str, toolkit: str) -> str:
         return self.auth_configs.get(connector_id) or self.auth_configs.get(toolkit, "")
 
+    def _authorize_with_auth_config(
+        self,
+        *,
+        user_id: str,
+        auth_config: str,
+        callback_url: str | None,
+    ) -> Any:
+        """Use direct OAuth for custom apps and Connect Link for Managed Auth."""
+        options = {"callback_url": callback_url} if callback_url else {}
+        if self._auth_config_is_managed(auth_config) is True:
+            return self.client.connected_accounts.link(user_id, auth_config, **options)
+        try:
+            # Custom OAuth apps return the provider URL directly.  This legacy
+            # endpoint remains supported for custom Auth Configs.
+            return self.client.connected_accounts.initiate(user_id, auth_config, **options)
+        except Exception as exc:
+            # Be resilient to an Auth Config being changed from custom to
+            # Composio-managed without restarting Agent Genia.  Composio now
+            # rejects initiate() for managed OAuth and requires link().
+            if not _requires_connect_link(exc):
+                raise
+            with self._lock:
+                self._managed_auth_configs[auth_config] = True
+            return self.client.connected_accounts.link(user_id, auth_config, **options)
+
+    def _auth_config_is_managed(self, auth_config: str) -> bool | None:
+        with self._lock:
+            cached = self._managed_auth_configs.get(auth_config)
+        if cached is not None:
+            return cached
+        try:
+            record = self.client.auth_configs.get(auth_config)
+        except Exception:
+            # Older/mocked clients may not expose auth-config metadata.  The
+            # caller still has the endpoint-retirement fallback above.
+            return None
+        managed = getattr(record, "is_composio_managed", None)
+        if not isinstance(managed, bool):
+            config_type = str(getattr(record, "type", "") or "").lower()
+            if config_type == "default":
+                managed = True
+            elif config_type == "custom":
+                managed = False
+            else:
+                managed = None
+        if isinstance(managed, bool):
+            with self._lock:
+                self._managed_auth_configs[auth_config] = managed
+        return managed
+
     def _check_start_rate(self, user_id: str) -> None:
         now = self._now()
         with self._lock:
@@ -558,12 +604,18 @@ def _delete_session(session: Any) -> None:
         pass
 
 
+def _requires_connect_link(exc: Exception) -> bool:
+    if exc.__class__.__name__ == "ComposioLegacyConnectedAccountsEndpointRetiredError":
+        return True
+    message = str(exc).lower()
+    return "no longer supported" in message and "connected_accounts/link" in message
+
+
 def _upstream_error(exc: Exception, fallback: str) -> ConnectorBrokerError:
-    message = str(exc).strip()
-    # Nunca devolver representaciones que pudieran incluir headers o secretos.
-    if not message or any(marker in message.lower() for marker in ("x-api-key", "bearer ", "api_key")):
-        message = fallback
-    return ConnectorBrokerError(502, message[:500], "connector_upstream_error")
+    # El detalle del proveedor puede contener IDs internos, URLs o headers. Se
+    # conserva únicamente en logs privados y nunca se devuelve al dispositivo.
+    logging.warning("%s: %s", fallback, exc, exc_info=True)
+    return ConnectorBrokerError(502, fallback, "connector_upstream_error")
 
 
 def _json_value(value: Any) -> Any:

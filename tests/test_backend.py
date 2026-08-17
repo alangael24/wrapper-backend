@@ -273,6 +273,7 @@ class FakeComposioAccounts:
         self.list_calls: list[dict] = []
         self.get_calls: list[str] = []
         self.initiate_calls: list[dict] = []
+        self.link_calls: list[dict] = []
 
     def initiate(self, user_id, auth_config_id, **options):
         account_id = f"ca_{len(self.items) + 1}"
@@ -299,6 +300,30 @@ class FakeComposioAccounts:
                 "https://login.salesforce.com/services/oauth2/authorize"
                 f"?state={account_id}"
             ),
+        )
+
+    def link(self, user_id, auth_config_id, **options):
+        account_id = f"ca_{len(self.items) + 1}"
+        toolkit = {
+            "ac_agentgenia_salesforce": "salesforce",
+        }.get(auth_config_id, "custom")
+        self.link_calls.append({
+            "user_id": user_id,
+            "auth_config_id": auth_config_id,
+            **options,
+        })
+        self.items[account_id] = SimpleNamespace(
+            id=account_id,
+            user_id=user_id,
+            toolkit=toolkit,
+            status="INITIATED",
+            alias="",
+            data={},
+            status_reason="",
+        )
+        return SimpleNamespace(
+            id=account_id,
+            redirect_url=f"https://connect.composio.dev/link/{account_id}",
         )
 
     def list(self, *, user_ids, statuses, limit, toolkit_slugs=None):
@@ -372,9 +397,25 @@ class FakeComposioSessions:
         )
 
 
+class FakeComposioAuthConfigs:
+    def __init__(self):
+        self.items = {
+            "ac_agentgenia_salesforce": SimpleNamespace(
+                is_composio_managed=False,
+                type="custom",
+            ),
+        }
+        self.get_calls: list[str] = []
+
+    def get(self, auth_config_id):
+        self.get_calls.append(auth_config_id)
+        return self.items[auth_config_id]
+
+
 class FakeComposioClient:
     def __init__(self):
         self.connected_accounts = FakeComposioAccounts()
+        self.auth_configs = FakeComposioAuthConfigs()
         self.sessions = FakeComposioSessions(self)
         self.session_options: list[dict] = []
         self.searches: list[tuple[str, str]] = []
@@ -2254,6 +2295,32 @@ class TestBackend(unittest.TestCase):
         self.assertNotIn("composio", started["authorize_url"])
         self.assertEqual(client.session_options, [])
         self.assertEqual(client.connected_accounts.initiate_calls, [{
+            "user_id": user_id,
+            "auth_config_id": "ac_agentgenia_salesforce",
+            "callback_url": "https://agentgenia-api.onrender.com/connections/complete",
+        }])
+
+    def test_composio_gateway_uses_connect_link_for_managed_auth_config(self):
+        client = FakeComposioClient()
+        client.auth_configs.items["ac_agentgenia_salesforce"] = SimpleNamespace(
+            is_composio_managed=True,
+            type="default",
+        )
+        user_id = self.new_user("managed-oauth-user")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+            store=self.ws.backend.store,
+        )
+
+        started = gateway.start(user_id, "salesforce")
+
+        self.assertTrue(
+            started["authorize_url"].startswith("https://connect.composio.dev/")
+        )
+        self.assertEqual(client.connected_accounts.initiate_calls, [])
+        self.assertEqual(client.connected_accounts.link_calls, [{
             "user_id": user_id,
             "auth_config_id": "ac_agentgenia_salesforce",
             "callback_url": "https://agentgenia-api.onrender.com/connections/complete",
