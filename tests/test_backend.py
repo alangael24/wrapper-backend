@@ -1920,7 +1920,7 @@ class TestBackend(unittest.TestCase):
         sent = json.loads(upstream[0][3])
         self.assertEqual(sent["messages"][0]["content"], "Reply briefly to the user: hola")
         self.assertEqual(sent["thinking"], {"type": "disabled"})
-        self.assertEqual(sent["max_tokens"], 1024)
+        self.assertEqual(sent["max_tokens"], 512)
 
     def test_direct_chat_streams_first_visible_model_delta(self):
         signup = self.new_user()

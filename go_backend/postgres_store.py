@@ -110,7 +110,10 @@ class PostgresStore(Store):
                 "connect_timeout": 10,
                 "application_name": "agentgenia-wrapper",
             },
-            min_size=1,
+            # Mobile startup performs profile/state/connector refreshes in
+            # parallel. Keep enough TLS connections warm so the first agent
+            # turn does not wait several seconds for lazy pool growth.
+            min_size=4,
             max_size=10,
             timeout=10,
             max_idle=300,

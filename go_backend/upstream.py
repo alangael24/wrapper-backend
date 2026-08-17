@@ -152,6 +152,7 @@ def proxy_request(
     api_key: str,
     on_chunk=None,
     on_headers=None,
+    timeout: httpx.Timeout | float | None = None,
 ) -> tuple[int, dict, bytes | None, Usage]:
     """Hace la request al upstream.
 
@@ -170,6 +171,7 @@ def proxy_request(
             url,
             headers=request_headers,
             content=request_body,
+            timeout=timeout,
         )
         resp = response_context.__enter__()
     except httpx.HTTPError:

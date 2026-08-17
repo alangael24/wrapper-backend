@@ -65,6 +65,7 @@ import secrets
 import sys
 import threading
 import time
+import httpx
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -803,6 +804,8 @@ class Backend:
         self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         self._pi_warm_lock = threading.Lock()
         self._pi_warm_events: dict[str, threading.Event] = {}
+        self._local_rate_limit_lock = threading.Lock()
+        self._local_rate_limits: dict[str, tuple[int, int]] = {}
         self._whatsapp_wake = threading.Event()
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
@@ -1124,6 +1127,29 @@ class Backend:
     @staticmethod
     def unlimited_usage(user: dict) -> bool:
         return bool(int(user.get("unlimited_usage") or 0))
+
+    def _consume_local_rate_limit(
+        self, scope: str, *, limit: int, window_seconds: int
+    ) -> bool:
+        """Low-latency guard for trusted unlimited accounts.
+
+        Durable credit/concurrency checks still run in Postgres. This small
+        per-process bucket avoids removing abuse protection merely to skip a
+        cross-region rate-limit write from the chat critical path.
+        """
+        window = int(time.time() // window_seconds)
+        with self._local_rate_limit_lock:
+            previous_window, count = self._local_rate_limits.get(scope, (window, 0))
+            if previous_window != window:
+                count = 0
+            count += 1
+            self._local_rate_limits[scope] = (window, count)
+            if len(self._local_rate_limits) > 1_000:
+                self._local_rate_limits = {
+                    key: value for key, value in self._local_rate_limits.items()
+                    if value[0] >= window - 1
+                }
+            return count <= limit
 
     def bearer(self, handler: BaseHTTPRequestHandler) -> str | None:
         auth = handler.headers.get("Authorization", "")
@@ -2363,7 +2389,7 @@ class Backend:
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": 1024,
+            "max_tokens": 512,
             "user_id": provider_user_id,
         }
         if self.cfg.pi_model.startswith("deepseek-"):
@@ -2437,6 +2463,10 @@ class Backend:
             provider["api_key"],
             on_chunk=on_chunk,
             on_headers=on_headers,
+            # Conversation should fail recoverably instead of leaving a
+            # durable run in `running` for the global 15-minute tool timeout.
+            # Full Pi/computer work retains its longer execution budget.
+            timeout=httpx.Timeout(60.0, connect=20.0),
         )
         if pending.strip():
             process_line(pending)
@@ -2518,13 +2548,20 @@ class Backend:
         user = self.require_user(handler)
         if not user:
             return
-        if not self.store.consume_rate_limit(
-            f"agent-run:{user['id']}", limit=30, window_seconds=60
-        ):
+        unlimited = self.unlimited_usage(user)
+        # Internal unlimited accounts are already protected by authenticated
+        # sessions and the concurrent-run reservation. Avoid an additional
+        # cross-region Postgres write on their latency-sensitive chat path.
+        rate_scope = f"agent-run:{user['id']}"
+        rate_allowed = (
+            self._consume_local_rate_limit(rate_scope, limit=30, window_seconds=60)
+            if unlimited
+            else self.store.consume_rate_limit(rate_scope, limit=30, window_seconds=60)
+        )
+        if not rate_allowed:
             error_response(handler, 429, "Demasiadas ejecuciones", "rate_limit")
             return
         tier = user.get("tier") or DEFAULT_TIER
-        unlimited = self.unlimited_usage(user)
         if not unlimited:
             self.ensure_trial(user)
         try:
@@ -2811,7 +2848,7 @@ class Backend:
                         warm_event = self._pi_warm_events.pop(conversation_key, None)
                     if warm_event is not None and not warm_event.is_set():
                         self._mark_run_timing(run_id, "pi_warm_wait_started_ms")
-                        warm_event.wait(timeout=25.0)
+                        warm_event.wait(timeout=12.0)
                         self._mark_run_timing(run_id, "pi_warm_wait_finished_ms")
                 if connector_ids or computer_enabled:
                     connector_run_token = self.connectors.issue(

@@ -234,7 +234,11 @@ final class AppModel {
         // with the response the user is waiting to see.
         await sendInitialMessageIfNeeded(botID: botID)
         Task {
-            try? await Task.sleep(for: .seconds(1))
+            // Starting Pi is CPU-heavy on the small production host. Most
+            // first turns use direct chat, so warm only after the user has had
+            // time to read the onboarding response instead of slowing or
+            // interrupting the next message.
+            try? await Task.sleep(for: .seconds(30))
             await warmAgent(botID: botID)
         }
     }
@@ -715,7 +719,9 @@ final class AppModel {
             schedulePersist()
         } catch {
             if let index = bots.firstIndex(where: { $0.id == botID }) {
-                bots[index].messages.removeAll { $0.id == replyID }
+                // A streamed answer can be useful even when the terminal frame
+                // is lost. Keep visible text; only remove an empty placeholder.
+                bots[index].messages.removeAll { $0.id == replyID && $0.text.isEmpty }
             }
             await persistLocalState(dirty: true)
             schedulePersist()

@@ -2131,7 +2131,7 @@ async function warmBotAgent(botId: string): Promise<boolean> {
   return task;
 }
 
-function scheduleBotWarm(botId: string, delayMs = 1_500): void {
+function scheduleBotWarm(botId: string, delayMs = 30_000): void {
   if (!connections.account.connected || !botId) return;
   if ((warmedBotUntil.get(botId) ?? 0) > Date.now()) return;
   if (scheduledAgentWarmTimer) window.clearTimeout(scheduledAgentWarmTimer);

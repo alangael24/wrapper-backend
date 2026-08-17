@@ -151,11 +151,24 @@ private struct AgentWarmResponse: Decodable, Sendable {
 }
 
 struct AgentRunResponse: Decodable, Sendable { let answer: String }
+private struct AgentStreamStart: Decodable, Sendable {
+    let runID: String
+    enum CodingKeys: String, CodingKey { case runID = "run_id" }
+}
 private struct AgentStreamDelta: Decodable, Sendable { let text: String }
 private struct AgentStreamFailure: Decodable, Sendable {
     let status: Int
     let message: String
     let type: String
+}
+private struct AgentRunStatusResponse: Decodable, Sendable {
+    let status: String
+    let errorCode: String?
+    let result: AgentRunResponse?
+    enum CodingKeys: String, CodingKey {
+        case status, result
+        case errorCode = "error_code"
+    }
 }
 
 struct ServerSentEvent: Equatable, Sendable {
@@ -671,13 +684,23 @@ actor APIClient {
 
         var parser = ServerSentEventParser()
         var finalResponse: AgentRunResponse?
+        var runID: String?
         var streamedText = ""
         var pendingDelta = ""
         var lastDeltaFlush = Date.distantPast
 
-        func decode(_ event: ServerSentEvent) throws -> (delta: String?, response: AgentRunResponse?) {
-            if event.name == "delta" {
-                do { return (try decoder.decode(AgentStreamDelta.self, from: event.data).text, nil) }
+        func decode(_ event: ServerSentEvent) throws -> (delta: String?, response: AgentRunResponse?, runID: String?) {
+            if event.name == "start" {
+                do { return (nil, nil, try decoder.decode(AgentStreamStart.self, from: event.data).runID) }
+                catch {
+                    throw ServiceError(
+                        message: "Agent Genia recibió un identificador de ejecución inválido.",
+                        code: "invalid_stream_start",
+                        status: response.statusCode
+                    )
+                }
+            } else if event.name == "delta" {
+                do { return (try decoder.decode(AgentStreamDelta.self, from: event.data).text, nil, nil) }
                 catch {
                     throw ServiceError(
                         message: "Agent Genia recibió un fragmento de respuesta inválido.",
@@ -697,9 +720,9 @@ actor APIClient {
                         status: response.statusCode
                     )
                 }
-                return (nil, AgentRunResponse(answer: answer))
+                return (nil, AgentRunResponse(answer: answer), nil)
             } else if event.name == "done" {
-                do { return (nil, try decoder.decode(AgentRunResponse.self, from: event.data)) }
+                do { return (nil, try decoder.decode(AgentRunResponse.self, from: event.data), nil) }
                 catch {
                     throw ServiceError(
                         message: "Agent Genia recibió una respuesta final inválida.",
@@ -710,13 +733,15 @@ actor APIClient {
             } else if event.name == "error", let failure = try? decoder.decode(AgentStreamFailure.self, from: event.data) {
                 throw ServiceError(message: failure.message, code: failure.type, status: failure.status)
             }
-            return (nil, nil)
+            return (nil, nil, nil)
         }
 
+        var transportFailure: ServiceError?
         do {
             for try await line in bytes.lines {
                 if let event = parser.consume(line: line) {
                     let decoded = try decode(event)
+                    if let value = decoded.runID { runID = value }
                     if let delta = decoded.delta {
                         streamedText += delta
                         pendingDelta += delta
@@ -735,6 +760,7 @@ actor APIClient {
             }
             if let event = parser.finish() {
                 let decoded = try decode(event)
+                if let value = decoded.runID { runID = value }
                 if let delta = decoded.delta {
                     streamedText += delta
                     pendingDelta += delta
@@ -750,24 +776,70 @@ actor APIClient {
                     finalResponse = response
                 }
             }
+        } catch let error as ServiceError where error.status == 0 {
+            transportFailure = error
         } catch let error as ServiceError {
             throw error
         } catch {
-            throw networkError(error, path: path)
+            transportFailure = networkError(error, path: path)
         }
         if !pendingDelta.isEmpty {
             let value = pendingDelta
             pendingDelta = ""
             await onDelta(value)
         }
-        guard let finalResponse else {
-            throw ServiceError(
-                message: "La conexión terminó antes de recibir la respuesta final.",
-                code: "incomplete_stream",
-                status: 502
-            )
+        if let finalResponse { return finalResponse }
+
+        // The run result is persisted before the terminal SSE frame is sent.
+        // Cellular transitions and app backgrounding can drop that last frame
+        // even though the agent completed successfully. Recover by run id
+        // instead of deleting an answer that already exists on the server.
+        if let runID {
+            do {
+                if let recovered = try await recoverAgentRun(runID: runID) {
+                    return recovered
+                }
+            } catch let error as ServiceError where error.code != "run_still_running" {
+                if streamedText.isEmpty { throw error }
+            } catch {
+                if streamedText.isEmpty { throw error }
+            }
         }
-        return finalResponse
+        if !streamedText.isEmpty {
+            return AgentRunResponse(answer: streamedText)
+        }
+        if let transportFailure { throw transportFailure }
+        throw ServiceError(
+            message: "La ejecución no entregó una respuesta recuperable.",
+            code: "incomplete_stream",
+            status: 502
+        )
+    }
+
+    private func recoverAgentRun(runID: String) async throws -> AgentRunResponse? {
+        for attempt in 0..<12 {
+            let snapshot: AgentRunStatusResponse = try await request(
+                "/v1/agent/runs/\(runID)",
+                body: Optional<EmptyBody>.none
+            )
+            if snapshot.status == "succeeded", let result = snapshot.result,
+               !result.answer.isEmpty {
+                return result
+            }
+            if ["failed", "cancelled", "budget_exhausted"].contains(snapshot.status) {
+                throw ServiceError(
+                    message: "La ejecución terminó sin una respuesta válida.",
+                    code: snapshot.errorCode ?? "agent_run_failed",
+                    status: 502
+                )
+            }
+            if attempt < 11 { try await Task.sleep(for: .milliseconds(500)) }
+        }
+        throw ServiceError(
+            message: "La ejecución continúa procesándose.",
+            code: "run_still_running",
+            status: 202
+        )
     }
 
     private func networkError(_ error: Error, path: String) -> ServiceError {
