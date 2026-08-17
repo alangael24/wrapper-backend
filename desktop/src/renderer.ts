@@ -1180,7 +1180,7 @@ function renderReadyBot(bot: BotProfile): void {
         ${bot.messages.length ? bot.messages.map((message, index) => {
           const hasLaterUserMessage = bot.messages.slice(index + 1).some((item) => item.role === "user");
           return `
-            <div class="chat-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"}">${escapeHtml(message.text).replace(/\n/g, "<br />")}</div>
+            ${message.text ? `<div class="chat-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"}">${escapeHtml(message.text).replace(/\n/g, "<br />")}</div>` : ""}
             ${message.widget && (!hasLaterUserMessage || !message.widget.dismissOnMoveOn)
               ? renderGeneratedQuestion(message, !hasLaterUserMessage)
               : ""}`;

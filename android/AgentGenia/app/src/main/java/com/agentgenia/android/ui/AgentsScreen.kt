@@ -283,7 +283,7 @@ private fun MessageBubble(message: BotMessage, onWidgetAnswer: (String) -> Unit)
             contentColor = if (message.role == MessageRole.User) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
         ) {
             Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(message.text)
+                if (message.text.isNotBlank()) Text(message.text)
                 message.widget?.let { QuestionWidget(it, onWidgetAnswer) }
             }
         }

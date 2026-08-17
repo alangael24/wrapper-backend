@@ -395,7 +395,9 @@ class AppViewModel(
                 chatPrompt = if (initial) prompt else buildDirectChatPrompt(original, userText),
                 userMessage = userText,
             ))
-            if (generated.text.isBlank()) throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)
+            if (generated.text.isBlank() && generated.widget == null) {
+                throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)
+            }
             mutateBot(botId, persistAfter = false) { bot ->
                 bot.copy(messages = (bot.messages + BotMessage(
                     role = MessageRole.Assistant, text = generated.text, widget = generated.widget,

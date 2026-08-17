@@ -608,7 +608,7 @@ function registerDesktopIpc(): void {
         }
       );
       const generated = parseAgentAnswer(result.answer);
-      if (!generated.text) throw new Error("El agente no devolvió una respuesta.");
+      if (!generated.text && !generated.widget) throw new Error("El agente no devolvió una respuesta.");
       const now = new Date().toISOString();
       return stateStore.update((current) => {
         const index = current.bots.findIndex((item) => item.id === botId);
@@ -991,16 +991,54 @@ function parseAgentAnswer(value: unknown): {
   const raw = typeof value === "string" ? value.trim().slice(0, 20_000) : "";
   if (!raw) return { text: "" };
   const candidate = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  try {
-    const parsed: unknown = JSON.parse(candidate);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const record = parsed as Record<string, unknown>;
-      const text = typeof record.text === "string" ? record.text.trim().slice(0, 20_000) : "";
-      const widget = normalizeQuestionWidget(record.widget);
-      return { text, ...(widget ? { widget } : {}) };
-    }
-  } catch {}
+  const record = firstAgentEnvelope(candidate);
+  if (record) {
+    const text = typeof record.text === "string" ? record.text.trim().slice(0, 20_000) : "";
+    const widget = normalizeQuestionWidget(record.widget);
+    return { text, ...(widget ? { widget } : {}) };
+  }
   return { text: raw };
+}
+
+function firstAgentEnvelope(value: string): Record<string, unknown> | undefined {
+  const decode = (candidate: string): Record<string, unknown> | undefined => {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (typeof parsed === "string") return firstAgentEnvelope(parsed);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const exact = decode(value);
+  if (exact) return exact;
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        const object = decode(value.slice(start, index + 1));
+        if (object) return object;
+      }
+    }
+  }
+  return undefined;
 }
 
 function createWindow(): void {

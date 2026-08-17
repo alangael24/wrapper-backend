@@ -966,7 +966,7 @@ func installAgentReply(
     createdAt: Date
 ) -> Bool {
     let visibleText = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(20_000))
-    guard !visibleText.isEmpty,
+    guard (!visibleText.isEmpty || widget != nil),
           let botIndex = bots.firstIndex(where: { $0.id == botID })
     else { return false }
 
@@ -1076,13 +1076,12 @@ private func buildDirectChatPrompt(bot: BotProfile, userText: String) -> String 
     ].filter { !$0.isEmpty }.joined(separator: "\n\n")
 }
 
-private func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionWidget?) {
+func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionWidget?) {
     let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
     let candidate = trimmed
         .replacingOccurrences(of: #"^```(?:json)?\s*"#, with: "", options: .regularExpression)
         .replacingOccurrences(of: #"\s*```$"#, with: "", options: .regularExpression)
-    guard let data = candidate.data(using: .utf8),
-          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    guard let object = firstAgentEnvelope(in: candidate)
     else { return (String(trimmed.prefix(20_000)), nil) }
     let text = ((object["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = object["widget"] as? [String: Any],
@@ -1110,6 +1109,49 @@ private func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQ
             dismissOnMoveOn: value["dismissOnMoveOn"] as? Bool ?? true
         )
     )
+}
+
+private func firstAgentEnvelope(in value: String) -> [String: Any]? {
+    func decode(_ candidate: Substring) -> [String: Any]? {
+        guard let data = String(candidate).data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data)
+        else { return nil }
+        if let object = decoded as? [String: Any] { return object }
+        if let nested = decoded as? String { return firstAgentEnvelope(in: nested) }
+        return nil
+    }
+    if let exact = decode(value[...]) { return exact }
+
+    var start: String.Index?
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for index in value.indices {
+        let character = value[index]
+        if inString {
+            if escaped {
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "\"" {
+                inString = false
+            }
+            continue
+        }
+        if character == "\"" {
+            inString = true
+        } else if character == "{" {
+            if depth == 0 { start = index }
+            depth += 1
+        } else if character == "}", depth > 0 {
+            depth -= 1
+            if depth == 0, let start {
+                let end = value.index(after: index)
+                if let object = decode(value[start..<end]) { return object }
+            }
+        }
+    }
+    return nil
 }
 
 private func clean(_ value: String, maximum: Int, fallback: String = "") -> String {

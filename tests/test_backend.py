@@ -94,6 +94,16 @@ class MockUpstream(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
         if self.path == "/v1/chat/completions":
             if payload.get("stream"):
+                content = str(payload.get("messages", [{}])[0].get("content", ""))
+                if "__empty_stream_retry__" in content:
+                    self._send(
+                        200,
+                        b'data: {"id":"cmpl-empty","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+                        b'data: {"id":"cmpl-empty","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}\n\n'
+                        b'data: [DONE]\n\n',
+                        ctype="text/event-stream",
+                    )
+                    return
                 self._send(
                     200,
                     b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n'
@@ -104,9 +114,13 @@ class MockUpstream(BaseHTTPRequestHandler):
                     ctype="text/event-stream",
                 )
             else:
+                content = str(payload.get("messages", [{}])[0].get("content", ""))
                 resp = {
                     "id": "cmpl-test", "model": "deepseek-v4-flash",
-                    "choices": [{"message": {"role": "assistant", "content": "hola"}}],
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "respuesta recuperada" if "__empty_stream_retry__" in content else "hola",
+                    }}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                               "total_tokens": 15,
                               "prompt_cache_hit_tokens": 4,
@@ -2168,6 +2182,31 @@ class TestBackend(unittest.TestCase):
         self.assertIn("first_visible_delta_ms", timing)
         self.assertLessEqual(timing["upstream_first_content_ms"], timing["first_visible_delta_ms"])
 
+    def test_direct_chat_recovers_from_empty_stream_with_json_retry(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy full agent prompt",
+                "chat_prompt": "__empty_stream_retry__",
+                "user_message": "hola",
+                "execution_mode": "auto",
+                "bot_id": "bot-empty-stream",
+                "idempotency_key": "direct-chat-empty-stream",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["answer"], "respuesta recuperada")
+        upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
+        self.assertEqual(len(upstream), 2)
+        self.assertTrue(json.loads(upstream[0][3])["stream"])
+        self.assertFalse(json.loads(upstream[1][3])["stream"])
+
     def test_auto_execution_keeps_tool_requests_on_pi(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
@@ -2191,6 +2230,32 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(result["execution_path"], "pi")
         self.assertIn("fake-pi", result["answer"])
         self.assertEqual(len(self.ws.backend.pi._sessions), 1)
+
+    def test_auto_execution_keeps_tool_followups_on_pi_from_recent_context(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "Continúa la acción pendiente con Google Calendar.",
+                "chat_prompt": (
+                    "Conversación reciente:\nAgente: ¿Hasta qué hora será el evento del calendario?\n"
+                    "Usuario: No necesitas ponerle hasta qué hora será"
+                ),
+                "user_message": "No necesitas ponerle hasta qué hora será",
+                "execution_mode": "auto",
+                "bot_id": "bot-calendar-followup",
+                "connector_ids": ["google-workspace"],
+                "idempotency_key": "pi-calendar-followup",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["execution_path"], "pi")
 
     def test_auto_execution_routes_natural_spanish_email_requests_to_pi(self):
         signup = self.new_user()

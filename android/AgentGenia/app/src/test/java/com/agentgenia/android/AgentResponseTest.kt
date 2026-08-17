@@ -31,6 +31,18 @@ class AgentResponseTest {
     }
 
     @Test
+    fun recoversWidgetEnvelopeFromSurroundingText() {
+        val result = parseAgentAnswer(
+            """Respuesta del modelo:
+            ```json
+            {"text":"","widget":{"prompt":"¿Qué deseas hacer?","options":[{"label":"Agendar","value":"Agenda un evento"}]}}
+            ```""".trimIndent()
+        )
+        assertEquals("", result.text)
+        assertEquals("¿Qué deseas hacer?", result.widget?.prompt)
+    }
+
+    @Test
     fun initialPromptRequiresRuntimeGeneration() {
         val prompt = buildBotPrompt(
             BotProfile(name = "Atlas", title = "Investigador", shape = BotShape.Hexagon),

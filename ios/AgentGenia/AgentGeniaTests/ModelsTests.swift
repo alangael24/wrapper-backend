@@ -118,6 +118,42 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(bots[0].messages[0].createdAt, createdAt)
     }
 
+    func testAgentEnvelopeIsRecoveredFromSurroundingModelText() throws {
+        let generated = parseAgentAnswer("""
+        Aquí está la pregunta:
+        ```json
+        {"text":"Vamos a programarlo.","widget":{"prompt":"¿Qué título le pongo?","options":[{"label":"Inicio de trabajo","value":"Ponle Inicio de trabajo"}],"allowCustom":true}}
+        ```
+        """)
+
+        XCTAssertEqual(generated.text, "Vamos a programarlo.")
+        XCTAssertEqual(generated.widget?.prompt, "¿Qué título le pongo?")
+        XCTAssertEqual(generated.widget?.options.first?.value, "Ponle Inicio de trabajo")
+    }
+
+    func testWidgetOnlyReplyReplacesThinkingPlaceholder() throws {
+        let botID = UUID()
+        let replyID = UUID()
+        let widget = try XCTUnwrap(parseAgentAnswer("""
+        {"text":"","widget":{"prompt":"¿Qué deseas hacer?","options":[{"label":"Agendar","value":"Agenda un evento"}]}}
+        """).widget)
+        var bots = [BotProfile(
+            id: botID, name: "Nuevo bot", title: "", description: "",
+            color: "#2f91f5", shape: .circle, notificationsEnabled: true,
+            connectorIDs: [], messages: [], createdAt: Date()
+        )]
+
+        XCTAssertTrue(installAgentReply(
+            in: &bots,
+            botID: botID,
+            messageID: replyID,
+            text: "",
+            widget: widget,
+            createdAt: Date()
+        ))
+        XCTAssertEqual(bots[0].messages.first?.widget?.prompt, "¿Qué deseas hacer?")
+    }
+
     func testConnectorCatalogUsesUniqueIdentifiers() {
         let identifiers = ConnectorDefinition.catalog.map(\.id)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)

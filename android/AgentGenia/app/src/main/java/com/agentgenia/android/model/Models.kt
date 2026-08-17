@@ -270,12 +270,52 @@ fun JSONObject.toQuestionWidget(): BotQuestionWidget? {
 
 fun parseAgentAnswer(raw: String): GeneratedAnswer {
     val trimmed = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-    val parsed = runCatching { JSONObject(trimmed) }.getOrNull()
+    val parsed = firstAgentEnvelope(trimmed)
         ?: return GeneratedAnswer(raw.trim().take(20_000), null)
     return GeneratedAnswer(
         text = parsed.optString("text").trim().take(20_000),
         widget = parsed.optJSONObject("widget")?.toQuestionWidget(),
     )
+}
+
+private fun firstAgentEnvelope(value: String): JSONObject? {
+    fun decode(candidate: String): JSONObject? {
+        val parsed = runCatching { org.json.JSONTokener(candidate).nextValue() }.getOrNull()
+        return when (parsed) {
+            is JSONObject -> parsed
+            is String -> firstAgentEnvelope(parsed)
+            else -> null
+        }
+    }
+    decode(value)?.let { return it }
+    var start = -1
+    var depth = 0
+    var inString = false
+    var escaped = false
+    value.forEachIndexed { index, character ->
+        if (inString) {
+            when {
+                escaped -> escaped = false
+                character == '\\' -> escaped = true
+                character == '"' -> inString = false
+            }
+        } else {
+            when (character) {
+                '"' -> inString = true
+                '{' -> {
+                    if (depth == 0) start = index
+                    depth += 1
+                }
+                '}' -> if (depth > 0) {
+                    depth -= 1
+                    if (depth == 0 && start >= 0) {
+                        decode(value.substring(start, index + 1))?.let { return it }
+                    }
+                }
+            }
+        }
+    }
+    return null
 }
 
 fun JSONObject.optNullableString(key: String): String? =

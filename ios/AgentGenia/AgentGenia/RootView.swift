@@ -313,12 +313,12 @@ private struct MessageBubble: View {
         HStack {
             if message.role == .user { Spacer(minLength: 46) }
             VStack(alignment: .leading, spacing: 10) {
-                if message.role == .assistant && message.text.isEmpty {
+                if message.role == .assistant && message.text.isEmpty && message.widget == nil {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text("Pensando…").foregroundStyle(.secondary)
                     }
-                } else {
+                } else if !message.text.isEmpty {
                     Text(message.text)
                         .textSelection(.enabled)
                 }

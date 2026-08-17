@@ -508,6 +508,24 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
     handler.wfile.write(body)
 
 
+def _completion_message_text(body: bytes | None) -> str:
+    """Read a non-stream OpenAI-compatible assistant message safely."""
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
 def _partial_json_text(value: str) -> str | None:
     """Decode the completed prefix of a top-level JSON ``text`` string.
 
@@ -2546,6 +2564,7 @@ class Backend:
         *,
         browser: bool,
         computer: bool,
+        conversation_context: str = "",
     ) -> bool:
         if execution_mode == "agent" or browser or computer:
             return False
@@ -2571,7 +2590,14 @@ class Backend:
             r"computadora|navegador|browser|archivo|terminal|shell)\b)",
             re.IGNORECASE,
         )
-        return tool_intent.search(message) is None
+        if tool_intent.search(message):
+            return False
+        # A short follow-up such as "no necesita hora final" still belongs to
+        # the pending Calendar/tool turn even though it no longer repeats the
+        # provider name. The client supplies only recent conversation here;
+        # generic bot instructions are deliberately excluded by callers.
+        context = conversation_context.strip().lower()
+        return not context or tool_intent.search(context) is None
 
     def _run_direct_chat(
         self,
@@ -2678,8 +2704,8 @@ class Backend:
         if pending.strip():
             process_line(pending)
         self._mark_run_timing(run_id, "upstream_complete_ms")
-        self.record(user, provider, "/chat/completions", status, usage, run_id=run_id)
         if status < 200 or status >= 300:
+            self.record(user, provider, "/chat/completions", status, usage, run_id=run_id)
             message = "El proveedor no pudo completar la respuesta."
             if response_body:
                 try:
@@ -2691,6 +2717,52 @@ class Backend:
                     pass
             raise DirectChatError(status, message)
         answer = "".join(answer_parts).strip()
+        if not answer:
+            # Some OpenAI-compatible gateways occasionally acknowledge an SSE
+            # request with a terminal/usage frame but no content frame. Retry
+            # once as ordinary JSON so a valid model response is not surfaced
+            # to the app as "El modelo no devolvió texto".
+            logging.warning("Empty direct-chat stream; retrying as JSON run_id=%s", run_id)
+            retry_payload = dict(request_payload)
+            retry_payload["stream"] = False
+            retry_payload.pop("stream_options", None)
+            retry_status, _retry_headers, retry_body, retry_usage = proxy_request(
+                "POST",
+                provider["base_url"],
+                "/chat/completions",
+                {
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                    "user-agent": DEFAULT_UA,
+                },
+                json.dumps(
+                    retry_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                provider["api_key"],
+                timeout=httpx.Timeout(60.0, connect=20.0),
+            )
+            for field in (
+                "input_tokens", "output_tokens", "cached_read", "cached_write"
+            ):
+                first = getattr(usage, field, None)
+                second = getattr(retry_usage, field, None)
+                setattr(
+                    usage,
+                    field,
+                    None if first is None and second is None else int(first or 0) + int(second or 0),
+                )
+            usage.model = retry_usage.model or usage.model
+            status = retry_status
+            response_body = retry_body
+            answer = _completion_message_text(retry_body)
+            if answer and event_stream:
+                self._mark_run_timing(run_id, "first_visible_delta_ms")
+                event_stream.text_delta(answer)
+        self.record(user, provider, "/chat/completions", status, usage, run_id=run_id)
+        if status < 200 or status >= 300:
+            raise DirectChatError(status, "El proveedor no pudo completar la respuesta.")
         if not answer:
             raise DirectChatError(502, "El modelo no devolvió texto.", "empty_model_response")
         return PiRunResult(
@@ -2881,6 +2953,7 @@ class Backend:
             user_message,
             browser=browser,
             computer=computer_requested,
+            conversation_context=chat_prompt if connector_ids else "",
         )
         if direct_chat and chat_prompt.strip():
             effective_prompt = chat_prompt.strip()
