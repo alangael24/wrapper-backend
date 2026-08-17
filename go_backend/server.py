@@ -124,6 +124,7 @@ from .whatsapp import (
 )
 from .whatsapp_agent import (
     build_bot_prompt as build_whatsapp_bot_prompt,
+    connector_command as whatsapp_connector_command,
     create_bot_from_request,
     extract_link_code,
     parse_agent_answer as parse_whatsapp_agent_answer,
@@ -1691,6 +1692,97 @@ class Backend:
 
         state_payload = self._account_state_payload(self.store.get_account_state(user_id))
         state = state_payload["state"]
+        active_bot = next(
+            (
+                item for item in state.get("bots", [])
+                if item.get("id") == (link.get("active_bot_id") or state.get("activeBotId"))
+            ),
+            state.get("bots", [None])[0] if state.get("bots") else None,
+        )
+        connector_action = whatsapp_connector_command(text)
+        if (
+            connector_action == ("refresh", None)
+            and not self.store.has_pending_connector_auth_attempt(user_id)
+        ):
+            # "Listo" is common conversational language. Only reserve it for
+            # connector setup while this account actually has a live OAuth
+            # attempt; otherwise it belongs to the active agent.
+            connector_action = None
+        if connector_action:
+            action, connector_id = connector_action
+            active_bot_id = str(active_bot.get("id") or "") if active_bot else None
+            try:
+                if action in {"list", "refresh"}:
+                    snapshot = self.connector_gateway.snapshot(user_id)
+                    connected_ids = [
+                        str(item["connector_id"])
+                        for item in snapshot
+                        if item.get("connected") is True
+                    ]
+                    self._sync_whatsapp_connector_state(
+                        user_id=user_id,
+                        connected_ids=connected_ids,
+                        active_bot_id=active_bot_id,
+                    )
+                    if action == "refresh" and connected_ids:
+                        self.store.consume_connected_auth_attempts(user_id, connected_ids)
+                    names = [CONNECTOR_CATALOG[item]["name"] for item in connected_ids]
+                    if names:
+                        prefix = "Listo. Tus conexiones activas son:" if action == "refresh" else "Tus conexiones activas son:"
+                        answer = prefix + "\n• " + "\n• ".join(names)
+                    elif action == "refresh":
+                        answer = (
+                            "Todavía no detecto una autorización terminada. Completa el enlace "
+                            "del proveedor y vuelve a escribir “listo”."
+                        )
+                    else:
+                        answer = (
+                            "Todavía no tienes conexiones activas. Puedes decir, por ejemplo, "
+                            "“Conecta Gmail”."
+                        )
+                elif action == "disconnect" and connector_id:
+                    name = CONNECTOR_CATALOG[connector_id]["name"]
+                    self.connector_gateway.disconnect(user_id, connector_id)
+                    self._remove_whatsapp_connector_state(user_id, connector_id)
+                    answer = f"Listo. Desconecté {name} de tu cuenta y de tus agentes."
+                elif action == "connect" and connector_id:
+                    name = CONNECTOR_CATALOG[connector_id]["name"]
+                    status = self.connector_gateway.status(user_id, connector_id)
+                    if status.get("connected") is True:
+                        self._add_whatsapp_connector_state(
+                            user_id=user_id,
+                            connector_id=connector_id,
+                            active_bot_id=active_bot_id,
+                        )
+                        answer = f"{name} ya está conectado y disponible para este agente."
+                    else:
+                        started = self.connector_gateway.start(user_id, connector_id)
+                        authorize_url = str(started.get("authorize_url") or "")
+                        answer = (
+                            f"Para conectar {name}, abre este enlace seguro y autoriza tu cuenta:\n"
+                            f"{authorize_url}\n\n"
+                            "Cuando termines, vuelve aquí y escribe “listo”."
+                        )
+                else:  # pragma: no cover - defensa ante futuras acciones
+                    raise RuntimeError("Acción de conector no soportada")
+            except ConnectorBrokerError as exc:
+                connector_name = (
+                    CONNECTOR_CATALOG[connector_id]["name"] if connector_id else "esa conexión"
+                )
+                if exc.code == "connector_not_configured":
+                    answer = f"{connector_name} todavía no está disponible para conexión."
+                elif exc.code == "connector_rate_limit":
+                    answer = "Espera un minuto antes de iniciar otra conexión."
+                else:
+                    answer = f"No pude gestionar {connector_name} en este momento. Inténtalo de nuevo."
+            outbound = self.whatsapp.send_text(
+                to=sender, text=answer, reply_to_message_id=message_id
+            )
+            self.store.complete_whatsapp_message(
+                message_id=message_id, status="succeeded", result_text=answer,
+                outbound_message_id=outbound, user_id=user_id,
+            )
+            return
         if wants_bot_list(text):
             names = [bot["name"] for bot in state.get("bots", [])]
             answer = (
@@ -1710,6 +1802,7 @@ class Backend:
         created = create_bot_from_request(text)
         if created:
             created["id"] = "bot_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:16]
+            created["connectorIds"] = list(state.get("selectedConnectorIds", []))
 
             def add_created(current: dict) -> dict:
                 if not any(bot.get("id") == created["id"] for bot in current["bots"]):
@@ -1776,7 +1869,12 @@ class Backend:
             )
             return
 
-        prompt = build_whatsapp_bot_prompt(bot, text)
+        connector_ids = list(dict.fromkeys([
+            *state.get("selectedConnectorIds", []),
+            *bot.get("connectorIds", []),
+        ]))
+        bot_for_run = {**bot, "connectorIds": connector_ids}
+        prompt = build_whatsapp_bot_prompt(bot_for_run, text)
         user_message_id = "msg_wu_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
         assistant_message_id = "msg_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
         self._append_whatsapp_state_message(
@@ -1800,7 +1898,7 @@ class Backend:
                 "computer": False,
                 "stream": False,
                 "bot_id": bot["id"],
-                "connector_ids": bot.get("connectorIds", []),
+                "connector_ids": connector_ids,
                 "idempotency_key": "whatsapp:" + hashlib.sha256(message_id.encode()).hexdigest(),
             },
         )
@@ -1872,6 +1970,56 @@ class Backend:
                 return current
             raise RuntimeError("El agente de WhatsApp ya no existe")
         self._mutate_whatsapp_state(user_id, append)
+
+    def _add_whatsapp_connector_state(
+        self, *, user_id: str, connector_id: str, active_bot_id: str | None
+    ) -> None:
+        def add(current: dict) -> dict:
+            selected = list(current.get("selectedConnectorIds", []))
+            if connector_id not in selected:
+                selected.append(connector_id)
+            current["selectedConnectorIds"] = selected
+            for bot in current.get("bots", []):
+                if active_bot_id and bot.get("id") == active_bot_id:
+                    connector_ids = list(bot.get("connectorIds", []))
+                    if connector_id not in connector_ids:
+                        connector_ids.append(connector_id)
+                    bot["connectorIds"] = connector_ids
+                    break
+            return current
+        self._mutate_whatsapp_state(user_id, add)
+
+    def _sync_whatsapp_connector_state(
+        self, *, user_id: str, connected_ids: list[str], active_bot_id: str | None
+    ) -> None:
+        connected = list(dict.fromkeys(
+            item for item in connected_ids if item in CONNECTOR_CATALOG
+        ))
+
+        def sync(current: dict) -> dict:
+            current["selectedConnectorIds"] = connected
+            for bot in current.get("bots", []):
+                if active_bot_id and bot.get("id") == active_bot_id:
+                    bot["connectorIds"] = connected
+                    break
+            return current
+        self._mutate_whatsapp_state(user_id, sync)
+
+    def _remove_whatsapp_connector_state(
+        self, user_id: str, connector_id: str
+    ) -> None:
+        def remove(current: dict) -> dict:
+            current["selectedConnectorIds"] = [
+                item for item in current.get("selectedConnectorIds", [])
+                if item != connector_id
+            ]
+            for bot in current.get("bots", []):
+                bot["connectorIds"] = [
+                    item for item in bot.get("connectorIds", [])
+                    if item != connector_id
+                ]
+            return current
+        self._mutate_whatsapp_state(user_id, remove)
 
     # ---------- connector accounts ----------
     def handle_connectors_snapshot(self, handler: BaseHTTPRequestHandler) -> None:

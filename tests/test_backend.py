@@ -55,6 +55,7 @@ from go_backend.whatsapp import (  # noqa: E402
     verify_webhook_signature,
 )
 from go_backend.whatsapp_agent import (  # noqa: E402
+    connector_command,
     create_bot_from_request,
     extract_link_code,
     requested_bot,
@@ -580,6 +581,132 @@ class TestBackend(unittest.TestCase):
             requested_bot({"bots": [{"id": "sales", "name": "Ventas"}]}, "usa Ventas"),
             {"id": "sales", "name": "Ventas"},
         )
+        self.assertEqual(connector_command("Conecta Gmail"), ("connect", "google-workspace"))
+        self.assertEqual(connector_command("desconecta Salesforce"), ("disconnect", "salesforce"))
+        self.assertEqual(connector_command("¿Cuáles son mis conexiones?"), ("list", None))
+        self.assertEqual(connector_command("listo"), ("refresh", None))
+
+    def test_whatsapp_can_manage_connectors_and_assign_them_to_the_active_bot(self):
+        class FakeConnectorGateway:
+            def __init__(self, store):
+                self.store = store
+                self.connected: set[str] = set()
+                self.started: list[tuple[str, str]] = []
+                self.disconnected: list[tuple[str, str]] = []
+
+            def status(self, user_id, connector_id):
+                return {"connector_id": connector_id, "connected": connector_id in self.connected}
+
+            def start(self, user_id, connector_id):
+                self.started.append((user_id, connector_id))
+                self.store.create_connector_auth_attempt(
+                    attempt_id="attempt-whatsapp",
+                    user_id=user_id,
+                    connector_id=connector_id,
+                    driver="composio",
+                    connected_account_id="account-whatsapp",
+                    expires_at=time.time() + 600,
+                )
+                return {
+                    "attempt_id": "attempt-whatsapp",
+                    "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?state=secure",
+                }
+
+            def snapshot(self, _user_id):
+                return [
+                    {"connector_id": connector_id, "connected": connector_id in self.connected}
+                    for connector_id in CONNECTOR_CATALOG
+                ]
+
+            def disconnect(self, user_id, connector_id):
+                self.disconnected.append((user_id, connector_id))
+                self.connected.discard(connector_id)
+                return {"disconnected": True}
+
+        config, sent = self.configure_fake_whatsapp()
+        user = self.new_user(tier="pro")
+        auth = {"Authorization": f"Bearer {user['api_key']}"}
+        status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
+        self.assertEqual(status, 201)
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.connector.link", f"Vincular Agentgenia {started['code']}"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.connector.bot", "Crea un agente para ventas"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+
+        gateway = FakeConnectorGateway(self.ws.backend.store)
+        self.ws.backend.connector_gateway = gateway
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.connector.start", "Conecta Gmail"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertEqual(gateway.started, [(user["user_id"], "google-workspace")])
+        self.assertIn("accounts.google.com", sent[-1]["text"])
+        self.assertIn("escribe “listo”", sent[-1]["text"])
+        self.assertNotIn("Composio", sent[-1]["text"])
+
+        gateway.connected.update({"google-workspace", "canva"})
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.connector.ready", "listo"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertIn("Google Workspace", sent[-1]["text"])
+        self.assertIn("Canva", sent[-1]["text"])
+        status, state = self.ws.req("GET", "/v1/account-state", headers=auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(state["state"]["selectedConnectorIds"]),
+            {"google-workspace", "canva"},
+        )
+        self.assertEqual(
+            set(state["state"]["bots"][0]["connectorIds"]),
+            {"google-workspace", "canva"},
+        )
+
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.connector.remove", "Desconecta Gmail"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertEqual(gateway.disconnected, [(user["user_id"], "google-workspace")])
+        status, state = self.ws.req("GET", "/v1/account-state", headers=auth)
+        self.assertEqual(state["state"]["selectedConnectorIds"], ["canva"])
+        self.assertEqual(state["state"]["bots"][0]["connectorIds"], ["canva"])
+
+        captured: dict = {}
+
+        def fake_agent_run(internal):
+            captured.update(json.loads(internal.rfile.read()))
+            internal.send_response(200)
+            internal.wfile.write(json.dumps({"answer": '{"text":"hecho","widget":null}'}).encode())
+
+        with patch.object(self.ws.backend, "handle_agent_run", fake_agent_run):
+            self.send_whatsapp_webhook(
+                self.whatsapp_payload("wamid.connector.task", "Haz una presentación"),
+                config.app_secret,
+            )
+            self.ws.backend._process_whatsapp_message(
+                self.ws.backend.store.claim_whatsapp_message()
+            )
+        self.assertEqual(captured["connector_ids"], ["canva"])
+        self.assertEqual(sent[-1]["text"], "hecho")
 
     def test_whatsapp_link_is_one_time_and_messages_share_account_state_and_fast_path(self):
         config, sent = self.configure_fake_whatsapp()

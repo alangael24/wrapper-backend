@@ -808,6 +808,26 @@ class Store:
             return None
         return dict(row)
 
+    def has_pending_connector_auth_attempt(self, user_id: str) -> bool:
+        row = self._one(
+            "SELECT 1 AS pending FROM connector_auth_attempts WHERE user_id=? "
+            "AND status='pending' AND consumed_at IS NULL AND expires_at>? LIMIT 1",
+            (user_id, _now()),
+        )
+        return row is not None
+
+    def consume_connected_auth_attempts(
+        self, user_id: str, connector_ids: list[str]
+    ) -> None:
+        now = _now()
+        for connector_id in dict.fromkeys(connector_ids):
+            self._exec(
+                "UPDATE connector_auth_attempts SET status='complete',consumed_at=?,updated_at=? "
+                "WHERE user_id=? AND connector_id=? AND status='pending' "
+                "AND consumed_at IS NULL AND expires_at>?",
+                (now, now, user_id, connector_id, now),
+            )
+
     def claim_connector_poll(
         self, attempt_id: str, user_id: str, interval: float, *, now: float | None = None
     ) -> tuple[dict | None, bool]:

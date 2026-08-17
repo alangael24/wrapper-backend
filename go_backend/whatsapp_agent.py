@@ -8,6 +8,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
+from .connectors import CONNECTOR_CATALOG
 from .store import new_id
 
 
@@ -17,6 +18,37 @@ CREATE_BOT_RE = re.compile(
     r"(?:\s+(?:(?:llamad[oa]|que\s+se\s+llame)\s+([^,.!?]+)|(?:para|que)\s+(.+)))?",
     re.IGNORECASE,
 )
+
+CONNECTOR_ACTION_RE = {
+    "connect": re.compile(
+        r"\b(?:conecta|conectar|agrega|agregar|anade|anadir|instala|instalar|"
+        r"autoriza|autorizar|vincula|vincular|link|connect|add|install|authorize)\b"
+    ),
+    "disconnect": re.compile(
+        r"\b(?:desconecta|desconectar|quita|quitar|elimina|eliminar|"
+        r"desvincula|desvincular|disconnect|remove|unlink)\b"
+    ),
+}
+CONNECTOR_LIST_RE = re.compile(
+    r"\b(?:mis conexiones|mis conectores|mis plugins|conexiones conectadas|"
+    r"conectores conectados|plugins conectados|que conexiones tengo|"
+    r"que conectores tengo|que plugins tengo|list connections|my connections)\b"
+)
+CONNECTOR_REFRESH_RE = re.compile(
+    r"^(?:listo|ya conecte|ya lo conecte|ya autorice|termine|done|connected)$"
+)
+
+_CONNECTOR_ALIASES: dict[str, tuple[str, ...]] = {
+    "google-workspace": (
+        "google workspace", "gmail", "google calendar", "google drive",
+        "google contacts", "google sheets", "drive", "sheets",
+    ),
+    "microsoft-365": (
+        "microsoft 365", "office 365", "outlook", "onedrive", "microsoft teams",
+    ),
+    "monday-com": ("monday.com", "monday com", "monday"),
+    "quickbooks": ("quickbooks", "quick books"),
+}
 
 
 def extract_link_code(text: str) -> str | None:
@@ -33,6 +65,40 @@ def wants_bot_list(text: str) -> bool:
             normalized,
         )
     )
+
+
+def connector_command(text: str) -> tuple[str, str | None] | None:
+    """Parsea comandos de conectores sin enviar la intención al LLM.
+
+    El OAuth sigue siendo propiedad del gateway privado del backend. Esta
+    función únicamente convierte lenguaje natural en una acción cerrada y un
+    id presente en el catálogo.
+    """
+    normalized = _normalized(text)
+    if CONNECTOR_LIST_RE.search(normalized):
+        return "list", None
+    if CONNECTOR_REFRESH_RE.fullmatch(normalized):
+        return "refresh", None
+    action = next(
+        (name for name, pattern in CONNECTOR_ACTION_RE.items() if pattern.search(normalized)),
+        None,
+    )
+    if not action:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for connector_id, item in CONNECTOR_CATALOG.items():
+        aliases = {
+            _normalized(connector_id.replace("-", " ")),
+            _normalized(str(item["name"])),
+            *(_normalized(alias) for alias in _CONNECTOR_ALIASES.get(connector_id, ())),
+        }
+        for alias in aliases:
+            if alias and re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", normalized):
+                candidates.append((len(alias), connector_id))
+    if not candidates:
+        return None
+    # Prefer the most explicit name ("Google Calendar" over "Google").
+    return action, max(candidates)[1]
 
 
 def requested_bot(state: dict[str, Any], text: str) -> dict[str, Any] | None:

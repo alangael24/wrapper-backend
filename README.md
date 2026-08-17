@@ -301,9 +301,14 @@ consume una vez y liga una identidad de WhatsApp a una sola cuenta activa.
 
 Después del vínculo, frases como “mis agentes”, “usa Ventas”, “crea un agente
 para cotizaciones” o una tarea normal se enrutan contra el estado canónico de la
-cuenta. Crear y conversar desde WhatsApp aparece también en las apps. El número
-público no es un chatbot sin autenticación: mensajes que no contienen un código
-válido y no provienen de una cuenta ligada se ignoran.
+cuenta. También se aceptan “conecta Gmail”, “mis conexiones” y “desconecta
+Gmail”. Para conectar, WhatsApp devuelve el enlace OAuth seguro del proveedor;
+al terminar, “listo” consulta la autorización real y asigna la conexión a la
+cuenta y al agente activo. Una tarea normal recibe tanto los conectores elegidos
+para el bot como los conectores seleccionados desde cualquier otra app. Crear,
+conectar y conversar desde WhatsApp aparece también en Electron, iOS y Android.
+El número público no es un chatbot sin autenticación: mensajes que no contienen
+un código válido y no provienen de una cuenta ligada se ignoran.
 
 Meta firma cada POST con `X-Hub-Signature-256`. El servidor valida el cuerpo
 crudo, guarda el `message_id` antes de devolver 200 y procesa después mediante
