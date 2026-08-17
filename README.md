@@ -357,9 +357,11 @@ Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
 Amplitude, Mixpanel y Databricks. Microsoft 365 y HubSpot usan también Managed
 Auth. Los proveedores que requieren una app propia se activan con
-`COMPOSIO_AUTH_CONFIGS_JSON`. La primera conexión abre el inicio de sesión de
-Agent Genia y después el Connect Link oficial; los tokens administrados
-permanecen en Composio, nunca en el renderer ni en Pi.
+`COMPOSIO_AUTH_CONFIGS_JSON`. Cuando el conector tiene un Auth Config privado,
+la primera conexión abre directamente el consentimiento OAuth del proveedor;
+no muestra primero la página de Composio. Los conectores que todavía usan
+Managed Auth conservan el Connect Link obligatorio de Composio. Los tokens
+administrados permanecen en Composio, nunca en el renderer ni en Pi.
 
 Cuando Composio no ofrece Managed Auth, `wrapper-backend` usa su adaptador REST
 first-party para Nooks, Rippling, Salesloft, Tiendanube, Clay, DocuSign,

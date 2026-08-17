@@ -272,6 +272,34 @@ class FakeComposioAccounts:
         self.items: dict[str, SimpleNamespace] = {}
         self.list_calls: list[dict] = []
         self.get_calls: list[str] = []
+        self.initiate_calls: list[dict] = []
+
+    def initiate(self, user_id, auth_config_id, **options):
+        account_id = f"ca_{len(self.items) + 1}"
+        toolkit = {
+            "ac_agentgenia_salesforce": "salesforce",
+        }.get(auth_config_id, "custom")
+        self.initiate_calls.append({
+            "user_id": user_id,
+            "auth_config_id": auth_config_id,
+            **options,
+        })
+        self.items[account_id] = SimpleNamespace(
+            id=account_id,
+            user_id=user_id,
+            toolkit=toolkit,
+            status="INITIATED",
+            alias="",
+            data={},
+            status_reason="",
+        )
+        return SimpleNamespace(
+            id=account_id,
+            redirect_url=(
+                "https://login.salesforce.com/services/oauth2/authorize"
+                f"?state={account_id}"
+            ),
+        )
 
     def list(self, *, user_ids, statuses, limit, toolkit_slugs=None):
         self.list_calls.append({
@@ -2209,6 +2237,27 @@ class TestBackend(unittest.TestCase):
         self.assertFalse(health["all_connectors_available"])
         self.assertIn("salesforce", health["unavailable_connectors"])
         self.assertLess(health["available_connectors"], health["catalog_connectors"])
+
+    def test_composio_gateway_skips_connect_link_for_private_auth_config(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("direct-oauth-user")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+            store=self.ws.backend.store,
+        )
+
+        started = gateway.start(user_id, "salesforce")
+
+        self.assertTrue(started["authorize_url"].startswith("https://login.salesforce.com/"))
+        self.assertNotIn("composio", started["authorize_url"])
+        self.assertEqual(client.session_options, [])
+        self.assertEqual(client.connected_accounts.initiate_calls, [{
+            "user_id": user_id,
+            "auth_config_id": "ac_agentgenia_salesforce",
+            "callback_url": "https://agentgenia-api.onrender.com/connections/complete",
+        }])
 
     def test_composio_gateway_rate_limits_new_links_per_user(self):
         user_id = self.new_user("rate-user")["user_id"]

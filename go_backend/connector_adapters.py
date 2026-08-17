@@ -228,15 +228,30 @@ class ComposioConnectorGateway:
         self.store.prune_auth_attempts()
         if description.get("driver") == "native":
             return self.native_gateway.start(user_id, connector_id)  # type: ignore[union-attr]
-        session = self._session(user_id, connector_id)
+        session = None
         callback_url = (
             f"{self.public_base_url}/connections/complete" if self.public_base_url else None
         )
         try:
-            request = session.authorize(
-                description["toolkit"],
-                **({"callback_url": callback_url} if callback_url else {}),
-            )
+            auth_config = self._auth_config(connector_id, description["toolkit"])
+            if auth_config:
+                # A private Auth Config belongs to Agent Genia.  Using the
+                # connected-accounts endpoint returns the provider's OAuth URL
+                # directly for redirectable schemes instead of first showing
+                # Composio's hosted Connect Link page.  Managed Auth must keep
+                # using session.authorize(), because Composio requires its
+                # explicit hosted consent step for those shared OAuth apps.
+                request = self.client.connected_accounts.initiate(
+                    user_id,
+                    auth_config,
+                    **({"callback_url": callback_url} if callback_url else {}),
+                )
+            else:
+                session = self._session(user_id, connector_id)
+                request = session.authorize(
+                    description["toolkit"],
+                    **({"callback_url": callback_url} if callback_url else {}),
+                )
             account_id = str(getattr(request, "id", "") or "")
             authorize_url = _safe_authorize_url(str(getattr(request, "redirect_url", "") or ""))
             if not account_id:
