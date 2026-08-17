@@ -408,7 +408,7 @@ class Config:
             r"\D", "", os.environ.get("WHATSAPP_PUBLIC_NUMBER") or ""
         )
         self.whatsapp_graph_version = (
-            os.environ.get("WHATSAPP_GRAPH_VERSION") or "v23.0"
+            os.environ.get("WHATSAPP_GRAPH_VERSION") or "v25.0"
         ).strip()
         self.whatsapp_link_ttl_seconds = int(
             os.environ.get("WHATSAPP_LINK_TTL_SECONDS", "600")

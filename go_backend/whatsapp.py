@@ -63,7 +63,7 @@ class WhatsAppConfig:
         if missing:
             raise ValueError("Faltan variables de WhatsApp: " + ", ".join(missing))
         if not re.fullmatch(r"v\d+\.\d+", self.graph_version):
-            raise ValueError("WHATSAPP_GRAPH_VERSION debe verse como v23.0")
+            raise ValueError("WHATSAPP_GRAPH_VERSION debe verse como v25.0")
         if not self.public_number.isdigit() or not 7 <= len(self.public_number) <= 15:
             raise ValueError("WHATSAPP_PUBLIC_NUMBER debe usar E.164 sin el signo +")
         if not self.phone_number_id.isdigit():

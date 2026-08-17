@@ -46,7 +46,7 @@ services:
       - key: GOOGLE_OAUTH_REDIRECT_URI
         sync: false
       - key: WHATSAPP_ENABLED
-        value: "0"
+        value: "1"
       - key: WHATSAPP_VERIFY_TOKEN
         sync: false
       - key: WHATSAPP_APP_SECRET
@@ -58,7 +58,7 @@ services:
       - key: WHATSAPP_PUBLIC_NUMBER
         sync: false
       - key: WHATSAPP_GRAPH_VERSION
-        value: v23.0
+        value: v25.0
       - key: WHATSAPP_LINK_TTL_SECONDS
         value: "600"
       - key: APPLE_CLIENT_ID

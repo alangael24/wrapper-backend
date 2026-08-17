@@ -710,7 +710,7 @@ runtime se agrupan aquí por función.
 | `WHATSAPP_ACCESS_TOKEN` | vacío | Token server-side para enviar mensajes por Cloud API |
 | `WHATSAPP_PHONE_NUMBER_ID` | vacío | ID del número configurado en Meta |
 | `WHATSAPP_PUBLIC_NUMBER` | vacío | E.164 sin `+`, usado solo para construir `wa.me` |
-| `WHATSAPP_GRAPH_VERSION` | `v23.0` | Versión explícita de Graph API |
+| `WHATSAPP_GRAPH_VERSION` | `v25.0` | Versión explícita de Graph API |
 | `WHATSAPP_LINK_TTL_SECONDS` | `600` | Vida del código; rango 120–3600 segundos |
 
 ### Stripe
