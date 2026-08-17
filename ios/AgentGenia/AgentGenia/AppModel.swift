@@ -655,15 +655,19 @@ final class AppModel {
         let prompt = buildBotPrompt(bot: source, userText: userText, initial: initial)
         let turnID = initial ? "initial-\(botID.uuidString.lowercased())" : UUID().uuidString.lowercased()
         if !initial, let index = bots.firstIndex(where: { $0.id == botID }) {
-            bots[index].messages.append(BotMessage(
+            var updated = bots[index]
+            updated.messages.append(BotMessage(
                 id: UUID(uuidString: turnID) ?? UUID(), role: .user, text: userText, widget: nil, createdAt: Date()
             ))
+            bots[index] = updated
         }
         let replyID = UUID()
         if let index = bots.firstIndex(where: { $0.id == botID }) {
-            bots[index].messages.append(BotMessage(
+            var updated = bots[index]
+            updated.messages.append(BotMessage(
                 id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
             ))
+            bots[index] = updated
         }
         // Make the outgoing turn crash-safe locally without blocking dispatch
         // on the cross-region account-state API.
@@ -706,22 +710,26 @@ final class AppModel {
             else {
                 throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
             }
-            let createdAt = bots[index].messages[messageIndex].createdAt
-            bots[index].messages[messageIndex] = BotMessage(
+            var updated = bots[index]
+            let createdAt = updated.messages[messageIndex].createdAt
+            updated.messages[messageIndex] = BotMessage(
                 id: replyID,
                 role: .assistant,
                 text: generated.text,
                 widget: generated.widget,
                 createdAt: createdAt
             )
-            bots[index].messages = Array(bots[index].messages.suffix(200))
+            updated.messages = Array(updated.messages.suffix(200))
+            bots[index] = updated
             await persistLocalState(dirty: true)
             schedulePersist()
         } catch {
             if let index = bots.firstIndex(where: { $0.id == botID }) {
                 // A streamed answer can be useful even when the terminal frame
                 // is lost. Keep visible text; only remove an empty placeholder.
-                bots[index].messages.removeAll { $0.id == replyID && $0.text.isEmpty }
+                var updated = bots[index]
+                updated.messages.removeAll { $0.id == replyID && $0.text.isEmpty }
+                bots[index] = updated
             }
             await persistLocalState(dirty: true)
             schedulePersist()
@@ -734,14 +742,19 @@ final class AppModel {
               let botIndex = bots.firstIndex(where: { $0.id == botID }),
               let messageIndex = bots[botIndex].messages.firstIndex(where: { $0.id == messageID })
         else { return }
-        let current = bots[botIndex].messages[messageIndex]
-        bots[botIndex].messages[messageIndex] = BotMessage(
+        var updated = bots[botIndex]
+        let current = updated.messages[messageIndex]
+        updated.messages[messageIndex] = BotMessage(
             id: current.id,
             role: current.role,
             text: String((current.text + delta).prefix(20_000)),
             widget: nil,
             createdAt: current.createdAt
         )
+        // Replacing the value in the observable array reliably invalidates the
+        // SwiftUI bot/chat view. Mutating messages through a nested subscript
+        // can leave the rendered value stale even though persistence succeeds.
+        bots[botIndex] = updated
     }
 
     private func currentState() -> PersistedAccountState {

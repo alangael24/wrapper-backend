@@ -580,6 +580,10 @@ class _AgentEventStream:
         self.handler.send_header("Cache-Control", "no-store, no-cache, max-age=0")
         self.handler.send_header("Pragma", "no-cache")
         self.handler.send_header("X-Accel-Buffering", "no")
+        # Give mobile clients a recovery handle before reading the first SSE
+        # frame. A cellular/proxy transition can discard that first frame even
+        # though the response headers arrived and the durable run continues.
+        self.handler.send_header("X-Agent-Run-Id", run_id)
         # HTTP/1.1 requires an explicit body delimiter for a persistent stream.
         # Relying on connection-close made Render/Cloudflare surface a normal
         # SSE completion as URLError.networkConnectionLost (-1005) on iOS.

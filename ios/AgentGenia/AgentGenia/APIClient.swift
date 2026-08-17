@@ -684,7 +684,12 @@ actor APIClient {
 
         var parser = ServerSentEventParser()
         var finalResponse: AgentRunResponse?
-        var runID: String?
+        // Prefer the response header because it arrives before any streamed
+        // body bytes. Keep parsing the start event for backwards compatibility
+        // while older backend instances drain during a deployment.
+        var runID = response.value(forHTTPHeaderField: "X-Agent-Run-Id")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if runID?.isEmpty == true { runID = nil }
         var streamedText = ""
         var pendingDelta = ""
         var lastDeltaFlush = Date.distantPast

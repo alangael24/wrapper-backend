@@ -1782,6 +1782,7 @@ class TestBackend(unittest.TestCase):
             for frame in frames
             if frame.splitlines()[0] == "event: start"
         )
+        self.assertEqual(response_headers["X-Agent-Run-Id"], run_id)
         saved_run = self.ws.backend.store.get_agent_run(run_id)
         timings = json.loads(saved_run["warnings_json"])[0]
         self.assertTrue(timings.startswith("timing:"))
