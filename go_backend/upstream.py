@@ -30,7 +30,8 @@ _CLIENT = httpx.Client(
     http2=False,
     follow_redirects=False,
     timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=20.0),
-    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=60.0),
+    # Reuse TLS connections across normal pauses between chat messages.
+    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=300.0),
 )
 
 

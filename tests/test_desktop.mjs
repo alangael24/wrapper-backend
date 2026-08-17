@@ -266,8 +266,8 @@ test("runs bot conversations through wrapper-backend without hardcoded replies",
   ]);
   assert.match(main, /desktop:run-bot-agent/);
   assert.match(main, /buildBotPrompt\(\{ \.\.\.bot, connectorIds \}, prompt, initial\)/);
-  assert.match(main, /executionMode: initial \? "agent" : "auto"/);
-  assert.match(main, /chatPrompt: buildDirectChatPrompt/);
+  assert.match(main, /executionMode: initial \? "chat" : "auto"/);
+  assert.match(main, /chatPrompt: initial[\s\S]{0,160}\? buildBotPrompt[\s\S]{0,160}: buildDirectChatPrompt/);
   assert.match(main, /\.\.\.before\.selectedConnectorIds/);
   assert.match(main, /\.\.\.bot\.connectorIds/);
   assert.match(oauth, /\$\{this\.options\.baseUrl\}\/v1\/agent\/run/);
@@ -410,7 +410,7 @@ test("stores real OAuth sessions outside the renderer and binds them to one sign
     readFile(new URL("../desktop/src/preload.ts", import.meta.url), "utf8"),
     readFile(new URL("../desktop/src/renderer.ts", import.meta.url), "utf8")
   ]);
-  assert.match(oauth, /safeStorage\.encryptString/);
+  assert.match(oauth, /safeStorage\.encryptStringAsync/);
   assert.match(oauth, /agent-genia-account\.bin/);
   assert.doesNotMatch(oauth, /agent-genia-connectors-account\.bin/);
   assert.match(oauth, /WrapperServiceClient/);
@@ -442,6 +442,13 @@ test("desktop layer does not import or rewrite the Pi harness", async () => {
   for (const source of files) assert.doesNotMatch(source, /pi_harness|go_backend/);
 });
 
+test("keeps account settings visible while a long bot list scrolls independently", async () => {
+  const styles = await readFile(new URL("../desktop/renderer/styles.css", import.meta.url), "utf8");
+  assert.match(styles, /\.desktop-sidebar \{[^}]*min-height: 0;[^}]*height: 100%;[^}]*overflow: hidden;/);
+  assert.match(styles, /\.sidebar-nav \{[^}]*flex: 1 1 auto;[^}]*min-height: 0;[^}]*overflow-y: auto;/);
+  assert.match(styles, /\.sidebar-footer \{[^}]*flex: 0 0 auto;/);
+});
+
 test("resolves Electron build inputs as native paths on Windows", async () => {
   const buildScript = await readFile(new URL("../desktop/build.mjs", import.meta.url), "utf8");
   assert.match(buildScript, /fileURLToPath/);
@@ -464,7 +471,9 @@ test("runs packaged smoke tests with isolated temporary user data on every deskt
   ]);
   assert.match(main, /mkdtempSync\(path\.join\(tmpdir\(\), "agentgenia-smoke-"\)\)/);
   assert.match(main, /app\.setPath\("userData", smokeUserDataPath\)/);
-  assert.match(oauth, /const encrypted = await readFile\(this\.options\.filePath\);[\s\S]{0,160}safeStorage\.isEncryptionAvailable/);
+  assert.match(main, /Create the first BrowserWindow before touching Keychain-backed session/);
+  assert.match(main, /createWindow\(\);[\s\S]{0,360}did-finish-load[\s\S]{0,180}oauthController\.accountId\(\)/);
+  assert.match(oauth, /safeStorage\.isAsyncEncryptionAvailable/);
   assert.match(workflow, /Launch packaged macOS application/);
   assert.match(workflow, /Launch packaged Windows application/);
   assert.match(workflow, /Launch packaged Linux application/);

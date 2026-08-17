@@ -151,7 +151,7 @@ button { color: inherit; }
 
 .desktop-shell { position: relative; display: grid; grid-template-columns: 480px minmax(0, 1fr); height: 100%; overflow: hidden; background: white; }
 .desktop-shell.has-settings { grid-template-columns: 390px minmax(0, 1fr) 420px; }
-.desktop-sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid #dadadc; background: #f7f7f7; padding: 14px 12px 12px; }
+.desktop-sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; border-right: 1px solid #dadadc; background: #f7f7f7; padding: 14px 12px 12px; }
 .sidebar-window-bar { display: flex; min-height: 30px; align-items: center; justify-content: space-between; padding: 0 5px; }
 .traffic-lights { display: flex; gap: 12px; }
 .traffic-lights i { width: 14px; height: 14px; border-radius: 50%; background: #ff5f57; }
@@ -164,7 +164,7 @@ button { color: inherit; }
 .sidebar-search svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-width: 1.8; }
 .sidebar-search input { min-width: 0; border: 0; outline: 0; background: transparent; padding: 11px 0; font-size: 15px; }
 .sidebar-search input::placeholder { color: #9c9ca0; }
-.sidebar-nav { display: grid; align-content: start; gap: 5px; overflow-y: auto; }
+.sidebar-nav { display: grid; flex: 1 1 auto; min-height: 0; align-content: start; gap: 5px; overflow-y: auto; overscroll-behavior: contain; }
 .sidebar-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 11px; width: 100%; border: 0; border-radius: 13px; background: transparent; padding: 10px; text-align: left; cursor: pointer; }
 .sidebar-row:hover { background: #eaeaec; }
 .sidebar-row.selected { background: #dededf; }
@@ -177,7 +177,7 @@ button { color: inherit; }
 .sidebar-connector-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 12px; background: #fff; color: #343437; box-shadow: 0 0 0 1px #dedee0; font-size: 15px; }
 .sidebar-connector-icon svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .sidebar-empty { display: grid; flex: 1; place-items: center; color: #a7a7aa; font-size: 12px; }
-.sidebar-footer { display: grid; gap: 4px; margin-top: auto; }
+.sidebar-footer { display: grid; flex: 0 0 auto; gap: 4px; margin-top: auto; }
 .sidebar-footer-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 11px; width: 100%; border: 0; border-radius: 13px; background: transparent; padding: 8px 10px; text-align: left; cursor: pointer; }
 .sidebar-footer-row:hover { background: #eaeaec; }
 .sidebar-footer-row strong { font-size: 13px; }

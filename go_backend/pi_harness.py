@@ -418,7 +418,11 @@ class PiHarness:
                             "contextWindow": 1_000_000,
                             "maxTokens": 384_000,
                             "thinkingLevelMap": {
-                                "off": None,
+                                # pi-ai's DeepSeek adapter only emits
+                                # thinking:{type:"disabled"} when the off
+                                # mapping is non-null. DeepSeek otherwise
+                                # defaults right back to high-effort thinking.
+                                "off": "off",
                                 "minimal": None,
                                 "low": None,
                                 "medium": None,

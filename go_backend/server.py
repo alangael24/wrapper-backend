@@ -330,10 +330,10 @@ class Config:
         ).rstrip("/")
         self.pi_runs_dir = Path(os.environ.get("PI_RUNS_DIR", str(DEFAULT_PI_RUNS)))
         self.pi_model = os.environ.get("PI_MODEL", "deepseek-v4-flash")
-        # Fast is the product default. Complex computer/tool tasks can still
-        # deliberate inside the harness, but ordinary chat should not pay the
-        # latency of forcing maximum reasoning on every turn.
-        self.pi_thinking = os.environ.get("PI_THINKING", "low")
+        # DeepSeek currently maps both `low` and `medium` to `high`. Keep the
+        # agent/tool path honest and deliberate; the latency-sensitive direct
+        # chat path explicitly disables thinking in `_run_direct_chat`.
+        self.pi_thinking = os.environ.get("PI_THINKING", "high")
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
@@ -1746,6 +1746,9 @@ class Backend:
             self.store.get_user_by_id(user_id) or link,
             {
                 "prompt": prompt,
+                "execution_mode": "auto",
+                "chat_prompt": prompt,
+                "user_message": text,
                 "browser": False,
                 "computer": False,
                 "stream": False,
@@ -2355,14 +2358,27 @@ class Backend:
             str(user["id"]).encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        request_body = json.dumps({
+        request_payload: dict[str, object] = {
             "model": self.cfg.pi_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": 2048,
+            "max_tokens": 1024,
             "user_id": provider_user_id,
-        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        }
+        if self.cfg.pi_model.startswith("deepseek-"):
+            # DeepSeek V4 enables thinking by default. Direct chat is the
+            # latency-sensitive path for conversation and drafting, so do not
+            # spend a hidden high-effort reasoning pass before the first
+            # visible token. This applies to both the first-party API and the
+            # OpenCode Zen OpenAI-compatible endpoint. Tool/computer work still
+            # uses Pi with thinking.
+            request_payload["thinking"] = {"type": "disabled"}
+        request_body = json.dumps(
+            request_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
         def process_line(line: str) -> None:
             line = line.strip()

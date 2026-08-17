@@ -511,7 +511,7 @@ class TestBackend(unittest.TestCase):
             {"id": "sales", "name": "Ventas"},
         )
 
-    def test_whatsapp_link_is_one_time_and_messages_share_account_state_and_agent_path(self):
+    def test_whatsapp_link_is_one_time_and_messages_share_account_state_and_fast_path(self):
         config, sent = self.configure_fake_whatsapp()
         self.ws.enable_fake_pi()
         user = self.new_user(tier="pro")
@@ -589,7 +589,8 @@ class TestBackend(unittest.TestCase):
         self.ws.backend._process_whatsapp_message(
             self.ws.backend.store.claim_whatsapp_message()
         )
-        self.assertIn("fake-pi", sent[-1]["text"])
+        self.assertEqual(sent[-1]["text"], "hola")
+        self.assertEqual(self.ws.backend.pi._sessions, {})
         status, state = self.ws.req("GET", "/v1/account-state", headers=auth)
         messages = state["state"]["bots"][0]["messages"]
         self.assertEqual([item["role"] for item in messages[-2:]], ["user", "assistant"])
@@ -1026,6 +1027,36 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(
             MockUpstream.requests[-1][2]["Authorization"],
             "Bearer sk-deepseek-server",
+        )
+
+        MockUpstream.requests.clear()
+        status, result = ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy agent prompt",
+                "chat_prompt": "Reply briefly: hola",
+                "user_message": "hola",
+                "execution_mode": "auto",
+                "bot_id": "bot-opencode-chat",
+                "idempotency_key": "private-opencode-chat",
+            },
+            headers=opencode_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result["execution_path"], "direct_chat")
+        opencode_request = next(
+            request
+            for request in MockUpstream.requests
+            if request[1] == "/v1/chat/completions"
+        )
+        self.assertEqual(
+            opencode_request[2]["Authorization"],
+            "Bearer sk-opencode-private",
+        )
+        self.assertEqual(
+            json.loads(opencode_request[3])["thinking"],
+            {"type": "disabled"},
         )
 
     def test_unlimited_opencode_account_runs_pi_without_consuming_credits(self):
@@ -1888,6 +1919,8 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(len(upstream), 1)
         sent = json.loads(upstream[0][3])
         self.assertEqual(sent["messages"][0]["content"], "Reply briefly to the user: hola")
+        self.assertEqual(sent["thinking"], {"type": "disabled"})
+        self.assertEqual(sent["max_tokens"], 1024)
 
     def test_direct_chat_streams_first_visible_model_delta(self):
         signup = self.new_user()
@@ -2009,6 +2042,7 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(
             model["compat"]["requiresReasoningContentOnAssistantMessages"]
         )
+        self.assertEqual(model["thinkingLevelMap"]["off"], "off")
         self.assertNotIn("extraBody", model)
 
     def test_connector_broker_scopes_catalog_and_execution_to_run_grant(self):

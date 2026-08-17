@@ -390,8 +390,8 @@ class AppViewModel(
                 botId = botId,
                 connectorIds = connectors,
                 idempotencyKey = turnId,
-                executionMode = if (initial) "agent" else "auto",
-                chatPrompt = if (initial) "" else buildDirectChatPrompt(original, userText),
+                executionMode = if (initial) "chat" else "auto",
+                chatPrompt = if (initial) prompt else buildDirectChatPrompt(original, userText),
                 userMessage = userText,
             ))
             if (generated.text.isBlank()) throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)

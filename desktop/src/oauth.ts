@@ -835,14 +835,14 @@ class DeviceIdentityStore {
   }
 
   private async loadOrCreate(): Promise<string> {
-    if (!this.options.safeStorage.isEncryptionAvailable()) throw new Error("Desbloquea la sesión del sistema para iniciar sesión.");
+    if (!await this.options.safeStorage.isAsyncEncryptionAvailable()) throw new Error("Desbloquea la sesión del sistema para iniciar sesión.");
     try {
-      const existing = this.options.safeStorage.decryptString(await readFile(this.filePath));
+      const existing = (await this.options.safeStorage.decryptStringAsync(await readFile(this.filePath))).result;
       if (/^[0-9a-f-]{36}$/i.test(existing)) return existing;
     } catch {}
     const identity = randomUUID();
     await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
-    await writeFile(this.filePath, this.options.safeStorage.encryptString(identity), { mode: 0o600 });
+    await writeFile(this.filePath, await this.options.safeStorage.encryptStringAsync(identity), { mode: 0o600 });
     await chmod(this.filePath, 0o600);
     return identity;
   }
@@ -863,8 +863,8 @@ class EncryptedJsonStore<T> {
   async get(): Promise<T | null> {
     try {
       const encrypted = await readFile(this.options.filePath);
-      if (!this.options.safeStorage.isEncryptionAvailable()) return null;
-      const value: unknown = JSON.parse(this.options.safeStorage.decryptString(encrypted));
+      if (!await this.options.safeStorage.isAsyncEncryptionAvailable()) return null;
+      const value: unknown = JSON.parse((await this.options.safeStorage.decryptStringAsync(encrypted)).result);
       return this.options.validate(value) ? value : null;
     } catch {
       return null;
@@ -873,11 +873,11 @@ class EncryptedJsonStore<T> {
 
   async set(value: T): Promise<void> {
     if (!this.options.validate(value)) throw new Error("El servicio OAuth devolvió una sesión inválida.");
-    if (!this.options.safeStorage.isEncryptionAvailable()) throw new Error("Desbloquea la sesión del sistema para guardar la cuenta.");
+    if (!await this.options.safeStorage.isAsyncEncryptionAvailable()) throw new Error("Desbloquea la sesión del sistema para guardar la cuenta.");
     await mkdir(path.dirname(this.options.filePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.options.filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
     try {
-      await writeFile(temporary, this.options.safeStorage.encryptString(JSON.stringify(value)), { mode: 0o600, flag: "wx" });
+      await writeFile(temporary, await this.options.safeStorage.encryptStringAsync(JSON.stringify(value)), { mode: 0o600, flag: "wx" });
       await rename(temporary, this.options.filePath);
       await chmod(this.options.filePath, 0o600);
     } finally {

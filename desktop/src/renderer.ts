@@ -170,6 +170,7 @@ const avatarSaveSequences = new Map<string, number>();
 const initialConversationRetryAfter = new Map<string, number>();
 const agentWarmTasks = new Map<string, Promise<boolean>>();
 const warmedBotUntil = new Map<string, number>();
+let scheduledAgentWarmTimer = 0;
 
 const desktopApi = window.wrapperDesktop ?? createPreviewApi();
 const removeAgentDeltaListener = desktopApi.onAgentDelta(({ botId, text }) => {
@@ -191,6 +192,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("beforeunload", () => {
   removeAgentDeltaListener();
   if (whatsAppPollTimer) window.clearTimeout(whatsAppPollTimer);
+  if (scheduledAgentWarmTimer) window.clearTimeout(scheduledAgentWarmTimer);
   if (!teachStatus.botId) return;
   cleanupTeachMedia();
   void desktopApi.discardTeachRecording(teachStatus.botId);
@@ -232,7 +234,7 @@ async function initialize(): Promise<void> {
   void refreshConnections();
   const activeBotId = state.activeBotId ?? state.bots[0]?.id ?? "";
   if (activeView === "bot-detail" && activeBotId) {
-    void warmBotAgent(activeBotId);
+    scheduleBotWarm(activeBotId);
     void refreshComputerStatus(activeBotId);
   }
   window.setInterval(() => void refreshTeachStatus(), 1_000);
@@ -246,7 +248,7 @@ async function resumeActiveBot(): Promise<void> {
   else await refreshConnections();
   const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
   if (activeView === "bot-detail" && botId) {
-    void warmBotAgent(botId);
+    scheduleBotWarm(botId);
     maybeInitializeBotConversation(botId);
   }
 }
@@ -269,7 +271,7 @@ async function refreshConnections(): Promise<void> {
     if (!sameValue(previousConnections, connections) || !sameValue(previousState, state) || previousView !== activeView) render();
     const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
     if (connections.account.connected && activeView === "bot-detail" && botId) {
-      void warmBotAgent(botId);
+      scheduleBotWarm(botId);
       maybeInitializeBotConversation(botId);
     }
   } catch {
@@ -1364,7 +1366,6 @@ function bindBotChat(bot: BotProfile): void {
   const form = document.querySelector<HTMLFormElement>(".message-composer");
   const input = form?.elements.namedItem("message") as HTMLInputElement | null;
   input?.addEventListener("input", () => botMessageDrafts.set(bot.id, input.value));
-  input?.addEventListener("focus", () => void warmBotAgent(bot.id));
   form?.addEventListener("submit", (event) => {
     event.preventDefault();
     const message = input?.value.trim() ?? "";
@@ -1451,7 +1452,6 @@ async function initializeBotConversation(botId: string): Promise<void> {
   transientError = "";
   render();
   try {
-    void warmBotAgent(botId);
     state = await desktopApi.runBotAgent(botId, "", true);
     initialConversationRetryAfter.delete(botId);
   } catch (error) {
@@ -1462,6 +1462,7 @@ async function initializeBotConversation(botId: string): Promise<void> {
     pendingUserMessage = "";
     streamingAssistantText = "";
     render();
+    scheduleBotWarm(botId, 0);
     void refreshComputerStatus(botId);
   }
 }
@@ -1489,6 +1490,7 @@ async function sendBotMessage(botId: string, message: string): Promise<void> {
     pendingUserMessage = "";
     streamingAssistantText = "";
     render();
+    scheduleBotWarm(botId, 0);
     void refreshComputerStatus(botId);
   }
 }
@@ -2107,7 +2109,7 @@ async function selectBot(botId: string): Promise<void> {
   }
   render();
   if (state.activeBotId === botId) {
-    void warmBotAgent(botId);
+    scheduleBotWarm(botId);
     void refreshComputerStatus(botId);
     maybeInitializeBotConversation(botId);
   }
@@ -2127,6 +2129,18 @@ async function warmBotAgent(botId: string): Promise<boolean> {
     .finally(() => agentWarmTasks.delete(botId));
   agentWarmTasks.set(botId, task);
   return task;
+}
+
+function scheduleBotWarm(botId: string, delayMs = 1_500): void {
+  if (!connections.account.connected || !botId) return;
+  if ((warmedBotUntil.get(botId) ?? 0) > Date.now()) return;
+  if (scheduledAgentWarmTimer) window.clearTimeout(scheduledAgentWarmTimer);
+  scheduledAgentWarmTimer = window.setTimeout(() => {
+    scheduledAgentWarmTimer = 0;
+    if (connections.account.connected && state.activeBotId === botId && !agentBusyBotId) {
+      void warmBotAgent(botId);
+    }
+  }, Math.max(0, delayMs));
 }
 
 function closeBotSettings(): void {

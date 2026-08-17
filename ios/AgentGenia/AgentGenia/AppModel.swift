@@ -227,11 +227,14 @@ final class AppModel {
     }
 
     func prepareBot(botID: UUID) async {
-        // Warming is speculative and must never block the first visible turn.
-        // The backend coordinates the rare race where a Pi task arrives while
-        // this background warm-up is still starting.
-        Task { await warmAgent(botID: botID) }
+        // Generate the visible first turn before starting Pi. Most messages use
+        // the direct chat path, so speculative process startup must not compete
+        // with the response the user is waiting to see.
         await sendInitialMessageIfNeeded(botID: botID)
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            await warmAgent(botID: botID)
+        }
     }
 
     private func warmAgent(botID: UUID) async {
@@ -669,8 +672,10 @@ final class AppModel {
                     botID: botID,
                     connectorIDs: connectorIDs,
                     idempotencyKey: turnID,
-                    executionMode: initial ? "agent" : "auto",
-                    chatPrompt: initial ? "" : buildDirectChatPrompt(bot: source, userText: userText),
+                    executionMode: initial ? "chat" : "auto",
+                    chatPrompt: initial
+                        ? prompt
+                        : buildDirectChatPrompt(bot: source, userText: userText),
                     userMessage: userText,
                     computer: false,
                     onDelta: { [weak self] delta in
