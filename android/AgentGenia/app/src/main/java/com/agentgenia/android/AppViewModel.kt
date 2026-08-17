@@ -367,9 +367,10 @@ class AppViewModel(
     }
 
     private fun sendInitialMessageIfNeeded(botId: String) {
-        if (_state.value.profile?.tier == "free") return
         val bot = _state.value.bots.firstOrNull { it.id == botId } ?: return
-        if (bot.messages.isEmpty()) runAgent(botId, "", initial = true)
+        if (shouldSendInitialBotMessage(_state.value.profile?.tier, bot)) {
+            runAgent(botId, "", initial = true)
+        }
     }
 
     private fun runAgent(botId: String, userText: String, initial: Boolean) = viewModelScope.launch {
@@ -448,6 +449,11 @@ class AppViewModel(
             }
     }
 }
+
+/** The backend, not a cached client tier label, owns model entitlements. */
+@Suppress("UNUSED_PARAMETER")
+internal fun shouldSendInitialBotMessage(tier: String?, bot: BotProfile?): Boolean =
+    bot?.messages?.isEmpty() == true
 
 internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean): String {
     val history = bot.messages.takeLast(20).joinToString("\n") { message ->

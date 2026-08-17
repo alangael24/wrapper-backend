@@ -27,6 +27,30 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(restored, state)
     }
 
+    func testFreeTierLabelDoesNotSuppressServerAuthorizedBotOnboarding() {
+        let emptyBot = BotProfile(
+            id: UUID(), name: "Nuevo bot", title: "", description: "",
+            color: "#2f91f5", shape: .circle, notificationsEnabled: true,
+            connectorIDs: [], messages: [], createdAt: Date()
+        )
+        XCTAssertTrue(shouldSendInitialBotMessage(tier: "free", bot: emptyBot))
+        XCTAssertTrue(shouldSendInitialBotMessage(tier: "pro", bot: emptyBot))
+
+        let answeredBot = BotProfile(
+            id: UUID(), name: "Listo", title: "", description: "",
+            color: "#2f91f5", shape: .circle, notificationsEnabled: true,
+            connectorIDs: [],
+            messages: [
+                BotMessage(
+                    id: UUID(), role: .assistant, text: "Hola", widget: nil,
+                    createdAt: Date()
+                )
+            ],
+            createdAt: Date()
+        )
+        XCTAssertFalse(shouldSendInitialBotMessage(tier: "free", bot: answeredBot))
+    }
+
     func testConnectorCatalogUsesUniqueIdentifiers() {
         let identifiers = ConnectorDefinition.catalog.map(\.id)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)

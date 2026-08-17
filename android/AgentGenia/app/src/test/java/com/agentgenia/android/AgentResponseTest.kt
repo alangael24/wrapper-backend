@@ -43,6 +43,19 @@ class AgentResponseTest {
     }
 
     @Test
+    fun freeTierLabelDoesNotSuppressServerAuthorizedBotOnboarding() {
+        assertTrue(shouldSendInitialBotMessage("free", BotProfile(name = "Nuevo bot")))
+        assertTrue(shouldSendInitialBotMessage("pro", BotProfile(name = "Nuevo bot")))
+        assertTrue(!shouldSendInitialBotMessage(
+            "free",
+            BotProfile(
+                name = "Listo",
+                messages = listOf(BotMessage(role = MessageRole.Assistant, text = "Hola")),
+            ),
+        ))
+    }
+
+    @Test
     fun promptNamesOnlyTheEffectiveConnectors() {
         val prompt = buildBotPrompt(
             BotProfile(name = "Atlas", connectorIds = listOf("github", "slack")),

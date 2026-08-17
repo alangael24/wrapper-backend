@@ -215,8 +215,10 @@ final class AppModel {
     }
 
     func sendInitialMessageIfNeeded(botID: UUID) async {
-        guard profile?.tier != "free" else { return }
-        guard let bot = bots.first(where: { $0.id == botID }), bot.messages.isEmpty else { return }
+        guard shouldSendInitialBotMessage(
+            tier: profile?.tier,
+            bot: bots.first(where: { $0.id == botID })
+        ) else { return }
         await runAgent(botID: botID, userText: "", initial: true)
     }
 
@@ -927,6 +929,13 @@ private actor AccountStateStore {
         let digest = SHA256.hash(data: Data(accountID.utf8)).map { String(format: "%02x", $0) }.joined()
         return root.appending(path: "AgentGenia/accounts/\(digest).json")
     }
+}
+
+/// Plans and private overrides are server-side entitlements. The clients must
+/// never suppress the first conversation from a stale or simplified tier
+/// label; `/v1/agent/run` remains the sole access-control authority.
+func shouldSendInitialBotMessage(tier _: String?, bot: BotProfile?) -> Bool {
+    bot?.messages.isEmpty == true
 }
 
 private func mergeAccountStates(
