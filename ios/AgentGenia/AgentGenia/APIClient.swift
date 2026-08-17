@@ -454,14 +454,26 @@ actor APIClient {
             connectorIDs: connectorIDs,
             maxCredits: 15,
             idempotencyKey: idempotencyKey,
-            stream: true
+            // Foundation has repeatedly lost otherwise valid SSE terminal
+            // frames on physical iPhones behind Render. Mobile uses a normal
+            // JSON response; the backend still persists the run before
+            // replying, and the same idempotency key makes a retry recover it.
+            stream: false
         )
-        return try await streamAgent(
-            bodyData: try encoder.encode(request),
-            authorization: try await accessToken(),
-            canRefresh: true,
-            onDelta: onDelta
-        )
+        _ = onDelta
+        do {
+            return try await self.request(
+                "/v1/agent/run", method: "POST", body: request
+            )
+        } catch let error as ServiceError where error.status == 0 {
+            // A response can be lost after the durable run has completed.
+            // Replaying the same idempotency key never starts a second run;
+            // production returns the saved answer (or waits for the original).
+            try await Task.sleep(for: .milliseconds(250))
+            return try await self.request(
+                "/v1/agent/run", method: "POST", body: request
+            )
+        }
     }
 
     func warmAgent(botID: UUID) async throws {

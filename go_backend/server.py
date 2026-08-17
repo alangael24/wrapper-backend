@@ -2741,6 +2741,22 @@ class Backend:
             raise
         if prepared["duplicate"]:
             existing = prepared["run"]
+            # A mobile client may retry after losing the HTTP response while
+            # the original request is still finishing. For non-streaming
+            # idempotent replays, briefly follow the durable row instead of
+            # returning a 409 that discards a result already in progress.
+            if not stream_requested and existing.get("status") in {"reserved", "running"}:
+                deadline = time.monotonic() + 60.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.2)
+                    refreshed = self.store.get_agent_run_for_user(
+                        existing["id"], user["id"]
+                    )
+                    if not refreshed:
+                        break
+                    existing = refreshed
+                    if existing.get("status") not in {"reserved", "running"}:
+                        break
             if existing.get("status") == "succeeded" and existing.get("result_json"):
                 try:
                     recovered = json.loads(existing["result_json"])
