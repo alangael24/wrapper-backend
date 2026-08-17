@@ -51,6 +51,73 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(shouldSendInitialBotMessage(tier: "free", bot: answeredBot))
     }
 
+    func testCompletedReplySurvivesMissingThinkingPlaceholder() throws {
+        let botID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let replyID = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+        let createdAt = Date(timeIntervalSince1970: 1_700_000_010)
+        var bots = [BotProfile(
+            id: botID,
+            name: "Nuevo bot",
+            title: "",
+            description: "",
+            color: "#2f91f5",
+            shape: .circle,
+            notificationsEnabled: true,
+            connectorIDs: [],
+            messages: [],
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )]
+
+        XCTAssertTrue(installAgentReply(
+            in: &bots,
+            botID: botID,
+            messageID: replyID,
+            text: "  Respuesta recuperada  ",
+            widget: nil,
+            createdAt: createdAt
+        ))
+        let message = try XCTUnwrap(bots.first?.messages.first)
+        XCTAssertEqual(message.id, replyID)
+        XCTAssertEqual(message.text, "Respuesta recuperada")
+        XCTAssertEqual(message.createdAt, createdAt)
+    }
+
+    func testCompletedReplyReplacesThinkingPlaceholderWithoutDuplication() throws {
+        let botID = UUID(uuidString: "00000000-0000-0000-0000-000000000004")!
+        let replyID = UUID(uuidString: "00000000-0000-0000-0000-000000000005")!
+        let createdAt = Date(timeIntervalSince1970: 1_700_000_020)
+        var bots = [BotProfile(
+            id: botID,
+            name: "Nuevo bot",
+            title: "",
+            description: "",
+            color: "#2f91f5",
+            shape: .circle,
+            notificationsEnabled: true,
+            connectorIDs: [],
+            messages: [BotMessage(
+                id: replyID,
+                role: .assistant,
+                text: "",
+                widget: nil,
+                createdAt: createdAt
+            )],
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )]
+
+        XCTAssertTrue(installAgentReply(
+            in: &bots,
+            botID: botID,
+            messageID: replyID,
+            text: "Lista",
+            widget: nil,
+            createdAt: Date()
+        ))
+        XCTAssertEqual(bots[0].messages.count, 1)
+        XCTAssertEqual(bots[0].messages[0].text, "Lista")
+        XCTAssertEqual(bots[0].messages[0].createdAt, createdAt)
+    }
+
     func testConnectorCatalogUsesUniqueIdentifiers() {
         let identifiers = ConnectorDefinition.catalog.map(\.id)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)

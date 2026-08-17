@@ -662,10 +662,11 @@ final class AppModel {
             bots[index] = updated
         }
         let replyID = UUID()
+        let replyCreatedAt = Date()
         if let index = bots.firstIndex(where: { $0.id == botID }) {
             var updated = bots[index]
             updated.messages.append(BotMessage(
-                id: replyID, role: .assistant, text: "", widget: nil, createdAt: Date()
+                id: replyID, role: .assistant, text: "", widget: nil, createdAt: replyCreatedAt
             ))
             bots[index] = updated
         }
@@ -704,23 +705,16 @@ final class AppModel {
             }
             let response = try await agentTask.value
             let generated = parseAgentAnswer(response.answer)
-            guard !generated.text.isEmpty,
-                  let index = bots.firstIndex(where: { $0.id == botID }),
-                  let messageIndex = bots[index].messages.firstIndex(where: { $0.id == replyID })
-            else {
-                throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
-            }
-            var updated = bots[index]
-            let createdAt = updated.messages[messageIndex].createdAt
-            updated.messages[messageIndex] = BotMessage(
-                id: replyID,
-                role: .assistant,
+            guard !deletedBotIDs.contains(botID), installAgentReply(
+                in: &bots,
+                botID: botID,
+                messageID: replyID,
                 text: generated.text,
                 widget: generated.widget,
-                createdAt: createdAt
-            )
-            updated.messages = Array(updated.messages.suffix(200))
-            bots[index] = updated
+                createdAt: replyCreatedAt
+            ) else {
+                throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
+            }
             await persistLocalState(dirty: true)
             schedulePersist()
         } catch {
@@ -955,6 +949,49 @@ private actor AccountStateStore {
 /// label; `/v1/agent/run` remains the sole access-control authority.
 func shouldSendInitialBotMessage(tier _: String?, bot: BotProfile?) -> Bool {
     bot?.messages.isEmpty == true
+}
+
+/// Installs a completed answer even if account-state reconciliation replaced
+/// the transient "Pensando…" placeholder while the HTTP request was in
+/// flight. The server result is authoritative; losing a local placeholder
+/// must never make the client discard a valid response.
+@discardableResult
+func installAgentReply(
+    in bots: inout [BotProfile],
+    botID: UUID,
+    messageID: UUID,
+    text: String,
+    widget: BotQuestionWidget?,
+    createdAt: Date
+) -> Bool {
+    let visibleText = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(20_000))
+    guard !visibleText.isEmpty,
+          let botIndex = bots.firstIndex(where: { $0.id == botID })
+    else { return false }
+
+    var updated = bots[botIndex]
+    let reply = BotMessage(
+        id: messageID,
+        role: .assistant,
+        text: visibleText,
+        widget: widget,
+        createdAt: createdAt
+    )
+    if let messageIndex = updated.messages.firstIndex(where: { $0.id == messageID }) {
+        let originalCreatedAt = updated.messages[messageIndex].createdAt
+        updated.messages[messageIndex] = BotMessage(
+            id: messageID,
+            role: .assistant,
+            text: visibleText,
+            widget: widget,
+            createdAt: originalCreatedAt
+        )
+    } else {
+        updated.messages.append(reply)
+    }
+    updated.messages = Array(updated.messages.suffix(200))
+    bots[botIndex] = updated
+    return true
 }
 
 private func mergeAccountStates(
