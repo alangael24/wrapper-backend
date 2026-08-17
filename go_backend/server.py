@@ -66,6 +66,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 import httpx
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -158,7 +159,7 @@ MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho m
 MAX_WHATSAPP_WEBHOOK_BODY = 1024 * 1024
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
-READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database"})
+READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "run_query"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
 READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
 
@@ -171,52 +172,70 @@ def _plain_intent_text(value: str) -> str:
 
 
 def _explicit_write_approvals(
-    connector_ids: tuple[str, ...], user_message: str, conversation_context: str
+    connector_ids: tuple[str, ...], user_message: str
 ) -> frozenset[tuple[str, str]]:
-    """Grant only writes explicitly requested by the human in this conversation.
+    """Grant writes only from the authenticated current human turn.
 
-    The client labels human history as ``Usuario:``. Restricting the scan to
-    those lines prevents connector/tool output from authorizing a later write
-    through prompt injection. The grant is scoped to one operation and expires
-    with the current Pi run.
+    Historical prompt text is intentionally excluded: it can contain model,
+    connector or quoted content and is therefore not an authorization source.
+    Grants remain operation-scoped and expire with this single Pi run.
     """
-    human_turns = [user_message]
-    for line in conversation_context.splitlines():
-        match = re.match(r"^\s*Usuario\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if match:
-            human_turns.append(match.group(1))
-    intent = _plain_intent_text("\n".join(human_turns[-8:]))
-    context_intent = _plain_intent_text(conversation_context)
+    intent = _plain_intent_text(user_message)
     approved: set[tuple[str, str]] = set()
-    if "google-workspace" in connector_ids:
-        asks_to_create = re.search(
-            r"\b(crea(?:r|me|lo)?|agenda(?:r|me|lo)?|programa(?:r|me|lo)?|"
-            r"agrega(?:r|me|lo)?|anade(?:r|me|lo)?|pon(?:er|lo)?|"
-            r"create|schedule|add)\b",
-            intent,
-        )
-        calendar_object = re.search(
-            r"\b(evento|calendario|cita|reunion|calendar|event|appointment|meeting)\b",
-            intent,
-        )
-        confirms_pending_action = re.search(
-            r"\b(?:si\s+)?(?:hazlo|adelante|confirmo|intentalo|reintentalo|go ahead|do it)\b",
-            _plain_intent_text(user_message),
-        )
-        pending_calendar_create = (
-            confirms_pending_action
-            and re.search(
-                r"\b(?:crear?|agendar?|programar?|agregar?|anadir?|create|schedule|add)\b",
-                context_intent,
-            )
-            and re.search(
-                r"\b(?:evento|calendario|cita|reunion|calendar|event|appointment|meeting)\b",
-                context_intent,
-            )
-        )
-        if (asks_to_create and calendar_object) or pending_calendar_create:
-            approved.add(("google-workspace", "create_calendar_event"))
+    mutation = re.search(
+        r"\b(?:crea|crear|creame|agrega|agregar|anade|anadir|agenda|agendar|"
+        r"programa|programar|envia|enviar|manda|mandar|publica|publicar|"
+        r"actualiza|actualizar|modifica|modificar|edita|editar|elimina|eliminar|"
+        r"sube|subir|responde|responder|cancela|cancelar|create|add|schedule|"
+        r"send|post|update|edit|delete|remove|upload|reply|cancel)\b",
+        intent,
+    )
+    if not mutation:
+        return frozenset()
+    aliases = {
+        "calendar": {"evento", "calendario", "cita", "reunion", "calendar", "event", "meeting"},
+        "email": {"correo", "email", "mail", "borrador", "draft"},
+        "message": {"mensaje", "message", "slack", "teams", "chat"},
+        "issue": {"issue", "ticket", "incidencia"},
+        "task": {"tarea", "task"},
+        "page": {"pagina", "page", "notion"},
+        "file": {"archivo", "file", "documento", "document"},
+        "record": {"registro", "record", "contacto", "contact", "cliente", "customer"},
+        "sheet": {"hoja", "sheet", "celda", "spreadsheet"},
+    }
+    words = set(re.findall(r"[a-z0-9]+", intent))
+    for connector_id in connector_ids:
+        for operation in CONNECTOR_CATALOG[connector_id]["operations"]:
+            if operation in READ_ONLY_CONNECTOR_OPERATIONS or operation.startswith(READ_ONLY_CONNECTOR_PREFIXES):
+                continue
+            operation_words = set(operation.split("_")) - {
+                "create", "add", "send", "post", "update", "edit", "delete",
+                "remove", "upload", "reply", "cancel", "draft",
+            }
+            expanded = set(operation_words)
+            for word in operation_words:
+                expanded.update(aliases.get(word, set()))
+            if expanded & words:
+                approved.add((connector_id, operation))
     return frozenset(approved)
+
+
+def _is_explicit_confirmation(value: str) -> bool:
+    intent = _plain_intent_text(value).strip(" .,!¡?¿")
+    return bool(re.fullmatch(
+        r"(?:si|ok|okay|vale|confirmo|adelante|hazlo|hazlo ya|do it|yes|go ahead)",
+        intent,
+    ))
+
+
+def _computer_write_intent(value: str) -> bool:
+    intent = _plain_intent_text(value)
+    return bool(re.search(
+        r"\b(?:abre|navega|ve|haz|ejecuta|corre|pulsa|presiona|clic|click|"
+        r"escribe|teclea|rellena|arrastra|sube|descarga|borra|elimina|mueve|"
+        r"open|navigate|go|run|execute|press|type|fill|drag|upload|download|delete|move)\b",
+        intent,
+    ))
 
 
 # OpenAI-compatible routes exposed by the wrapper.
@@ -551,7 +570,7 @@ def validate_runtime_security(cfg: Config) -> None:
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
-    body = json.dumps(obj, allow_nan=False).encode()
+    body = json.dumps(obj, allow_nan=False, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
@@ -900,6 +919,8 @@ class Backend:
         self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         self._pi_warm_lock = threading.Lock()
         self._pi_warm_events: dict[str, threading.Event] = {}
+        self._conversation_locks_lock = threading.Lock()
+        self._conversation_locks: dict[str, threading.Lock] = {}
         self._local_rate_limit_lock = threading.Lock()
         self._local_rate_limits: dict[str, tuple[int, int]] = {}
         self._whatsapp_wake = threading.Event()
@@ -966,7 +987,8 @@ class Backend:
             allow_secret_file=cfg.environment != "production",
         )
         self.connectors = ConnectorBroker(
-            default_ttl_seconds=cfg.pi_connector_token_ttl_seconds
+            default_ttl_seconds=cfg.pi_connector_token_ttl_seconds,
+            operation_store=self.store,
         )
         try:
             self.native_connector_gateway = NativeConnectorGateway(
@@ -1051,11 +1073,16 @@ class Backend:
         self._run_retention_once()
         threading.Thread(target=self._retention_loop, daemon=True).start()
         if self.whatsapp.config.configured:
-            threading.Thread(
-                target=self._whatsapp_worker_loop,
-                name="agentgenia-whatsapp",
-                daemon=True,
-            ).start()
+            # PostgreSQL uses SKIP LOCKED and SQLite claims under BEGIN
+            # IMMEDIATE, so independent workers cannot lease the same inbound
+            # message. A slow agent no longer blocks every WhatsApp account.
+            worker_count = max(2, min(4, cfg.pi_max_concurrent))
+            for index in range(worker_count):
+                threading.Thread(
+                    target=self._whatsapp_worker_loop,
+                    name=f"agentgenia-whatsapp-{index + 1}",
+                    daemon=True,
+                ).start()
 
     def _run_retention_once(self) -> None:
         try:
@@ -1681,6 +1708,31 @@ class Backend:
                 self._whatsapp_wake.wait(5)
                 self._whatsapp_wake.clear()
 
+    def _deliver_whatsapp_answer(
+        self,
+        *,
+        message_id: str,
+        sender: str,
+        answer: str,
+        user_id: str | None,
+    ) -> None:
+        # Claim delivery durably before talking to Meta. Cloud API does not
+        # accept a caller idempotency key, so a timeout after submission is an
+        # uncertain one-shot delivery and must never be sent a second time.
+        self.store.prepare_whatsapp_outbound(
+            message_id=message_id, result_text=answer, user_id=user_id
+        )
+        outbound = self.whatsapp.send_text(
+            to=sender, text=answer, reply_to_message_id=message_id
+        )
+        self.store.complete_whatsapp_message(
+            message_id=message_id,
+            status="succeeded",
+            result_text=answer,
+            outbound_message_id=outbound,
+            user_id=user_id,
+        )
+
     def _process_whatsapp_message(self, message: dict) -> None:
         message_id = str(message["message_id"])
         sender = str(message["wa_user_id"])
@@ -1703,14 +1755,8 @@ class Backend:
         if code:
             if link:
                 answer = "Este WhatsApp ya está vinculado con tu cuenta de Agentgenia. Ya puedes pedirme una tarea."
-                outbound = self.whatsapp.send_text(
-                    to=sender, text=answer, reply_to_message_id=message_id
-                )
-                self.store.complete_whatsapp_message(
-                    message_id=message_id,
-                    status="succeeded",
-                    result_text=answer,
-                    outbound_message_id=outbound,
+                self._deliver_whatsapp_answer(
+                    message_id=message_id, sender=sender, answer=answer,
                     user_id=link["user_id"],
                 )
                 return
@@ -1727,14 +1773,8 @@ class Backend:
                 )
             else:
                 answer = "Ese código no es válido o ya expiró. Genera uno nuevo desde Agentgenia."
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id,
-                status="succeeded",
-                result_text=answer,
-                outbound_message_id=outbound,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer,
                 user_id=(link or {}).get("user_id"),
             )
             return
@@ -1751,14 +1791,8 @@ class Backend:
                 "Por ahora este canal acepta mensajes de texto. "
                 "Las notas de voz, imágenes y documentos llegarán en una siguiente actualización."
             )
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id,
-                status="succeeded",
-                result_text=answer,
-                outbound_message_id=outbound,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer,
                 user_id=user_id,
             )
             return
@@ -1849,16 +1883,17 @@ class Backend:
                 )
                 if exc.code == "connector_not_configured":
                     answer = f"{connector_name} todavía no está disponible para conexión."
-                elif exc.code == "connector_rate_limit":
-                    answer = "Espera un minuto antes de iniciar otra conexión."
+                elif exc.code in {
+                    "connector_rate_limit", "connector_unavailable",
+                    "connector_provider_error", "connector_timeout",
+                }:
+                    # Let the durable queue retry provider outages instead of
+                    # finalizing a transient failure as a successful turn.
+                    raise WhatsAppError(f"Conector temporalmente no disponible: {exc.code}") from exc
                 else:
                     answer = f"No pude gestionar {connector_name} en este momento. Inténtalo de nuevo."
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id, status="succeeded", result_text=answer,
-                outbound_message_id=outbound, user_id=user_id,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer, user_id=user_id,
             )
             return
         if wants_bot_list(text):
@@ -1868,18 +1903,14 @@ class Backend:
                 if names
                 else "Todavía no tienes agentes. Puedes decir: “Crea un agente para cotizaciones”."
             )
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id, status="succeeded", result_text=answer,
-                outbound_message_id=outbound, user_id=user_id,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer, user_id=user_id,
             )
             return
 
         created = create_bot_from_request(text)
         if created:
-            created["id"] = "bot_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:16]
+            created["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:bot:{message_id}"))
             created["connectorIds"] = list(state.get("selectedConnectorIds", []))
 
             def add_created(current: dict) -> dict:
@@ -1895,12 +1926,8 @@ class Backend:
                 f"Creé el agente “{created['name']}” y quedó seleccionado. "
                 "Ahora dime qué quieres que haga."
             )
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id, status="succeeded", result_text=answer,
-                outbound_message_id=outbound, user_id=user_id,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer, user_id=user_id,
             )
             return
 
@@ -1921,7 +1948,7 @@ class Backend:
             bot = create_bot_from_request("crea un agente")
             if bot is None:
                 raise RuntimeError("No se pudo crear el agente inicial")
-            bot["id"] = "bot_wa_default_" + hashlib.sha256(user_id.encode()).hexdigest()[:12]
+            bot["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:default:{user_id}"))
 
             def add_default(current: dict) -> dict:
                 if not any(item.get("id") == bot["id"] for item in current["bots"]):
@@ -1938,23 +1965,18 @@ class Backend:
         switch_prefix = re.match(r"^(?:cambia|cambiar|usa|selecciona|habla con)\b", normalized)
         if selected and switch_prefix and len(normalized.split()) <= len(selected["name"].split()) + 3:
             answer = f"Listo. Ahora estás hablando con {selected['name']}."
-            outbound = self.whatsapp.send_text(
-                to=sender, text=answer, reply_to_message_id=message_id
-            )
-            self.store.complete_whatsapp_message(
-                message_id=message_id, status="succeeded", result_text=answer,
-                outbound_message_id=outbound, user_id=user_id,
+            self._deliver_whatsapp_answer(
+                message_id=message_id, sender=sender, answer=answer, user_id=user_id,
             )
             return
 
-        connector_ids = list(dict.fromkeys([
-            *state.get("selectedConnectorIds", []),
-            *bot.get("connectorIds", []),
-        ]))
+        # The bot assignment is the sole scope. Account-wide connected tools
+        # are intentionally not inherited by every agent.
+        connector_ids = list(dict.fromkeys(bot.get("connectorIds", [])))
         bot_for_run = {**bot, "connectorIds": connector_ids}
         prompt = build_whatsapp_bot_prompt(bot_for_run, text)
-        user_message_id = "msg_wu_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
-        assistant_message_id = "msg_wa_" + hashlib.sha256(message_id.encode()).hexdigest()[:20]
+        user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:user:{message_id}"))
+        assistant_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:assistant:{message_id}"))
         self._append_whatsapp_state_message(
             user_id=user_id,
             bot_id=bot["id"],
@@ -1980,10 +2002,22 @@ class Backend:
                 "idempotency_key": "whatsapp:" + hashlib.sha256(message_id.encode()).hexdigest(),
             },
         )
-        self.handle_agent_run(internal)  # exact same credits/harness path as every app
+        try:
+            self.handle_agent_run(internal)  # exact same credits/harness path as every app
+        finally:
+            # Internal WhatsApp dispatch does not pass through Handler._dispatch,
+            # so release the per-bot conversation lease here as well.
+            lock = getattr(internal, "agent_conversation_lock", None)
+            internal.agent_conversation_lock = None
+            if lock is not None:
+                lock.release()
         response = internal.json()
         if internal.status != 200:
             error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            if internal.status in {408, 409, 425, 429, 500, 502, 503, 504}:
+                raise WhatsAppError(
+                    str(error.get("message") or f"agent_http_{internal.status}")
+                )
             answer = (
                 "No pude completar esa tarea: "
                 + str(error.get("message") or "el agente no está disponible en este momento")
@@ -2000,15 +2034,8 @@ class Backend:
                 "createdAt": self._whatsapp_timestamp(),
             },
         )
-        outbound = self.whatsapp.send_text(
-            to=sender, text=answer, reply_to_message_id=message_id
-        )
-        self.store.complete_whatsapp_message(
-            message_id=message_id,
-            status="succeeded",
-            result_text=answer,
-            outbound_message_id=outbound,
-            user_id=user_id,
+        self._deliver_whatsapp_answer(
+            message_id=message_id, sender=sender, answer=answer, user_id=user_id,
         )
 
     @staticmethod
@@ -2057,6 +2084,92 @@ class Backend:
             user_id, add, source="connector-reconciliation"
         )
 
+    def _replace_connected_connectors_in_state(
+        self, user_id: str, connector_ids: list[str] | tuple[str, ...]
+    ) -> dict:
+        """Reconcile account and bot selections from authoritative connections."""
+        connected = list(dict.fromkeys(
+            item for item in connector_ids if item in CONNECTOR_CATALOG
+        ))
+        connected_set = set(connected)
+
+        def replace(current: dict) -> dict:
+            current["selectedConnectorIds"] = connected
+            changed_at = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z")
+            for bot in current.get("bots", []):
+                previous = list(bot.get("connectorIds", []))
+                reconciled = [
+                    item for item in bot.get("connectorIds", [])
+                    if item in connected_set
+                ]
+                bot["connectorIds"] = reconciled
+                if reconciled != previous:
+                    # A server-confirmed revocation must be newer than an
+                    # offline device snapshot, otherwise per-bot merge rules
+                    # can resurrect the removed connector later.
+                    bot["updatedAt"] = changed_at
+            return current
+
+        return self._mutate_account_state(
+            user_id, replace, source="connector-reconciliation"
+        )
+
+    def _assigned_connector_ids(self, user_id: str, bot_id: str | None) -> tuple[str, ...]:
+        """Return only connector ids assigned to this bot in server state."""
+        if not bot_id:
+            return ()
+        payload = self._account_state_payload(self.store.get_account_state(user_id))
+        bot = next(
+            (item for item in payload["state"].get("bots", []) if item.get("id") == bot_id),
+            None,
+        )
+        if not isinstance(bot, dict):
+            return ()
+        return tuple(
+            item for item in bot.get("connectorIds", []) if item in CONNECTOR_CATALOG
+        )
+
+    def _run_write_approvals(
+        self,
+        *,
+        user_id: str,
+        bot_id: str | None,
+        connector_ids: tuple[str, ...],
+        user_message: str,
+    ) -> frozenset[tuple[str, str]]:
+        """Resolve approval from authenticated, structured user turns only."""
+        direct = _explicit_write_approvals(connector_ids, user_message)
+        if direct or not bot_id or not _is_explicit_confirmation(user_message):
+            return direct
+        payload = self._account_state_payload(self.store.get_account_state(user_id))
+        bot = next(
+            (item for item in payload["state"].get("bots", []) if item.get("id") == bot_id),
+            None,
+        )
+        if not isinstance(bot, dict):
+            return frozenset()
+        # The role is a JSON field validated by account_state.py. Newlines or
+        # quoted assistant text cannot manufacture another user turn.
+        for message in reversed(bot.get("messages", [])[-12:]):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = message.get("text")
+            if not isinstance(text, str) or _is_explicit_confirmation(text):
+                continue
+            inferred = _explicit_write_approvals(connector_ids, text)
+            if inferred:
+                return inferred
+        return frozenset()
+
+    def _conversation_lock(self, user_id: str, bot_id: str | None) -> threading.Lock | None:
+        if not bot_id:
+            return None
+        key = hashlib.sha256(f"{user_id}\0{bot_id}".encode()).hexdigest()
+        with self._conversation_locks_lock:
+            return self._conversation_locks.setdefault(key, threading.Lock())
+
     def _append_whatsapp_state_message(
         self, *, user_id: str, bot_id: str, message: dict
     ) -> None:
@@ -2086,6 +2199,7 @@ class Backend:
                     if connector_id not in connector_ids:
                         connector_ids.append(connector_id)
                     bot["connectorIds"] = connector_ids
+                    bot["updatedAt"] = self._whatsapp_timestamp()
                     break
             return current
         self._mutate_whatsapp_state(user_id, add)
@@ -2115,10 +2229,13 @@ class Backend:
                 if item != connector_id
             ]
             for bot in current.get("bots", []):
+                before = list(bot.get("connectorIds", []))
                 bot["connectorIds"] = [
-                    item for item in bot.get("connectorIds", [])
+                    item for item in before
                     if item != connector_id
                 ]
+                if bot["connectorIds"] != before:
+                    bot["updatedAt"] = self._whatsapp_timestamp()
             return current
         self._mutate_whatsapp_state(user_id, remove)
 
@@ -2131,8 +2248,7 @@ class Backend:
         connected_ids = [
             item["connector_id"] for item in snapshot if item.get("connected") is True
         ]
-        if connected_ids:
-            self._add_connected_connectors_to_state(user["id"], connected_ids)
+        self._replace_connected_connectors_in_state(user["id"], connected_ids)
         json_response(
             handler,
             200,
@@ -2185,7 +2301,9 @@ class Backend:
         connector_id = body.get("connector_id")
         if not isinstance(connector_id, str):
             raise ConnectorBrokerError(400, "Falta connector_id", "bad_connector")
-        json_response(handler, 200, self.connector_gateway.disconnect(user["id"], connector_id))
+        result = self.connector_gateway.disconnect(user["id"], connector_id)
+        self._remove_whatsapp_connector_state(user["id"], connector_id)
+        json_response(handler, 200, result)
 
     def handle_native_connector_setup(
         self, handler: BaseHTTPRequestHandler, attempt_id: str
@@ -2615,6 +2733,33 @@ class Backend:
             "result": result,
         })
 
+    def handle_agent_run_recover(self, handler: BaseHTTPRequestHandler) -> None:
+        """Resolve an uncertain transport result using the client's stable key."""
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        idempotency_key = body.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not 8 <= len(idempotency_key.strip()) <= 200:
+            error_response(handler, 400, "idempotency_key no es válida", "bad_idempotency_key")
+            return
+        run = self.store.get_agent_run_by_idempotency(user["id"], idempotency_key.strip())
+        if not run:
+            error_response(handler, 404, "Ejecución no encontrada", "run_not_found")
+            return
+        result = None
+        if run.get("result_json"):
+            try:
+                result = json.loads(run["result_json"])
+            except (TypeError, json.JSONDecodeError):
+                logging.exception("Invalid durable agent result run_id=%s", run["id"])
+        json_response(handler, 200, {
+            "run_id": run["id"],
+            "status": run.get("status"),
+            "error_code": run.get("error_code"),
+            "result": result,
+        })
+
     @staticmethod
     def _direct_chat_allowed(
         execution_mode: str,
@@ -2643,6 +2788,8 @@ class Backend:
             r"open|search|look\s+up|check|review|read|download|upload|send|post|"
             r"update|edit|delete|remove|schedule|book|buy|connect|install|run|"
             r"log\s+in|create\s+(?:an?\s+)?(?:issue|ticket|event|file|folder|task|document)|"
+            r"qu[eé]\s+tengo\s+(?:hoy|ma[nñ]ana|esta\s+semana)|cu[aá]ndo\s+es\s+(?:mi|la)|"
+            r"pr[oó]xim[oa]\s+(?:reuni[oó]n|cita|evento)|mi\s+agenda|"
             r"gmail|correo(?:s)?|email(?:s)?|bandeja|calendar|calendario|agenda|"
             r"slack|notion|github|jira|drive|dropbox|shopify|stripe|crm|salesforce|"
             r"computadora|navegador|browser|archivo|terminal|shell)\b)",
@@ -2680,7 +2827,7 @@ class Backend:
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": 512,
+            "max_tokens": 4096,
             "user_id": provider_user_id,
         }
         if self.cfg.pi_model.startswith("deepseek-"):
@@ -2864,21 +3011,33 @@ class Backend:
             else:
                 should_start = False
 
-        def prewarm_in_background() -> None:
-            try:
-                self.pi.prewarm(conversation_key=conversation_key)
-            except (PiHarnessBusy, PiHarnessTimeout, PiHarnessError):
-                logging.info("Background Pi warm failed key=%s", conversation_key, exc_info=True)
-            finally:
-                warm_event.set()
-
-        if should_start:
-            threading.Thread(
-                target=prewarm_in_background,
-                name=f"pi-warm-{hashlib.sha256(conversation_key.encode()).hexdigest()[:10]}",
-                daemon=True,
-            ).start()
-        json_response(handler, 200, {"ready": False, "started": True, "warming": True})
+        if not should_start:
+            # Another request is already warming the same bot. Wait for its
+            # verified outcome instead of returning a false "ready" signal.
+            if not warm_event.wait(timeout=28.0):
+                error_response(handler, 503, "El agente sigue iniciando", "pi_warm_timeout")
+                return
+            json_response(handler, 200, {"ready": True, "started": False, "warming": False})
+            return
+        try:
+            result = self.pi.prewarm(conversation_key=conversation_key)
+        except PiHarnessBusy as exc:
+            error_response(handler, 429, str(exc), "pi_busy")
+            return
+        except PiHarnessTimeout as exc:
+            error_response(handler, 504, str(exc), "pi_warm_timeout")
+            return
+        except PiHarnessError as exc:
+            error_response(handler, 502, str(exc), "pi_error")
+            return
+        finally:
+            warm_event.set()
+        json_response(handler, 200, {
+            "ready": True,
+            "started": bool(result.get("started")),
+            "warming": False,
+            "duration_ms": result.get("duration_ms"),
+        })
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
         request_started_at = time.monotonic()
@@ -3001,10 +3160,38 @@ class Backend:
             )
             return
         try:
-            connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
+            requested_connector_ids = self.connectors.normalize_connector_ids(connector_ids_value)
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
+        assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
+        # ``connector_ids`` from a client is a hint for backwards
+        # compatibility, never an authorization source. A connector must be
+        # assigned to this bot in server state and currently connected.
+        if requested_connector_ids and set(requested_connector_ids) != set(assigned_connector_ids):
+            logging.info(
+                "Ignoring stale connector scope user_id=%s bot_id=%s requested=%s assigned=%s",
+                user["id"], bot_id, requested_connector_ids, assigned_connector_ids,
+            )
+        connected_connector_ids: tuple[str, ...] = ()
+        if assigned_connector_ids:
+            try:
+                connected_connector_ids = self.connector_gateway.connected_connector_ids(
+                    user["id"]
+                )
+            except ConnectorBrokerError as exc:
+                error_response(
+                    handler,
+                    503,
+                    "No pudimos verificar las conexiones de este agente",
+                    "connector_status_unavailable",
+                )
+                logging.warning("Connector reconciliation failed: %s", exc)
+                return
+            self._replace_connected_connectors_in_state(user["id"], connected_connector_ids)
+        connector_ids = tuple(
+            item for item in assigned_connector_ids if item in set(connected_connector_ids)
+        )
 
         direct_chat = self._direct_chat_allowed(
             execution_mode,
@@ -3020,24 +3207,6 @@ class Backend:
             effective_prompt = prompt
 
         if not direct_chat:
-            try:
-                connected_connector_ids = self.connector_gateway.connected_connector_ids(
-                    user["id"]
-                )
-            except ConnectorBrokerError:
-                # An upstream status outage must not remove connectors the
-                # authenticated client already requested for this run.
-                logging.warning(
-                    "Could not reconcile connected accounts before agent run",
-                    exc_info=True,
-                )
-                connected_connector_ids = ()
-            discovered_ids = tuple(
-                item for item in connected_connector_ids if item not in connector_ids
-            )
-            connector_ids = tuple(dict.fromkeys((*connector_ids, *connected_connector_ids)))
-            if discovered_ids:
-                self._add_connected_connectors_to_state(user["id"], discovered_ids)
             if connector_ids:
                 connector_names = ", ".join(
                     f"{CONNECTOR_CATALOG[item]['name']} ({item})"
@@ -3073,6 +3242,15 @@ class Backend:
                 elif connector_context not in effective_prompt:
                     effective_prompt = f"{effective_prompt}\n\n{connector_context}"
 
+        if len(effective_prompt) > self.cfg.pi_max_prompt_chars:
+            error_response(
+                handler,
+                400,
+                f"El prompt final excede {self.cfg.pi_max_prompt_chars} caracteres",
+                "prompt_too_large",
+            )
+            return
+
         pi_status = self.pi.status()
         if not direct_chat:
             if not pi_status["enabled"]:
@@ -3086,7 +3264,15 @@ class Backend:
             ):
                 error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
                 return
-        computer_enabled = bool(computer_requested and self.computers.configured)
+        if computer_requested and not self.computers.configured:
+            error_response(
+                handler,
+                409,
+                "La computadora solicitada no está disponible en este despliegue",
+                "computer_unavailable",
+            )
+            return
+        computer_enabled = bool(computer_requested)
         if not direct_chat and (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
             error_response(
                 handler,
@@ -3095,6 +3281,20 @@ class Backend:
                 "pi_connectors_unavailable",
             )
             return
+
+        conversation_lock = self._conversation_lock(user["id"], bot_id)
+        if conversation_lock is not None:
+            # One bot is one ordered conversation across desktop, mobile and
+            # WhatsApp. Queue the next turn instead of letting the harness or
+            # the credit concurrency guard reject it with a transient 429.
+            if not conversation_lock.acquire(timeout=self.cfg.pi_timeout_seconds + 60):
+                error_response(
+                    handler, 503,
+                    "La conversación anterior sigue ejecutándose",
+                    "conversation_busy",
+                )
+                return
+            handler.agent_conversation_lock = conversation_lock
 
         run_api_key = "agrn_" + secrets.token_urlsafe(48)
         try:
@@ -3268,17 +3468,27 @@ class Backend:
                         warm_event = self._pi_warm_events.pop(conversation_key, None)
                     if warm_event is not None and not warm_event.is_set():
                         self._mark_run_timing(run_id, "pi_warm_wait_started_ms")
-                        warm_event.wait(timeout=12.0)
+                        warm_event.wait(timeout=28.0)
                         self._mark_run_timing(run_id, "pi_warm_wait_finished_ms")
                 if connector_ids or computer_enabled:
-                    approved_write_operations = _explicit_write_approvals(
-                        connector_ids, user_message, effective_prompt
+                    approved_write_operations = self._run_write_approvals(
+                        user_id=user["id"],
+                        bot_id=bot_id,
+                        connector_ids=connector_ids,
+                        user_message=user_message,
                     )
                     connector_run_token = self.connectors.issue(
                         user_id=user["id"],
+                        run_id=run_id,
                         connector_ids=connector_ids,
                         computer_id=bot_id if computer_enabled else None,
                         approved_write_operations=approved_write_operations,
+                        # A computer mutation needs both the authenticated
+                        # per-run capability and an action verb in the current
+                        # human turn. Model/transcript text is never consulted.
+                        computer_writes_approved=(
+                            computer_enabled and _computer_write_intent(user_message)
+                        ),
                     )
                 self._mark_run_timing(run_id, "pi_dispatch_ms")
 
@@ -3300,7 +3510,10 @@ class Backend:
                         f"{user['id']}\0{bot_id}" if bot_id is not None else None
                     ),
                     on_text_delta=on_text_delta,
-                    is_cancelled=(lambda: bool(event_stream and event_stream.disconnected)),
+                    # Transport loss is not cancellation. The run remains
+                    # durable and recoverable by run_id, avoiding duplicate
+                    # external side effects when a mobile/desktop stream drops.
+                    is_cancelled=None,
                 )
                 self._mark_run_timing(run_id, "pi_complete_ms")
         except DirectChatError as e:
@@ -3391,8 +3604,34 @@ class Backend:
             self.connectors.revoke(connector_run_token)
             self._run_provider(run_id, pop=True)
             self._run_principal(run_api_key, pop=True)
+        if len(result.answer) > 20_000:
+            result.answer = result.answer[:19_940].rstrip() + "\n\n[Respuesta truncada por límite de sincronización]"
+        # Persist the human-visible result before charging or marking success.
+        # If persistence fails, release the reservation and return an error;
+        # the system can no longer reach a charged-without-result state.
+        provisional = result.as_dict()
+        provisional.update({
+            "run_id": run_id,
+            "status": "running",
+            "connector_ids": [] if direct_chat else list(connector_ids),
+            "computer_enabled": computer_enabled,
+            "execution_path": "direct_chat" if direct_chat else "pi",
+        })
+        try:
+            self.store.save_agent_run_result(run_id, provisional)
+        except Exception:
+            self.store.release_agent_run(
+                run_id=run_id,
+                final_status="failed",
+                error_code="result_persistence_failed",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+            logging.exception("Could not persist agent result run_id=%s", run_id)
+            agent_error(500, "No pudimos guardar el resultado de la ejecución", "result_persistence_failed")
+            return
+
         settled, credits = settle("succeeded")
-        payload = result.as_dict()
+        payload = provisional
         payload["run_id"] = run_id
         payload["status"] = settled["status"]
         payload["credits"] = credits
@@ -3407,7 +3646,12 @@ class Backend:
         payload["execution_path"] = "direct_chat" if direct_chat else "pi"
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
-        self.store.save_agent_run_result(run_id, payload)
+        try:
+            self.store.save_agent_run_result(run_id, payload)
+        except Exception:
+            # The provisional answer was durably stored before settlement, so
+            # recovery remains possible even if the metadata refresh fails.
+            logging.exception("Could not refresh final agent metadata run_id=%s", run_id)
         logging.info(
             "agent timing run_id=%s timings=%s",
             run_id,
@@ -3534,6 +3778,7 @@ class Backend:
                 connector_id=connector_id,
                 operation=operation,
                 arguments=body.get("arguments", {}),
+                operation_id=body.get("operation_id"),
             )
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
@@ -3547,7 +3792,17 @@ class Backend:
         user_id, bot_id = self.connectors.computer(token)
         body = self.read_json(handler) or {}
         operation = body.get("operation")
-        if not self.cfg.external_writes_enabled and operation not in READ_ONLY_COMPUTER_OPERATIONS:
+        write_is_approved = False
+        try:
+            write_is_approved = self.connectors.computer_write_is_approved(token)
+        except ConnectorBrokerError as e:
+            error_response(handler, e.status, str(e), e.code)
+            return
+        if (
+            not self.cfg.external_writes_enabled
+            and operation not in READ_ONLY_COMPUTER_OPERATIONS
+            and not write_is_approved
+        ):
             error_response(
                 handler,
                 409,
@@ -3809,6 +4064,7 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(30)
+        self.agent_conversation_lock: threading.Lock | None = None
 
     def log_message(self, fmt, *args):
         status = args[1] if len(args) > 1 else "unknown"
@@ -3906,6 +4162,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_warm(self)
             elif self.command == "POST" and path == "/v1/agent/run":
                 backend.handle_agent_run(self)
+            elif self.command == "POST" and path == "/v1/agent/recover":
+                backend.handle_agent_run_recover(self)
             elif self.command == "GET" and path.startswith("/v1/agent/runs/"):
                 backend.handle_agent_run_status(self, path.rsplit("/", 1)[-1])
             elif path.startswith("/v1/computers/"):
@@ -4007,6 +4265,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
             except Exception:
                 self.close_connection = True
+        finally:
+            lock = self.agent_conversation_lock
+            self.agent_conversation_lock = None
+            if lock is not None:
+                lock.release()
 
     def do_GET(self):
         self._dispatch()
@@ -4027,7 +4290,27 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._worker_slots.acquire(blocking=False):
-            request.close()
+            payload = json.dumps({
+                "error": {
+                    "message": "El servidor está temporalmente ocupado",
+                    "type": "server_busy",
+                }
+            }, separators=(",", ":")).encode("utf-8")
+            response = (
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"Retry-After: 2\r\n"
+                b"Connection: close\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                + payload
+            )
+            try:
+                request.sendall(response)
+            except OSError:
+                pass
+            finally:
+                request.close()
             return
         try:
             super().process_request(request, client_address)

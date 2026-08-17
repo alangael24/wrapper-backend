@@ -172,6 +172,10 @@ private struct AgentRunStatusResponse: Decodable, Sendable {
         case errorCode = "error_code"
     }
 }
+private struct AgentRunRecoveryRequest: Encodable, Sendable {
+    let idempotencyKey: String
+    enum CodingKeys: String, CodingKey { case idempotencyKey = "idempotency_key" }
+}
 
 struct ServerSentEvent: Equatable, Sendable {
     let name: String
@@ -238,6 +242,7 @@ private struct ComputerEnsureRequest: Encodable, Sendable {
     let botName: String
     enum CodingKeys: String, CodingKey { case botName = "bot_name" }
 }
+private struct ComputerDeleteResponse: Decodable, Sendable { let deleted: Bool }
 
 private struct CheckoutRequest: Encodable, Sendable { let tier: String }
 private struct CheckoutResponse: Decodable, Sendable {
@@ -287,7 +292,7 @@ actor APIClient {
         configuration.waitsForConnectivity = true
         configuration.httpMaximumConnectionsPerHost = 6
         configuration.timeoutIntervalForRequest = 60
-        configuration.timeoutIntervalForResource = 1_800
+        configuration.timeoutIntervalForResource = 1_860
         self.urlSession = URLSession(configuration: configuration)
     }
 
@@ -473,9 +478,16 @@ actor APIClient {
             // Replaying the same idempotency key never starts a second run;
             // production returns the saved answer (or waits for the original).
             try await Task.sleep(for: .milliseconds(250))
-            return try await self.request(
-                "/v1/agent/run", method: "POST", body: request
-            )
+            do {
+                return try await self.request(
+                    "/v1/agent/run", method: "POST", body: request
+                )
+            } catch {
+                if let recovered = try await recoverAgentRun(idempotencyKey: idempotencyKey) {
+                    return recovered
+                }
+                throw error
+            }
         }
     }
 
@@ -498,7 +510,7 @@ actor APIClient {
                 body: AgentWarmRequest(botID: botID.uuidString.lowercased())
             )
         }
-        guard response.ready || response.started else {
+        guard response.ready else {
             throw ServiceError(
                 message: "El agente todavía no está listo.",
                 code: "pi_warm_incomplete",
@@ -528,6 +540,15 @@ actor APIClient {
             method: "POST",
             body: EmptyBody()
         )
+    }
+
+    func deleteComputer(botID: UUID) async throws -> Bool {
+        let response: ComputerDeleteResponse = try await request(
+            "/v1/computers/\(botID.uuidString.lowercased())/delete",
+            method: "POST",
+            body: EmptyBody()
+        )
+        return response.deleted
     }
 
     func billing() async throws -> BillingSnapshot {
@@ -602,7 +623,7 @@ actor APIClient {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = path == "/v1/agent/run" ? 1_800 : 60
+        request.timeoutInterval = path == "/v1/agent/run" ? 1_860 : 60
         request.httpBody = bodyData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if bodyData != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
@@ -648,7 +669,7 @@ actor APIClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = 1_800
+        request.timeoutInterval = 1_860
         request.httpBody = bodyData
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -860,6 +881,29 @@ actor APIClient {
             code: "run_still_running",
             status: 202
         )
+    }
+
+    private func recoverAgentRun(idempotencyKey: String) async throws -> AgentRunResponse? {
+        for attempt in 0..<120 {
+            let snapshot: AgentRunStatusResponse = try await request(
+                "/v1/agent/recover",
+                method: "POST",
+                body: AgentRunRecoveryRequest(idempotencyKey: idempotencyKey)
+            )
+            if snapshot.status == "succeeded", let result = snapshot.result,
+               !result.answer.isEmpty {
+                return result
+            }
+            if ["failed", "cancelled", "budget_exhausted", "expired"].contains(snapshot.status) {
+                throw ServiceError(
+                    message: "La ejecución terminó sin una respuesta válida.",
+                    code: snapshot.errorCode ?? "agent_run_failed",
+                    status: 502
+                )
+            }
+            if attempt < 119 { try await Task.sleep(for: .milliseconds(500)) }
+        }
+        return nil
     }
 
     private func networkError(_ error: Error, path: String) -> ServiceError {

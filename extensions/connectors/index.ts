@@ -10,6 +10,58 @@ const MAX_COMPUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
 const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 
+const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "google-workspace": ["search_email", "read_email", "draft_email", "list_calendar_events", "create_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
+  slack: ["list_channels", "search_messages", "read_thread", "post_message"],
+  notion: ["search", "read_page", "create_page", "query_database", "update_page"],
+  salesforce: ["search_records", "get_record", "create_record", "update_record"],
+  "microsoft-365": ["search_email", "read_email", "draft_email", "list_calendar_events", "create_calendar_event", "search_files", "read_file", "post_teams_message"],
+  linkedin: ["get_profile", "search_connections"],
+  zoom: ["list_meetings", "get_meeting", "create_meeting", "list_recordings"],
+  github: ["search_repositories", "read_file", "list_issues", "get_issue", "create_issue", "list_pull_requests"],
+  jira: ["search_issues", "get_issue", "create_issue", "update_issue"],
+  linear: ["search_issues", "get_issue", "create_issue", "update_issue"],
+  asana: ["search_tasks", "get_task", "create_task", "update_task"],
+  clickup: ["search_tasks", "get_task", "create_task", "update_task"],
+  figma: ["search_files", "get_file", "list_comments", "post_comment"],
+  hubspot: ["search_contacts", "get_contact", "create_contact", "update_contact", "search_deals"],
+  canva: ["search_designs", "get_design", "create_design"],
+  trello: ["list_boards", "get_board", "list_cards", "create_card", "update_card"],
+  "monday-com": ["list_boards", "get_board", "list_items", "create_item", "update_item"],
+  intercom: ["search_contacts", "list_conversations", "get_conversation", "reply_conversation"],
+  zendesk: ["search_tickets", "get_ticket", "create_ticket", "update_ticket"],
+  box: ["search_files", "get_file", "list_folder", "upload_file"],
+  dropbox: ["search_files", "get_file", "list_folder", "upload_file"],
+  docusign: ["list_envelopes", "get_envelope", "create_envelope", "send_envelope"],
+  calendly: ["list_event_types", "list_scheduled_events", "get_event", "cancel_event"],
+  loom: ["search_videos", "get_video", "list_transcripts"],
+  outreach: ["search_prospects", "get_prospect", "list_sequences", "create_task", "update_prospect"],
+  salesloft: ["search_people", "get_person", "list_cadences", "create_activity", "update_person"],
+  apollo: ["search_people", "search_organizations", "enrich_person", "enrich_organization"],
+  clay: ["list_tables", "get_table", "list_records", "update_record"],
+  zoominfo: ["search_contacts", "search_companies", "get_contact", "get_company"],
+  nooks: ["list_sessions", "get_session", "list_calls", "get_call"],
+  stripe: ["search_customers", "get_customer", "list_payments", "list_invoices", "list_subscriptions"],
+  quickbooks: ["search_customers", "get_customer", "list_invoices", "create_invoice", "list_expenses"],
+  netsuite: ["search_records", "get_record", "create_record", "update_record"],
+  ramp: ["list_cards", "list_transactions", "list_reimbursements", "get_transaction"],
+  workday: ["search_workers", "get_worker", "list_positions", "list_time_off"],
+  rippling: ["list_employees", "get_employee", "list_payroll_runs", "list_devices"],
+  ashby: ["list_jobs", "search_candidates", "get_candidate", "list_interviews"],
+  greenhouse: ["list_jobs", "search_candidates", "get_candidate", "list_applications"],
+  vercel: ["list_projects", "get_project", "list_deployments", "get_deployment", "list_domains"],
+  tableau: ["search_workbooks", "get_workbook", "list_views", "query_view"],
+  hex: ["list_projects", "get_project", "run_project", "get_run"],
+  amplitude: ["query_events", "query_funnel", "query_retention", "list_cohorts"],
+  mixpanel: ["query_events", "query_funnel", "query_retention", "list_profiles"],
+  snowflake: ["list_databases", "list_schemas", "list_tables", "describe_table", "run_query"],
+  databricks: ["list_catalogs", "list_schemas", "list_tables", "run_query", "list_jobs"],
+  mailchimp: ["list_audiences", "search_members", "get_campaign", "create_campaign", "list_automations"],
+  shopify: ["search_products", "get_product", "list_orders", "get_order", "list_customers"],
+  tiendanube: ["search_products", "get_product", "list_orders", "get_order"],
+  woocommerce: ["search_products", "get_product", "list_orders", "get_order"],
+});
+
 const PROVIDERS = Object.freeze([
   provider("google-workspace", "Google Workspace", "Gmail, Calendar, Drive, Contacts y Sheets"),
   provider("slack", "Slack", "canales, mensajes y threads"),
@@ -229,6 +281,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
   const providerToolNames = new Set(PROVIDERS.map((item) => item.toolName));
 
   for (const item of PROVIDERS) {
+    const operations = PROVIDER_OPERATIONS[item.id] ?? [];
     pi.registerTool({
       name: item.toolName,
       label: item.name,
@@ -236,14 +289,13 @@ export default function connectorExtension(pi: ExtensionAPI): void {
       parameters: Type.Object({
         operation: Type.String({
           description: "Operacion exacta anunciada por connector_search",
-          minLength: 1,
-          maxLength: 80,
+          enum: [...operations],
         }),
         arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
           description: providerArgumentDescription(item.id),
         })),
       }),
-      async execute(_toolCallId, params, signal) {
+      async execute(toolCallId, params, signal) {
         try {
           const response = await brokerRequest("/v1/internal/connectors/execute", {
             method: "POST",
@@ -251,6 +303,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
               connector_id: item.id,
               operation: params.operation,
               arguments: params.arguments ?? {},
+              operation_id: toolCallId,
             }),
           }, signal);
           if (!response.ok) {
@@ -288,7 +341,8 @@ export default function connectorExtension(pi: ExtensionAPI): void {
       }),
     }),
     async execute(_toolCallId, params, signal) {
-      const words = params.query.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+      const words = params.query.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u)
+        .filter((word) => word.length >= 2);
       if (!words.length) {
         return {
           content: [{ type: "text", text: "Especifica una capacidad o proveedor para buscar." }],
@@ -315,12 +369,17 @@ export default function connectorExtension(pi: ExtensionAPI): void {
         const computerAvailable = isRecord(response.body) && response.body.computer === true;
         const wantsComputer = words.some((word) => [
           "computer", "computadora", "desktop", "escritorio", "gui", "screen", "pantalla",
-          "file", "files", "archivo", "archivos", "shell", "terminal",
-        ].some((term) => term.includes(word) || word.includes(term)));
+          "shell", "terminal", "navegador", "browser",
+        ].includes(word));
         const matches = connectors.filter((connector) => {
-          const haystack = [connector.id, connector.name, connector.description, ...connector.keywords, ...connector.operations]
-            .join(" ").toLocaleLowerCase();
-          return words.some((word) => haystack.includes(word));
+          if (!connector.connected) return false;
+          const tokens = new Set(
+            [connector.id, connector.name, connector.description, ...connector.keywords, ...connector.operations]
+              .join(" ").toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean),
+          );
+          return words.some((word) => tokens.has(word)
+            || (word.length >= 5 && [...tokens].some((token) => token.length >= 5
+              && (token.startsWith(word) || word.startsWith(token)))));
         });
         const matchedTools = matches
           .flatMap((match): string[] => {

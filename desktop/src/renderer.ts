@@ -1837,17 +1837,19 @@ function renderTeachOverlay(bot: BotProfile): string {
 }
 
 function renderWorkflowPanel(bot: BotProfile): string {
+  const computerAvailable = computerLoadedBotId === bot.id && computerSnapshot.configured;
   return `
     <section class="workflow-panel" aria-label="Tareas aprendidas">
       <header><span><strong>Tareas aprendidas</strong><small>${bot.workflows.length} flujos para ${escapeHtml(bot.name)}</small></span><button type="button" data-close-workflows aria-label="Cerrar">×</button></header>
       <div class="workflow-list">
+        ${bot.workflows.length && !computerAvailable ? `<div class="workflow-empty"><strong>Ejecución pausada</strong><p>Estas tareas requieren la computadora aislada del agente, que no está habilitada en este despliegue.</p></div>` : ""}
         ${bot.workflows.length ? bot.workflows.map((workflow) => `
           <article class="workflow-card">
             <div><strong>${escapeHtml(workflow.title)}</strong>${workflow.summary ? `<p>${escapeHtml(workflow.summary)}</p>` : ""}</div>
             <ol>${workflow.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>
             <footer>
               <small>${workflow.lastRunAt ? `Última ejecución ${escapeHtml(formatRelativeTime(workflow.lastRunAt))}` : "Todavía no se ha ejecutado"}</small>
-              <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId ? "disabled" : ""}>Ejecutar ahora</button></span>
+              <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId || !computerAvailable ? "disabled" : ""}>Ejecutar ahora</button></span>
             </footer>
           </article>`).join("") : `
           <div class="workflow-empty"><strong>Todavía no hay tareas aprendidas</strong><p>La grabación de tareas estará disponible cuando vuelva el soporte visual.</p></div>`}

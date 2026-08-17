@@ -77,9 +77,10 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
     var messages: [BotMessage]
     var workflows: [BotWorkflow] = []
     var createdAt: Date
+    var updatedAt: Date
 
     enum CodingKeys: String, CodingKey {
-        case id, name, title, description, color, shape, notificationsEnabled, messages, workflows, createdAt
+        case id, name, title, description, color, shape, notificationsEnabled, messages, workflows, createdAt, updatedAt
         case avatarDataURL = "avatarDataUrl"
         case connectorIDs = "connectorIds"
     }
@@ -96,12 +97,14 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
         connectorIDs: [String],
         messages: [BotMessage],
         workflows: [BotWorkflow] = [],
-        createdAt: Date
+        createdAt: Date,
+        updatedAt: Date? = nil
     ) {
         self.id = id; self.name = name; self.title = title; self.description = description
         self.color = color; self.shape = shape; self.avatarDataURL = avatarDataURL
         self.notificationsEnabled = notificationsEnabled; self.connectorIDs = connectorIDs
         self.messages = messages; self.workflows = workflows; self.createdAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -118,6 +121,7 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
         messages = try values.decodeIfPresent([BotMessage].self, forKey: .messages) ?? []
         workflows = try values.decodeIfPresent([BotWorkflow].self, forKey: .workflows) ?? []
         createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try values.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 }
 

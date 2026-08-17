@@ -72,7 +72,10 @@ versión 13 añade el estado versionado por cuenta para sincronizar bots,
 conversaciones, personalización, workflows y selección de conectores entre
 Electron e iOS sin compartir archivos locales entre usuarios. La versión 17
 añade códigos de vínculo hasheados, identidades de WhatsApp y un inbox
-durable/idempotente para webhooks de Meta.
+durable/idempotente para webhooks de Meta. La versión 18 añade idempotencia
+durable por operación de conector y la versión 19 conserva tombstones de bots
+en el servidor para impedir que un dispositivo offline resucite un agente
+eliminado.
 
 En cualquier host con filesystem efímero define al menos `DATABASE_URL`,
 `WRAPPER_SECRET` y `ADMIN_TOKEN` como secretos. No dependas de `DB_PATH` ni de

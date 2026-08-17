@@ -62,13 +62,18 @@ class AppViewModel(
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
     private var whatsAppPollingJob: Job? = null
+    private var accountStateRevision = 0
+    private var stateSyncJob: Job? = null
+    private var stateSyncRequested = false
+    private var onboardingCompleted = false
+    private var deletedBotIds: List<String> = emptyList()
 
     init { bootstrap() }
 
     fun beginSignIn() = launchBusy {
         val started = api.beginSignIn(appVersion)
         _state.update { it.copy(externalUrl = api.validateAuthorizationUrl(started.authorizeUrl, googleOnly = true)) }
-        pollSignIn(started.attemptId)
+        pollSignIn(started.attemptId, started.expiresIn)
     }
 
     fun consumeExternalUrl() = _state.update { it.copy(externalUrl = null) }
@@ -78,6 +83,10 @@ class AppViewModel(
     fun signOut() = viewModelScope.launch {
         whatsAppPollingJob?.cancel()
         whatsAppPollingJob = null
+        stateSyncJob?.cancel()
+        stateSyncJob = null
+        stateSyncRequested = false
+        accountStateRevision = 0
         api.signOut()
         _state.value = AppUiState(phase = AppPhase.SignedOut)
     }
@@ -145,11 +154,12 @@ class AppViewModel(
         mutateBot(botId) { bot ->
             bot.copy(
                 name = clean(name, 60, "Nuevo bot"),
-                title = clean(title, 120),
+                title = clean(title, 100),
                 description = clean(description, 600),
                 color = color.takeIf(BOT_COLORS::contains) ?: bot.color,
                 shape = shape,
                 notificationsEnabled = notifications,
+                updatedAt = System.currentTimeMillis(),
             )
         }
     }
@@ -177,7 +187,12 @@ class AppViewModel(
         _state.update { current ->
             current.copy(
                 selectedConnectorIds = current.selectedConnectorIds - connectorId,
-                bots = current.bots.map { it.copy(connectorIds = it.connectorIds - connectorId) },
+                bots = current.bots.map {
+                    if (connectorId in it.connectorIds) it.copy(
+                        connectorIds = it.connectorIds - connectorId,
+                        updatedAt = System.currentTimeMillis(),
+                    ) else it
+                },
             )
         }
         persist()
@@ -260,6 +275,14 @@ class AppViewModel(
         _state.update { it.copy(computer = snapshot, computerBotId = botId, computerViewerUrl = null) }
     }
 
+    fun deleteComputer(botId: String) = launchBusy {
+        api.deleteComputer(botId)
+        val snapshot = api.computerStatus(botId)
+        _state.update {
+            it.copy(computer = snapshot, computerBotId = botId, computerViewerUrl = null)
+        }
+    }
+
     private fun bootstrap() = viewModelScope.launch {
         val session = runCatching { api.restoreSession() }.getOrNull()
         if (session == null) {
@@ -276,6 +299,8 @@ class AppViewModel(
     private suspend fun activate(account: AccountIdentity) {
         val profile = api.me()
         val persisted = store.readAccountState(account.id)
+        onboardingCompleted = persisted.onboardingCompleted
+        deletedBotIds = persisted.deletedBotIds
         _state.value = AppUiState(
             phase = AppPhase.Ready,
             account = account,
@@ -286,9 +311,24 @@ class AppViewModel(
                 ?: persisted.bots.firstOrNull()?.id,
             section = MainSection.Agents,
         )
+        val accountState = viewModelScope.async { runCatching { api.accountState() } }
         val connectors = viewModelScope.async { runCatching { api.connectors() } }
         val billing = viewModelScope.async { runCatching { api.billing() }.getOrNull() }
         val whatsApp = viewModelScope.async { runCatching { api.whatsAppStatus() }.getOrNull() }
+        val accountStateResult = accountState.await()
+        accountStateResult.onSuccess { remote ->
+            accountStateRevision = remote.revision
+            val local = currentAccountState()
+            val resolved = mergeAccountStates(remote.state, local)
+            applyAccountState(resolved)
+            writeLocalState(account.id, resolved)
+            if (resolved != remote.state) scheduleStateSync()
+        }.onFailure {
+            // Keep the encrypted local cache usable while a sleeping or
+            // temporarily unavailable backend wakes up. The serialized sync
+            // worker retries on this and the next local mutation.
+            scheduleStateSync()
+        }
         val connectorResult = connectors.await()
         val billingValue = billing.await()
         val whatsAppValue = whatsApp.await()
@@ -316,19 +356,23 @@ class AppViewModel(
             .toList()
         _state.update { current ->
             current.copy(
-                // A temporary provider/status failure must not erase an
-                // installation that another device already synchronized.
-                selectedConnectorIds = (
-                    current.selectedConnectorIds + connectedIds
-                ).distinct().sorted(),
+                selectedConnectorIds = connectedIds,
+                bots = current.bots.map { bot ->
+                    val reconciled = bot.connectorIds.filter(connectedIds.toSet()::contains)
+                    if (reconciled == bot.connectorIds) bot else bot.copy(
+                        connectorIds = reconciled,
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                },
                 connectorStatuses = statuses.associateBy(ConnectorStatus::connectorId),
             )
         }
         persist()
     }
 
-    private suspend fun pollSignIn(attemptId: String) {
-        repeat(120) {
+    private suspend fun pollSignIn(attemptId: String, expiresIn: Int = 600) {
+        val attempts = ((expiresIn.coerceIn(30, 1_800) + 1) / 2).coerceAtLeast(1)
+        repeat(attempts) {
             val status = api.authStatus(attemptId)
             when (status.status) {
                 "complete" -> {
@@ -353,6 +397,12 @@ class AppViewModel(
                         current.copy(
                             externalUrl = null,
                             selectedConnectorIds = (current.selectedConnectorIds + connectorId).distinct(),
+                            bots = current.bots.map { bot ->
+                                if (bot.id == current.selectedBotId) bot.copy(
+                                    connectorIds = (bot.connectorIds + connectorId).distinct(),
+                                    updatedAt = System.currentTimeMillis(),
+                                ) else bot
+                            },
                         )
                     }
                     persist()
@@ -384,7 +434,7 @@ class AppViewModel(
         persist()
         try {
             val current = _state.value
-            val connectors = (current.selectedConnectorIds + original.connectorIds).distinct().sorted()
+            val connectors = original.connectorIds.distinct().sorted()
             val prompt = buildBotPrompt(original.copy(connectorIds = connectors), userText, initial)
             val generated = parseAgentAnswer(api.runAgent(
                 prompt = prompt,
@@ -400,6 +450,7 @@ class AppViewModel(
             }
             mutateBot(botId, persistAfter = false) { bot ->
                 bot.copy(messages = (bot.messages + BotMessage(
+                    id = if (initial) botId else UUID.randomUUID().toString(),
                     role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
                 )).takeLast(200))
             }
@@ -421,12 +472,79 @@ class AppViewModel(
     private fun persist() {
         val current = _state.value
         val accountId = current.account?.id ?: return
-        runCatching {
-            store.writeAccountState(
-                accountId,
-                PersistedAccountState(current.bots, current.selectedConnectorIds, current.selectedBotId),
+        val snapshot = currentAccountState()
+        runCatching { writeLocalState(accountId, snapshot) }.onFailure(::report)
+        scheduleStateSync()
+    }
+
+    private fun currentAccountState() = PersistedAccountState(
+        onboardingCompleted = onboardingCompleted,
+        bots = _state.value.bots,
+        selectedConnectorIds = _state.value.selectedConnectorIds,
+        activeBotId = _state.value.selectedBotId,
+        deletedBotIds = deletedBotIds,
+    )
+
+    private fun writeLocalState(accountId: String, snapshot: PersistedAccountState) {
+        store.writeAccountState(accountId, snapshot)
+    }
+
+    private fun applyAccountState(snapshot: PersistedAccountState) {
+        onboardingCompleted = snapshot.onboardingCompleted
+        deletedBotIds = snapshot.deletedBotIds.takeLast(1_000)
+        val deleted = deletedBotIds.toSet()
+        val bots = snapshot.bots.filterNot { it.id in deleted }
+        _state.update { current ->
+            val active = snapshot.activeBotId?.takeIf { id -> bots.any { it.id == id } }
+                ?: current.selectedBotId?.takeIf { id -> bots.any { it.id == id } }
+                ?: bots.firstOrNull()?.id
+            current.copy(
+                bots = bots,
+                selectedConnectorIds = snapshot.selectedConnectorIds,
+                selectedBotId = active,
             )
-        }.onFailure(::report)
+        }
+    }
+
+    private fun scheduleStateSync() {
+        if (_state.value.account == null) return
+        stateSyncRequested = true
+        if (stateSyncJob != null) return
+        stateSyncJob = viewModelScope.launch {
+            var retryDelay = 250L
+            while (stateSyncRequested) {
+                stateSyncRequested = false
+                val account = _state.value.account ?: break
+                val local = currentAccountState()
+                try {
+                    val saved = try {
+                        api.saveAccountState(local, accountStateRevision)
+                    } catch (error: ServiceException) {
+                        if (error.status != 409) throw error
+                        val remote = api.accountState()
+                        val merged = mergeAccountStates(remote.state, currentAccountState())
+                        api.saveAccountState(merged, remote.revision)
+                    }
+                    if (_state.value.account?.id != account.id) break
+                    accountStateRevision = saved.revision
+                    if (currentAccountState() == local) {
+                        applyAccountState(saved.state)
+                        writeLocalState(account.id, currentAccountState())
+                    } else {
+                        stateSyncRequested = true
+                    }
+                    retryDelay = 250L
+                } catch (_: Throwable) {
+                    // Local data stays encrypted and marked for retry; a
+                    // transient sync failure must not interrupt an agent turn.
+                    stateSyncRequested = true
+                    delay(retryDelay)
+                    retryDelay = (retryDelay * 2).coerceAtMost(30_000L)
+                }
+            }
+            stateSyncJob = null
+            if (stateSyncRequested) scheduleStateSync()
+        }
     }
 
     private fun launchBusy(block: suspend () -> Unit) = viewModelScope.launch {
@@ -458,8 +576,8 @@ internal fun shouldSendInitialBotMessage(tier: String?, bot: BotProfile?): Boole
     bot?.messages?.isEmpty() == true
 
 internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean): String {
-    val history = bot.messages.takeLast(20).joinToString("\n") { message ->
-        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text}"
+    val history = bot.messages.takeLast(4).joinToString("\n") { message ->
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(8_000)}"
     }
     val profile = listOfNotNull(
         "Eres ${bot.name}, un agente de Agent Genia.",
@@ -481,7 +599,7 @@ internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean)
 
 internal fun buildDirectChatPrompt(bot: BotProfile, userText: String): String {
     val history = bot.messages.takeLast(6).joinToString("\n") { message ->
-        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text}"
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(8_000)}"
     }
     return listOfNotNull(
         "Eres ${bot.name}, un agente de Agent Genia.",
@@ -498,4 +616,52 @@ internal fun buildDirectChatPrompt(bot: BotProfile, userText: String): String {
 private fun clean(value: String, maximum: Int, fallback: String = ""): String {
     val normalized = value.replace(Regex("\\s+"), " ").trim().take(maximum)
     return normalized.ifBlank { fallback }
+}
+
+internal fun mergeAccountStates(
+    server: PersistedAccountState,
+    local: PersistedAccountState,
+): PersistedAccountState {
+    val deletedIds = (server.deletedBotIds + local.deletedBotIds).distinct().takeLast(1_000)
+    val deleted = deletedIds.toSet()
+    val bots = server.bots.associateBy { it.id }.toMutableMap()
+    local.bots.forEach { localBot ->
+        val remoteBot = bots[localBot.id]
+        if (remoteBot == null) {
+            bots[localBot.id] = localBot
+            return@forEach
+        }
+        val messages = remoteBot.messages.associateBy { it.id }.toMutableMap()
+        localBot.messages.forEach { messages[it.id] = it }
+        val workflows = remoteBot.workflows.associateBy { it.id }.toMutableMap()
+        localBot.workflows.forEach { workflow ->
+            val existing = workflows[workflow.id]
+            if (existing == null || workflow.updatedAt >= existing.updatedAt) {
+                workflows[workflow.id] = workflow
+            }
+        }
+        val preferred = if (localBot.updatedAt >= remoteBot.updatedAt) localBot else remoteBot
+        bots[localBot.id] = preferred.copy(
+            connectorIds = preferred.connectorIds.distinct().sorted(),
+            messages = messages.values.sortedBy { it.createdAt }.takeLast(200),
+            workflows = workflows.values.sortedBy { it.updatedAt }.takeLast(50),
+        )
+    }
+    val mergedBots = bots.values
+        .filterNot { it.id in deleted }
+        .sortedBy { it.createdAt }
+        .takeLast(100)
+    val available = mergedBots.mapTo(mutableSetOf()) { it.id }
+    val active = local.activeBotId?.takeIf(available::contains)
+        ?: server.activeBotId?.takeIf(available::contains)
+        ?: mergedBots.firstOrNull()?.id
+    return PersistedAccountState(
+        onboardingCompleted = server.onboardingCompleted || local.onboardingCompleted,
+        bots = mergedBots,
+        // OAuth connection state is authoritative on the server. A stale
+        // local cache must not resurrect a connector after revocation.
+        selectedConnectorIds = server.selectedConnectorIds.distinct().sorted(),
+        activeBotId = active,
+        deletedBotIds = deletedIds,
+    )
 }

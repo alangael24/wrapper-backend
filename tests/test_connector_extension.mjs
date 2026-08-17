@@ -139,6 +139,7 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
       connector_id: "github",
       operation: "search_repositories",
       arguments: { query: "wrapper" },
+      operation_id: "github-call",
     });
     assert.equal(requests[1].url, "/v1/internal/connectors/catalog");
     assert.equal(requests[3].url, "/v1/internal/connectors/catalog");

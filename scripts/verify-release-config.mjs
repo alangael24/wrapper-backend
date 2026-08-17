@@ -163,6 +163,8 @@ const expectedMigrations = [
   ["20260814070000_run_recovery_and_retention.sql", 16],
   ["20260814120000_whatsapp_channel.sql", 17],
   ["20260814123000_whatsapp_channel_rls.sql", 17],
+  ["20260817120000_connector_operation_idempotency.sql", 18],
+  ["20260817123000_account_bot_tombstones.sql", 19],
 ];
 const migrationContents = await Promise.all(
   expectedMigrations.map(([name]) => readFile(`supabase/migrations/${name}`, "utf8")),

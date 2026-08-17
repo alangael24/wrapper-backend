@@ -387,6 +387,13 @@ struct ComputerPanel: View {
                         .disabled(model.isBusy)
                     }
                 }
+                if let state = snapshot?.state,
+                   state != .off && state != .disabled {
+                    Button("Eliminar computadora definitivamente", role: .destructive) {
+                        Task { await model.deleteComputer(botID: botID) }
+                    }
+                    .disabled(model.isBusy)
+                }
                 Spacer()
             }
             .padding()

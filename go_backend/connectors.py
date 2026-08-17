@@ -7,6 +7,7 @@ Los adaptadores reales viven en el proceso del backend y se registran aqui.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import threading
@@ -315,23 +316,47 @@ class ConnectorAdapter(Protocol):
     def execute(self, user_id: str, operation: str, arguments: dict[str, Any]) -> Any: ...
 
 
+class ConnectorOperationStore(Protocol):
+    def begin_connector_operation(self, **values: Any) -> dict: ...
+    def complete_connector_operation(self, **values: Any) -> None: ...
+    def fail_connector_operation(self, **values: Any) -> None: ...
+
+
 @dataclass(frozen=True)
 class ConnectorRunGrant:
     user_id: str
+    run_id: str
     connector_ids: frozenset[str]
     computer_id: str | None
     approved_write_operations: frozenset[tuple[str, str]]
+    computer_writes_approved: bool
     expires_at: float
 
 
 class ConnectorBroker:
     """Emite grants de corta vida y despacha solo adaptadores autorizados."""
 
-    def __init__(self, *, default_ttl_seconds: int = 1900, now=time.monotonic):
+    def __init__(
+        self,
+        *,
+        default_ttl_seconds: int = 1900,
+        now=time.monotonic,
+        operation_store: ConnectorOperationStore | None = None,
+    ):
         self.default_ttl_seconds = max(1, min(int(default_ttl_seconds), 3600))
         self._now = now
+        self._operation_store = operation_store
         self._grants: dict[str, ConnectorRunGrant] = {}
         self._adapters: dict[str, ConnectorAdapter] = {}
+        # Include the complete call identity in the process-local key. The
+        # durable table separately enforces that one operation_id cannot be
+        # reused with different arguments after a retry or worker restart.
+        self._operation_results: dict[
+            tuple[str, str, str, str, str], dict[str, Any]
+        ] = {}
+        self._operation_events: dict[
+            tuple[str, str, str, str, str], threading.Event
+        ] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -361,8 +386,10 @@ class ConnectorBroker:
         *,
         user_id: str,
         connector_ids: tuple[str, ...],
+        run_id: str = "",
         computer_id: str | None = None,
         approved_write_operations: frozenset[tuple[str, str]] = frozenset(),
+        computer_writes_approved: bool = False,
         ttl_seconds: int | None = None,
     ) -> str:
         if not connector_ids and not computer_id:
@@ -379,9 +406,11 @@ class ConnectorBroker:
         token = secrets.token_urlsafe(32)
         grant = ConnectorRunGrant(
             user_id=user_id,
+            run_id=run_id,
             connector_ids=frozenset(connector_ids),
             computer_id=computer_id,
             approved_write_operations=scoped_write_operations,
+            computer_writes_approved=bool(computer_id and computer_writes_approved),
             expires_at=self._now() + expires_in,
         )
         with self._lock:
@@ -394,6 +423,8 @@ class ConnectorBroker:
             return
         with self._lock:
             self._grants.pop(token, None)
+            for key in [key for key in self._operation_results if key[0] == token]:
+                self._operation_results.pop(key, None)
 
     def revoke_user(self, user_id: str) -> int:
         """Revoca grants de conectores/computadora que sigan vivos para una cuenta."""
@@ -403,6 +434,8 @@ class ConnectorBroker:
             ]
             for token in tokens:
                 self._grants.pop(token, None)
+                for key in [key for key in self._operation_results if key[0] == token]:
+                    self._operation_results.pop(key, None)
             return len(tokens)
 
     def catalog(self, token: str) -> list[dict[str, Any]]:
@@ -443,6 +476,10 @@ class ConnectorBroker:
         grant = self._require_grant(token)
         return (connector_id, operation) in grant.approved_write_operations
 
+    def computer_write_is_approved(self, token: str) -> bool:
+        """Return the explicit, run-scoped approval for computer mutations."""
+        return self._require_grant(token).computer_writes_approved
+
     def execute(
         self,
         *,
@@ -450,6 +487,7 @@ class ConnectorBroker:
         connector_id: Any,
         operation: Any,
         arguments: Any,
+        operation_id: Any = None,
     ) -> dict[str, Any]:
         grant = self._require_grant(token)
         if not isinstance(connector_id, str) or connector_id not in CONNECTOR_CATALOG:
@@ -472,37 +510,148 @@ class ConnectorBroker:
         if len(encoded_arguments) > MAX_CONNECTOR_ARGUMENTS_BYTES:
             raise ConnectorBrokerError(413, "arguments excede 64 KiB", "connector_arguments_too_large")
 
-        adapter = self._adapter_for(connector_id)
-        try:
-            connected = bool(adapter.is_connected(grant.user_id))
-        except Exception as exc:
-            raise ConnectorBrokerError(502, "No se pudo consultar la conexion", "connector_adapter_error") from exc
-        if not connected:
-            raise ConnectorBrokerError(
-                409,
-                f"{item['name']} todavia no esta autenticado para este usuario",
-                "connector_not_connected",
+        durable_operation_id: str | None = None
+        durable_owner = False
+        operation_key: tuple[str, str, str, str, str] | None = None
+        operation_event: threading.Event | None = None
+        operation_owner = False
+        if operation_id is not None:
+            if not isinstance(operation_id, str) or not operation_id.strip() or len(operation_id) > 200:
+                raise ConnectorBrokerError(400, "operation_id inválido", "bad_operation_id")
+            operation_key = (
+                token,
+                operation_id.strip(),
+                connector_id,
+                operation,
+                hashlib.sha256(encoded_arguments).hexdigest(),
             )
+            with self._lock:
+                cached = self._operation_results.get(operation_key)
+                if cached is not None:
+                    return cached
+                operation_event = self._operation_events.get(operation_key)
+                if operation_event is None:
+                    operation_event = threading.Event()
+                    self._operation_events[operation_key] = operation_event
+                    operation_owner = True
+            if not operation_owner:
+                if not operation_event.wait(25):
+                    raise ConnectorBrokerError(
+                        409, "La misma operación sigue en curso", "connector_operation_running"
+                    )
+                with self._lock:
+                    cached = self._operation_results.get(operation_key)
+                if cached is not None:
+                    return cached
+                raise ConnectorBrokerError(
+                    502, "La operación anterior no terminó correctamente", "connector_operation_failed"
+                )
+            durable_operation_id = operation_id.strip()
+
         try:
-            result = adapter.execute(grant.user_id, operation, arguments)
-        except ConnectorBrokerError:
+            # Reserve only after the in-process owner has been elected. A
+            # concurrent duplicate in the same worker waits for that owner;
+            # a duplicate after restart is stopped by this durable row.
+            if (
+                durable_operation_id
+                and grant.run_id
+                and self._operation_store is not None
+            ):
+                reservation = self._operation_store.begin_connector_operation(
+                    user_id=grant.user_id,
+                    run_id=grant.run_id,
+                    operation_id=durable_operation_id,
+                    connector_id=connector_id,
+                    operation=operation,
+                    arguments_hash=hashlib.sha256(encoded_arguments).hexdigest(),
+                )
+                if reservation.get("status") == "replay":
+                    replay = reservation.get("result")
+                    if not isinstance(replay, dict):
+                        raise ConnectorBrokerError(
+                            409,
+                            "El resultado anterior no es recuperable",
+                            "connector_operation_uncertain",
+                        )
+                    if operation_key is not None:
+                        with self._lock:
+                            self._operation_results[operation_key] = replay
+                    return replay
+                if reservation.get("status") != "owner":
+                    raise ConnectorBrokerError(
+                        409,
+                        "La operación ya fue enviada y su resultado es incierto; no se repetirá automáticamente",
+                        "connector_operation_uncertain",
+                    )
+                durable_owner = True
+
+            adapter = self._adapter_for(connector_id)
+            try:
+                connected = bool(adapter.is_connected(grant.user_id))
+            except Exception as exc:
+                raise ConnectorBrokerError(502, "No se pudo consultar la conexion", "connector_adapter_error") from exc
+            if not connected:
+                raise ConnectorBrokerError(
+                    409,
+                    f"{item['name']} todavia no esta autenticado para este usuario",
+                    "connector_not_connected",
+                )
+            try:
+                result = adapter.execute(grant.user_id, operation, arguments)
+            except ConnectorBrokerError:
+                raise
+            except Exception as exc:
+                raise ConnectorBrokerError(502, "El proveedor rechazo la operacion", "connector_upstream_error") from exc
+            payload = {"connector_id": connector_id, "operation": operation, "result": result}
+            try:
+                result_size = len(
+                    json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ConnectorBrokerError(
+                    502, "El adaptador devolvio un resultado no serializable", "connector_adapter_error"
+                ) from exc
+            if result_size > MAX_CONNECTOR_RESULT_BYTES:
+                # Preserve a bounded preview instead of discarding the entire
+                # successful provider response.
+                preview = json.dumps(
+                    result, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                ).encode("utf-8")[:48_000].decode("utf-8", errors="ignore")
+                payload["result"] = {
+                    "truncated": True,
+                    "preview_json": preview,
+                    "message": "Resultado truncado; limita la consulta o usa paginación.",
+                }
+            if operation_key is not None:
+                with self._lock:
+                    self._operation_results[operation_key] = payload
+            if durable_owner and durable_operation_id and self._operation_store is not None:
+                self._operation_store.complete_connector_operation(
+                    user_id=grant.user_id,
+                    run_id=grant.run_id,
+                    operation_id=durable_operation_id,
+                    result=payload,
+                )
+            return payload
+        except Exception as exc:
+            if durable_owner and durable_operation_id and self._operation_store is not None:
+                error_code = exc.code if isinstance(exc, ConnectorBrokerError) else "connector_operation_failed"
+                try:
+                    self._operation_store.fail_connector_operation(
+                        user_id=grant.user_id,
+                        run_id=grant.run_id,
+                        operation_id=durable_operation_id,
+                        error_code=error_code,
+                    )
+                except Exception:
+                    pass
             raise
-        except Exception as exc:
-            raise ConnectorBrokerError(502, "El proveedor rechazo la operacion", "connector_upstream_error") from exc
-        payload = {"connector_id": connector_id, "operation": operation, "result": result}
-        try:
-            result_size = len(
-                json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
-            )
-        except (TypeError, ValueError) as exc:
-            raise ConnectorBrokerError(
-                502, "El adaptador devolvio un resultado no serializable", "connector_adapter_error"
-            ) from exc
-        if result_size > MAX_CONNECTOR_RESULT_BYTES:
-            raise ConnectorBrokerError(
-                502, "El resultado del conector excedio 64 KiB", "connector_result_too_large"
-            )
-        return payload
+        finally:
+            if operation_key is not None and operation_owner:
+                with self._lock:
+                    event = self._operation_events.pop(operation_key, None)
+                if event is not None:
+                    event.set()
 
     def _adapter_for(self, connector_id: str) -> ConnectorAdapter:
         with self._lock:

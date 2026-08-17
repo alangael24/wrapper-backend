@@ -227,9 +227,16 @@ class DesktopStateStore {
       connections.connectors.filter((item) => item.connected).map((item) => item.connectorId)
     ).sort();
     const current = await this.snapshot();
+    const connectedSet = new Set(connected);
     const next = normalizeAppState({
       ...current,
-      selectedConnectorIds: normalizeConnectorIds([...current.selectedConnectorIds, ...connected]).sort()
+      selectedConnectorIds: connected,
+      bots: current.bots.map((bot) => {
+        const connectorIds = bot.connectorIds.filter((item) => connectedSet.has(item));
+        return connectorIds.length === bot.connectorIds.length
+          ? bot
+          : { ...bot, connectorIds, updatedAt: new Date().toISOString() };
+      })
     });
     return JSON.stringify(current) === JSON.stringify(next) ? current : this.update(() => next);
   }
@@ -328,7 +335,7 @@ function hasUserState(state: AppState): boolean {
 }
 
 function mergeAppStates(server: AppState, local: AppState): AppState {
-  const deletedBotIds = [...new Set([...server.deletedBotIds, ...local.deletedBotIds])].slice(-200);
+  const deletedBotIds = [...new Set([...server.deletedBotIds, ...local.deletedBotIds])].slice(-1000);
   const deletedBots = new Set(deletedBotIds);
   const bots = new Map(server.bots.map((bot) => [bot.id, bot]));
   for (const localBot of local.bots) {
@@ -346,10 +353,14 @@ function mergeAppStates(server: AppState, local: AppState): AppState {
         workflows.set(workflow.id, workflow);
       }
     }
+    const preferred = Date.parse(localBot.updatedAt) >= Date.parse(serverBot.updatedAt)
+      ? localBot
+      : serverBot;
     bots.set(localBot.id, {
-      ...serverBot,
-      ...localBot,
-      connectorIds: normalizeConnectorIds([...serverBot.connectorIds, ...localBot.connectorIds]),
+      ...preferred,
+      // The device resolving the conflict owns mutable selections. Union
+      // would resurrect a connector that was removed on this device.
+      connectorIds: normalizeConnectorIds(preferred.connectorIds),
       messages: [...messages.values()]
         .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
         .slice(-200),
@@ -363,10 +374,9 @@ function mergeAppStates(server: AppState, local: AppState): AppState {
   return normalizeAppState({
     version: 2,
     onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
-    selectedConnectorIds: normalizeConnectorIds([
-      ...server.selectedConnectorIds,
-      ...local.selectedConnectorIds
-    ]),
+    // Installation/revocation is owned by the server-side OAuth snapshot.
+    // Local set union (or always preferring local) resurrects revoked access.
+    selectedConnectorIds: normalizeConnectorIds(server.selectedConnectorIds),
     bots: mergedBots,
     deletedBotIds,
     activeBotId
@@ -476,6 +486,16 @@ function registerDesktopIpc(): void {
     if (typeof connectorId !== "string") throw new Error("Conector inválido.");
     const connections = await oauthController.connect(connectorId);
     await stateStore.reconcileConnections(connections);
+    await stateStore.update((state) => ({
+      ...state,
+      bots: state.bots.map((bot) => bot.id === state.activeBotId
+        ? {
+          ...bot,
+          connectorIds: normalizeConnectorIds([...bot.connectorIds, connectorId]),
+          updatedAt: new Date().toISOString()
+        }
+        : bot)
+    }));
     return connections;
   });
   ipcMain.handle(CHANNELS.disconnectConnector, async (_event, connectorId: unknown) => {
@@ -564,10 +584,7 @@ function registerDesktopIpc(): void {
     const bot = before.bots.find((item) => item.id === botId);
     if (!bot) throw new Error("No encontramos ese bot.");
     if (initial && bot.messages.length) return before;
-    const connectorIds = normalizeConnectorIds([
-      ...before.selectedConnectorIds,
-      ...bot.connectorIds
-    ]);
+    const connectorIds = normalizeConnectorIds(bot.connectorIds);
     const turnId = initial ? `initial-${botId}` : randomUUID();
     if (!initial) {
       const createdAt = new Date().toISOString();
@@ -616,7 +633,7 @@ function registerDesktopIpc(): void {
         const messages = [
           ...current.bots[index].messages,
           {
-            id: randomUUID(),
+            id: initial ? botId : randomUUID(),
             role: "assistant" as const,
             text: generated.text,
             ...(generated.widget ? { widget: generated.widget } : {}),
@@ -628,16 +645,9 @@ function registerDesktopIpc(): void {
         return { ...current, bots, activeBotId: botId };
       });
     } catch (error) {
-      if (!initial) {
-        await stateStore.update((current) => ({
-          ...current,
-          bots: current.bots.map((item) => item.id === botId
-            ? { ...item, messages: item.messages.filter((message) => message.id !== turnId) }
-            : item)
-        })).catch((rollbackError) => {
-          console.error(`[agent] No fue posible revertir el mensaje fallido: ${errorMessage(rollbackError)}`);
-        });
-      }
+      // Keep the user's turn on uncertain transport failures. The durable
+      // run can still finish and execute external work; deleting the turn
+      // encourages a dangerous duplicate submission and loses context.
       throw error;
     }
   });
@@ -745,11 +755,16 @@ function registerDesktopIpc(): void {
     const bot = before.bots.find((item) => item.id === botId);
     const workflow = bot?.workflows.find((item) => item.id === workflowId);
     if (!bot || !workflow) throw new Error("No encontramos esa tarea aprendida.");
-    const connectorIds = normalizeConnectorIds([...before.selectedConnectorIds, ...bot.connectorIds]);
+    const connectorIds = normalizeConnectorIds(bot.connectorIds);
     const result = await oauthController.runAgent(
       buildWorkflowRunPrompt(bot, workflow),
       connectorIds,
-      { computer: true, botId }
+      {
+        computer: true,
+        botId,
+        userMessage: `Ejecuta la tarea aprendida: ${workflow.title}`,
+        idempotencyKey: randomUUID()
+      }
     );
     const generated = parseAgentAnswer(result.answer);
     if (!generated.text) throw new Error("El agente no devolvió un resultado.");
@@ -813,7 +828,7 @@ function registerDesktopIpc(): void {
       return {
         ...state,
         bots,
-        deletedBotIds: [...new Set([...state.deletedBotIds, removed.id])].slice(-200),
+        deletedBotIds: [...new Set([...state.deletedBotIds, removed.id])].slice(-1000),
         activeBotId: state.activeBotId === botId ? bots[0]?.id ?? null : state.activeBotId
       };
     });
@@ -947,7 +962,7 @@ function buildBotPrompt(
   initial: boolean
 ): string {
   const history = bot.messages.slice(-4).map((message) => (
-    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text}`
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 8_000)}`
   )).join("\n");
   const profile = [
     `Eres ${bot.name}, un agente de Agent Genia.`,
@@ -970,7 +985,7 @@ function buildDirectChatPrompt(
   userPrompt: string
 ): string {
   const history = bot.messages.slice(-6).map((message) => (
-    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text}`
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 8_000)}`
   )).join("\n");
   return [
     `Eres ${bot.name}, un agente de Agent Genia.`,

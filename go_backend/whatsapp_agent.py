@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from .connectors import CONNECTOR_CATALOG
-from .store import new_id
 
 
 LINK_CODE_RE = re.compile(r"\bAG-[A-Z2-9]{4}-[A-Z2-9]{4}\b", re.IGNORECASE)
@@ -132,7 +132,7 @@ def create_bot_from_request(text: str) -> dict[str, Any] | None:
         description = ""
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return {
-        "id": new_id("bot"),
+        "id": str(uuid.uuid4()),
         "name": name,
         "title": description[:100],
         "description": description[:600],
@@ -144,16 +144,28 @@ def create_bot_from_request(text: str) -> dict[str, Any] | None:
         "messages": [],
         "workflows": [],
         "createdAt": now,
+        "updatedAt": now,
     }
 
 
 def build_bot_prompt(bot: dict[str, Any], user_prompt: str) -> str:
     messages = bot.get("messages") if isinstance(bot.get("messages"), list) else []
-    history = "\n".join(
-        f"{'Usuario' if message.get('role') == 'user' else bot['name']}: {message.get('text', '')}"
-        for message in messages[-20:]
-        if isinstance(message, dict) and isinstance(message.get("text"), str)
-    )
+    history_lines: list[str] = []
+    history_chars = 0
+    # Build backwards so the newest context wins, with a hard total budget
+    # below the backend's final prompt limit.
+    for message in reversed(messages[-20:]):
+        if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+            continue
+        line = (
+            f"{'Usuario' if message.get('role') == 'user' else bot['name']}: "
+            f"{message.get('text', '')[:8_000]}"
+        )
+        if history_chars + len(line) + 1 > 60_000:
+            break
+        history_lines.append(line)
+        history_chars += len(line) + 1
+    history = "\n".join(reversed(history_lines))
     connectors = bot.get("connectorIds") if isinstance(bot.get("connectorIds"), list) else []
     profile = "\n".join(
         part
@@ -174,7 +186,9 @@ def build_bot_prompt(bot: dict[str, Any], user_prompt: str) -> str:
         )
         if part
     )
-    return f"{profile}{f'\n\nConversación reciente:\n{history}' if history else ''}\n\nUsuario: {user_prompt}"
+    history_section = f"\n\nConversación reciente:\n{history}" if history else ""
+    result = f"{profile}{history_section}\n\nUsuario: {user_prompt[:20_000]}"
+    return result[:95_000]
 
 
 def parse_agent_answer(value: str) -> str:

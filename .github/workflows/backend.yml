@@ -86,7 +86,7 @@ jobs:
             stripe_subscription_id,user_id,tier,status,updated_at
           ) values ('sub_ci_business','ci_business','business','active',extract(epoch from now()));
           do $$ begin
-            if (select v from agentgenia.kv where k='schema_version') <> '17' then
+            if (select v from agentgenia.kv where k='schema_version') <> '19' then
               raise exception 'unexpected schema version';
             end if;
           end $$;

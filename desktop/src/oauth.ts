@@ -21,7 +21,7 @@ const ACCOUNT_AUTH_ATTEMPTS = 120;
 const CONNECTOR_AUTH_ATTEMPTS = 300;
 const OAUTH_POLL_MS = 2_000;
 const JSON_REQUEST_TIMEOUT_MS = 30_000;
-const AGENT_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
+const AGENT_REQUEST_TIMEOUT_MS = 31 * 60 * 1_000;
 
 interface AccountIdentity {
   id: string;
@@ -480,7 +480,7 @@ class WrapperServiceClient {
       body: { bot_id: botId },
       signal
     });
-    if (result.ready !== true && result.started !== true) throw new Error("El agente todavía no está listo.");
+    if (result.ready !== true) throw new Error("El agente todavía no está listo.");
   }
 
   runAgent(
@@ -725,6 +725,8 @@ class WrapperServiceClient {
     let buffer = "";
     let streamedText = "";
     let finalResponse: Record<string, unknown> | null = null;
+    let runId = response.headers.get("x-agent-run-id")?.trim() || "";
+    let streamFailure: unknown = null;
 
     const processFrame = (frame: string): void => {
       let eventName = "message";
@@ -738,7 +740,10 @@ class WrapperServiceClient {
         else if (field === "data") data.push(value);
       }
       const payload = data.join("\n");
-      if (eventName === "delta") {
+      if (eventName === "start") {
+        const parsed = JSON.parse(payload) as Record<string, unknown>;
+        runId = stringValue(parsed.run_id) || runId;
+      } else if (eventName === "delta") {
         const parsed = JSON.parse(payload) as Record<string, unknown>;
         const text = stringValue(parsed.text);
         if (text) {
@@ -777,15 +782,40 @@ class WrapperServiceClient {
       }
       if (buffer.trim()) processFrame(buffer);
     } catch (error) {
-      if (operationSignal.aborted) {
-        throw networkError(operationSignal.reason ?? error, "La respuesta de Agent Genia tardó demasiado.");
-      }
-      throw error;
+      streamFailure = operationSignal.aborted
+        ? networkError(operationSignal.reason ?? error, "La respuesta de Agent Genia tardó demasiado.")
+        : error;
     } finally {
       reader.releaseLock();
     }
     if (finalResponse) return finalResponse;
-    throw new Error("La conexión terminó antes de recibir la respuesta final.");
+    if (runId) {
+      const recovered = await this.recoverAgentRun(runId, signal).catch(() => null);
+      if (recovered) return recovered;
+    }
+    if (streamedText) return { answer: streamedText, run_id: runId };
+    if (streamFailure) throw streamFailure;
+    throw new Error("La ejecución no entregó una respuesta recuperable.");
+  }
+
+  private async recoverAgentRun(
+    runId: string,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown> | null> {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const snapshot = await this.authorizedJson(
+        `/v1/agent/runs/${encodeURIComponent(runId)}`,
+        { signal }
+      );
+      if (snapshot.status === "succeeded" && isRecord(snapshot.result)) {
+        return snapshot.result;
+      }
+      if (["failed", "cancelled", "budget_exhausted", "expired"].includes(stringValue(snapshot.status))) {
+        throw new Error(`La ejecución terminó con estado ${stringValue(snapshot.status)}.`);
+      }
+      if (attempt < 119) await delay(500, signal);
+    }
+    return null;
   }
 
   private async publicJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {

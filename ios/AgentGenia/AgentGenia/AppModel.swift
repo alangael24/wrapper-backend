@@ -79,7 +79,9 @@ final class AppModel {
             let url = try trustedHTTPSURL(started.authorizeURL, allowedHosts: ["accounts.google.com"])
             presentBrowser(url: url, purpose: .account)
             accountPollingTask?.cancel()
-            accountPollingTask = Task { await pollSignIn(attemptID: started.attemptID) }
+            accountPollingTask = Task {
+                await pollSignIn(attemptID: started.attemptID, expiresIn: started.expiresIn)
+            }
         } catch { report(error) }
     }
 
@@ -205,11 +207,12 @@ final class AppModel {
     ) async {
         guard let index = bots.firstIndex(where: { $0.id == id }) else { return }
         bots[index].name = clean(name, maximum: 60, fallback: "Nuevo bot")
-        bots[index].title = clean(title, maximum: 120)
+        bots[index].title = clean(title, maximum: 100)
         bots[index].description = clean(description, maximum: 600)
         bots[index].color = botColors.contains(color) ? color : bots[index].color
         bots[index].shape = shape
         bots[index].notificationsEnabled = notificationsEnabled
+        bots[index].updatedAt = Date()
         await persistLocalState(dirty: true)
         schedulePersist()
     }
@@ -297,9 +300,17 @@ final class AppModel {
                 .filter { $0.connected && knownIDs.contains($0.connectorID) }
                 .map(\.connectorID)
                 .sorted()
-            let installedIDs = Array(Set(selectedConnectorIDs).union(connectedIDs)).sorted()
-            let changed = selectedConnectorIDs != installedIDs
-            selectedConnectorIDs = installedIDs
+            let connectedSet = Set(connectedIDs)
+            let changed = selectedConnectorIDs != connectedIDs
+                || bots.contains { !Set($0.connectorIDs).isSubset(of: connectedSet) }
+            selectedConnectorIDs = connectedIDs
+            for index in bots.indices {
+                let reconciled = bots[index].connectorIDs.filter(connectedSet.contains)
+                if reconciled != bots[index].connectorIDs {
+                    bots[index].connectorIDs = reconciled
+                    bots[index].updatedAt = Date()
+                }
+            }
             if changed {
                 await persistLocalState(dirty: true)
                 schedulePersist()
@@ -332,7 +343,10 @@ final class AppModel {
         do {
             try await api.disconnectConnector(connectorID)
             selectedConnectorIDs.removeAll { $0 == connectorID }
-            for index in bots.indices { bots[index].connectorIDs.removeAll { $0 == connectorID } }
+            for index in bots.indices where bots[index].connectorIDs.contains(connectorID) {
+                bots[index].connectorIDs.removeAll { $0 == connectorID }
+                bots[index].updatedAt = Date()
+            }
             await persistLocalState(dirty: true)
             schedulePersist()
             await refreshConnectors(force: true)
@@ -464,6 +478,16 @@ final class AppModel {
         catch { report(error) }
     }
 
+    func deleteComputer(botID: UUID) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            _ = try await api.deleteComputer(botID: botID)
+            computer = try await api.computerStatus(botID: botID)
+        } catch { report(error) }
+    }
+
     func dismissBrowser() {
         let dismissedPurpose = browserPurpose
         browserPurpose = nil
@@ -479,9 +503,10 @@ final class AppModel {
         }
     }
 
-    private func pollSignIn(attemptID: String) async {
+    private func pollSignIn(attemptID: String, expiresIn: Int) async {
         defer { accountPollingTask = nil }
-        for _ in 0..<120 {
+        let attempts = max(1, (min(max(expiresIn, 30), 1_800) + 1) / 2)
+        for _ in 0..<attempts {
             guard !Task.isCancelled else { return }
             do {
                 let status = try await api.authStatus(attemptID: attemptID)
@@ -513,6 +538,12 @@ final class AppModel {
                 let status = try await api.connectorStatus(attemptID)
                 if status.status == "complete" {
                     if !selectedConnectorIDs.contains(connectorID) { selectedConnectorIDs.append(connectorID) }
+                    if case let .bot(activeID) = destination,
+                       let index = bots.firstIndex(where: { $0.id == activeID }),
+                       !bots[index].connectorIDs.contains(connectorID) {
+                        bots[index].connectorIDs.append(connectorID)
+                        bots[index].updatedAt = Date()
+                    }
                     connectorPollingTask = nil
                     isBusy = false
                     browserRequest = nil
@@ -662,9 +693,7 @@ final class AppModel {
         guard !runningBotIDs.contains(botID), let source = bots.first(where: { $0.id == botID }) else { return }
         runningBotIDs.insert(botID)
         defer { runningBotIDs.remove(botID) }
-        let availableConnectorIDs = Array(
-            Set(selectedConnectorIDs + source.connectorIDs)
-        ).sorted()
+        let availableConnectorIDs = Array(Set(source.connectorIDs)).sorted()
         var executionBot = source
         executionBot.connectorIDs = availableConnectorIDs
         let prompt = buildBotPrompt(bot: executionBot, userText: userText, initial: initial)
@@ -676,7 +705,9 @@ final class AppModel {
             ))
             bots[index] = updated
         }
-        let replyID = UUID()
+        // All devices use the bot UUID for its single generated first reply,
+        // so replaying `initial-<bot>` cannot create duplicate messages.
+        let replyID = initial ? botID : UUID()
         let replyCreatedAt = Date()
         if let index = bots.firstIndex(where: { $0.id == botID }) {
             var updated = bots[index]
@@ -854,7 +885,7 @@ final class AppModel {
     }
 
     private func applyRemoteState(_ state: PersistedAccountState) {
-        deletedBotIDs = Array(state.deletedBotIDs.suffix(200))
+        deletedBotIDs = Array(state.deletedBotIDs.suffix(1_000))
         let deleted = Set(deletedBotIDs)
         bots = state.bots.filter { !deleted.contains($0.id) }
         selectedConnectorIDs = state.selectedConnectorIDs
@@ -1011,7 +1042,7 @@ private func mergeAccountStates(
     _ server: PersistedAccountState,
     _ local: PersistedAccountState
 ) -> PersistedAccountState {
-    let deletedBotIDs = Array(Set(server.deletedBotIDs + local.deletedBotIDs)).suffix(200)
+    let deletedBotIDs = Array(Set(server.deletedBotIDs + local.deletedBotIDs)).suffix(1_000)
     let deleted = Set(deletedBotIDs)
     var bots = Dictionary(uniqueKeysWithValues: server.bots.map { ($0.id, $0) })
     for localBot in local.bots {
@@ -1027,10 +1058,10 @@ private func mergeAccountStates(
                 workflows[workflow.id] = workflow
             }
         }
-        var merged = localBot
+        var merged = localBot.updatedAt >= serverBot.updatedAt ? localBot : serverBot
         // The device performing the conflict resolution owns mutable
         // selections. Union would make disconnect/removal impossible forever.
-        merged.connectorIDs = Array(Set(localBot.connectorIDs)).sorted()
+        merged.connectorIDs = Array(Set(merged.connectorIDs)).sorted()
         merged.messages = Array(messages.values.sorted { $0.createdAt < $1.createdAt }.suffix(200))
         merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
         bots[localBot.id] = merged
@@ -1044,7 +1075,9 @@ private func mergeAccountStates(
         onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
         bots: mergedBots,
         deletedBotIDs: Array(deletedBotIDs),
-        selectedConnectorIDs: Array(Set(local.selectedConnectorIDs)).sorted(),
+        // OAuth connection state is authoritative on the server. Preferring
+        // a stale device here would resurrect a connector after revocation.
+        selectedConnectorIDs: Array(Set(server.selectedConnectorIDs)).sorted(),
         activeBotID: active
     )
 }
@@ -1054,7 +1087,7 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
     // enough to recover context after a restart without resending a growing
     // transcript on every turn.
     let history = bot.messages.suffix(4).map { message in
-        "\(message.role == .user ? "Usuario" : bot.name): \(message.text)"
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(8_000))"
     }.joined(separator: "\n")
     let profile = [
         "Eres \(bot.name), un agente de Agent Genia.",
@@ -1074,7 +1107,7 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
 
 private func buildDirectChatPrompt(bot: BotProfile, userText: String) -> String {
     let history = bot.messages.suffix(6).map { message in
-        "\(message.role == .user ? "Usuario" : bot.name): \(message.text)"
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(8_000))"
     }.joined(separator: "\n")
     return [
         "Eres \(bot.name), un agente de Agent Genia.",
@@ -1105,16 +1138,16 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
         guard let label = item["label"] as? String, !label.isEmpty else { return nil }
         let naturalValue = (item["value"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? label
         return BotQuestionOption(
-            label: String(label.prefix(180)),
-            value: String(naturalValue.prefix(1_000)),
-            description: String(((item["description"] as? String) ?? "").prefix(300))
+            label: String(label.prefix(120)),
+            value: String(naturalValue.prefix(300)),
+            description: String(((item["description"] as? String) ?? "").prefix(240))
         )
     }
     guard !options.isEmpty else { return (String(text.prefix(20_000)), nil) }
     return (
         String(text.prefix(20_000)),
         BotQuestionWidget(
-            prompt: String(prompt.prefix(500)),
+            prompt: String(prompt.prefix(300)),
             helpText: String(((value["helpText"] as? String) ?? "").prefix(500)),
             options: options,
             allowCustom: value["allowCustom"] as? Bool ?? false,

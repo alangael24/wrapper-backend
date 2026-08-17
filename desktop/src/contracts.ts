@@ -189,6 +189,7 @@ export interface BotProfile {
   messages: BotMessage[];
   workflows: BotWorkflow[];
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface BotWorkflow {
@@ -350,7 +351,7 @@ export function normalizeAppState(value: unknown): AppState {
   const validConnectorIds = new Set(CONNECTOR_CATALOG.map((item) => item.id));
   const selectedConnectorIds = uniqueStrings(value.selectedConnectorIds)
     .filter((id) => validConnectorIds.has(id));
-  const deletedBotIds = uniqueStrings(value.deletedBotIds).slice(-200);
+  const deletedBotIds = uniqueStrings(value.deletedBotIds).slice(-1000);
   const deleted = new Set(deletedBotIds);
   const bots = Array.isArray(value.bots)
     ? value.bots.slice(0, 100).map(normalizeBot).filter((bot): bot is BotProfile => Boolean(bot))
@@ -379,6 +380,7 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
   if (!name) throw new Error("Escribe un nombre para el bot.");
   const color = BOT_COLORS.includes(draft.color as BotColor) ? draft.color as BotColor : BOT_COLORS[6];
   const shape = BOT_SHAPES.includes(draft.shape as BotShape) ? draft.shape as BotShape : BOT_SHAPES[0];
+  const timestamp = now.toISOString();
   return {
     id,
     name,
@@ -391,7 +393,8 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
     connectorIds: normalizeConnectorIds(connectorIds),
     messages: [],
     workflows: [],
-    createdAt: now.toISOString()
+    createdAt: timestamp,
+    updatedAt: timestamp
   };
 }
 
@@ -413,7 +416,8 @@ export function updateBotProfile(bot: BotProfile, patch: BotPatch): BotProfile {
     color,
     shape,
     avatarDataUrl,
-    notificationsEnabled: patch.notificationsEnabled === undefined ? bot.notificationsEnabled : patch.notificationsEnabled === true
+    notificationsEnabled: patch.notificationsEnabled === undefined ? bot.notificationsEnabled : patch.notificationsEnabled === true,
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -439,7 +443,8 @@ function normalizeBot(value: unknown): BotProfile | null {
       avatarDataUrl: safeAvatarDataUrl(value.avatarDataUrl),
       notificationsEnabled: value.notificationsEnabled !== false,
       messages: normalizeBotMessages(value.messages),
-      workflows: normalizeBotWorkflows(value.workflows)
+      workflows: normalizeBotWorkflows(value.workflows),
+      updatedAt: normalizeDate(value.updatedAt, createdAt.toISOString())
     };
   } catch {
     return null;
@@ -453,7 +458,7 @@ export function createBotWorkflow(
   recordingMimeType: BotWorkflow["recordingMimeType"],
   now = new Date()
 ): BotWorkflow {
-  const title = cleanProfileText(draft.title, 120).replace(/\s+/g, " ");
+  const title = cleanProfileText(draft.title, 100).replace(/\s+/g, " ");
   const steps = normalizeWorkflowSteps(draft.steps);
   if (!title || !steps.length) throw new Error("No pudimos extraer los pasos de la tarea.");
   const timestamp = now.toISOString();
@@ -524,7 +529,8 @@ function normalizeBotMessages(value: unknown): BotMessage[] {
   return value.slice(-200).flatMap((item): BotMessage[] => {
     if (!isRecord(item) || (item.role !== "user" && item.role !== "assistant")) return [];
     const text = cleanProfileText(item.text, 20_000);
-    if (!text) return [];
+    const widget = item.role === "assistant" ? normalizeQuestionWidget(item.widget) : undefined;
+    if (!text && !widget) return [];
     const createdAt = typeof item.createdAt === "string" && !Number.isNaN(Date.parse(item.createdAt))
       ? new Date(item.createdAt).toISOString()
       : new Date().toISOString();
@@ -532,9 +538,7 @@ function normalizeBotMessages(value: unknown): BotMessage[] {
       id: typeof item.id === "string" && item.id ? item.id.slice(0, 100) : crypto.randomUUID(),
       role: item.role,
       text,
-      ...(item.role === "assistant" && normalizeQuestionWidget(item.widget)
-        ? { widget: normalizeQuestionWidget(item.widget)! }
-        : {}),
+      ...(widget ? { widget } : {}),
       createdAt
     }];
   });
@@ -557,16 +561,16 @@ export function normalizeQuestionWidget(value: unknown): BotQuestionWidget | und
   if (!options.length) return undefined;
   return {
     prompt,
-    helpText: cleanProfileText(value.helpText, 300),
+    helpText: cleanProfileText(value.helpText, 500),
     options,
-    allowCustom: value.allowCustom !== false,
+    allowCustom: value.allowCustom === true,
     dismissOnMoveOn: value.dismissOnMoveOn !== false
   };
 }
 
 function normalizeAvatarDataUrl(value: unknown): string {
   if (value === "" || value === undefined || value === null) return "";
-  if (typeof value !== "string" || value.length > 1_500_000) throw new Error("La imagen del avatar es demasiado grande.");
+  if (typeof value !== "string" || value.length > 700_000) throw new Error("La imagen del avatar es demasiado grande.");
   if (!/^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/i.test(value)) {
     throw new Error("El avatar debe ser PNG, JPEG o WebP.");
   }

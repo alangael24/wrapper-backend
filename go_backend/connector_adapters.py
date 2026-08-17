@@ -9,6 +9,7 @@ los tokens OAuth de cada usuario.
 from __future__ import annotations
 
 import json
+import jsonschema
 import logging
 import re
 import secrets
@@ -448,23 +449,44 @@ class ComposioConnectorGateway:
             normalized_arguments = _normalize_operation_arguments(
                 connector_id, operation, arguments
             )
+            search = session.search(
+                query=(
+                    f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
+                    # Preserve the canonical operation id so the router can
+                    # return an action that we can match exactly.
+                    f"operation '{operation}'."
+                )
+            )
+            results = list(getattr(search, "results", []) or [])
             slug = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
             if not slug:
-                search = session.search(
-                    query=(
-                        f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
-                        f"operation '{operation.replace('_', ' ')}'."
-                    )
-                )
-                results = list(getattr(search, "results", []) or [])
-                slugs = list(getattr(results[0], "primary_tool_slugs", []) or []) if results else []
-                if not slugs:
+                slug = _select_composio_tool_slug(connector_id, operation, results)
+                if not slug:
                     raise ConnectorBrokerError(
                         404,
-                        "No encontramos una operacion compatible en el toolkit",
+                        "No encontramos una acción inequívoca para esta operación",
                         "connector_operation_not_found",
                     )
-                slug = slugs[0]
+            input_schema = _composio_input_schema(search, slug)
+            if input_schema:
+                try:
+                    jsonschema.validate(normalized_arguments, input_schema)
+                except jsonschema.ValidationError as exc:
+                    field = ".".join(str(item) for item in exc.absolute_path)
+                    suffix = f" en {field}" if field else ""
+                    raise ConnectorBrokerError(
+                        400,
+                        f"Argumentos inválidos para {operation}{suffix}",
+                        "bad_connector_arguments",
+                    ) from exc
+                except jsonschema.SchemaError:
+                    # A malformed provider schema is an upstream metadata
+                    # issue. Keep deterministic slug selection and let the
+                    # provider validate instead of rejecting valid calls.
+                    logging.warning(
+                        "Ignoring invalid provider schema connector=%s operation=%s tool=%s",
+                        connector_id, operation, slug,
+                    )
             logging.info(
                 "Executing connector operation connector=%s operation=%s tool=%s",
                 connector_id,
@@ -700,6 +722,57 @@ def _account_toolkit(account: Any) -> str:
 def _normalized_toolkit_slug(value: str) -> str:
     """Tolerate SDK casing/separators while preserving exact toolkit identity."""
     return re.sub(r"[^a-z0-9]", "", value.strip().lower())
+
+
+def _select_composio_tool_slug(
+    connector_id: str, operation: str, results: list[Any]
+) -> str:
+    """Choose by action identity, never by whichever search result ranks first."""
+    candidates: list[str] = []
+    for result in results:
+        for raw in list(getattr(result, "primary_tool_slugs", []) or []):
+            if isinstance(raw, str) and raw and raw not in candidates:
+                candidates.append(raw)
+    target = operation.upper()
+    exact = [
+        slug for slug in candidates
+        if slug.upper() == target or slug.upper().endswith("_" + target)
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    toolkit = COMPOSIO_TOOLKITS.get(connector_id, "").upper().replace("-", "_")
+    toolkit_exact = [slug for slug in exact if slug.upper().startswith(toolkit + "_")]
+    if len(toolkit_exact) == 1:
+        return toolkit_exact[0]
+    operation_tokens = set(target.split("_"))
+    scored = []
+    for slug in candidates:
+        slug_tokens = set(re.split(r"[^A-Z0-9]+", slug.upper()))
+        if operation_tokens <= slug_tokens and (
+            not toolkit
+            or _normalized_toolkit_slug(toolkit) in _normalized_toolkit_slug(slug)
+        ):
+            scored.append(slug)
+    return scored[0] if len(scored) == 1 else ""
+
+
+def _composio_input_schema(search: Any, slug: str) -> dict[str, Any] | None:
+    """Return the exact selected action schema from Tool Router search."""
+    schemas = getattr(search, "tool_schemas", None)
+    if not isinstance(schemas, dict):
+        return None
+    selected = next(
+        (value for key, value in schemas.items() if str(key).upper() == slug.upper()),
+        None,
+    )
+    if selected is None:
+        return None
+    schema = (
+        selected.get("input_schema")
+        if isinstance(selected, dict)
+        else getattr(selected, "input_schema", None)
+    )
+    return schema if isinstance(schema, dict) else None
 
 
 def _delete_session(session: Any) -> None:

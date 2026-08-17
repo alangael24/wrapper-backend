@@ -10,12 +10,16 @@ import com.agentgenia.android.model.BillingSubscription
 import com.agentgenia.android.model.ComputerSnapshot
 import com.agentgenia.android.model.ComputerState
 import com.agentgenia.android.model.ConnectorStatus
+import com.agentgenia.android.model.PersistedAccountState
 import com.agentgenia.android.model.WhatsAppLinkStart
 import com.agentgenia.android.model.WhatsAppStatus
 import com.agentgenia.android.model.optNullableString
 import com.agentgenia.android.model.toAccountIdentity
 import com.agentgenia.android.model.toAccountSession
+import com.agentgenia.android.model.toPersistedAccountState
+import com.agentgenia.android.model.toJson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -40,6 +44,7 @@ data class AuthStatus(
 )
 data class ConnectorStart(val attemptId: String, val authorizeUrl: String)
 data class ConnectorPoll(val status: String, val message: String?)
+data class AccountStateSnapshot(val revision: Int, val state: PersistedAccountState)
 
 class ServiceException(
     override val message: String,
@@ -55,9 +60,9 @@ class AgentGeniaApi(
     private val jsonType = "application/json; charset=utf-8".toMediaType()
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(1_800, TimeUnit.SECONDS)
+        .readTimeout(1_860, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
-        .callTimeout(1_810, TimeUnit.SECONDS)
+        .callTimeout(1_870, TimeUnit.SECONDS)
         .build()
     private val sessionMutex = Mutex()
     @Volatile private var session: AccountSession? = null
@@ -150,6 +155,28 @@ class AgentGeniaApi(
         }
     }
 
+    suspend fun accountState(): AccountStateSnapshot {
+        val json = requestJson("/v1/account-state")
+        return AccountStateSnapshot(
+            revision = json.optInt("revision"),
+            state = (json.optJSONObject("state") ?: JSONObject()).toPersistedAccountState(),
+        )
+    }
+
+    suspend fun saveAccountState(state: PersistedAccountState, baseRevision: Int): AccountStateSnapshot {
+        val json = requestJson(
+            "/v1/account-state", "POST",
+            JSONObject()
+                .put("base_revision", baseRevision)
+                .put("device_id", secureStore.deviceId())
+                .put("state", state.toJson()),
+        )
+        return AccountStateSnapshot(
+            revision = json.optInt("revision"),
+            state = (json.optJSONObject("state") ?: JSONObject()).toPersistedAccountState(),
+        )
+    }
+
     suspend fun startConnector(connectorId: String): ConnectorStart {
         val json = requestJson(
             "/v1/connectors/start", "POST", JSONObject().put("connector_id", connectorId),
@@ -172,10 +199,7 @@ class AgentGeniaApi(
         prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
         executionMode: String = "agent", chatPrompt: String = "", userMessage: String = "",
     ): String {
-        val json = requestJson(
-            "/v1/agent/run",
-            "POST",
-            JSONObject()
+        val body = JSONObject()
                 .put("prompt", prompt)
                 .put("execution_mode", executionMode)
                 .put("chat_prompt", chatPrompt)
@@ -186,9 +210,34 @@ class AgentGeniaApi(
                 .put("bot_id", botId)
                 .put("connector_ids", JSONArray(connectorIds))
                 .put("max_credits", 15)
-                .put("idempotency_key", idempotencyKey),
-        )
+                .put("idempotency_key", idempotencyKey)
+        val json = try {
+            requestJson("/v1/agent/run", "POST", body)
+        } catch (error: ServiceException) {
+            if (error.status != 0) throw error
+            runCatching { requestJson("/v1/agent/run", "POST", body) }.getOrElse {
+                recoverAgentRun(idempotencyKey)
+            }
+        }
         return json.optString("answer")
+    }
+
+    private suspend fun recoverAgentRun(idempotencyKey: String): JSONObject {
+        repeat(120) { attempt ->
+            val snapshot = requestJson(
+                "/v1/agent/recover", "POST",
+                JSONObject().put("idempotency_key", idempotencyKey),
+            )
+            when (snapshot.optString("status")) {
+                "succeeded" -> snapshot.optJSONObject("result")?.let { return it }
+                "failed", "cancelled", "expired", "budget_exhausted" -> throw ServiceException(
+                    "La ejecución terminó sin una respuesta válida.",
+                    snapshot.optString("error_code", "agent_run_failed"), 502,
+                )
+            }
+            if (attempt < 119) delay(500)
+        }
+        throw ServiceException("La ejecución continúa procesándose.", "run_still_running", 202)
     }
 
     suspend fun computerStatus(botId: String): ComputerSnapshot =
@@ -201,6 +250,9 @@ class AgentGeniaApi(
 
     suspend fun handBackComputer(botId: String): ComputerSnapshot =
         requestJson("/v1/computers/${path(botId)}/hand-back", "POST", JSONObject()).toComputerSnapshot()
+
+    suspend fun deleteComputer(botId: String): Boolean =
+        requestJson("/v1/computers/${path(botId)}/delete", "POST", JSONObject()).optBoolean("deleted")
 
     suspend fun billing(): BillingSnapshot {
         val json = requestJson("/v1/billing")

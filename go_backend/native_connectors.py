@@ -61,8 +61,6 @@ NATIVE_CONNECTORS: dict[str, NativeDefinition] = {
     "nooks": NativeDefinition(
         (TOKEN, LABEL), "https://partner-api.nooks.in/v1/", "bearer",
         {
-            "list_sessions": Operation("GET", "sequences"),
-            "get_session": Operation("GET", "sequences/{id}"),
             "list_calls": Operation("GET", "calls"),
             "get_call": Operation("GET", "calls/{id}"),
         },
@@ -188,7 +186,6 @@ NATIVE_CONNECTORS: dict[str, NativeDefinition] = {
             "search_workers": Operation("GET", "workers"),
             "get_worker": Operation("GET", "workers/{id}"),
             "list_positions": Operation("GET", "positions"),
-            "list_time_off": Operation("GET", "workers"),
         },
     ),
     "zoominfo": NativeDefinition(

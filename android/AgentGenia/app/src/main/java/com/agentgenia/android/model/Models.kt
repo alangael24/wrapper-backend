@@ -59,13 +59,29 @@ data class BotProfile(
     val description: String = "",
     val color: String = BOT_COLORS.first(),
     val shape: BotShape = BotShape.Bean,
+    val avatarDataUrl: String = "",
     val notificationsEnabled: Boolean = true,
     val connectorIds: List<String> = emptyList(),
     val messages: List<BotMessage> = emptyList(),
+    val workflows: List<BotWorkflow> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = createdAt,
+)
+
+data class BotWorkflow(
+    val id: String,
+    val title: String,
+    val summary: String = "",
+    val steps: List<String> = emptyList(),
+    val recordingId: String = "",
+    val recordingMimeType: String = "",
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis(),
+    val lastRunAt: Long? = null,
 )
 
 data class PersistedAccountState(
+    val onboardingCompleted: Boolean = false,
     val bots: List<BotProfile> = emptyList(),
     val selectedConnectorIds: List<String> = emptyList(),
     val activeBotId: String? = null,
@@ -171,6 +187,8 @@ fun JSONObject.toAccountSession() = AccountSession(
 )
 
 fun PersistedAccountState.toJson() = JSONObject()
+    .put("version", 2)
+    .put("onboardingCompleted", onboardingCompleted)
     .put("bots", JSONArray().also { array -> bots.forEach { array.put(it.toJson()) } })
     .put("deletedBotIds", JSONArray(deletedBotIds))
     .put("selectedConnectorIds", JSONArray(selectedConnectorIds))
@@ -181,10 +199,11 @@ fun JSONObject.toPersistedAccountState(): PersistedAccountState {
     val selected = optJSONArray("selectedConnectorIds") ?: JSONArray()
     val deleted = optJSONArray("deletedBotIds") ?: JSONArray()
     return PersistedAccountState(
+        onboardingCompleted = optBoolean("onboardingCompleted"),
         bots = List(botArray.length()) { botArray.getJSONObject(it).toBotProfile() },
         selectedConnectorIds = List(selected.length()) { selected.getString(it) },
         activeBotId = optNullableString("activeBotId"),
-        deletedBotIds = List(deleted.length()) { deleted.getString(it) }.takeLast(200),
+        deletedBotIds = List(deleted.length()) { deleted.getString(it) }.takeLast(1_000),
     )
 }
 
@@ -195,14 +214,18 @@ fun BotProfile.toJson() = JSONObject()
     .put("description", description)
     .put("color", color)
     .put("shape", shape.name.lowercase())
+    .put("avatarDataUrl", avatarDataUrl)
     .put("notificationsEnabled", notificationsEnabled)
     .put("connectorIds", JSONArray(connectorIds))
     .put("messages", JSONArray().also { array -> messages.forEach { array.put(it.toJson()) } })
+    .put("workflows", JSONArray().also { array -> workflows.forEach { array.put(it.toJson()) } })
     .put("createdAt", createdAt)
+    .put("updatedAt", updatedAt)
 
 fun JSONObject.toBotProfile(): BotProfile {
     val connectorArray = optJSONArray("connectorIds") ?: JSONArray()
     val messageArray = optJSONArray("messages") ?: JSONArray()
+    val workflowArray = optJSONArray("workflows") ?: JSONArray()
     return BotProfile(
         id = optString("id", UUID.randomUUID().toString()).lowercase(),
         name = optString("name", "Nuevo bot"),
@@ -210,10 +233,13 @@ fun JSONObject.toBotProfile(): BotProfile {
         description = optString("description"),
         color = optString("color", BOT_COLORS.first()),
         shape = BotShape.entries.firstOrNull { it.name.equals(optString("shape"), true) } ?: BotShape.Bean,
+        avatarDataUrl = optString("avatarDataUrl"),
         notificationsEnabled = optBoolean("notificationsEnabled", true),
         connectorIds = List(connectorArray.length()) { connectorArray.getString(it) },
         messages = List(messageArray.length()) { messageArray.getJSONObject(it).toBotMessage() },
+        workflows = List(workflowArray.length()) { workflowArray.getJSONObject(it).toBotWorkflow() },
         createdAt = optLong("createdAt", System.currentTimeMillis()),
+        updatedAt = optLong("updatedAt", optLong("createdAt", System.currentTimeMillis())),
     )
 }
 
@@ -232,6 +258,32 @@ fun JSONObject.toBotMessage() = BotMessage(
     createdAt = optLong("createdAt", System.currentTimeMillis()),
 )
 
+fun BotWorkflow.toJson() = JSONObject()
+    .put("id", id)
+    .put("title", title)
+    .put("summary", summary)
+    .put("steps", JSONArray(steps))
+    .put("recordingId", recordingId)
+    .put("recordingMimeType", recordingMimeType)
+    .put("createdAt", createdAt)
+    .put("updatedAt", updatedAt)
+    .put("lastRunAt", lastRunAt ?: JSONObject.NULL)
+
+fun JSONObject.toBotWorkflow(): BotWorkflow {
+    val values = optJSONArray("steps") ?: JSONArray()
+    return BotWorkflow(
+        id = optString("id"),
+        title = optString("title"),
+        summary = optString("summary"),
+        steps = List(values.length()) { values.getString(it) },
+        recordingId = optString("recordingId"),
+        recordingMimeType = optString("recordingMimeType"),
+        createdAt = optLong("createdAt", System.currentTimeMillis()),
+        updatedAt = optLong("updatedAt", System.currentTimeMillis()),
+        lastRunAt = if (isNull("lastRunAt")) null else optLong("lastRunAt"),
+    )
+}
+
 fun BotQuestionWidget.toJson() = JSONObject()
     .put("prompt", prompt)
     .put("helpText", helpText)
@@ -242,18 +294,18 @@ fun BotQuestionWidget.toJson() = JSONObject()
     .put("dismissOnMoveOn", dismissOnMoveOn)
 
 fun JSONObject.toQuestionWidget(): BotQuestionWidget? {
-    val prompt = optString("prompt").trim().take(500)
+    val prompt = optString("prompt").trim().take(300)
     val values = optJSONArray("options") ?: return null
     if (prompt.isEmpty() || values.length() !in 1..6) return null
     val options = buildList {
         repeat(values.length().coerceAtMost(6)) { index ->
             val item = values.optJSONObject(index) ?: return@repeat
-            val label = item.optString("label").trim().take(180)
+            val label = item.optString("label").trim().take(120)
             if (label.isNotEmpty()) add(
                 BotQuestionOption(
                     label = label,
-                    value = item.optString("value", label).ifBlank { label }.take(1_000),
-                    description = item.optString("description").take(300),
+                    value = item.optString("value", label).ifBlank { label }.take(300),
+                    description = item.optString("description").take(240),
                 )
             )
         }

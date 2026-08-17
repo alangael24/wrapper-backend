@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -140,6 +140,13 @@ CREATE TABLE IF NOT EXISTS account_states (
   updated_by_device_hash TEXT NOT NULL,
   created_at             REAL NOT NULL,
   updated_at             REAL NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_bot_tombstones (
+  user_id    TEXT NOT NULL,
+  bot_id     TEXT NOT NULL,
+  deleted_at REAL NOT NULL,
+  PRIMARY KEY(user_id, bot_id),
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS account_auth_attempts (
@@ -285,6 +292,22 @@ CREATE TABLE IF NOT EXISTS agent_run_tokens (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS connector_operations (
+  user_id       TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  operation_id  TEXT NOT NULL,
+  connector_id  TEXT NOT NULL,
+  operation     TEXT NOT NULL,
+  arguments_hash TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'running',
+  result_json   TEXT,
+  error_code    TEXT,
+  created_at    REAL NOT NULL,
+  updated_at    REAL NOT NULL,
+  PRIMARY KEY(user_id, run_id, operation_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS whatsapp_link_codes (
   code_hash   TEXT PRIMARY KEY,
   user_id     TEXT NOT NULL,
@@ -344,6 +367,8 @@ CREATE INDEX IF NOT EXISTS idx_bot_computers_user
   ON bot_computers(user_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_account_states_updated
   ON account_states(updated_at);
+CREATE INDEX IF NOT EXISTS idx_account_bot_tombstones_deleted
+  ON account_bot_tombstones(user_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_account_auth_attempts_expires
   ON account_auth_attempts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_connector_auth_attempts_user
@@ -353,6 +378,8 @@ CREATE INDEX IF NOT EXISTS idx_account_identity_tokens_expires
 CREATE INDEX IF NOT EXISTS idx_account_provider_credentials_account
   ON account_provider_credentials(account_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_status ON agent_runs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_connector_operations_run
+  ON connector_operations(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_grants_user_expiry
   ON credit_grants(user_id, expires_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created
@@ -1080,6 +1107,20 @@ class Store:
         device_hash: str,
     ) -> dict:
         now = _now()
+        payload = json.loads(state_json)
+        if not isinstance(payload, dict):
+            raise ValueError("state_json debe contener un objeto")
+        deleted_ids = [
+            item for item in payload.get("deletedBotIds", [])
+            if isinstance(item, str) and item
+        ]
+        incoming_bots = payload.get("bots")
+        incoming_bot_ids = [
+            item.get("id") for item in incoming_bots
+            if isinstance(incoming_bots, list)
+            and isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+        ] if isinstance(incoming_bots, list) else []
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1099,6 +1140,34 @@ class Store:
                         "created_at": now,
                         "updated_at": now,
                     })
+                for bot_id in deleted_ids:
+                    self._conn.execute(
+                        "INSERT INTO account_bot_tombstones(user_id,bot_id,deleted_at) "
+                        "VALUES(?,?,?) ON CONFLICT(user_id,bot_id) DO NOTHING",
+                        (user_id, bot_id, now),
+                    )
+                tombstoned: set[str] = set()
+                if incoming_bot_ids:
+                    placeholders = ",".join("?" for _item in incoming_bot_ids)
+                    rows = self._conn.execute(
+                        "SELECT bot_id FROM account_bot_tombstones WHERE user_id=? "
+                        f"AND bot_id IN ({placeholders})",
+                        (user_id, *incoming_bot_ids),
+                    ).fetchall()
+                    tombstoned = {str(item["bot_id"]) for item in rows}
+                if tombstoned:
+                    payload["bots"] = [
+                        item for item in incoming_bots
+                        if not isinstance(item, dict) or item.get("id") not in tombstoned
+                    ]
+                    active = payload.get("activeBotId")
+                    if active in tombstoned:
+                        payload["activeBotId"] = (
+                            payload["bots"][0].get("id") if payload["bots"] else None
+                        )
+                    state_json = json.dumps(
+                        payload, separators=(",", ":"), ensure_ascii=False
+                    )
                 if row is None:
                     self._conn.execute(
                         "INSERT INTO account_states(user_id,revision,state_json,updated_by_device_hash,created_at,updated_at) "
@@ -1334,14 +1403,38 @@ class Store:
             ),
         )
 
+    def prepare_whatsapp_outbound(
+        self, *, message_id: str, result_text: str, user_id: str | None = None
+    ) -> None:
+        """Persist the final text and claim the one allowed delivery attempt.
+
+        Meta does not expose a caller supplied idempotency key for message
+        sends. Moving to ``sending`` before the network call makes an
+        interrupted delivery explicit and prevents an automatic duplicate.
+        """
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE whatsapp_messages SET status='sending',result_text=?,"
+                "user_id=COALESCE(?,user_id),updated_at=? "
+                "WHERE message_id=? AND status='processing'",
+                (result_text[:20_000], user_id, _now(), message_id),
+            )
+            self._conn.commit()
+        if changed.rowcount != 1:
+            raise RuntimeError("whatsapp_delivery_already_claimed")
+
     def retry_whatsapp_message(
         self, *, message_id: str, error: str, maximum_attempts: int = 3
     ) -> None:
         row = self._one(
-            "SELECT attempts FROM whatsapp_messages WHERE message_id=?", (message_id,)
+            "SELECT attempts,status FROM whatsapp_messages WHERE message_id=?", (message_id,)
         )
         attempts = int(row["attempts"]) if row else maximum_attempts
-        terminal = attempts >= maximum_attempts
+        # Once delivery entered ``sending`` the provider outcome is uncertain.
+        # Never resend automatically: that would create duplicate WhatsApp
+        # replies after a timeout or process crash.
+        uncertain_delivery = bool(row and row["status"] == "sending")
+        terminal = uncertain_delivery or attempts >= maximum_attempts
         delay = min(300, 5 * (2 ** max(0, attempts - 1)))
         self._exec(
             "UPDATE whatsapp_messages SET status=?,next_attempt_at=?,last_error=?,updated_at=? "
@@ -1349,7 +1442,7 @@ class Store:
             (
                 "failed" if terminal else "pending",
                 _now() if terminal else _now() + delay,
-                error[:500],
+                ("outbound_delivery_uncertain: " + error if uncertain_delivery else error)[:500],
                 _now(),
                 message_id,
             ),
@@ -2186,8 +2279,18 @@ class Store:
                     (user_id, idempotency_key),
                 ).fetchone()
                 if existing:
-                    self._conn.rollback()
-                    return {"duplicate": True, "run": dict(existing)}
+                    if existing["status"] in {"failed", "cancelled", "expired", "budget_exhausted"}:
+                        # A terminal failure must not poison the user's stable
+                        # idempotency key for the whole retention window. Keep
+                        # the old run auditable under a retired key and allow
+                        # one controlled fresh execution.
+                        self._conn.execute(
+                            "UPDATE agent_runs SET idempotency_key=? WHERE id=?",
+                            (f"{idempotency_key}:retired:{existing['id']}", existing["id"]),
+                        )
+                    else:
+                        self._conn.rollback()
+                        return {"duplicate": True, "run": dict(existing)}
                 active = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM agent_runs WHERE user_id=? "
                     "AND status IN ('reserved','running')",
@@ -2325,13 +2428,100 @@ class Store:
         )
         return dict(row) if row else None
 
+    def get_agent_run_by_idempotency(self, user_id: str, idempotency_key: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM agent_runs WHERE user_id=? AND idempotency_key=?",
+            (user_id, idempotency_key),
+        )
+        return dict(row) if row else None
+
     def save_agent_run_result(self, run_id: str, payload: dict) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > 1_000_000:
             raise ValueError("El resultado durable excede 1 MB")
         self._exec(
-            "UPDATE agent_runs SET result_json=? WHERE id=? AND status='succeeded'",
+            "UPDATE agent_runs SET result_json=? WHERE id=? "
+            "AND status IN ('reserved','running','succeeded')",
             (encoded, run_id),
+        )
+
+    def begin_connector_operation(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        operation_id: str,
+        connector_id: str,
+        operation: str,
+        arguments_hash: str,
+    ) -> dict:
+        """Atomically reserve a provider call or replay its durable result.
+
+        A row left in ``running`` after a crash is deliberately treated as
+        uncertain. Replaying it could duplicate an email, calendar event, or
+        payment even though the first provider request actually succeeded.
+        """
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT * FROM connector_operations "
+                    "WHERE user_id=? AND run_id=? AND operation_id=?",
+                    (user_id, run_id, operation_id),
+                ).fetchone()
+                if existing is not None:
+                    row = dict(existing)
+                    same_call = (
+                        row["connector_id"] == connector_id
+                        and row["operation"] == operation
+                        and row["arguments_hash"] == arguments_hash
+                    )
+                    self._conn.rollback()
+                    if not same_call:
+                        return {"status": "conflict"}
+                    if row["status"] == "succeeded" and row.get("result_json"):
+                        try:
+                            result = json.loads(row["result_json"])
+                        except (TypeError, json.JSONDecodeError):
+                            return {"status": "uncertain"}
+                        return {"status": "replay", "result": result}
+                    return {"status": "uncertain"}
+                self._conn.execute(
+                    "INSERT INTO connector_operations("
+                    "user_id,run_id,operation_id,connector_id,operation,arguments_hash,"
+                    "status,created_at,updated_at) VALUES(?,?,?,?,?,?,'running',?,?)",
+                    (
+                        user_id, run_id, operation_id, connector_id, operation,
+                        arguments_hash, now, now,
+                    ),
+                )
+                self._conn.commit()
+                return {"status": "owner"}
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def complete_connector_operation(
+        self, *, user_id: str, run_id: str, operation_id: str, result: dict
+    ) -> None:
+        encoded = json.dumps(
+            result, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        self._exec(
+            "UPDATE connector_operations SET status='succeeded',result_json=?,"
+            "error_code=NULL,updated_at=? WHERE user_id=? AND run_id=? "
+            "AND operation_id=? AND status='running'",
+            (encoded, _now(), user_id, run_id, operation_id),
+        )
+
+    def fail_connector_operation(
+        self, *, user_id: str, run_id: str, operation_id: str, error_code: str
+    ) -> None:
+        self._exec(
+            "UPDATE connector_operations SET status='failed',error_code=?,updated_at=? "
+            "WHERE user_id=? AND run_id=? AND operation_id=? AND status='running'",
+            (error_code[:100], _now(), user_id, run_id, operation_id),
         )
 
     def get_agent_run_by_token(self, token: str) -> dict | None:
@@ -2891,6 +3081,12 @@ class Store:
                     "UPDATE whatsapp_messages SET status='pending',next_attempt_at=?,updated_at=? "
                     "WHERE status='processing' AND updated_at<=?",
                     (current, current, current - 3600),
+                )
+                self._conn.execute(
+                    "UPDATE whatsapp_messages SET status='failed',"
+                    "last_error='outbound_delivery_uncertain',updated_at=? "
+                    "WHERE status='sending' AND updated_at<=?",
+                    (current, current - 3600),
                 )
                 self._conn.commit()
                 return counts

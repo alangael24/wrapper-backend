@@ -274,9 +274,14 @@ class PostgresStore(Store):
         row = self._one(
             "WITH locked AS MATERIALIZED ("
             " SELECT pg_advisory_xact_lock(hashtextextended(?::text,0))"
+            "), retired AS ("
+            " UPDATE agent_runs SET idempotency_key=idempotency_key||':retired:'||id "
+            " WHERE user_id=? AND idempotency_key=? "
+            " AND status IN ('failed','cancelled','expired','budget_exhausted') RETURNING id"
             "), existing AS MATERIALIZED ("
             " SELECT ar.* FROM agent_runs ar,locked "
-            " WHERE ar.user_id=? AND ar.idempotency_key=?"
+            " WHERE ar.user_id=? AND ar.idempotency_key=? "
+            " AND (SELECT COUNT(*) FROM retired)>=0"
             "), active AS MATERIALIZED ("
             " SELECT COUNT(*)::bigint AS n FROM agent_runs ar,locked "
             " WHERE ar.user_id=? AND ar.status IN ('reserved','running')"
@@ -297,6 +302,8 @@ class PostgresStore(Store):
             " UNION ALL SELECT 'inserted',to_jsonb(inserted) FROM inserted",
             (
                 user_id,
+                user_id,
+                idempotency_key,
                 user_id,
                 idempotency_key,
                 user_id,

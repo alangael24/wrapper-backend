@@ -130,7 +130,7 @@ test("records teach-task locally but fails closed while the text-only model cann
   assert.match(main, /useSystemPicker:\s*true/);
   assert.match(main, /mode:\s*0o600, flag:\s*"wx"/);
   assert.match(main, /buildWorkflowRunPrompt\(bot, workflow\)/);
-  assert.match(main, /\{ computer: true, botId \}/);
+  assert.match(main, /computer: true,\s+botId/);
   assert.match(preload, /startTeachRecording/);
   assert.match(preload, /stopTeachRecording/);
   assert.match(oauth, /Teach a task está pausado mientras Agent Genia no tenga soporte visual/);
@@ -268,8 +268,8 @@ test("runs bot conversations through wrapper-backend without hardcoded replies",
   assert.match(main, /buildBotPrompt\(\{ \.\.\.bot, connectorIds \}, prompt, initial\)/);
   assert.match(main, /executionMode: initial \? "chat" : "auto"/);
   assert.match(main, /chatPrompt: initial[\s\S]{0,160}\? buildBotPrompt[\s\S]{0,160}: buildDirectChatPrompt/);
-  assert.match(main, /\.\.\.before\.selectedConnectorIds/);
-  assert.match(main, /\.\.\.bot\.connectorIds/);
+  assert.match(main, /const connectorIds = normalizeConnectorIds\(bot\.connectorIds\)/);
+  assert.doesNotMatch(main, /\.\.\.before\.selectedConnectorIds/);
   assert.match(oauth, /\$\{this\.options\.baseUrl\}\/v1\/agent\/run/);
   assert.match(oauth, /connector_ids: connectorIds/);
   assert.match(oauth, /Accept: "text\/event-stream"/);

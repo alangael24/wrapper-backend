@@ -433,6 +433,9 @@ private fun ComputerDialog(bot: BotProfile, state: AppUiState, model: AppViewMod
         dismissButton = {
             Row {
                 if (snapshot?.state == ComputerState.Running) TextButton(onClick = { model.handBackComputer(bot.id) }) { Text("Hibernar") }
+                if (snapshot != null && snapshot.state !in setOf(ComputerState.Off, ComputerState.Disabled)) {
+                    TextButton(onClick = { model.deleteComputer(bot.id) }) { Text("Eliminar") }
+                }
                 TextButton(onClick = onDismiss) { Text("Cerrar") }
             }
         },
