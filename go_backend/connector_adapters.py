@@ -32,7 +32,10 @@ UPSTREAM_POLL_INTERVAL_SECONDS = 2.0
 # overrides de entorno permiten incorporar o renombrar toolkits sin publicar
 # una nueva app de escritorio.
 COMPOSIO_TOOLKITS: dict[str, str] = {
-    "google-workspace": "google_super",
+    # Composio's public toolkit slug is ``googlesuper`` (without an
+    # underscore). ``google_super`` is rejected by Tool Router v2 before the
+    # user can reach Google's OAuth screen.
+    "google-workspace": "googlesuper",
     "slack": "slack",
     "notion": "notion",
     "salesforce": "salesforce",

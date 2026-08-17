@@ -2279,6 +2279,27 @@ class TestBackend(unittest.TestCase):
         gateway.disconnect(alice_id, "github")
         self.assertFalse(gateway.status(alice_id, "github")["connected"])
 
+    def test_google_workspace_uses_current_composio_toolkit_slug(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("google-workspace-user")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        started = gateway.start(user_id, "google-workspace")
+
+        self.assertEqual(client.session_options[-1]["toolkits"], ["googlesuper"])
+        self.assertEqual(
+            client.connected_accounts.items["ca_1"].toolkit,
+            "googlesuper",
+        )
+        self.assertEqual(
+            started["authorize_url"],
+            "https://connect.composio.dev/link/ca_1",
+        )
+
     def test_composio_gateway_fails_closed_without_private_auth_config(self):
         gateway = ComposioConnectorGateway(
             client=FakeComposioClient(), store=self.ws.backend.store
