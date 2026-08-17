@@ -289,8 +289,14 @@ private struct ChatTimeline: View {
                             .foregroundStyle(.secondary)
                             .padding()
                     }
-                    ForEach(bot.messages) { item in
-                        MessageBubble(message: item, botID: bot.id)
+                    ForEach(Array(bot.messages.enumerated()), id: \.element.id) { index, item in
+                        MessageBubble(
+                            message: item,
+                            botID: bot.id,
+                            hasLaterUserMessage: bot.messages.dropFirst(index + 1).contains {
+                                $0.role == .user
+                            }
+                        )
                             .id(item.id)
                     }
                 }
@@ -308,6 +314,7 @@ private struct MessageBubble: View {
     @Environment(AppModel.self) private var model
     let message: BotMessage
     let botID: UUID
+    let hasLaterUserMessage: Bool
 
     var body: some View {
         HStack {
@@ -322,8 +329,10 @@ private struct MessageBubble: View {
                     Text(message.text)
                         .textSelection(.enabled)
                 }
-                if message.role == .assistant, let widget = message.widget {
-                    QuestionWidgetView(widget: widget) { value in
+                if message.role == .assistant,
+                   let widget = message.widget,
+                   !hasLaterUserMessage || !widget.dismissOnMoveOn {
+                    QuestionWidgetView(widget: widget, alreadyAnswered: hasLaterUserMessage) { value in
                         Task { await model.sendMessage(botID: botID, text: value) }
                     }
                 }
@@ -339,6 +348,7 @@ private struct MessageBubble: View {
 
 private struct QuestionWidgetView: View {
     let widget: BotQuestionWidget
+    let alreadyAnswered: Bool
     let submit: (String) -> Void
     @State private var custom = ""
     @State private var answered = false
@@ -366,9 +376,9 @@ private struct QuestionWidgetView: View {
                     .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 12))
                 }
                 .buttonStyle(.plain)
-                .disabled(answered)
+                .disabled(answered || alreadyAnswered)
             }
-            if widget.allowCustom {
+            if widget.allowCustom && !alreadyAnswered {
                 HStack {
                     TextField("Escribe tu respuesta", text: $custom)
                         .textFieldStyle(.roundedBorder)

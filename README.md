@@ -777,7 +777,7 @@ runtime se agrupan aquí por función.
 | Variable | Default | Descripción |
 |---|---|---|
 | `COMPUTERS_ENABLED` | `0` | Habilita una sandbox Daytona persistente por `(usuario, bot)` |
-| `EXTERNAL_WRITES_ENABLED` | `0` | Debe seguir apagado: escrituras, shell y efectos externos requieren aprobación humana por operación |
+| `EXTERNAL_WRITES_ENABLED` | `0` | Debe seguir apagado: el backend concede únicamente operaciones de escritura reconocidas en una petición humana explícita y las limita al grant efímero de esa ejecución |
 | `DAYTONA_API_KEY` | vacío | Credencial server-side; obligatoria si la función está habilitada |
 | `DAYTONA_API_URL` | vacío | Endpoint alternativo de Daytona |
 | `DAYTONA_TARGET` | vacío | Target o región opcional |

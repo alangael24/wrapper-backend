@@ -320,6 +320,7 @@ class ConnectorRunGrant:
     user_id: str
     connector_ids: frozenset[str]
     computer_id: str | None
+    approved_write_operations: frozenset[tuple[str, str]]
     expires_at: float
 
 
@@ -361,6 +362,7 @@ class ConnectorBroker:
         user_id: str,
         connector_ids: tuple[str, ...],
         computer_id: str | None = None,
+        approved_write_operations: frozenset[tuple[str, str]] = frozenset(),
         ttl_seconds: int | None = None,
     ) -> str:
         if not connector_ids and not computer_id:
@@ -368,11 +370,18 @@ class ConnectorBroker:
         expires_in = self.default_ttl_seconds if ttl_seconds is None else max(
             1, min(int(ttl_seconds), self.default_ttl_seconds)
         )
+        scoped_write_operations = frozenset(
+            (connector_id, operation)
+            for connector_id, operation in approved_write_operations
+            if connector_id in connector_ids
+            and operation in CONNECTOR_CATALOG[connector_id]["operations"]
+        )
         token = secrets.token_urlsafe(32)
         grant = ConnectorRunGrant(
             user_id=user_id,
             connector_ids=frozenset(connector_ids),
             computer_id=computer_id,
+            approved_write_operations=scoped_write_operations,
             expires_at=self._now() + expires_in,
         )
         with self._lock:
@@ -426,6 +435,13 @@ class ConnectorBroker:
 
     def has_computer(self, token: str) -> bool:
         return bool(self._require_grant(token).computer_id)
+
+    def write_is_approved(
+        self, token: str, connector_id: str, operation: str
+    ) -> bool:
+        """Check the exact write permission attached to this short-lived run."""
+        grant = self._require_grant(token)
+        return (connector_id, operation) in grant.approved_write_operations
 
     def execute(
         self,

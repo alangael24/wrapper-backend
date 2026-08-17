@@ -65,6 +65,7 @@ import secrets
 import sys
 import threading
 import time
+import unicodedata
 import httpx
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -160,6 +161,63 @@ JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
 READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
+
+
+def _plain_intent_text(value: str) -> str:
+    folded = unicodedata.normalize("NFKD", value.casefold())
+    return " ".join(
+        "".join(char for char in folded if not unicodedata.combining(char)).split()
+    )
+
+
+def _explicit_write_approvals(
+    connector_ids: tuple[str, ...], user_message: str, conversation_context: str
+) -> frozenset[tuple[str, str]]:
+    """Grant only writes explicitly requested by the human in this conversation.
+
+    The client labels human history as ``Usuario:``. Restricting the scan to
+    those lines prevents connector/tool output from authorizing a later write
+    through prompt injection. The grant is scoped to one operation and expires
+    with the current Pi run.
+    """
+    human_turns = [user_message]
+    for line in conversation_context.splitlines():
+        match = re.match(r"^\s*Usuario\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if match:
+            human_turns.append(match.group(1))
+    intent = _plain_intent_text("\n".join(human_turns[-8:]))
+    context_intent = _plain_intent_text(conversation_context)
+    approved: set[tuple[str, str]] = set()
+    if "google-workspace" in connector_ids:
+        asks_to_create = re.search(
+            r"\b(crea(?:r|me|lo)?|agenda(?:r|me|lo)?|programa(?:r|me|lo)?|"
+            r"agrega(?:r|me|lo)?|anade(?:r|me|lo)?|pon(?:er|lo)?|"
+            r"create|schedule|add)\b",
+            intent,
+        )
+        calendar_object = re.search(
+            r"\b(evento|calendario|cita|reunion|calendar|event|appointment|meeting)\b",
+            intent,
+        )
+        confirms_pending_action = re.search(
+            r"\b(?:si\s+)?(?:hazlo|adelante|confirmo|intentalo|reintentalo|go ahead|do it)\b",
+            _plain_intent_text(user_message),
+        )
+        pending_calendar_create = (
+            confirms_pending_action
+            and re.search(
+                r"\b(?:crear?|agendar?|programar?|agregar?|anadir?|create|schedule|add)\b",
+                context_intent,
+            )
+            and re.search(
+                r"\b(?:evento|calendario|cita|reunion|calendar|event|appointment|meeting)\b",
+                context_intent,
+            )
+        )
+        if (asks_to_create and calendar_object) or pending_calendar_create:
+            approved.add(("google-workspace", "create_calendar_event"))
+    return frozenset(approved)
+
 
 # OpenAI-compatible routes exposed by the wrapper.
 UPSTREAM_PATHS = {
@@ -2579,7 +2637,7 @@ class Backend:
         tool_intent = re.compile(
             r"(?:https?://|\b(?:abre|busca|consulta|revisa|revisar|checa|checar|"
             r"comprueba|verifica|mira|mu[eé]strame|dime\s+(?:qu[eé]|cu[aá]l(?:es)?|si)|lee|descarga|sube|"
-            r"env[ií]a|manda|publica|actualiza|modifica|elimina|borra|crea\s+(?:un\s+)?"
+            r"env[ií]a|manda|publica|actualiza|modifica|elimina|borra|crea(?:r)?\s+(?:un\s+)?"
             r"(?:issue|ticket|evento|archivo|carpeta|tarea|documento)|agenda|programa|"
             r"reserva|compra|conecta|instala|ejecuta|corre|inicia\s+sesi[oó]n|"
             r"open|search|look\s+up|check|review|read|download|upload|send|post|"
@@ -3213,10 +3271,14 @@ class Backend:
                         warm_event.wait(timeout=12.0)
                         self._mark_run_timing(run_id, "pi_warm_wait_finished_ms")
                 if connector_ids or computer_enabled:
+                    approved_write_operations = _explicit_write_approvals(
+                        connector_ids, user_message, effective_prompt
+                    )
                     connector_run_token = self.connectors.issue(
                         user_id=user["id"],
                         connector_ids=connector_ids,
                         computer_id=bot_id if computer_enabled else None,
+                        approved_write_operations=approved_write_operations,
                     )
                 self._mark_run_timing(run_id, "pi_dispatch_ms")
 
@@ -3441,12 +3503,23 @@ class Backend:
         if not token:
             return
         body = self.read_json(handler) or {}
+        connector_id = body.get("connector_id")
         operation = body.get("operation")
+        write_is_approved = False
+        if isinstance(connector_id, str) and isinstance(operation, str):
+            try:
+                write_is_approved = self.connectors.write_is_approved(
+                    token, connector_id, operation
+                )
+            except ConnectorBrokerError as e:
+                error_response(handler, e.status, str(e), e.code)
+                return
         if (
             not self.cfg.external_writes_enabled
             and isinstance(operation, str)
             and operation not in READ_ONLY_CONNECTOR_OPERATIONS
             and not operation.startswith(READ_ONLY_CONNECTOR_PREFIXES)
+            and not write_is_approved
         ):
             error_response(
                 handler,
@@ -3458,7 +3531,7 @@ class Backend:
         try:
             result = self.connectors.execute(
                 token=token,
-                connector_id=body.get("connector_id"),
+                connector_id=connector_id,
                 operation=operation,
                 arguments=body.get("arguments", {}),
             )

@@ -225,6 +225,18 @@ final class AppModel {
     func sendMessage(botID: UUID, text: String) async {
         let value = clean(text, maximum: 20_000)
         guard !value.isEmpty else { return }
+        // A widget can become visible a few milliseconds before the run that
+        // produced it finishes its local/server persistence. Never drop an
+        // immediate option tap during that window; wait for the prior turn and
+        // then dispatch the selected value normally.
+        while runningBotIDs.contains(botID) {
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+            guard phase == .ready, bots.contains(where: { $0.id == botID }) else { return }
+        }
         await runAgent(botID: botID, userText: value, initial: false)
     }
 

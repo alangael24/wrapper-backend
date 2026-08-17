@@ -92,7 +92,7 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
       calendar_id: "Usa primary salvo que el usuario indique otro calendario",
       attendees: "Lista opcional de emails",
     },
-    rule: "No afirmes que el evento fue creado hasta que esta herramienta responda sin error. Si falla por argumentos, corrige y reintenta.",
+    rule: "No afirmes que el evento fue creado hasta que esta herramienta responda sin error. Si el usuario no quiere indicar una hora final, omite end_datetime y la duración para usar el valor seguro predeterminado de una hora; nunca inventes una jornada de 8 horas. Si falla por argumentos, corrige y reintenta.",
   },
 });
 
