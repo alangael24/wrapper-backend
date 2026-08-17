@@ -314,14 +314,14 @@ class AppViewModel(
             .distinct()
             .sorted()
             .toList()
-        val connectedSet = connectedIds.toSet()
         _state.update { current ->
             current.copy(
-                selectedConnectorIds = connectedIds,
+                // A temporary provider/status failure must not erase an
+                // installation that another device already synchronized.
+                selectedConnectorIds = (
+                    current.selectedConnectorIds + connectedIds
+                ).distinct().sorted(),
                 connectorStatuses = statuses.associateBy(ConnectorStatus::connectorId),
-                bots = current.bots.map { bot ->
-                    bot.copy(connectorIds = bot.connectorIds.filter(connectedSet::contains))
-                },
             )
         }
         persist()

@@ -456,11 +456,9 @@ final class AppModel {
         let dismissedPurpose = browserPurpose
         browserPurpose = nil
         browserRequest = nil
-        if case .connector = dismissedPurpose, connectorPollingTask != nil {
-            connectorPollingTask?.cancel()
-            connectorPollingTask = nil
-            isBusy = false
-        }
+        // OAuth finishes outside the app and the browser sheet can close
+        // before Composio reports ACTIVE. Keep polling so the completed
+        // connection is persisted and synchronized across devices.
         if dismissedPurpose == .billing {
             Task { await refreshBilling(force: true) }
         }
@@ -652,7 +650,12 @@ final class AppModel {
         guard !runningBotIDs.contains(botID), let source = bots.first(where: { $0.id == botID }) else { return }
         runningBotIDs.insert(botID)
         defer { runningBotIDs.remove(botID) }
-        let prompt = buildBotPrompt(bot: source, userText: userText, initial: initial)
+        let availableConnectorIDs = Array(
+            Set(selectedConnectorIDs + source.connectorIDs)
+        ).sorted()
+        var executionBot = source
+        executionBot.connectorIDs = availableConnectorIDs
+        let prompt = buildBotPrompt(bot: executionBot, userText: userText, initial: initial)
         let turnID = initial ? "initial-\(botID.uuidString.lowercased())" : UUID().uuidString.lowercased()
         if !initial, let index = bots.firstIndex(where: { $0.id == botID }) {
             var updated = bots[index]
@@ -674,9 +677,7 @@ final class AppModel {
         // on the cross-region account-state API.
         await persistLocalState(dirty: true)
         do {
-            let connectorIDs = initial
-                ? []
-                : Array(Set(selectedConnectorIDs + source.connectorIDs)).sorted()
+            let connectorIDs = initial ? [] : availableConnectorIDs
             let agentTask = Task {
                 try await api.runAgent(
                     prompt: prompt,
@@ -686,7 +687,7 @@ final class AppModel {
                     executionMode: initial ? "chat" : "auto",
                     chatPrompt: initial
                         ? prompt
-                        : buildDirectChatPrompt(bot: source, userText: userText),
+                        : buildDirectChatPrompt(bot: executionBot, userText: userText),
                     userMessage: userText,
                     computer: false,
                     onDelta: { [weak self] delta in

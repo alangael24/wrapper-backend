@@ -27,6 +27,7 @@ TERMINAL_CONNECTION_STATES = frozenset({"FAILED", "EXPIRED", "REVOKED", "DELETED
 AUTH_ATTEMPT_TTL_SECONDS = 10 * 60
 AUTH_STARTS_PER_MINUTE = 12
 UPSTREAM_POLL_INTERVAL_SECONDS = 2.0
+CONNECTION_SNAPSHOT_TTL_SECONDS = 15.0
 
 # Nombres verificados contra el catalogo de toolkits de Composio. Los
 # overrides de entorno permiten incorporar o renombrar toolkits sin publicar
@@ -131,6 +132,7 @@ class ComposioConnectorGateway:
         self._attempt_ttl_seconds = max(60, min(int(attempt_ttl_seconds), 1800))
         self.store = store
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
+        self._snapshot_cache: dict[str, tuple[float, tuple[dict[str, Any], ...]]] = {}
         self._lock = threading.RLock()
         self.client = client
         self.native_gateway = native_gateway
@@ -191,6 +193,11 @@ class ComposioConnectorGateway:
             return self.native_gateway.status(user_id, connector_id)  # type: ignore[union-attr]
         if not description["available"]:
             return {**description, "connected": False, "account": ""}
+        cached = self._cached_snapshot(user_id)
+        if cached is not None:
+            for item in cached:
+                if item["connector_id"] == connector_id:
+                    return item
         accounts = self.client.connected_accounts.list(
             user_ids=[user_id],
             toolkit_slugs=[description["toolkit"]],
@@ -207,14 +214,19 @@ class ComposioConnectorGateway:
 
     def snapshot(self, user_id: str) -> list[dict[str, Any]]:
         """Devuelve todo el catalogo usando una sola consulta a Composio."""
+        cached = self._cached_snapshot(user_id)
+        if cached is not None:
+            return cached
         descriptions = [self.describe(connector_id) for connector_id in CONNECTOR_CATALOG]
         if not self.configured:
-            return [
+            snapshot = [
                 self.native_gateway.status(user_id, item["connector_id"])
                 if item.get("driver") == "native" and self.native_gateway
                 else {**item, "connected": False, "account": ""}
                 for item in descriptions
             ]
+            self._store_snapshot(user_id, snapshot)
+            return snapshot
         try:
             accounts_page = self.client.connected_accounts.list(
                 user_ids=[user_id],
@@ -226,7 +238,7 @@ class ComposioConnectorGateway:
             raise _upstream_error(exc, "No se pudo consultar las cuentas conectadas") from exc
         by_toolkit: dict[str, Any] = {}
         for account in accounts:
-            toolkit = _account_toolkit(account)
+            toolkit = _normalized_toolkit_slug(_account_toolkit(account))
             if toolkit and toolkit not in by_toolkit:
                 by_toolkit[toolkit] = account
         snapshot: list[dict[str, Any]] = []
@@ -234,15 +246,26 @@ class ComposioConnectorGateway:
             if item.get("driver") == "native":
                 snapshot.append(self.native_gateway.status(user_id, item["connector_id"]))  # type: ignore[union-attr]
             else:
+                toolkit = _normalized_toolkit_slug(item["toolkit"])
                 snapshot.append({
                     **item,
-                    "connected": item["available"] and item["toolkit"] in by_toolkit,
-                    "account": _account_label(by_toolkit.get(item["toolkit"])),
+                    "connected": item["available"] and toolkit in by_toolkit,
+                    "account": _account_label(by_toolkit.get(toolkit)),
                 })
+        self._store_snapshot(user_id, snapshot)
         return snapshot
+
+    def connected_connector_ids(self, user_id: str) -> tuple[str, ...]:
+        """Lista autoritativa usada al emitir un grant, no una preferencia del cliente."""
+        return tuple(
+            item["connector_id"]
+            for item in self.snapshot(user_id)
+            if item.get("connected") is True
+        )
 
     def start(self, user_id: str, connector_id: str) -> dict[str, str]:
         self._check_start_rate(user_id)
+        self._invalidate_snapshot(user_id)
         description = self.describe(connector_id)
         if not description["available"]:
             raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
@@ -295,7 +318,10 @@ class ComposioConnectorGateway:
 
     def poll(self, user_id: str, attempt_id: str) -> dict[str, Any]:
         if attempt_id.startswith("nat_") and self.native_gateway:
-            return self.native_gateway.poll(user_id, attempt_id)
+            result = self.native_gateway.poll(user_id, attempt_id)
+            if result.get("status") == "complete":
+                self._invalidate_snapshot(user_id)
+            return result
         attempt, should_poll = self.store.claim_connector_poll(
             attempt_id,
             user_id,
@@ -316,6 +342,7 @@ class ComposioConnectorGateway:
         except Exception as exc:
             raise _upstream_error(exc, "No se pudo consultar la autorizacion") from exc
         if state == ACTIVE:
+            self._invalidate_snapshot(user_id)
             self.store.finish_connector_auth_attempt(
                 attempt_id=attempt_id,
                 status="complete",
@@ -349,6 +376,7 @@ class ComposioConnectorGateway:
         }
 
     def disconnect(self, user_id: str, connector_id: str) -> dict[str, bool]:
+        self._invalidate_snapshot(user_id)
         description = self.describe(connector_id)
         native_result = None
         if self.native_gateway and self.native_gateway.supports(connector_id):
@@ -366,6 +394,7 @@ class ComposioConnectorGateway:
                 account_id = str(getattr(account, "id", "") or "")
                 if account_id:
                     self.client.connected_accounts.delete(account_id)
+            self._invalidate_snapshot(user_id)
         except Exception as exc:
             raise _upstream_error(exc, "No se pudo desconectar la cuenta") from exc
         return {"disconnected": True}
@@ -384,6 +413,7 @@ class ComposioConnectorGateway:
                 if account_id:
                     self.client.connected_accounts.delete(account_id)
                     deleted += 1
+            self._invalidate_snapshot(user_id)
             return deleted
         except Exception as exc:
             raise _upstream_error(exc, "No se pudieron revocar las cuentas conectadas") from exc
@@ -491,6 +521,28 @@ class ComposioConnectorGateway:
                 )
             bucket.append(now)
 
+    def _cached_snapshot(self, user_id: str) -> list[dict[str, Any]] | None:
+        with self._lock:
+            cached = self._snapshot_cache.get(user_id)
+            if cached is None:
+                return None
+            expires_at, items = cached
+            if expires_at <= self._now():
+                self._snapshot_cache.pop(user_id, None)
+                return None
+            return [dict(item) for item in items]
+
+    def _store_snapshot(self, user_id: str, snapshot: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self._snapshot_cache[user_id] = (
+                self._now() + CONNECTION_SNAPSHOT_TTL_SECONDS,
+                tuple(dict(item) for item in snapshot),
+            )
+
+    def _invalidate_snapshot(self, user_id: str) -> None:
+        with self._lock:
+            self._snapshot_cache.pop(user_id, None)
+
 
 class ComposioConnectorAdapter:
     """Adaptador del broker Pi hacia el gateway interno, sin HTTP intermedio."""
@@ -588,6 +640,10 @@ def _account_toolkit(account: Any) -> str:
     toolkit = getattr(account, "toolkit", None)
     if isinstance(toolkit, str):
         return toolkit
+    if isinstance(toolkit, dict):
+        slug = toolkit.get("slug")
+        if isinstance(slug, str):
+            return slug
     if toolkit is not None:
         slug = getattr(toolkit, "slug", None)
         if isinstance(slug, str):
@@ -603,6 +659,11 @@ def _account_toolkit(account: Any) -> str:
             if isinstance(value, str):
                 return value
     return ""
+
+
+def _normalized_toolkit_slug(value: str) -> str:
+    """Tolerate SDK casing/separators while preserving exact toolkit identity."""
+    return re.sub(r"[^a-z0-9]", "", value.strip().lower())
 
 
 def _delete_session(session: Any) -> None:

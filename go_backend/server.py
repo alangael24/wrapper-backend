@@ -1937,13 +1937,17 @@ class Backend:
     def _whatsapp_timestamp() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    def _mutate_whatsapp_state(self, user_id: str, mutate) -> dict:
-        device_hash = hashlib.sha256(b"account-state-device|whatsapp-channel").hexdigest()
+    def _mutate_account_state(self, user_id: str, mutate, *, source: str) -> dict:
+        device_hash = hashlib.sha256(
+            f"account-state-device|{source}".encode()
+        ).hexdigest()
         for _attempt in range(5):
             payload = self._account_state_payload(self.store.get_account_state(user_id))
             # JSON round-trip gives the mutator an isolated copy.
             state = json.loads(json.dumps(payload["state"]))
             next_state = normalize_account_state(mutate(state))
+            if next_state == payload["state"]:
+                return next_state
             try:
                 saved = self.store.save_account_state(
                     user_id=user_id,
@@ -1954,7 +1958,26 @@ class Backend:
                 return self._account_state_payload(saved)["state"]
             except AccountStateConflict:
                 continue
-        raise RuntimeError("La cuenta cambió demasiadas veces mientras WhatsApp respondía")
+        raise RuntimeError("La cuenta cambió demasiadas veces durante la sincronización")
+
+    def _mutate_whatsapp_state(self, user_id: str, mutate) -> dict:
+        return self._mutate_account_state(user_id, mutate, source="whatsapp-channel")
+
+    def _add_connected_connectors_to_state(
+        self, user_id: str, connector_ids: list[str] | tuple[str, ...]
+    ) -> dict:
+        connected = [
+            item for item in dict.fromkeys(connector_ids) if item in CONNECTOR_CATALOG
+        ]
+
+        def add(current: dict) -> dict:
+            selected = list(current.get("selectedConnectorIds", []))
+            current["selectedConnectorIds"] = list(dict.fromkeys(selected + connected))
+            return current
+
+        return self._mutate_account_state(
+            user_id, add, source="connector-reconciliation"
+        )
 
     def _append_whatsapp_state_message(
         self, *, user_id: str, bot_id: str, message: dict
@@ -2026,10 +2049,16 @@ class Backend:
         user = self.require_user(handler)
         if not user:
             return
+        snapshot = self.connector_gateway.snapshot(user["id"])
+        connected_ids = [
+            item["connector_id"] for item in snapshot if item.get("connected") is True
+        ]
+        if connected_ids:
+            self._add_connected_connectors_to_state(user["id"], connected_ids)
         json_response(
             handler,
             200,
-            {"connectors": self.connector_gateway.snapshot(user["id"])},
+            {"connectors": snapshot},
         )
 
     def handle_connector_status_public(
@@ -2063,7 +2092,12 @@ class Backend:
         attempt_id = body.get("attempt_id") if isinstance(body.get("attempt_id"), str) else ""
         if not attempt_id:
             raise ConnectorBrokerError(400, "Falta attempt_id", "bad_connector")
-        json_response(handler, 200, self.connector_gateway.poll(user["id"], attempt_id))
+        result = self.connector_gateway.poll(user["id"], attempt_id)
+        session = result.get("session") if isinstance(result, dict) else None
+        connector_id = session.get("connector_id") if isinstance(session, dict) else None
+        if result.get("status") == "complete" and isinstance(connector_id, str):
+            self._add_connected_connectors_to_state(user["id"], [connector_id])
+        json_response(handler, 200, result)
 
     def handle_connector_disconnect(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -2837,6 +2871,42 @@ class Backend:
         else:
             direct_chat = False
             effective_prompt = prompt
+
+        if not direct_chat:
+            try:
+                connected_connector_ids = self.connector_gateway.connected_connector_ids(
+                    user["id"]
+                )
+            except ConnectorBrokerError:
+                # An upstream status outage must not remove connectors the
+                # authenticated client already requested for this run.
+                logging.warning(
+                    "Could not reconcile connected accounts before agent run",
+                    exc_info=True,
+                )
+                connected_connector_ids = ()
+            discovered_ids = tuple(
+                item for item in connected_connector_ids if item not in connector_ids
+            )
+            connector_ids = tuple(dict.fromkeys((*connector_ids, *connected_connector_ids)))
+            if discovered_ids:
+                self._add_connected_connectors_to_state(user["id"], discovered_ids)
+            if connector_ids:
+                connector_names = ", ".join(
+                    f"{CONNECTOR_CATALOG[item]['name']} ({item})"
+                    for item in connector_ids
+                )
+                connector_context = (
+                    "Conectores autenticados disponibles para esta ejecución: "
+                    f"{connector_names}. Cuando la tarea los necesite, usa "
+                    "connector_search y después la herramienta activada."
+                )
+                if "No hay conectores seleccionados." in effective_prompt:
+                    effective_prompt = effective_prompt.replace(
+                        "No hay conectores seleccionados.", connector_context, 1
+                    )
+                elif connector_context not in effective_prompt:
+                    effective_prompt = f"{effective_prompt}\n\n{connector_context}"
 
         pi_status = self.pi.status()
         if not direct_chat:

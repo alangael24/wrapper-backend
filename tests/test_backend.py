@@ -2427,6 +2427,22 @@ class TestBackend(unittest.TestCase):
             "https://connect.composio.dev/link/ca_1",
         )
 
+        client.connected_accounts.items["ca_nested"] = SimpleNamespace(
+            id="ca_nested",
+            user_id=user_id,
+            toolkit={"slug": "Google_Super"},
+            status="ACTIVE",
+            alias="alan@example.com",
+            data={},
+            status_reason="",
+        )
+        snapshot = gateway.snapshot(user_id)
+        google = next(
+            item for item in snapshot if item["connector_id"] == "google-workspace"
+        )
+        self.assertTrue(google["connected"])
+        self.assertEqual(google["account"], "alan@example.com")
+
     def test_composio_gateway_fails_closed_without_private_auth_config(self):
         gateway = ComposioConnectorGateway(
             client=FakeComposioClient(), store=self.ws.backend.store
@@ -2647,6 +2663,64 @@ class TestBackend(unittest.TestCase):
             if value == "--extension"
         ]
         self.assertEqual(extension_paths, [str(Path("extensions/connectors/index.ts").resolve())])
+
+    def test_agent_run_recovers_connected_accounts_missing_from_client_state(self):
+        signup = self.new_user()
+        user_id = signup["user_id"]
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        client = FakeComposioClient()
+        client.connected_accounts.items["ca_google"] = SimpleNamespace(
+            id="ca_google",
+            user_id=user_id,
+            toolkit=SimpleNamespace(slug="googlesuper"),
+            status="ACTIVE",
+            alias="alan@example.com",
+            data={},
+            status_reason="",
+        )
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        self.ws.backend.connector_gateway = gateway
+        self.ws.backend.connectors.register_adapter(
+            "google-workspace",
+            ComposioConnectorAdapter(gateway, "google-workspace"),
+        )
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": (
+                    "Eres un agente.\nNo hay conectores seleccionados.\n"
+                    "Usuario: lee mis correos recientes"
+                ),
+                "user_message": "lee mis correos recientes",
+                "execution_mode": "auto",
+                "connector_ids": [],
+                "idempotency_key": "recover-connected-google",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["connector_ids"], ["google-workspace"])
+        run_dir = self.ws.backend.pi.runs_dir / result["run_id"]
+        catalog = json.loads((run_dir / "config" / "connector-catalog.json").read_text())
+        self.assertEqual([item["id"] for item in catalog["connectors"]], ["google-workspace"])
+        prompt = self.upstream_payloads("/v1/chat/completions")[-1]["messages"][0]["content"]
+        self.assertIn("Google Workspace (google-workspace)", prompt)
+        self.assertNotIn("No hay conectores seleccionados.", prompt)
+        status, account_state = self.ws.req(
+            "GET", "/v1/account-state", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            account_state["state"]["selectedConnectorIds"], ["google-workspace"]
+        )
 
     def test_agent_rejects_unknown_connector_before_starting_pi(self):
         signup = self.new_user()
