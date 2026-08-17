@@ -121,6 +121,9 @@ struct ConnectorPollResponse: Decodable, Sendable {
 
 private struct AgentRunRequest: Encodable, Sendable {
     let prompt: String
+    let executionMode: String
+    let chatPrompt: String
+    let userMessage: String
     let browser: Bool
     let computer: Bool
     let botID: String
@@ -130,6 +133,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     let stream: Bool
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
+        case executionMode = "execution_mode"; case chatPrompt = "chat_prompt"; case userMessage = "user_message"
         case botID = "bot_id"; case connectorIDs = "connector_ids"
         case maxCredits = "max_credits"; case idempotencyKey = "idempotency_key"
         case stream
@@ -143,6 +147,7 @@ private struct AgentWarmRequest: Encodable, Sendable {
 
 private struct AgentWarmResponse: Decodable, Sendable {
     let ready: Bool
+    let started: Bool
 }
 
 struct AgentRunResponse: Decodable, Sendable { let answer: String }
@@ -419,11 +424,17 @@ actor APIClient {
         botID: UUID,
         connectorIDs: [String],
         idempotencyKey: String,
+        executionMode: String = "agent",
+        chatPrompt: String = "",
+        userMessage: String = "",
         computer: Bool = true,
         onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> AgentRunResponse {
         let request = AgentRunRequest(
             prompt: prompt,
+            executionMode: executionMode,
+            chatPrompt: chatPrompt,
+            userMessage: userMessage,
             browser: false,
             computer: computer,
             botID: botID.uuidString.lowercased(),
@@ -459,7 +470,7 @@ actor APIClient {
                 body: AgentWarmRequest(botID: botID.uuidString.lowercased())
             )
         }
-        guard response.ready else {
+        guard response.ready || response.started else {
             throw ServiceError(
                 message: "El agente todavía no está listo.",
                 code: "pi_warm_incomplete",

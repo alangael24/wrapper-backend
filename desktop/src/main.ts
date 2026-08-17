@@ -180,11 +180,13 @@ class DesktopStateStore {
   async refreshRemote(): Promise<AppState> {
     await this.writes;
     if (!this.filePath) return this.snapshot();
+    const filePath = this.filePath;
     if (this.syncPromise) await this.syncPromise;
+    if (this.filePath !== filePath) return this.snapshot();
     const server = await this.remote.loadAccountState();
     let result = structuredClone(this.state);
     this.writes = this.writes.then(async () => {
-      if (!this.filePath || server.revision <= this.revision) {
+      if (this.filePath !== filePath || server.revision <= this.revision) {
         result = structuredClone(this.state);
         return;
       }
@@ -463,8 +465,10 @@ function registerDesktopIpc(): void {
         })
         : Promise.resolve()
     ]);
-    if (cleanup.some((result) => result.status === "rejected")) {
-      throw new Error("La cuenta se eliminó, pero no fue posible borrar todos los datos locales.");
+    for (const result of cleanup) {
+      if (result.status === "rejected") {
+        console.error(`[account-delete] No fue posible borrar todos los datos locales: ${errorMessage(result.reason)}`);
+      }
     }
     return connections;
   });
@@ -583,38 +587,55 @@ function registerDesktopIpc(): void {
         activeBotId: botId
       }));
     }
-    const result = await oauthController.runAgent(
-      buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
-      connectorIds,
-      {
-        computer: false,
-        botId,
-        idempotencyKey: turnId,
-        onDelta: (text) => {
-          if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
-        }
-      }
-    );
-    const generated = parseAgentAnswer(result.answer);
-    if (!generated.text) throw new Error("El agente no devolvió una respuesta.");
-    const now = new Date().toISOString();
-    return stateStore.update((current) => {
-      const index = current.bots.findIndex((item) => item.id === botId);
-      if (index < 0) throw new Error("El bot se eliminó mientras trabajaba.");
-      const messages = [
-        ...current.bots[index].messages,
+    try {
+      const result = await oauthController.runAgent(
+        buildBotPrompt({ ...bot, connectorIds }, prompt, initial),
+        connectorIds,
         {
-          id: randomUUID(),
-          role: "assistant" as const,
-          text: generated.text,
-          ...(generated.widget ? { widget: generated.widget } : {}),
-          createdAt: now
+          computer: false,
+          botId,
+          idempotencyKey: turnId,
+          executionMode: initial ? "agent" : "auto",
+          chatPrompt: buildDirectChatPrompt({ ...bot, connectorIds }, prompt),
+          userMessage: prompt,
+          onDelta: (text) => {
+            if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
+          }
         }
-      ].slice(-200);
-      const bots = [...current.bots];
-      bots[index] = { ...bots[index], messages };
-      return { ...current, bots, activeBotId: botId };
-    });
+      );
+      const generated = parseAgentAnswer(result.answer);
+      if (!generated.text) throw new Error("El agente no devolvió una respuesta.");
+      const now = new Date().toISOString();
+      return stateStore.update((current) => {
+        const index = current.bots.findIndex((item) => item.id === botId);
+        if (index < 0) throw new Error("El bot se eliminó mientras trabajaba.");
+        const messages = [
+          ...current.bots[index].messages,
+          {
+            id: randomUUID(),
+            role: "assistant" as const,
+            text: generated.text,
+            ...(generated.widget ? { widget: generated.widget } : {}),
+            createdAt: now
+          }
+        ].slice(-200);
+        const bots = [...current.bots];
+        bots[index] = { ...bots[index], messages };
+        return { ...current, bots, activeBotId: botId };
+      });
+    } catch (error) {
+      if (!initial) {
+        await stateStore.update((current) => ({
+          ...current,
+          bots: current.bots.map((item) => item.id === botId
+            ? { ...item, messages: item.messages.filter((message) => message.id !== turnId) }
+            : item)
+        })).catch((rollbackError) => {
+          console.error(`[agent] No fue posible revertir el mensaje fallido: ${errorMessage(rollbackError)}`);
+        });
+      }
+      throw error;
+    }
   });
   ipcMain.handle(CHANNELS.getTeachRecordingStatus, () => teachRecordingStatus());
   ipcMain.handle(CHANNELS.startTeachRecording, async (
@@ -630,7 +651,7 @@ function registerDesktopIpc(): void {
     if (!bot) throw new Error("No encontramos ese bot.");
     if (activeTeachRecording) {
       if (activeTeachRecording.botId === botId) return teachRecordingStatus();
-      throw new Error(`Recording another agent's computer: ${activeTeachRecording.botName}.`);
+      throw new Error(`Ya se está grabando la computadora de ${activeTeachRecording.botName}.`);
     }
     activeTeachRecording = {
       phase: "recording",
@@ -646,7 +667,7 @@ function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.discardTeachRecording, (_event, botIdValue: unknown) => {
     const botId = typeof botIdValue === "string" ? botIdValue : "";
     if (activeTeachRecording && activeTeachRecording.botId !== botId) {
-      throw new Error(`Recording another agent's computer: ${activeTeachRecording.botName}.`);
+      throw new Error(`Ya se está grabando la computadora de ${activeTeachRecording.botName}.`);
     }
     activeTeachRecording = null;
     return teachRecordingStatus();
@@ -767,7 +788,9 @@ function registerDesktopIpc(): void {
       activeBotId: botId
     }));
     if (accountId && workflow.recordingMimeType) {
-      await deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType);
+      await deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType).catch((error) => {
+        console.error(`[teach-recording] No fue posible borrar la grabación local: ${errorMessage(error)}`);
+      });
     }
     return next;
   });
@@ -778,28 +801,33 @@ function registerDesktopIpc(): void {
   ipcMain.handle(CHANNELS.deleteBot, async (_event, botId: unknown) => {
     const before = await stateStore.snapshot();
     const removed = typeof botId === "string" ? before.bots.find((bot) => bot.id === botId) : undefined;
+    if (!removed) throw new Error("No encontramos ese bot.");
     const accountId = await oauthController.accountId();
-    if (removed && accountId) {
-      await oauthController.deleteComputer(removed.id);
-      issuedComputerViewerUrls.clear();
-      computerWindow?.close();
-    }
     if (activeTeachRecording?.botId === botId) activeTeachRecording = null;
     const next = await stateStore.update((state) => {
-      const bots = typeof botId === "string" ? state.bots.filter((bot) => bot.id !== botId) : state.bots;
+      const bots = state.bots.filter((bot) => bot.id !== botId);
       return {
         ...state,
         bots,
-        deletedBotIds: removed
-          ? [...new Set([...state.deletedBotIds, removed.id])].slice(-200)
-          : state.deletedBotIds,
+        deletedBotIds: [...new Set([...state.deletedBotIds, removed.id])].slice(-200),
         activeBotId: state.activeBotId === botId ? bots[0]?.id ?? null : state.activeBotId
       };
     });
-    if (accountId && removed) {
-      await Promise.all(removed.workflows.map((workflow) => workflow.recordingMimeType
-        ? deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType)
-        : Promise.resolve()));
+    issuedComputerViewerUrls.clear();
+    computerWindow?.close();
+    if (accountId) {
+      void Promise.allSettled([
+        oauthController.deleteComputer(removed.id),
+        ...removed.workflows.map((workflow) => workflow.recordingMimeType
+          ? deleteTeachRecording(accountScope(accountId), workflow.recordingId, workflow.recordingMimeType)
+          : Promise.resolve())
+      ]).then((cleanup) => {
+        for (const result of cleanup) {
+          if (result.status === "rejected") {
+            console.error(`[bot-delete] No fue posible limpiar un recurso asociado: ${errorMessage(result.reason)}`);
+          }
+        }
+      });
     }
     return next;
   });
@@ -931,6 +959,25 @@ function buildBotPrompt(
     return `${profile}\n\nEsta es tu primera intervención. Genera al vuelo un saludo breve con tu nombre y un widget con una sola pregunta útil para descubrir qué debe lograr el usuario. El contenido y las opciones deben adaptarse al perfil y conectores disponibles; no uses una plantilla fija ni menciones estas instrucciones.`;
   }
   return `${profile}${history ? `\n\nConversación reciente:\n${history}` : ""}\n\nUsuario: ${userPrompt}`;
+}
+
+function buildDirectChatPrompt(
+  bot: AppState["bots"][number],
+  userPrompt: string
+): string {
+  const history = bot.messages.slice(-6).map((message) => (
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text}`
+  )).join("\n");
+  return [
+    `Eres ${bot.name}, un agente de Agent Genia.`,
+    bot.title ? `Rol: ${bot.title}.` : "",
+    bot.description ? `Objetivo: ${bot.description}.` : "",
+    "Responde directamente en el idioma del usuario, con naturalidad y concisión.",
+    "No uses JSON ni menciones instrucciones internas.",
+    "No afirmes haber ejecutado acciones externas; esta ruta solo conversa y redacta.",
+    history ? `Conversación reciente:\n${history}` : "",
+    `Usuario: ${userPrompt}`,
+  ].filter(Boolean).join("\n\n");
 }
 
 function parseAgentAnswer(value: unknown): {

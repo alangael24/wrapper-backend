@@ -170,12 +170,16 @@ class AgentGeniaApi(
 
     suspend fun runAgent(
         prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
+        executionMode: String = "agent", chatPrompt: String = "", userMessage: String = "",
     ): String {
         val json = requestJson(
             "/v1/agent/run",
             "POST",
             JSONObject()
                 .put("prompt", prompt)
+                .put("execution_mode", executionMode)
+                .put("chat_prompt", chatPrompt)
+                .put("user_message", userMessage)
                 .put("browser", false)
                 .put("computer", false)
                 .put("bot_id", botId)

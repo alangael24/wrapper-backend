@@ -227,11 +227,10 @@ final class AppModel {
     }
 
     func prepareBot(botID: UUID) async {
-        // A new bot used to prewarm and send its initial turn concurrently.
-        // Both requests target the same isolated Pi session, so the first
-        // message could race the warm-up and fail with pi_busy (or pay another
-        // cold start).  Make readiness explicit before the first turn.
-        await warmAgent(botID: botID)
+        // Warming is speculative and must never block the first visible turn.
+        // The backend coordinates the rare race where a Pi task arrives while
+        // this background warm-up is still starting.
+        Task { await warmAgent(botID: botID) }
         await sendInitialMessageIfNeeded(botID: botID)
     }
 
@@ -252,16 +251,6 @@ final class AppModel {
             }
             agentWarmTasks[botID] = task
         }
-        let ready = await task.value
-        agentWarmTasks[botID] = nil
-        if ready { warmedBotUntil[botID] = Date().addingTimeInterval(10 * 60) }
-    }
-
-    private func awaitWarmAgentIfInFlight(botID: UUID) async {
-        // The bot screen starts prewarming in the background. Reuse that work
-        // when it exists, but do not create a second HTTP request on Send: the
-        // agent run can start the same persistent Pi session itself.
-        guard let task = agentWarmTasks[botID] else { return }
         let ready = await task.value
         agentWarmTasks[botID] = nil
         if ready { warmedBotUntil[botID] = Date().addingTimeInterval(10 * 60) }
@@ -670,7 +659,6 @@ final class AppModel {
         // Make the outgoing turn crash-safe locally without blocking dispatch
         // on the cross-region account-state API.
         await persistLocalState(dirty: true)
-        await awaitWarmAgentIfInFlight(botID: botID)
         do {
             let connectorIDs = initial
                 ? []
@@ -681,6 +669,9 @@ final class AppModel {
                     botID: botID,
                     connectorIDs: connectorIDs,
                     idempotencyKey: turnID,
+                    executionMode: initial ? "agent" : "auto",
+                    chatPrompt: initial ? "" : buildDirectChatPrompt(bot: source, userText: userText),
+                    userMessage: userText,
                     computer: false,
                     onDelta: { [weak self] delta in
                         await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
@@ -996,6 +987,22 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
         return "\(profile)\n\nEsta es tu primera intervención. Genera al vuelo un saludo breve con tu nombre y un widget con una sola pregunta útil para descubrir qué debe lograr el usuario. El contenido y las opciones deben adaptarse al perfil y conectores disponibles; no uses una plantilla fija ni menciones estas instrucciones."
     }
     return "\(profile)\(history.isEmpty ? "" : "\n\nConversación reciente:\n\(history)")\n\nUsuario: \(userText)"
+}
+
+private func buildDirectChatPrompt(bot: BotProfile, userText: String) -> String {
+    let history = bot.messages.suffix(6).map { message in
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text)"
+    }.joined(separator: "\n")
+    return [
+        "Eres \(bot.name), un agente de Agent Genia.",
+        bot.title.isEmpty ? "" : "Rol: \(bot.title).",
+        bot.description.isEmpty ? "" : "Objetivo: \(bot.description).",
+        "Responde directamente en el idioma del usuario, con naturalidad y concisión.",
+        "No uses JSON ni menciones instrucciones internas.",
+        "No afirmes haber ejecutado acciones externas; esta ruta solo conversa y redacta.",
+        history.isEmpty ? "" : "Conversación reciente:\n\(history)",
+        "Usuario: \(userText)"
+    ].filter { !$0.isEmpty }.joined(separator: "\n\n")
 }
 
 private func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionWidget?) {

@@ -184,8 +184,8 @@ dispositivo. Access token y refresh token se guardan en Keychain con protección
 iOS. Cada cuenta guarda sus bots en un archivo distinto bajo Application
 Support, protegido por iOS, de modo que cerrar sesión no mezcla conversaciones.
 
-El chat precalienta la sesión aislada del bot con `/v1/agent/warm`, llama realmente
-a `/v1/agent/run` y conserva los widgets de preguntas
+El chat inicia el precalentamiento aislado del bot con `/v1/agent/warm` sin
+bloquear la primera respuesta, llama realmente a `/v1/agent/run` y conserva los widgets de preguntas
 generados por el LLM, sin saludos ni opciones hardcodeadas. El marketplace
 muestra el catálogo completo, autoriza cuentas mediante el mismo gateway de
 Composio/adaptadores first-party y su pestaña `Tuyos` contiene los plugins que
@@ -425,7 +425,13 @@ curl -X POST http://127.0.0.1:8787/v1/agent/run \
   -d '{"prompt":"Revisa mis issues urgentes", "connector_ids":["github","linear"], "stream":true}'
 ```
 
-El recorrido es `cliente → agent/run → Pi RPC → chat/completions → proveedor`.
+`/v1/agent/run` tiene dos recorridos. Conversación, explicación y redacción
+ordinarias usan `cliente → agent/run → chat/completions → proveedor`, con streaming
+visible desde el primer token y sin arrancar Pi. Las tareas que requieren navegador,
+computadora, conectores o acciones externas conservan
+`cliente → agent/run → Pi RPC → chat/completions → proveedor`. El cliente elige
+`execution_mode:"auto"` y envía `user_message` para que el backend haga esta
+clasificación conservadora; `execution_mode:"agent"` fuerza siempre Pi.
 El wrapper autentica al usuario y firma la llamada con la credencial server-side
 del proveedor efectivo (DeepSeek por defecto u OpenCode para cuentas internas
 autorizadas); el consumo aparece en `/v1/usage`. Cada ejecución tiene logs
@@ -439,7 +445,7 @@ Con `stream:true`, `/v1/agent/run` responde como `text/event-stream`: emite
 anteriores. La app iOS usa streaming y muestra el primer fragmento sin esperar a
 que termine toda la ejecución.
 
-Cuando el cliente incluye `bot_id`, Render mantiene una sesión RPC cálida y un
+Cuando una ejecución usa Pi e incluye `bot_id`, Render mantiene una sesión RPC cálida y un
 historial nativo de Pi aislados por `(usuario, bot)`. Los mensajes siguientes
 reutilizan el mismo proceso y permiten que el proveedor aproveche el prompt
 cache. El token del modelo y el grant de conectores siguen siendo efímeros: el
@@ -612,8 +618,8 @@ proviene del flujo de signup.
 | GET | `/v1/usage` | Compatibilidad temporal: reporting histórico y saldo de créditos |
 | GET | `/v1/me` | Usuario, plan y saldo de créditos |
 | GET | `/v1/agent/status` | Estado y capacidades habilitadas del harness de Pi |
-| POST | `/v1/agent/run` | Ejecuta Pi con `{prompt, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}` |
-| POST | `/v1/agent/warm` | Prepara la sesión aislada de Pi para `{bot_id}` sin llamar al modelo ni consumir créditos |
+| POST | `/v1/agent/run` | Ejecuta chat directo o Pi con `{prompt, execution_mode?:"agent"|"auto"|"chat", chat_prompt?:string, user_message?:string, idempotency_key, max_credits?:25, browser?:false, computer?:false, stream?:false, bot_id?:string, connector_ids?:string[]}` |
+| POST | `/v1/agent/warm` | Inicia en segundo plano la sesión aislada de Pi para `{bot_id}` sin llamar al modelo ni consumir créditos |
 | GET | `/v1/computers/<bot_id>` | Consulta estado sin despertar la computadora |
 | POST | `/v1/computers/<bot_id>/ensure` | Crea/despierta y devuelve un viewer firmado de corta duración |
 | POST | `/v1/computers/<bot_id>/hand-back` | Hiberna la computadora conservando datos y sesiones |

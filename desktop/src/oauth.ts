@@ -20,6 +20,8 @@ const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
 const CONNECTOR_AUTH_ATTEMPTS = 300;
 const OAUTH_POLL_MS = 2_000;
+const JSON_REQUEST_TIMEOUT_MS = 30_000;
+const AGENT_REQUEST_TIMEOUT_MS = 10 * 60 * 1_000;
 
 interface AccountIdentity {
   id: string;
@@ -76,6 +78,8 @@ export class DesktopOAuthController {
   private readonly deviceStore: DeviceIdentityStore;
   private readonly client: WrapperServiceClient;
   private readonly managedConnectorSessions: Map<string, ManagedConnectorAccount>;
+  private lastConnectorResponse: Record<string, unknown> | null = null;
+  private sessionInvalidated = false;
 
   constructor({
     baseUrl,
@@ -121,7 +125,19 @@ export class DesktopOAuthController {
 
   async snapshot(): Promise<ConnectorConnectionSnapshot> {
     const account = await this.accountStatus();
-    const response = account.connected ? await this.client.connectors().catch(() => null) : null;
+    let response: Record<string, unknown> | null = null;
+    let loadError = "";
+    if (account.connected) {
+      try {
+        response = await this.client.connectors();
+        this.lastConnectorResponse = response;
+      } catch (error) {
+        response = this.lastConnectorResponse;
+        loadError = oauthErrorMessage(error);
+      }
+    } else {
+      this.lastConnectorResponse = null;
+    }
     const remoteConnectors = Array.isArray(response?.connectors) ? response.connectors : [];
     const remoteById = new Map<string, Record<string, unknown>>(
       remoteConnectors.filter(isRecord).map((item) => [stringValue(item.connector_id), item])
@@ -137,12 +153,16 @@ export class DesktopOAuthController {
         connected,
         account: connected ? stringValue(remote?.account) : "",
         reason: connected
-          ? ""
+          ? loadError ? "Mostrando el último estado conocido; no se pudo actualizar." : ""
           : !account.connected
             ? "Inicia sesión para conectar tu cuenta."
+            : loadError && !response
+              ? `No se pudo actualizar los conectores: ${loadError}`
             : typeof remote?.reason === "string" && remote.reason
               ? remote.reason
-              : available ? "Listo para conectar tu cuenta real." : "Este conector todavía no está configurado."
+              : available
+                ? loadError ? "Mostrando el último estado conocido; vuelve a intentarlo en unos segundos." : "Listo para conectar tu cuenta real."
+                : loadError ? `No se pudo actualizar los conectores: ${loadError}` : "Este conector todavía no está configurado."
       };
     });
     return { account, connectors };
@@ -150,22 +170,28 @@ export class DesktopOAuthController {
 
   async signIn(signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
     await this.client.signIn(shellSafeSignal(signal));
+    this.sessionInvalidated = false;
     return this.snapshot();
   }
 
   async signOut(): Promise<ConnectorConnectionSnapshot> {
     await this.client.signOut();
+    this.sessionInvalidated = true;
+    this.lastConnectorResponse = null;
     return this.snapshot();
   }
 
   async deleteAccount(): Promise<ConnectorConnectionSnapshot> {
     await this.client.deleteAccount();
+    this.sessionInvalidated = true;
+    this.lastConnectorResponse = null;
     return this.snapshot();
   }
 
   async connect(connectorId: string, signal?: AbortSignal): Promise<ConnectorConnectionSnapshot> {
-    if (!await this.accountStore.get()) {
+    if (!await this.accountId()) {
       await this.client.signIn(shellSafeSignal(signal));
+      this.sessionInvalidated = false;
     }
     const managed = this.managedConnectorSessions.get(connectorId);
     if (managed) {
@@ -232,6 +258,9 @@ export class DesktopOAuthController {
       computer?: boolean;
       botId?: string;
       idempotencyKey?: string;
+      executionMode?: "auto" | "agent" | "chat";
+      chatPrompt?: string;
+      userMessage?: string;
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
@@ -248,6 +277,7 @@ export class DesktopOAuthController {
   }
 
   async accountId(): Promise<string | null> {
+    if (this.sessionInvalidated) return null;
     return (await this.accountStore.get())?.account.id ?? null;
   }
 
@@ -264,6 +294,7 @@ export class DesktopOAuthController {
   }
 
   private async accountStatus(): Promise<AccountConnectionStatus> {
+    if (this.sessionInvalidated) return { connected: false, required: true, email: "", name: "" };
     const stored = await this.accountStore.get();
     return stored
       ? { connected: true, required: true, email: stored.account.email, name: stored.account.name ?? "" }
@@ -370,7 +401,9 @@ class WrapperServiceClient {
       }).catch(() => {});
     }
     this.session = null;
-    await this.options.accountStore.clear();
+    await this.options.accountStore.clear().catch((error) => {
+      console.error(`[account-signout] No fue posible borrar la sesión local: ${oauthErrorMessage(error)}`);
+    });
   }
 
   async deleteAccount(): Promise<void> {
@@ -379,8 +412,15 @@ class WrapperServiceClient {
       body: { confirmation: "DELETE" }
     });
     this.session = null;
-    await this.options.accountStore.clear();
-    await this.options.deviceStore.clear();
+    const cleanup = await Promise.allSettled([
+      this.options.accountStore.clear(),
+      this.options.deviceStore.clear()
+    ]);
+    for (const result of cleanup) {
+      if (result.status === "rejected") {
+        console.error(`[account-delete] No fue posible borrar un secreto local: ${oauthErrorMessage(result.reason)}`);
+      }
+    }
   }
 
   connector(connectorId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -440,7 +480,7 @@ class WrapperServiceClient {
       body: { bot_id: botId },
       signal
     });
-    if (result.ready !== true) throw new Error("El agente todavía no está listo.");
+    if (result.ready !== true && result.started !== true) throw new Error("El agente todavía no está listo.");
   }
 
   runAgent(
@@ -451,6 +491,9 @@ class WrapperServiceClient {
       computer?: boolean;
       botId?: string;
       idempotencyKey?: string;
+      executionMode?: "auto" | "agent" | "chat";
+      chatPrompt?: string;
+      userMessage?: string;
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
@@ -461,6 +504,9 @@ class WrapperServiceClient {
       computer: options.computer === true,
       bot_id: options.botId ?? "",
       connector_ids: connectorIds,
+      execution_mode: options.executionMode ?? "agent",
+      chat_prompt: options.chatPrompt ?? "",
+      user_message: options.userMessage ?? "",
       max_credits: 15,
       idempotency_key: options.idempotencyKey ?? randomUUID(),
       stream: true
@@ -622,8 +668,9 @@ class WrapperServiceClient {
     onDelta?: (text: string) => void,
     canRefresh = true
   ): Promise<Record<string, unknown>> {
-    const session = await this.getSession(signal);
-    throwIfAborted(signal);
+    const operationSignal = requestSignal(signal, AGENT_REQUEST_TIMEOUT_MS);
+    const session = await this.getSession(operationSignal);
+    throwIfAborted(operationSignal);
     let response: Response;
     try {
       response = await fetch(`${this.options.baseUrl}/v1/agent/run`, {
@@ -634,17 +681,25 @@ class WrapperServiceClient {
           Authorization: `Bearer ${session.token}`
         },
         body: JSON.stringify(body),
-        signal
+        signal: operationSignal
       });
     } catch (error) {
-      throw new Error(error instanceof Error ? error.message : "No fue posible conectar con Agent Genia.");
+      throw networkError(error, "No fue posible conectar con Agent Genia.");
     }
     if (response.status === 401 && canRefresh) {
-      await this.refreshSession(signal);
+      await this.refreshSession(operationSignal);
       return this.authorizedAgentStream(body, signal, onDelta, false);
     }
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+      let payload: Record<string, unknown>;
+      try {
+        payload = await response.json() as Record<string, unknown>;
+      } catch (error) {
+        if (operationSignal.aborted) {
+          throw networkError(operationSignal.reason ?? error, "No fue posible recibir la respuesta de Agent Genia.");
+        }
+        payload = {};
+      }
       const nested = isRecord(payload.error) ? payload.error : {};
       throw new WrapperHttpError(
         typeof nested.message === "string" ? nested.message : `Agent Genia respondió HTTP ${response.status}.`,
@@ -653,7 +708,14 @@ class WrapperServiceClient {
       );
     }
     if (!response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
-      return response.json() as Promise<Record<string, unknown>>;
+      try {
+        return await response.json() as Record<string, unknown>;
+      } catch (error) {
+        if (operationSignal.aborted) {
+          throw networkError(operationSignal.reason ?? error, "No fue posible recibir la respuesta de Agent Genia.");
+        }
+        throw error;
+      }
     }
     if (!response.body) throw new Error("Agent Genia no devolvió un flujo de respuesta.");
 
@@ -714,6 +776,9 @@ class WrapperServiceClient {
       }
       if (buffer.trim()) processFrame(buffer);
     } catch (error) {
+      if (operationSignal.aborted) {
+        throw networkError(operationSignal.reason ?? error, "La respuesta de Agent Genia tardó demasiado.");
+      }
       throw error;
     } finally {
       reader.releaseLock();
@@ -723,17 +788,29 @@ class WrapperServiceClient {
   }
 
   private async publicJson(route: string, request: JsonRequestOptions = {}): Promise<Record<string, unknown>> {
-    throwIfAborted(request.signal);
-    const response = await fetch(`${this.options.baseUrl}${route}`, {
-      method: request.method ?? "GET",
-      headers: {
-        ...request.headers,
-        ...(request.body ? { "Content-Type": "application/json" } : {})
-      },
-      body: request.body ? JSON.stringify(request.body) : undefined,
-      signal: request.signal
-    });
-    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const signal = requestSignal(request.signal, JSON_REQUEST_TIMEOUT_MS);
+    throwIfAborted(signal);
+    let response: Response;
+    try {
+      response = await fetch(`${this.options.baseUrl}${route}`, {
+        method: request.method ?? "GET",
+        headers: {
+          ...request.headers,
+          ...(request.body ? { "Content-Type": "application/json" } : {})
+        },
+        body: request.body ? JSON.stringify(request.body) : undefined,
+        signal
+      });
+    } catch (error) {
+      throw networkError(error, "No fue posible conectar con Agent Genia.");
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = await response.json() as Record<string, unknown>;
+    } catch (error) {
+      if (signal.aborted) throw networkError(signal.reason ?? error, "No fue posible recibir la respuesta de Agent Genia.");
+      payload = {};
+    }
     if (!response.ok) {
       const nested = isRecord(payload.error) ? payload.error : {};
       const message = typeof nested.message === "string" ? nested.message : `El servicio OAuth respondió HTTP ${response.status}.`;
@@ -995,6 +1072,26 @@ function safeWhatsAppUrl(value: string): string {
     throw new Error("El servicio devolvió una URL de WhatsApp insegura.");
   }
   return url.toString();
+}
+
+function oauthErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function networkError(error: unknown, fallback: string): Error {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return new Error("La solicitud tardó demasiado. Revisa tu conexión e inténtalo de nuevo.");
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return new Error("La operación fue cancelada.");
+  }
+  if (error instanceof TypeError) return new Error(fallback);
+  return error instanceof Error ? error : new Error(fallback);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

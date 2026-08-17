@@ -100,6 +100,7 @@ from .pi_harness import (
     PiHarnessError,
     PiHarnessTimeout,
     PiHarnessUsageError,
+    PiRunResult,
 )
 from .postgres_store import create_store
 from .store import AccountStateConflict, hash_agent_run_token
@@ -177,6 +178,13 @@ class UnsafeConfigurationError(RuntimeError):
 
 class ModelProviderUnavailable(RuntimeError):
     pass
+
+
+class DirectChatError(RuntimeError):
+    def __init__(self, status: int, message: str, code: str = "upstream_error"):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 def validate_admin_token(admin_token: str | None) -> None:
@@ -627,6 +635,13 @@ class _AgentEventStream:
         self.visible_sent = visible
         self.send("delta", {"text": next_delta})
 
+    def text_delta(self, delta: str) -> None:
+        """Publish already-visible text from the direct chat fast path."""
+        if not delta:
+            return
+        self.visible_sent += delta
+        self.send("delta", {"text": delta})
+
     def error(self, status: int, message: str, code: str) -> None:
         self._heartbeat_stop.set()
         self.send("error", {"status": status, "message": message, "type": code})
@@ -786,6 +801,8 @@ class Backend:
         self._run_providers: dict[str, dict[str, Any]] = {}
         self._run_principal_lock = threading.Lock()
         self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        self._pi_warm_lock = threading.Lock()
+        self._pi_warm_events: dict[str, threading.Event] = {}
         self._whatsapp_wake = threading.Event()
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
@@ -2288,6 +2305,157 @@ class Backend:
             "result": result,
         })
 
+    @staticmethod
+    def _direct_chat_allowed(
+        execution_mode: str,
+        user_message: str,
+        *,
+        browser: bool,
+        computer: bool,
+    ) -> bool:
+        if execution_mode == "agent" or browser or computer:
+            return False
+        if execution_mode == "chat":
+            return True
+        message = user_message.strip().lower()
+        if not message:
+            return False
+        # Stay conservative: anything that sounds like an external mutation,
+        # lookup or computer action keeps the full Pi/tool path. Ordinary
+        # conversation, explanation and drafting take the direct path.
+        tool_intent = re.compile(
+            r"(?:https?://|\b(?:abre|busca|consulta|revisa|lee|descarga|sube|"
+            r"env[ií]a|manda|publica|actualiza|modifica|elimina|borra|crea\s+(?:un\s+)?"
+            r"(?:issue|ticket|evento|archivo|carpeta|tarea|documento)|agenda|programa|"
+            r"reserva|compra|conecta|instala|ejecuta|corre|inicia\s+sesi[oó]n|"
+            r"open|search|look\s+up|check|review|read|download|upload|send|post|"
+            r"update|edit|delete|remove|schedule|book|buy|connect|install|run|"
+            r"log\s+in|create\s+(?:an?\s+)?(?:issue|ticket|event|file|folder|task|document)|"
+            r"gmail|calendar|slack|notion|github|jira|drive|dropbox|shopify|stripe|"
+            r"computadora|navegador|browser|archivo|terminal|shell)\b)",
+            re.IGNORECASE,
+        )
+        return tool_intent.search(message) is None
+
+    def _run_direct_chat(
+        self,
+        *,
+        run_id: str,
+        user: dict,
+        provider: dict,
+        prompt: str,
+        event_stream: _AgentEventStream | None,
+    ) -> PiRunResult:
+        started = time.monotonic()
+        answer_parts: list[str] = []
+        pending = ""
+        secret = (self.cfg.wrapper_secret or "development-only").encode("utf-8")
+        provider_user_id = hmac.new(
+            secret,
+            str(user["id"]).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        request_body = json.dumps({
+            "model": self.cfg.pi_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "max_tokens": 2048,
+            "user_id": provider_user_id,
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        def process_line(line: str) -> None:
+            line = line.strip()
+            if not line.startswith("data:"):
+                return
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                return
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+            choices = payload.get("choices") if isinstance(payload, dict) else None
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                return
+            delta = choices[0].get("delta")
+            if not isinstance(delta, dict):
+                return
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                self._mark_run_timing(run_id, "upstream_first_reasoning_ms")
+            content = delta.get("content")
+            if not isinstance(content, str) or not content:
+                return
+            self._mark_run_timing(run_id, "upstream_first_content_ms")
+            answer_parts.append(content)
+            if event_stream:
+                self._mark_run_timing(run_id, "first_visible_delta_ms")
+                event_stream.text_delta(content)
+
+        def on_headers(_status: int, _headers: dict) -> None:
+            self._mark_run_timing(run_id, "upstream_headers_ms")
+
+        def on_chunk(chunk: bytes) -> None:
+            nonlocal pending
+            if chunk.strip():
+                self._mark_run_timing(run_id, "upstream_first_byte_ms")
+            pending += chunk.decode("utf-8", errors="replace")
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                process_line(line.rstrip("\r"))
+
+        self._mark_run_timing(run_id, "direct_dispatch_ms")
+        self._mark_run_timing(run_id, "upstream_request_ms")
+        status, _headers, response_body, usage = proxy_request(
+            "POST",
+            provider["base_url"],
+            "/chat/completions",
+            {
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+                "stream": "true",
+                "user-agent": DEFAULT_UA,
+            },
+            request_body,
+            provider["api_key"],
+            on_chunk=on_chunk,
+            on_headers=on_headers,
+        )
+        if pending.strip():
+            process_line(pending)
+        self._mark_run_timing(run_id, "upstream_complete_ms")
+        self.record(user, provider, "/chat/completions", status, usage, run_id=run_id)
+        if status < 200 or status >= 300:
+            message = "El proveedor no pudo completar la respuesta."
+            if response_body:
+                try:
+                    payload = json.loads(response_body)
+                    nested = payload.get("error") if isinstance(payload, dict) else None
+                    if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+                        message = nested["message"]
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+            raise DirectChatError(status, message)
+        answer = "".join(answer_parts).strip()
+        if not answer:
+            raise DirectChatError(502, "El modelo no devolvió texto.", "empty_model_response")
+        return PiRunResult(
+            run_id=run_id,
+            answer=answer,
+            model=usage.model or self.cfg.pi_model,
+            duration_seconds=round(time.monotonic() - started, 3),
+            usage={
+                "input_tokens": int(usage.input_tokens or 0),
+                "output_tokens": int(usage.output_tokens or 0),
+                "cached_read_tokens": int(usage.cached_read or 0),
+                "cached_write_tokens": int(usage.cached_write or 0),
+            },
+            browser=False,
+            event_log="",
+            stderr_log="",
+        )
+
     def handle_agent_warm(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
         if not user:
@@ -2299,22 +2467,35 @@ class Backend:
             return
         try:
             self.model_provider(user)
-            result = self.pi.prewarm(
-                conversation_key=f"{user['id']}\0{bot_id.strip()}",
-            )
         except ModelProviderUnavailable as exc:
             error_response(handler, 503, str(exc), "model_unavailable")
             return
-        except PiHarnessBusy as exc:
-            error_response(handler, 429, str(exc), "pi_busy")
-            return
-        except PiHarnessTimeout as exc:
-            error_response(handler, 504, str(exc), "pi_warm_timeout")
-            return
-        except PiHarnessError as exc:
-            error_response(handler, 502, str(exc), "pi_warm_error")
-            return
-        json_response(handler, 200, result)
+        conversation_key = f"{user['id']}\0{bot_id.strip()}"
+
+        with self._pi_warm_lock:
+            warm_event = self._pi_warm_events.get(conversation_key)
+            if warm_event is None or warm_event.is_set():
+                warm_event = threading.Event()
+                self._pi_warm_events[conversation_key] = warm_event
+                should_start = True
+            else:
+                should_start = False
+
+        def prewarm_in_background() -> None:
+            try:
+                self.pi.prewarm(conversation_key=conversation_key)
+            except (PiHarnessBusy, PiHarnessTimeout, PiHarnessError):
+                logging.info("Background Pi warm failed key=%s", conversation_key, exc_info=True)
+            finally:
+                warm_event.set()
+
+        if should_start:
+            threading.Thread(
+                target=prewarm_in_background,
+                name=f"pi-warm-{hashlib.sha256(conversation_key.encode()).hexdigest()[:10]}",
+                daemon=True,
+            ).start()
+        json_response(handler, 200, {"ready": False, "started": True, "warming": True})
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
         request_started_at = time.monotonic()
@@ -2341,6 +2522,9 @@ class Backend:
         browser = body.get("browser", False)
         computer_requested = body.get("computer", False)
         stream_requested = body.get("stream", False)
+        execution_mode = body.get("execution_mode", "agent")
+        chat_prompt = body.get("chat_prompt", "")
+        user_message = body.get("user_message", "")
         bot_id = body.get("bot_id")
         connector_ids_value = body.get("connector_ids", [])
         idempotency_key = body.get("idempotency_key")
@@ -2358,6 +2542,15 @@ class Backend:
             return
         if not isinstance(stream_requested, bool):
             error_response(handler, 400, "stream debe ser true o false", "bad_stream")
+            return
+        if execution_mode not in ("agent", "auto", "chat"):
+            error_response(handler, 400, "execution_mode no es válido", "bad_execution_mode")
+            return
+        if not isinstance(chat_prompt, str) or len(chat_prompt) > self.cfg.pi_max_prompt_chars:
+            error_response(handler, 400, "chat_prompt no es válido", "bad_chat_prompt")
+            return
+        if not isinstance(user_message, str) or len(user_message) > 20_000:
+            error_response(handler, 400, "user_message no es válido", "bad_user_message")
             return
         if computer_requested and (not isinstance(bot_id, str) or not bot_id):
             error_response(handler, 400, "bot_id es obligatorio para usar una computadora", "bad_bot_id")
@@ -2411,20 +2604,33 @@ class Backend:
             error_response(handler, e.status, str(e), e.code)
             return
 
+        direct_chat = self._direct_chat_allowed(
+            execution_mode,
+            user_message,
+            browser=browser,
+            computer=computer_requested,
+        )
+        if direct_chat and chat_prompt.strip():
+            effective_prompt = chat_prompt.strip()
+        else:
+            direct_chat = False
+            effective_prompt = prompt
+
         pi_status = self.pi.status()
-        if not pi_status["enabled"]:
-            error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
-            return
-        if not pi_status["available"]:
-            error_response(handler, 503, "Pi no esta instalado o PI_BIN es invalido", "pi_unavailable")
-            return
-        if browser and not (
-            pi_status["browser_available"] and pi_status["browser_auto_authorize"]
-        ):
-            error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
-            return
+        if not direct_chat:
+            if not pi_status["enabled"]:
+                error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
+                return
+            if not pi_status["available"]:
+                error_response(handler, 503, "Pi no esta instalado o PI_BIN es invalido", "pi_unavailable")
+                return
+            if browser and not (
+                pi_status["browser_available"] and pi_status["browser_auto_authorize"]
+            ):
+                error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
+                return
         computer_enabled = bool(computer_requested and self.computers.configured)
-        if (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
+        if not direct_chat and (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
             error_response(
                 handler,
                 409,
@@ -2568,37 +2774,62 @@ class Backend:
         connector_run_token = None
         self._run_provider(run_id, value=selected_provider)
         try:
-            if connector_ids or computer_enabled:
-                connector_run_token = self.connectors.issue(
-                    user_id=user["id"],
-                    connector_ids=connector_ids,
-                    computer_id=bot_id if computer_enabled else None,
-                )
             # The optimized unlimited Postgres reservation inserts the run in
             # ``running`` state in the same round trip. Metered/SQLite runs
             # retain the explicit transition used by the credit ledger.
             if not unlimited:
                 self.store.mark_agent_run_running(run_id)
-            self._mark_run_timing(run_id, "pi_dispatch_ms")
+            if direct_chat:
+                result = self._run_direct_chat(
+                    run_id=run_id,
+                    user=user,
+                    provider=selected_provider,
+                    prompt=effective_prompt,
+                    event_stream=event_stream,
+                )
+                self._mark_run_timing(run_id, "direct_complete_ms")
+            else:
+                if bot_id is not None:
+                    conversation_key = f"{user['id']}\0{bot_id}"
+                    with self._pi_warm_lock:
+                        warm_event = self._pi_warm_events.pop(conversation_key, None)
+                    if warm_event is not None and not warm_event.is_set():
+                        self._mark_run_timing(run_id, "pi_warm_wait_started_ms")
+                        warm_event.wait(timeout=25.0)
+                        self._mark_run_timing(run_id, "pi_warm_wait_finished_ms")
+                if connector_ids or computer_enabled:
+                    connector_run_token = self.connectors.issue(
+                        user_id=user["id"],
+                        connector_ids=connector_ids,
+                        computer_id=bot_id if computer_enabled else None,
+                    )
+                self._mark_run_timing(run_id, "pi_dispatch_ms")
 
-            def on_text_delta(delta: str) -> None:
-                self._mark_run_timing(run_id, "pi_first_text_ms")
-                if event_stream:
-                    event_stream.model_delta(delta)
+                def on_text_delta(delta: str) -> None:
+                    self._mark_run_timing(run_id, "pi_first_text_ms")
+                    if event_stream:
+                        before = len(event_stream.visible_sent)
+                        event_stream.model_delta(delta)
+                        if len(event_stream.visible_sent) > before:
+                            self._mark_run_timing(run_id, "first_visible_delta_ms")
 
-            result = self.pi.run(
-                run_id=run_id,
-                run_api_key=run_api_key,
-                prompt=prompt,
-                browser=browser,
-                connector_run_token=connector_run_token,
-                conversation_key=(
-                    f"{user['id']}\0{bot_id}" if bot_id is not None else None
-                ),
-                on_text_delta=on_text_delta,
-                is_cancelled=(lambda: bool(event_stream and event_stream.disconnected)),
-            )
-            self._mark_run_timing(run_id, "pi_complete_ms")
+                result = self.pi.run(
+                    run_id=run_id,
+                    run_api_key=run_api_key,
+                    prompt=effective_prompt,
+                    browser=browser,
+                    connector_run_token=connector_run_token,
+                    conversation_key=(
+                        f"{user['id']}\0{bot_id}" if bot_id is not None else None
+                    ),
+                    on_text_delta=on_text_delta,
+                    is_cancelled=(lambda: bool(event_stream and event_stream.disconnected)),
+                )
+                self._mark_run_timing(run_id, "pi_complete_ms")
+        except DirectChatError as e:
+            _settled, _credits = settle("failed", e.code)
+            agent_error(e.status, str(e), e.code)
+            return
         except ConnectorBrokerError as e:
             self.store.release_agent_run(
                 run_id=run_id,
@@ -2694,8 +2925,9 @@ class Backend:
             "extra_cost_microusd": int(settled["extra_cost_microusd"]),
             "duration_seconds": float(settled["duration_seconds"] or 0),
         })
-        payload["connector_ids"] = list(connector_ids)
+        payload["connector_ids"] = [] if direct_chat else list(connector_ids)
         payload["computer_enabled"] = computer_enabled
+        payload["execution_path"] = "direct_chat" if direct_chat else "pi"
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
         self.store.save_agent_run_result(run_id, payload)

@@ -154,9 +154,20 @@ let composerMenuOpen = false;
 let workflowPanelOpen = false;
 let computerSnapshot = idleComputerSnapshot();
 let computerLoadedBotId = "";
+let computerStatusLoadingBotId = "";
+let computerRequestSequence = 0;
+let computerPollTimer = 0;
 let computerBusy = false;
+let forceConversationBottomBotId = "";
+let botMutationBusy = false;
 const botMessageDrafts = new Map<string, string>();
 const settingsSaveTimers = new Map<string, number>();
+const settingsSaveRevisions = new Map<string, number>();
+const settingsSaveTasks = new Map<string, Promise<AppState>>();
+const settingsDirtyBotIds = new Set<string>();
+const avatarSavingBotIds = new Set<string>();
+const avatarSaveSequences = new Map<string, number>();
+const initialConversationRetryAfter = new Map<string, number>();
 const agentWarmTasks = new Map<string, Promise<boolean>>();
 const warmedBotUntil = new Map<string, number>();
 
@@ -168,7 +179,7 @@ const removeAgentDeltaListener = desktopApi.onAgentDelta(({ botId, text }) => {
   streamRenderPending = true;
   window.setTimeout(() => {
     streamRenderPending = false;
-    if (botId === agentBusyBotId) render();
+    if (botId === agentBusyBotId) updateStreamingAssistantBubble(botId);
   }, 40);
 });
 
@@ -234,22 +245,33 @@ async function resumeActiveBot(): Promise<void> {
   if (connections.account.connected) await refreshAccountState();
   else await refreshConnections();
   const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
-  if (activeView === "bot-detail" && botId) void warmBotAgent(botId);
+  if (activeView === "bot-detail" && botId) {
+    void warmBotAgent(botId);
+    maybeInitializeBotConversation(botId);
+  }
 }
 
 async function refreshConnections(): Promise<void> {
   if (connectionRefreshBusy || accountAuthBusy) return;
   connectionRefreshBusy = true;
   try {
-    connections = await desktopApi.connectionSnapshot();
-    state = await desktopApi.bootstrap();
+    const previousConnections = connections;
+    const previousState = state;
+    const previousView = activeView;
+    const nextConnections = await desktopApi.connectionSnapshot();
+    const nextState = preservePendingBotSettings(await desktopApi.bootstrap());
+    connections = nextConnections;
+    state = nextState;
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     if (activeView !== "plugins" && activeView !== "billing") {
       activeView = state.onboardingCompleted ? (state.bots.length ? "bot-detail" : "bot-builder") : "connectors";
     }
-    render();
+    if (!sameValue(previousConnections, connections) || !sameValue(previousState, state) || previousView !== activeView) render();
     const botId = state.activeBotId ?? state.bots[0]?.id ?? "";
-    if (connections.account.connected && activeView === "bot-detail" && botId) void warmBotAgent(botId);
+    if (connections.account.connected && activeView === "bot-detail" && botId) {
+      void warmBotAgent(botId);
+      maybeInitializeBotConversation(botId);
+    }
   } catch {
     // Keep rendering the encrypted local cache and retry on focus.
   } finally {
@@ -261,10 +283,12 @@ async function refreshAccountState(): Promise<void> {
   if (!connections.account.connected || accountStateRefreshBusy) return;
   accountStateRefreshBusy = true;
   try {
-    state = await desktopApi.refreshAccountState();
+    const previousState = state;
+    const previousView = activeView;
+    state = preservePendingBotSettings(await desktopApi.refreshAccountState());
     selectedConnectorIds = new Set(state.selectedConnectorIds);
     if (activeView === "bot-detail" && !state.bots.length) activeView = "bot-builder";
-    render();
+    if (!sameValue(previousState, state) || previousView !== activeView) render();
   } catch {
     // Offline refresh is best-effort. Local state remains authoritative until
     // the next focus/interval retry and user actions continue to work.
@@ -274,11 +298,64 @@ async function refreshAccountState(): Promise<void> {
 }
 
 function render(): void {
+  const focus = captureFocusState();
+  const previousView = activeView;
   if (activeView === "connectors") renderConnectors();
   else if (activeView === "plugins") renderPluginMarketplace();
   else if (activeView === "billing") renderBilling();
   else if (activeView === "bot-builder") renderBotBuilder();
   else renderBotDetail();
+  if (previousView === activeView) restoreFocusState(focus);
+}
+
+interface FocusState {
+  selector: string;
+  start: number | null;
+  end: number | null;
+}
+
+function captureFocusState(): FocusState | null {
+  const element = document.activeElement;
+  if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) return null;
+  const selector = element.id
+    ? `#${CSS.escape(element.id)}`
+    : element.name ? `[name="${CSS.escape(element.name)}"]` : "";
+  if (!selector) return null;
+  return { selector, start: element.selectionStart, end: element.selectionEnd };
+}
+
+function restoreFocusState(snapshot: FocusState | null): void {
+  if (!snapshot) return;
+  const element = document.querySelector(snapshot.selector);
+  if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) || element.disabled) return;
+  element.focus({ preventScroll: true });
+  if (snapshot.start !== null && snapshot.end !== null) element.setSelectionRange(snapshot.start, snapshot.end);
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function preservePendingBotSettings(nextState: AppState): AppState {
+  if (!settingsDirtyBotIds.size && !avatarSavingBotIds.size) return nextState;
+  const localById = new Map(state.bots.map((bot) => [bot.id, bot]));
+  return {
+    ...nextState,
+    bots: nextState.bots.map((bot) => {
+      if (!settingsDirtyBotIds.has(bot.id) && !avatarSavingBotIds.has(bot.id)) return bot;
+      const local = localById.get(bot.id);
+      return local ? {
+        ...bot,
+        name: local.name,
+        title: local.title,
+        description: local.description,
+        color: local.color,
+        shape: local.shape,
+        avatarDataUrl: local.avatarDataUrl,
+        notificationsEnabled: local.notificationsEnabled
+      } : bot;
+    })
+  };
 }
 
 function renderConnectors(): void {
@@ -390,7 +467,9 @@ function connectorConnection(connectorId: string) {
 function renderConnectorAuthAction(connectorId: string): string {
   const connection = connectorConnection(connectorId);
   if (!connection.available) {
-    return `<span class="connector-auth unavailable" title="${escapeAttribute(connection.reason)}">Próximamente</span>`;
+    const temporaryFailure = /no se pudo actualizar|sin conexión|tardó demasiado/i.test(connection.reason);
+    const label = !connections.account.connected ? "Inicia sesión" : temporaryFailure ? "Sin conexión" : "Próximamente";
+    return `<span class="connector-auth unavailable" title="${escapeAttribute(connection.reason)}">${label}</span>`;
   }
   if (connection.connected) {
     return `<button class="connector-auth connected" type="button" data-disconnect-connector="${connectorId}" title="Desconectar ${escapeAttribute(connection.account)}">✓ Conectado</button>`;
@@ -534,7 +613,7 @@ function renderPluginMarketplace(): void {
       <section class="plugin-toolbar">
         <nav class="plugin-tabs" aria-label="Secciones de plugins">
           <button type="button" data-plugin-tab="marketplace" class="${pluginTab === "marketplace" ? "selected" : ""}">Marketplace</button>
-          <button type="button" data-plugin-tab="yours" class="${pluginTab === "yours" ? "selected" : ""}">Yours <span>${installed.length}</span></button>
+          <button type="button" data-plugin-tab="yours" class="${pluginTab === "yours" ? "selected" : ""}">Tus plugins <span>${installed.length}</span></button>
         </nav>
         <label class="plugin-search"><span>⌕</span><input type="search" id="plugin-search" placeholder="Buscar plugins" value="${escapeAttribute(pluginQuery)}" /></label>
       </section>
@@ -1015,6 +1094,8 @@ function renderBotBuilder(): void {
 }
 
 async function createBot(): Promise<void> {
+  if (botMutationBusy) return;
+  botMutationBusy = true;
   setBusy(true);
   transientError = "";
   try {
@@ -1026,21 +1107,23 @@ async function createBot(): Promise<void> {
     avatarEditorOpen = false;
   } catch (error) {
     transientError = errorMessage(error);
+  } finally {
+    botMutationBusy = false;
   }
   render();
   const created = state.bots.find((bot) => bot.id === state.activeBotId);
-  if (created && !created.messages.length) {
-    void initializeBotConversation(created.id);
-  }
+  if (created) maybeInitializeBotConversation(created.id);
 }
 
 async function createDefaultBot(): Promise<void> {
+  if (botMutationBusy) return;
   if (!state.bots.length) {
     closeBotSettings();
     activeView = "bot-builder";
     render();
     return;
   }
+  botMutationBusy = true;
   setBusy(true);
   transientError = "";
   try {
@@ -1054,12 +1137,12 @@ async function createDefaultBot(): Promise<void> {
     closeBotSettings();
   } catch (error) {
     transientError = errorMessage(error);
+  } finally {
+    botMutationBusy = false;
   }
   render();
   const created = state.bots.find((bot) => bot.id === state.activeBotId);
-  if (created && !created.messages.length) {
-    void initializeBotConversation(created.id);
-  }
+  if (created) maybeInitializeBotConversation(created.id);
 }
 
 function renderBotDetail(): void {
@@ -1073,6 +1156,10 @@ function renderBotDetail(): void {
 }
 
 function renderReadyBot(bot: BotProfile): void {
+  const previousThread = document.querySelector<HTMLElement>("#bot-conversation-thread");
+  const previousScrollTop = previousThread?.scrollTop ?? 0;
+  const wasNearBottom = !previousThread
+    || previousThread.scrollHeight - previousThread.scrollTop - previousThread.clientHeight < 80;
   appRoot.innerHTML = renderDesktopShell(`
     <section class="bot-chat-view">
       <header class="workspace-topbar">
@@ -1082,7 +1169,7 @@ function renderReadyBot(bot: BotProfile): void {
           <span>${bot.connectorIds.length} plugins</span>
           ${bot.workflows.length ? `<button class="topbar-link" type="button" data-open-workflows>${bot.workflows.length} aprendidas</button>` : ""}
           <button id="edit-connectors" class="topbar-link" type="button">Plugins</button>
-          <button id="delete-bot" class="topbar-link" type="button">Eliminar</button>
+          <button id="delete-bot" class="topbar-link" type="button" ${botMutationBusy ? "disabled" : ""}>Eliminar</button>
         </div>
       </header>
       ${renderComputerStrip(bot)}
@@ -1099,9 +1186,9 @@ function renderReadyBot(bot: BotProfile): void {
           <div class="conversation-empty">${renderBotAvatar(bot, "large")}<strong>${escapeHtml(bot.name)} está listo</strong><span>Escríbele qué necesitas y generará su respuesta con el modelo.</span></div>
         `}
         ${agentBusyBotId === bot.id && pendingUserMessage ? `<div class="chat-bubble user-bubble">${escapeHtml(pendingUserMessage)}</div>` : ""}
-        ${agentBusyBotId === bot.id && streamingAssistantText
-          ? `<div class="chat-bubble assistant-bubble">${escapeHtml(streamingAssistantText).replace(/\n/g, "<br />")}</div>`
-          : agentBusyBotId === bot.id ? '<div class="assistant-bubble agent-thinking"><i></i><i></i><i></i></div>' : ""}
+        ${agentBusyBotId === bot.id
+          ? `<div class="chat-bubble assistant-bubble${streamingAssistantText ? "" : " agent-thinking"}" data-agent-streaming="${escapeAttribute(bot.id)}">${streamingAssistantText ? escapeHtml(streamingAssistantText).replace(/\n/g, "<br />") : "<i></i><i></i><i></i>"}</div>`
+          : ""}
         ${renderError()}
       </div>
       ${workflowPanelOpen ? renderWorkflowPanel(bot) : ""}
@@ -1122,7 +1209,12 @@ function renderReadyBot(bot: BotProfile): void {
   document.querySelector("#delete-bot")?.addEventListener("click", () => void deleteActiveBot(bot));
   requestAnimationFrame(() => {
     const thread = document.querySelector<HTMLElement>("#bot-conversation-thread");
-    if (thread) thread.scrollTop = thread.scrollHeight;
+    if (!thread) return;
+    const forceBottom = forceConversationBottomBotId === bot.id;
+    thread.scrollTop = forceBottom || wasNearBottom
+      ? thread.scrollHeight
+      : Math.min(previousScrollTop, thread.scrollHeight - thread.clientHeight);
+    if (forceBottom) forceConversationBottomBotId = "";
   });
   if (computerLoadedBotId !== bot.id && !computerBusy) void refreshComputerStatus(bot.id);
 }
@@ -1170,40 +1262,53 @@ function renderComputerStrip(bot: BotProfile): string {
 }
 
 async function refreshComputerStatus(botId: string): Promise<void> {
-  if (!botId || computerBusy) return;
-  if (!connections.account.connected) {
-    computerSnapshot = {
-      ...idleComputerSnapshot(botId),
-      reason: "Inicia sesión para crear la computadora privada de este bot."
-    };
-    computerLoadedBotId = botId;
-    if (activeView === "bot-detail" && state.activeBotId === botId) render();
-    return;
-  }
+  if (!botId || computerBusy || computerStatusLoadingBotId === botId) return;
+  const requestSequence = ++computerRequestSequence;
+  computerStatusLoadingBotId = botId;
+  const previousSnapshot = computerSnapshot;
+  const previousLoadedBotId = computerLoadedBotId;
   try {
-    const snapshot = await desktopApi.computerStatus(botId);
-    if (!state.bots.some((bot) => bot.id === botId)) return;
-    computerSnapshot = snapshot;
-    computerLoadedBotId = botId;
+    if (!connections.account.connected) {
+      computerSnapshot = {
+        ...idleComputerSnapshot(botId),
+        reason: "Inicia sesión para crear la computadora privada de este bot."
+      };
+      computerLoadedBotId = botId;
+    } else {
+      const snapshot = await desktopApi.computerStatus(botId);
+      if (requestSequence !== computerRequestSequence || !state.bots.some((bot) => bot.id === botId)) return;
+      computerSnapshot = snapshot;
+      computerLoadedBotId = botId;
+    }
   } catch (error) {
+    if (requestSequence !== computerRequestSequence) return;
     computerSnapshot = {
       ...idleComputerSnapshot(botId),
       state: "error",
       reason: errorMessage(error)
     };
     computerLoadedBotId = botId;
+  } finally {
+    if (requestSequence === computerRequestSequence) computerStatusLoadingBotId = "";
   }
-  if (activeView === "bot-detail" && state.activeBotId === botId) {
-    render();
-    if (computerSnapshot.state === "pulling") {
-      window.setTimeout(() => void refreshComputerStatus(botId), 2_000);
-    }
+  if (requestSequence !== computerRequestSequence || activeView !== "bot-detail" || state.activeBotId !== botId) return;
+  if (!sameValue(previousSnapshot, computerSnapshot) || previousLoadedBotId !== computerLoadedBotId) render();
+  if (computerPollTimer) window.clearTimeout(computerPollTimer);
+  if (computerSnapshot.state === "pulling") {
+    computerPollTimer = window.setTimeout(() => {
+      computerPollTimer = 0;
+      void refreshComputerStatus(botId);
+    }, 2_000);
   }
 }
 
 async function openBotComputer(bot: BotProfile): Promise<void> {
   if (computerBusy) return;
   computerBusy = true;
+  computerRequestSequence += 1;
+  computerStatusLoadingBotId = "";
+  if (computerPollTimer) window.clearTimeout(computerPollTimer);
+  computerPollTimer = 0;
   computerLoadedBotId = bot.id;
   computerSnapshot = { ...computerSnapshot, bot_id: bot.id, configured: true, state: "pulling", reason: "" };
   transientError = "";
@@ -1226,6 +1331,10 @@ async function openBotComputer(bot: BotProfile): Promise<void> {
 async function handBackBotComputer(botId: string): Promise<void> {
   if (computerBusy) return;
   computerBusy = true;
+  computerRequestSequence += 1;
+  computerStatusLoadingBotId = "";
+  if (computerPollTimer) window.clearTimeout(computerPollTimer);
+  computerPollTimer = 0;
   transientError = "";
   render();
   try {
@@ -1237,6 +1346,18 @@ async function handBackBotComputer(botId: string): Promise<void> {
     computerBusy = false;
     render();
   }
+}
+
+function updateStreamingAssistantBubble(botId: string): void {
+  const bubble = [...document.querySelectorAll<HTMLElement>("[data-agent-streaming]")]
+    .find((element) => element.dataset.agentStreaming === botId);
+  if (!bubble) return;
+  const thread = document.querySelector<HTMLElement>("#bot-conversation-thread");
+  const wasNearBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+  const text = streamingAssistantText;
+  bubble.classList.toggle("agent-thinking", !text);
+  bubble.innerHTML = text ? escapeHtml(text).replace(/\n/g, "<br />") : "<i></i><i></i><i></i>";
+  if (thread && wasNearBottom) thread.scrollTop = thread.scrollHeight;
 }
 
 function bindBotChat(bot: BotProfile): void {
@@ -1314,17 +1435,27 @@ function renderGeneratedQuestion(message: BotProfile["messages"][number], active
     </section>`;
 }
 
+function maybeInitializeBotConversation(botId: string): void {
+  const bot = state.bots.find((item) => item.id === botId);
+  if (!bot || bot.messages.length || agentBusyBotId || !connections.account.connected) return;
+  if ((initialConversationRetryAfter.get(botId) ?? 0) > Date.now()) return;
+  void initializeBotConversation(botId);
+}
+
 async function initializeBotConversation(botId: string): Promise<void> {
   if (agentBusyBotId || !connections.account.connected) return;
   agentBusyBotId = botId;
+  forceConversationBottomBotId = botId;
   pendingUserMessage = "";
   streamingAssistantText = "";
   transientError = "";
   render();
   try {
-    await warmBotAgent(botId);
+    void warmBotAgent(botId);
     state = await desktopApi.runBotAgent(botId, "", true);
+    initialConversationRetryAfter.delete(botId);
   } catch (error) {
+    initialConversationRetryAfter.set(botId, Date.now() + 30_000);
     transientError = errorMessage(error);
   } finally {
     agentBusyBotId = "";
@@ -1343,13 +1474,12 @@ async function sendBotMessage(botId: string, message: string): Promise<void> {
     return;
   }
   agentBusyBotId = botId;
+  forceConversationBottomBotId = botId;
   pendingUserMessage = message;
   streamingAssistantText = "";
   transientError = "";
   render();
   try {
-    const warming = agentWarmTasks.get(botId);
-    if (warming) await warming;
     state = await desktopApi.runBotAgent(botId, message);
   } catch (error) {
     botMessageDrafts.set(botId, message);
@@ -1556,6 +1686,7 @@ async function runLearnedWorkflow(botId: string, workflowId: string): Promise<vo
   const workflow = bot?.workflows.find((item) => item.id === workflowId);
   if (!workflow) return;
   agentBusyBotId = botId;
+  forceConversationBottomBotId = botId;
   pendingUserMessage = `Ejecuta la tarea aprendida: ${workflow.title}`;
   transientError = "";
   workflowPanelOpen = false;
@@ -1573,17 +1704,23 @@ async function runLearnedWorkflow(botId: string, workflowId: string): Promise<vo
 
 async function deleteLearnedWorkflow(bot: BotProfile, workflowId: string): Promise<void> {
   const workflow = bot.workflows.find((item) => item.id === workflowId);
-  if (!workflow || !window.confirm(`¿Eliminar la tarea aprendida “${workflow.title}”?`)) return;
+  if (!workflow || botMutationBusy || !window.confirm(`¿Eliminar la tarea aprendida “${workflow.title}”?`)) return;
+  botMutationBusy = true;
+  transientError = "";
   try {
     state = await desktopApi.deleteBotWorkflow(bot.id, workflow.id);
   } catch (error) {
     transientError = errorMessage(error);
+  } finally {
+    botMutationBusy = false;
   }
   render();
 }
 
 async function deleteActiveBot(bot: BotProfile): Promise<void> {
-  if (!window.confirm(`¿Eliminar ${bot.name}?`)) return;
+  if (botMutationBusy || !window.confirm(`¿Eliminar ${bot.name}?`)) return;
+  botMutationBusy = true;
+  transientError = "";
   setBusy(true);
   try {
     state = await desktopApi.deleteBot(bot.id);
@@ -1591,6 +1728,8 @@ async function deleteActiveBot(bot: BotProfile): Promise<void> {
     closeBotSettings();
   } catch (error) {
     transientError = errorMessage(error);
+  } finally {
+    botMutationBusy = false;
   }
   render();
 }
@@ -1606,7 +1745,7 @@ function renderDesktopShell(content: string, activeId: string, settingsBot?: Bot
       <aside class="desktop-sidebar">
         <div class="sidebar-window-bar">
           <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
-          <button class="sidebar-new-button" type="button" data-new-bot aria-label="Crear un bot">＋</button>
+          <button class="sidebar-new-button" type="button" data-new-bot aria-label="Crear un bot" ${botMutationBusy ? "disabled" : ""}>＋</button>
         </div>
         <label class="sidebar-search"><span aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m15.5 15.5 5 5"></path></svg></span><input id="sidebar-search" type="search" placeholder="Buscar" value="${escapeAttribute(sidebarQuery)}" autocomplete="off" /></label>
         <nav class="sidebar-nav" aria-label="Navegación de bots">
@@ -1666,7 +1805,7 @@ function renderMessageComposer(botName: string, botId = ""): string {
         <button type="button" data-composer-add aria-label="Agregar" aria-expanded="${composerMenuOpen}">＋</button>
         ${composerMenuOpen ? `
           <span class="composer-menu" role="menu">
-            <button type="button" role="menuitem" data-composer-workflows><strong>Learned tasks</strong><small>Run a saved workflow again</small></button>
+            <button type="button" role="menuitem" data-composer-workflows><strong>Tareas aprendidas</strong><small>Vuelve a ejecutar un flujo guardado</small></button>
           </span>` : ""}
       </span>
       <input name="message" type="text" maxlength="20000" placeholder="Mensaje para ${escapeAttribute(botName)}" aria-label="Mensaje" value="${escapeAttribute(botId ? botMessageDrafts.get(botId) ?? "" : "")}" ${busy ? "disabled" : ""} />
@@ -1677,28 +1816,28 @@ function renderMessageComposer(botName: string, botId = ""): string {
 function renderTeachOverlay(bot: BotProfile): string {
   if (teachStatus.phase === "idle") return "";
   if (teachStatus.botId !== bot.id) {
-    return `<aside class="teach-recording-overlay compact"><span class="recording-dot"></span><strong>Recording another agent's computer</strong><small>${escapeHtml(teachStatus.botName)}</small></aside>`;
+    return `<aside class="teach-recording-overlay compact"><span class="recording-dot"></span><strong>Grabando la computadora de otro agente</strong><small>${escapeHtml(teachStatus.botName)}</small></aside>`;
   }
   if (teachStatus.phase === "processing") {
     return `
       <aside class="teach-recording-overlay processing" aria-live="assertive">
         <span class="teach-spinner" aria-hidden="true"></span>
-        <span><strong>${escapeHtml(bot.name)} is learning your steps…</strong><small>Agent Genia is recording the workflow so the bot can repeat it.</small></span>
+        <span><strong>${escapeHtml(bot.name)} está aprendiendo tus pasos…</strong><small>Agent Genia está procesando el flujo para que el bot pueda repetirlo.</small></span>
       </aside>`;
   }
   return `
     <aside class="teach-recording-overlay" aria-live="assertive">
       <span class="recording-dot"></span>
-      <span><strong>Recording ${escapeHtml(bot.name)}'s computer</strong><small>${escapeHtml(bot.name)} is learning your steps… · <time data-teach-clock>${formatTeachElapsed()}</time></small></span>
-      <button class="teach-stop-button" type="button" data-stop-teach>Stop &amp; save</button>
-      <button class="teach-discard-button" type="button" data-discard-teach aria-label="Discard recording">Discard</button>
+      <span><strong>Grabando la computadora de ${escapeHtml(bot.name)}</strong><small>${escapeHtml(bot.name)} está aprendiendo tus pasos… · <time data-teach-clock>${formatTeachElapsed()}</time></small></span>
+      <button class="teach-stop-button" type="button" data-stop-teach>Detener y guardar</button>
+      <button class="teach-discard-button" type="button" data-discard-teach aria-label="Descartar grabación">Descartar</button>
     </aside>`;
 }
 
 function renderWorkflowPanel(bot: BotProfile): string {
   return `
-    <section class="workflow-panel" aria-label="Learned tasks">
-      <header><span><strong>Learned tasks</strong><small>${bot.workflows.length} workflows for ${escapeHtml(bot.name)}</small></span><button type="button" data-close-workflows aria-label="Close">×</button></header>
+    <section class="workflow-panel" aria-label="Tareas aprendidas">
+      <header><span><strong>Tareas aprendidas</strong><small>${bot.workflows.length} flujos para ${escapeHtml(bot.name)}</small></span><button type="button" data-close-workflows aria-label="Cerrar">×</button></header>
       <div class="workflow-list">
         ${bot.workflows.length ? bot.workflows.map((workflow) => `
           <article class="workflow-card">
@@ -1706,10 +1845,10 @@ function renderWorkflowPanel(bot: BotProfile): string {
             <ol>${workflow.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>
             <footer>
               <small>${workflow.lastRunAt ? `Última ejecución ${escapeHtml(formatRelativeTime(workflow.lastRunAt))}` : "Todavía no se ha ejecutado"}</small>
-              <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId ? "disabled" : ""}>Run now</button></span>
+              <span><button type="button" data-delete-workflow="${escapeAttribute(workflow.id)}">Eliminar</button><button class="primary" type="button" data-run-workflow="${escapeAttribute(workflow.id)}" ${agentBusyBotId ? "disabled" : ""}>Ejecutar ahora</button></span>
             </footer>
           </article>`).join("") : `
-          <div class="workflow-empty"><strong>No learned tasks yet</strong><p>La grabación de tareas estará disponible cuando vuelva el soporte visual.</p></div>`}
+          <div class="workflow-empty"><strong>Todavía no hay tareas aprendidas</strong><p>La grabación de tareas estará disponible cuando vuelva el soporte visual.</p></div>`}
       </div>
     </section>`;
 }
@@ -1759,7 +1898,7 @@ function renderAvatarEditor(bot: BotProfile): string {
         </form>` : `
         <div class="avatar-tool-panel">
           <strong>Subir una imagen</strong>
-          <p>PNG, JPEG o WebP. Máximo 1 MB; se guarda solamente en este dispositivo.</p>
+          <p>PNG, JPEG o WebP. Máximo 1 MB; se guarda cifrada y se sincroniza con tu cuenta.</p>
           <label class="upload-avatar-button">Elegir imagen<input id="avatar-upload" type="file" accept="image/png,image/jpeg,image/webp" /></label>
           ${bot.avatarDataUrl ? '<button id="remove-uploaded-avatar" class="remove-avatar-button" type="button">Volver al bot</button>' : ""}
         </div>`}
@@ -1770,6 +1909,8 @@ function bindBotSettings(): void {
   if (!settingsOpen) return;
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-close-settings]")) {
     button.addEventListener("click", () => {
+      const botId = state.activeBotId;
+      if (botId) flushBotSettings(botId);
       settingsOpen = false;
       avatarEditorOpen = false;
       render();
@@ -1798,6 +1939,7 @@ function bindBotSettings(): void {
     });
     field.addEventListener("blur", () => {
       if (field.name === "name" && !field.value.trim()) render();
+      else flushBotSettings(activeBot.id);
     });
   }
   const notification = form.elements.namedItem("notificationsEnabled") as HTMLInputElement | null;
@@ -1832,35 +1974,73 @@ function applyLocalBotPatch(botId: string, patch: BotPatch): void {
 }
 
 function scheduleBotSettingsSave(botId: string, delay = 450): void {
+  settingsDirtyBotIds.add(botId);
+  settingsSaveRevisions.set(botId, (settingsSaveRevisions.get(botId) ?? 0) + 1);
   const previous = settingsSaveTimers.get(botId);
   if (previous !== undefined) window.clearTimeout(previous);
   const timer = window.setTimeout(() => void persistBotSettings(botId), delay);
   settingsSaveTimers.set(botId, timer);
 }
 
+function flushBotSettings(botId: string): void {
+  const timer = settingsSaveTimers.get(botId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  settingsSaveTimers.delete(botId);
+  if (settingsDirtyBotIds.has(botId)) void persistBotSettings(botId);
+}
+
 async function persistBotSettings(botId: string): Promise<void> {
   settingsSaveTimers.delete(botId);
+  if (settingsSaveTasks.has(botId)) return;
   const bot = state.bots.find((item) => item.id === botId);
-  if (!bot) return;
+  if (!bot) {
+    settingsDirtyBotIds.delete(botId);
+    return;
+  }
+  const revision = settingsSaveRevisions.get(botId) ?? 0;
+  const task = desktopApi.updateBot(botId, {
+    name: bot.name,
+    title: bot.title,
+    description: bot.description,
+    notificationsEnabled: bot.notificationsEnabled
+  });
+  settingsSaveTasks.set(botId, task);
   try {
-    state = await desktopApi.updateBot(botId, {
-      name: bot.name,
-      title: bot.title,
-      description: bot.description,
-      notificationsEnabled: bot.notificationsEnabled
-    });
+    const nextState = await task;
+    if ((settingsSaveRevisions.get(botId) ?? 0) === revision) {
+      settingsDirtyBotIds.delete(botId);
+      state = preservePendingBotSettings(nextState);
+    }
   } catch (error) {
     transientError = errorMessage(error);
     render();
+  } finally {
+    settingsSaveTasks.delete(botId);
+    if ((settingsSaveRevisions.get(botId) ?? 0) !== revision) void persistBotSettings(botId);
   }
 }
 
 async function saveAvatarPatch(botId: string, patch: BotPatch): Promise<void> {
+  const previousBot = state.bots.find((item) => item.id === botId);
+  if (!previousBot) return;
+  const sequence = (avatarSaveSequences.get(botId) ?? 0) + 1;
+  avatarSaveSequences.set(botId, sequence);
+  avatarSavingBotIds.add(botId);
   transientError = "";
+  applyLocalBotPatch(botId, patch);
+  render();
   try {
-    applyLocalBotPatch(botId, patch);
-    state = await desktopApi.updateBot(botId, patch);
+    const nextState = await desktopApi.updateBot(botId, patch);
+    if (avatarSaveSequences.get(botId) !== sequence) return;
+    avatarSavingBotIds.delete(botId);
+    state = preservePendingBotSettings(nextState);
   } catch (error) {
+    if (avatarSaveSequences.get(botId) !== sequence) return;
+    avatarSavingBotIds.delete(botId);
+    state = {
+      ...state,
+      bots: state.bots.map((bot) => bot.id === botId ? previousBot : bot)
+    };
     transientError = errorMessage(error);
   }
   render();
@@ -1874,13 +2054,18 @@ async function uploadAvatar(botId: string, input: HTMLInputElement): Promise<voi
     render();
     return;
   }
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => resolve(String(reader.result ?? "")), { once: true });
-    reader.addEventListener("error", () => reject(reader.error), { once: true });
-    reader.readAsDataURL(file);
-  });
-  await saveAvatarPatch(botId, { avatarDataUrl: dataUrl });
+  try {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => resolve(String(reader.result ?? "")), { once: true });
+      reader.addEventListener("error", () => reject(reader.error), { once: true });
+      reader.readAsDataURL(file);
+    });
+    await saveAvatarPatch(botId, { avatarDataUrl: dataUrl });
+  } catch (error) {
+    transientError = errorMessage(error);
+    render();
+  }
 }
 
 function bindSidebar(): void {
@@ -1906,6 +2091,11 @@ function bindSidebar(): void {
 }
 
 async function selectBot(botId: string): Promise<void> {
+  transientError = "";
+  computerRequestSequence += 1;
+  computerStatusLoadingBotId = "";
+  if (computerPollTimer) window.clearTimeout(computerPollTimer);
+  computerPollTimer = 0;
   try {
     state = await desktopApi.setActiveBot(botId);
     activeView = "bot-detail";
@@ -1919,6 +2109,7 @@ async function selectBot(botId: string): Promise<void> {
   if (state.activeBotId === botId) {
     void warmBotAgent(botId);
     void refreshComputerStatus(botId);
+    maybeInitializeBotConversation(botId);
   }
 }
 
@@ -1939,6 +2130,8 @@ async function warmBotAgent(botId: string): Promise<boolean> {
 }
 
 function closeBotSettings(): void {
+  const botId = state.activeBotId;
+  if (botId) flushBotSettings(botId);
   settingsOpen = false;
   avatarEditorOpen = false;
 }
@@ -2223,7 +2416,7 @@ function createPreviewApi(): DesktopApi {
         bots: previewState.bots.map((bot) => bot.id === botId ? {
           ...bot,
           workflows: bot.workflows.map((workflow) => workflow.id === workflowId ? { ...workflow, lastRunAt: now } : workflow),
-          messages: [...bot.messages, { id: crypto.randomUUID(), role: "assistant", text: "Workflow completed.", createdAt: now }]
+          messages: [...bot.messages, { id: crypto.randomUUID(), role: "assistant", text: "Flujo completado.", createdAt: now }]
         } : bot),
         activeBotId: botId
       };

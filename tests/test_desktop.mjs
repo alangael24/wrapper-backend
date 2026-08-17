@@ -137,8 +137,8 @@ test("records teach-task locally but fails closed while the text-only model cann
   assert.doesNotMatch(oauth, /"\/v1\/responses"|type: "input_image"/);
   assert.match(renderer, /navigator\.mediaDevices\.getDisplayMedia/);
   assert.match(renderer, /new MediaRecorder/);
-  assert.match(renderer, /Recording \$\{escapeHtml\(bot\.name\)\}'s computer/);
-  assert.match(renderer, /Stop &amp; save/);
+  assert.match(renderer, /Grabando la computadora de \$\{escapeHtml\(bot\.name\)\}/);
+  assert.match(renderer, /Detener y guardar/);
   assert.match(renderer, /La grabación de tareas estará disponible cuando vuelva el soporte visual/);
   assert.match(styles, /\.teach-recording-overlay/);
   assert.match(styles, /\.workflow-panel/);
@@ -252,7 +252,7 @@ test("keeps the first-bot builder and starts every created bot with the LLM", as
   assert.match(renderer, /async function createDefaultBot\(\): Promise<void>/);
   assert.match(renderer, /if \(!state\.bots\.length\)[\s\S]{0,180}activeView = "bot-builder"/);
   assert.match(renderer, /name: "Nuevo bot",\s+color: BOT_COLORS\[6\],\s+shape: BOT_SHAPES\[0\]/);
-  assert.match(renderer, /initializeBotConversation\(created\.id\)/);
+  assert.match(renderer, /maybeInitializeBotConversation\(created\.id\)/);
   assert.doesNotMatch(renderer, /skipSetup|renderBotOnboarding|BOT_SETUP_OPTIONS/);
   assert.match(renderer, /\[data-new-bot\][\s\S]{0,150}createDefaultBot\(\)/);
 });
@@ -266,6 +266,8 @@ test("runs bot conversations through wrapper-backend without hardcoded replies",
   ]);
   assert.match(main, /desktop:run-bot-agent/);
   assert.match(main, /buildBotPrompt\(\{ \.\.\.bot, connectorIds \}, prompt, initial\)/);
+  assert.match(main, /executionMode: initial \? "agent" : "auto"/);
+  assert.match(main, /chatPrompt: buildDirectChatPrompt/);
   assert.match(main, /\.\.\.before\.selectedConnectorIds/);
   assert.match(main, /\.\.\.bot\.connectorIds/);
   assert.match(oauth, /\$\{this\.options\.baseUrl\}\/v1\/agent\/run/);
@@ -278,6 +280,8 @@ test("runs bot conversations through wrapper-backend without hardcoded replies",
   assert.match(renderer, /desktopApi\.runBotAgent\(botId, message\)/);
   assert.match(renderer, /streamingAssistantText/);
   assert.match(renderer, /desktopApi\.warmBotAgent\(botId\)/);
+  assert.match(renderer, /void warmBotAgent\(botId\)/);
+  assert.doesNotMatch(renderer, /const warming = agentWarmTasks\.get\(botId\);/);
   assert.match(oauth, /"\/v1\/agent\/warm"/);
   assert.match(main, /normalizeQuestionWidget\(record\.widget\)/);
   assert.match(main, /scheduleRemoteSync\(\)/);

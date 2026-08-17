@@ -1825,9 +1825,17 @@ class TestBackend(unittest.TestCase):
             headers=headers,
         )
         self.assertEqual(status, 200)
-        self.assertTrue(warmed["ready"])
         self.assertTrue(warmed["started"])
-        session = next(iter(self.ws.backend.pi._sessions.values()))
+        self.assertTrue(warmed["warming"])
+        deadline = time.monotonic() + 2
+        session = None
+        while time.monotonic() < deadline:
+            session = next(iter(self.ws.backend.pi._sessions.values()), None)
+            if session is not None and session.process is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(session)
+        self.assertIsNotNone(session.process)
         process_id = session.process.pid
         self.assertEqual(
             json.loads(session.auth_file.read_text(encoding="utf-8")),
@@ -1851,6 +1859,93 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("fake-pi", result["answer"])
         self.assertEqual(next(iter(self.ws.backend.pi._sessions.values())).process.pid, process_id)
+
+    def test_auto_execution_uses_direct_chat_for_ordinary_conversation(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy full agent prompt",
+                "chat_prompt": "Reply briefly to the user: hola",
+                "user_message": "hola",
+                "execution_mode": "auto",
+                "bot_id": "bot-chat-rapido",
+                "idempotency_key": "direct-chat-run",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["answer"], "hola")
+        self.assertEqual(result["execution_path"], "direct_chat")
+        self.assertEqual(result["connector_ids"], [])
+        self.assertEqual(self.ws.backend.pi._sessions, {})
+        self.assertIn("direct_dispatch_ms", result["timings"])
+        upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
+        self.assertEqual(len(upstream), 1)
+        sent = json.loads(upstream[0][3])
+        self.assertEqual(sent["messages"][0]["content"], "Reply briefly to the user: hola")
+
+    def test_direct_chat_streams_first_visible_model_delta(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+
+        status, body = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy full agent prompt",
+                "chat_prompt": "Reply directly: hola",
+                "user_message": "hello",
+                "execution_mode": "auto",
+                "stream": True,
+                "bot_id": "bot-chat-stream",
+                "idempotency_key": "direct-chat-stream",
+            },
+            headers=headers,
+            raw=True,
+        )
+
+        self.assertEqual(status, 200)
+        frames = [frame for frame in body.decode("utf-8").split("\n\n") if frame]
+        self.assertTrue(any(frame.startswith("event: delta\n") for frame in frames))
+        self.assertTrue(any(frame.startswith("event: done64\n") for frame in frames))
+        run_id = next(
+            json.loads(frame.splitlines()[1].removeprefix("data: "))["run_id"]
+            for frame in frames
+            if frame.startswith("event: start\n")
+        )
+        saved = self.ws.backend.store.get_agent_run(run_id)
+        timing = json.loads(json.loads(saved["warnings_json"])[0].removeprefix("timing:"))
+        self.assertIn("first_visible_delta_ms", timing)
+        self.assertLessEqual(timing["upstream_first_content_ms"], timing["first_visible_delta_ms"])
+
+    def test_auto_execution_keeps_tool_requests_on_pi(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "Use the configured tools and review GitHub.",
+                "chat_prompt": "Do not use this direct prompt.",
+                "user_message": "revisa mis issues de GitHub",
+                "execution_mode": "auto",
+                "bot_id": "bot-con-herramientas",
+                "idempotency_key": "pi-tool-run",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["execution_path"], "pi")
+        self.assertIn("fake-pi", result["answer"])
+        self.assertEqual(len(self.ws.backend.pi._sessions), 1)
 
     def test_pi_sessions_are_separated_by_account_and_bot(self):
         first = self.new_user()

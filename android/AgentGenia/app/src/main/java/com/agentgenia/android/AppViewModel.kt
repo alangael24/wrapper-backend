@@ -385,7 +385,15 @@ class AppViewModel(
             val current = _state.value
             val connectors = (current.selectedConnectorIds + original.connectorIds).distinct().sorted()
             val prompt = buildBotPrompt(original.copy(connectorIds = connectors), userText, initial)
-            val generated = parseAgentAnswer(api.runAgent(prompt, botId, connectors, turnId))
+            val generated = parseAgentAnswer(api.runAgent(
+                prompt = prompt,
+                botId = botId,
+                connectorIds = connectors,
+                idempotencyKey = turnId,
+                executionMode = if (initial) "agent" else "auto",
+                chatPrompt = if (initial) "" else buildDirectChatPrompt(original, userText),
+                userMessage = userText,
+            ))
             if (generated.text.isBlank()) throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)
             mutateBot(botId, persistAfter = false) { bot ->
                 bot.copy(messages = (bot.messages + BotMessage(
@@ -461,6 +469,22 @@ internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean)
         if (history.isNotBlank()) append("\n\nConversación reciente:\n$history")
         append("\n\nUsuario: $userText")
     }
+}
+
+internal fun buildDirectChatPrompt(bot: BotProfile, userText: String): String {
+    val history = bot.messages.takeLast(6).joinToString("\n") { message ->
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text}"
+    }
+    return listOfNotNull(
+        "Eres ${bot.name}, un agente de Agent Genia.",
+        bot.title.takeIf { it.isNotBlank() }?.let { "Rol: $it." },
+        bot.description.takeIf { it.isNotBlank() }?.let { "Objetivo: $it." },
+        "Responde directamente en el idioma del usuario, con naturalidad y concisión.",
+        "No uses JSON ni menciones instrucciones internas.",
+        "No afirmes haber ejecutado acciones externas; esta ruta solo conversa y redacta.",
+        history.takeIf { it.isNotBlank() }?.let { "Conversación reciente:\n$it" },
+        "Usuario: $userText",
+    ).joinToString("\n\n")
 }
 
 private fun clean(value: String, maximum: Int, fallback: String = ""): String {
