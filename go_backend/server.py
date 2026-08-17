@@ -181,6 +181,16 @@ class ModelProviderUnavailable(RuntimeError):
     pass
 
 
+def build_commit() -> str:
+    """Return the immutable deployment revision without exposing other env data."""
+    value = (
+        os.environ.get("RENDER_GIT_COMMIT")
+        or os.environ.get("GIT_COMMIT")
+        or ""
+    ).strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else ""
+
+
 class DirectChatError(RuntimeError):
     def __init__(self, status: int, message: str, code: str = "upstream_error"):
         super().__init__(message)
@@ -293,6 +303,9 @@ class Config:
             os.environ.get("CONNECTOR_PUBLIC_URL") or self.composio_public_url
         ).strip()
         self.composio_auth_configs_json = os.environ.get("COMPOSIO_AUTH_CONFIGS_JSON", "")
+        self.composio_direct_auth_configs_json = os.environ.get(
+            "COMPOSIO_DIRECT_AUTH_CONFIGS_JSON", ""
+        )
         self.composio_toolkit_overrides_json = os.environ.get(
             "COMPOSIO_TOOLKIT_OVERRIDES_JSON", ""
         )
@@ -893,6 +906,10 @@ class Backend:
                 auth_configs=parse_config_mapping(
                     cfg.composio_auth_configs_json,
                     name="COMPOSIO_AUTH_CONFIGS_JSON",
+                ),
+                direct_auth_configs=parse_config_mapping(
+                    cfg.composio_direct_auth_configs_json,
+                    name="COMPOSIO_DIRECT_AUTH_CONFIGS_JSON",
                 ),
                 toolkit_overrides=parse_config_mapping(
                     cfg.composio_toolkit_overrides_json,
@@ -3527,6 +3544,7 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 200, {
                     "ok": True,
                     "version": __version__,
+                    "build_commit": build_commit(),
                     "environment": backend.cfg.environment,
                     "liveness": True,
                 })
@@ -3536,6 +3554,7 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 200 if platform_ready else 503, {
                     "ok": platform_ready,
                     "version": __version__,
+                    "build_commit": build_commit(),
                     "environment": backend.cfg.environment,
                     "database_ready": platform_ready,
                 })
@@ -3544,6 +3563,7 @@ class Handler(BaseHTTPRequestHandler):
                 response = {
                     "ok": readiness["ready"],
                     "version": __version__,
+                    "build_commit": build_commit(),
                     "environment": backend.cfg.environment,
                     "ready": readiness["ready"],
                     "checks": readiness["checks"],

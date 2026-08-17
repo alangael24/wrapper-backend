@@ -357,10 +357,10 @@ Figma, Canva, Trello, monday.com, Intercom, Zendesk, Box, Dropbox, Calendly,
 Stripe, QuickBooks, Greenhouse, Mailchimp, Shopify, Apollo, Ashby, Vercel, Hex,
 Amplitude, Mixpanel y Databricks. Microsoft 365 y HubSpot usan también Managed
 Auth. Los proveedores que requieren una app propia se activan con
-`COMPOSIO_AUTH_CONFIGS_JSON`. Cuando el conector tiene un Auth Config privado,
-la primera conexión abre directamente el consentimiento OAuth del proveedor;
-no muestra primero la página de Composio. Los conectores que todavía usan
-Managed Auth conservan el Connect Link obligatorio de Composio. Los tokens
+`COMPOSIO_AUTH_CONFIGS_JSON`. Todos los Auth Configs usan por defecto el Connect
+Link v3 soportado por Composio. Solo un Auth Config propio, verificado por el
+operador y repetido explícitamente en `COMPOSIO_DIRECT_AUTH_CONFIGS_JSON`, abre
+directamente el consentimiento OAuth del proveedor. Los tokens
 administrados permanecen en Composio, nunca en el renderer ni en Pi.
 
 Cuando Composio no ofrece Managed Auth, `wrapper-backend` usa su adaptador REST
@@ -737,6 +737,7 @@ runtime se agrupan aquí por función.
 | `COMPOSIO_PUBLIC_URL` | vacío | URL pública para callbacks de Composio |
 | `CONNECTOR_PUBLIC_URL` | `COMPOSIO_PUBLIC_URL` | URL HTTPS para formularios first-party |
 | `COMPOSIO_AUTH_CONFIGS_JSON` | `{}` | Mapa privado de connector ID a Auth Config |
+| `COMPOSIO_DIRECT_AUTH_CONFIGS_JSON` | `{}` | Opt-in de Auth Configs propios verificados que pueden omitir Connect Link |
 | `COMPOSIO_TOOLKIT_OVERRIDES_JSON` | `{}` | Overrides de toolkit por connector ID |
 | `COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS` | `600` | Vida de un intento de conexión |
 

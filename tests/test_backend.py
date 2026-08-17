@@ -138,6 +138,7 @@ class WrapperServer:
         os.environ.pop("GOOGLE_OAUTH_REDIRECT_URI", None)
         for name in (
             "COMPOSIO_API_KEY", "COMPOSIO_PUBLIC_URL", "COMPOSIO_AUTH_CONFIGS_JSON",
+            "COMPOSIO_DIRECT_AUTH_CONFIGS_JSON",
             "COMPOSIO_TOOLKIT_OVERRIDES_JSON", "COMPOSIO_AUTH_ATTEMPT_TTL_SECONDS",
         ):
             os.environ.pop(name, None)
@@ -1346,11 +1347,25 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(body["error"]["request_id"].startswith("req_"))
 
     def test_liveness_never_waits_for_dependency_readiness(self):
-        with patch.object(self.ws.backend.store, "health", side_effect=RuntimeError("database unavailable")):
+        with (
+            patch.dict(
+                os.environ,
+                {"RENDER_GIT_COMMIT": "0123456789abcdef0123456789abcdef01234567"},
+            ),
+            patch.object(
+                self.ws.backend.store,
+                "health",
+                side_effect=RuntimeError("database unavailable"),
+            ),
+        ):
             status, body = self.ws.req("GET", "/healthz")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertTrue(body["liveness"])
+        self.assertEqual(
+            body["build_commit"],
+            "0123456789abcdef0123456789abcdef01234567",
+        )
         self.assertNotIn("database", body)
 
     def test_platform_health_checks_the_database_without_third_party_providers(self):
@@ -2286,6 +2301,7 @@ class TestBackend(unittest.TestCase):
             client=client,
             public_base_url="https://agentgenia-api.onrender.com",
             auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+            direct_auth_configs={"salesforce": "ac_agentgenia_salesforce"},
             store=self.ws.backend.store,
         )
 
@@ -2302,10 +2318,6 @@ class TestBackend(unittest.TestCase):
 
     def test_composio_gateway_uses_connect_link_for_managed_auth_config(self):
         client = FakeComposioClient()
-        client.auth_configs.items["ac_agentgenia_salesforce"] = SimpleNamespace(
-            is_composio_managed=True,
-            type="default",
-        )
         user_id = self.new_user("managed-oauth-user")["user_id"]
         gateway = ComposioConnectorGateway(
             client=client,
@@ -2325,6 +2337,15 @@ class TestBackend(unittest.TestCase):
             "auth_config_id": "ac_agentgenia_salesforce",
             "callback_url": "https://agentgenia-api.onrender.com/connections/complete",
         }])
+
+    def test_composio_gateway_rejects_unregistered_direct_auth_config(self):
+        with self.assertRaisesRegex(ValueError, "mismo valor"):
+            ComposioConnectorGateway(
+                client=FakeComposioClient(),
+                auth_configs={"salesforce": "ac_agentgenia_salesforce"},
+                direct_auth_configs={"salesforce": "ac_other_salesforce"},
+                store=self.ws.backend.store,
+            )
 
     def test_composio_gateway_rate_limits_new_links_per_user(self):
         user_id = self.new_user("rate-user")["user_id"]

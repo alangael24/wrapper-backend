@@ -99,6 +99,8 @@ services:
         sync: false
       - key: COMPOSIO_AUTH_CONFIGS_JSON
         sync: false
+      - key: COMPOSIO_DIRECT_AUTH_CONFIGS_JSON
+        value: "{}"
       - key: COMPOSIO_TOOLKIT_OVERRIDES_JSON
         value: "{}"
       - key: COMPUTERS_ENABLED

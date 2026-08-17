@@ -95,6 +95,7 @@ class ComposioConnectorGateway:
         api_key: str = "",
         public_base_url: str = "",
         auth_configs: dict[str, str] | None = None,
+        direct_auth_configs: dict[str, str] | None = None,
         toolkit_overrides: dict[str, str] | None = None,
         client: Any = None,
         native_gateway: NativeConnectorGateway | None = None,
@@ -104,14 +105,29 @@ class ComposioConnectorGateway:
     ):
         self.api_key = api_key.strip()
         self.public_base_url = _validate_public_base_url(public_base_url)
-        self.auth_configs = _validated_mapping(auth_configs or {}, prefix="ac_")
+        self.auth_configs = _validated_mapping(
+            auth_configs or {},
+            prefix="ac_",
+            name="COMPOSIO_AUTH_CONFIGS_JSON",
+        )
+        self.direct_auth_configs = _validated_mapping(
+            direct_auth_configs or {},
+            prefix="ac_",
+            name="COMPOSIO_DIRECT_AUTH_CONFIGS_JSON",
+        )
+        for key, auth_config in self.direct_auth_configs.items():
+            if self.auth_configs.get(key) != auth_config:
+                raise ValueError(
+                    "COMPOSIO_DIRECT_AUTH_CONFIGS_JSON solo puede habilitar "
+                    "Auth Configs presentes con el mismo valor en "
+                    "COMPOSIO_AUTH_CONFIGS_JSON"
+                )
         self.toolkits = dict(COMPOSIO_TOOLKITS)
         self.toolkits.update(_validated_toolkit_overrides(toolkit_overrides or {}))
         self._now = now
         self._attempt_ttl_seconds = max(60, min(int(attempt_ttl_seconds), 1800))
         self.store = store
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
-        self._managed_auth_configs: dict[str, bool] = {}
         self._lock = threading.RLock()
         self.client = client
         self.native_gateway = native_gateway
@@ -241,6 +257,10 @@ class ComposioConnectorGateway:
                     user_id=user_id,
                     auth_config=auth_config,
                     callback_url=callback_url,
+                    direct=(
+                        self._direct_auth_config(connector_id, description["toolkit"])
+                        == auth_config
+                    ),
                 )
             else:
                 session = self._session(user_id, connector_id)
@@ -424,55 +444,35 @@ class ComposioConnectorGateway:
     def _auth_config(self, connector_id: str, toolkit: str) -> str:
         return self.auth_configs.get(connector_id) or self.auth_configs.get(toolkit, "")
 
+    def _direct_auth_config(self, connector_id: str, toolkit: str) -> str:
+        return (
+            self.direct_auth_configs.get(connector_id)
+            or self.direct_auth_configs.get(toolkit, "")
+        )
+
     def _authorize_with_auth_config(
         self,
         *,
         user_id: str,
         auth_config: str,
         callback_url: str | None,
+        direct: bool,
     ) -> Any:
-        """Use direct OAuth for custom apps and Connect Link for Managed Auth."""
+        """Use Connect Link by default; direct OAuth requires an explicit opt-in."""
         options = {"callback_url": callback_url} if callback_url else {}
-        if self._auth_config_is_managed(auth_config) is True:
+        if not direct:
             return self.client.connected_accounts.link(user_id, auth_config, **options)
         try:
-            # Custom OAuth apps return the provider URL directly.  This legacy
-            # endpoint remains supported for custom Auth Configs.
+            # Only operator-verified custom OAuth apps may use the legacy
+            # direct endpoint. Merely appearing in COMPOSIO_AUTH_CONFIGS_JSON
+            # is not proof that an Auth Config is custom.
             return self.client.connected_accounts.initiate(user_id, auth_config, **options)
         except Exception as exc:
-            # Be resilient to an Auth Config being changed from custom to
-            # Composio-managed without restarting Agent Genia.  Composio now
-            # rejects initiate() for managed OAuth and requires link().
+            # Fail safely if Composio changes an explicitly opted-in config to
+            # Managed Auth: retry through the supported v3 Connect Link route.
             if not _requires_connect_link(exc):
                 raise
-            with self._lock:
-                self._managed_auth_configs[auth_config] = True
             return self.client.connected_accounts.link(user_id, auth_config, **options)
-
-    def _auth_config_is_managed(self, auth_config: str) -> bool | None:
-        with self._lock:
-            cached = self._managed_auth_configs.get(auth_config)
-        if cached is not None:
-            return cached
-        try:
-            record = self.client.auth_configs.get(auth_config)
-        except Exception:
-            # Older/mocked clients may not expose auth-config metadata.  The
-            # caller still has the endpoint-retirement fallback above.
-            return None
-        managed = getattr(record, "is_composio_managed", None)
-        if not isinstance(managed, bool):
-            config_type = str(getattr(record, "type", "") or "").lower()
-            if config_type == "default":
-                managed = True
-            elif config_type == "custom":
-                managed = False
-            else:
-                managed = None
-        if isinstance(managed, bool):
-            with self._lock:
-                self._managed_auth_configs[auth_config] = managed
-        return managed
 
     def _check_start_rate(self, user_id: str) -> None:
         now = self._now()
@@ -519,11 +519,16 @@ def parse_config_mapping(raw: str, *, name: str) -> dict[str, str]:
     return {key.strip(): item.strip() for key, item in value.items() if key.strip() and item.strip()}
 
 
-def _validated_mapping(value: dict[str, str], *, prefix: str) -> dict[str, str]:
+def _validated_mapping(
+    value: dict[str, str],
+    *,
+    prefix: str,
+    name: str,
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for key, item in value.items():
         if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", key) or not item.startswith(prefix):
-            raise ValueError("COMPOSIO_AUTH_CONFIGS_JSON contiene un valor invalido")
+            raise ValueError(f"{name} contiene un valor invalido")
         result[key] = item
     return result
 
