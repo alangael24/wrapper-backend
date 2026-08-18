@@ -190,6 +190,11 @@ export interface BotProfile {
   workflows: BotWorkflow[];
   createdAt: string;
   updatedAt: string;
+  profileRevision: string;
+  connectorAssignmentRevision: string;
+  notificationRevision: string;
+  conversationRevision: string;
+  workflowRevision: string;
 }
 
 export interface BotWorkflow {
@@ -249,6 +254,8 @@ export interface BotMessage {
 }
 
 export interface BotQuestionWidget {
+  type?: "question" | "approval";
+  approvalId?: string;
   prompt: string;
   helpText: string;
   options: BotQuestionOption[];
@@ -260,6 +267,13 @@ export interface BotQuestionOption {
   label: string;
   value: string;
   description: string;
+  action?: BotWidgetAction;
+}
+
+export interface BotWidgetAction {
+  type: "approval";
+  approvalId: string;
+  decision: "approve" | "reject";
 }
 
 export interface AppState {
@@ -269,6 +283,17 @@ export interface AppState {
   bots: BotProfile[];
   deletedBotIds: string[];
   activeBotId: string | null;
+  pendingRuns: PendingAgentRun[];
+}
+
+export interface PendingAgentRun {
+  turnId: string;
+  idempotencyKey: string;
+  runId: string;
+  botId: string;
+  status: "pending" | "running" | "recovering";
+  submittedAt: string;
+  lastRecoveryAt: string;
 }
 
 export interface AccountStateSnapshot {
@@ -322,7 +347,7 @@ export interface DesktopApi {
   createBot(draft: BotDraft): Promise<AppState>;
   updateBot(botId: string, patch: BotPatch): Promise<AppState>;
   warmBotAgent(botId: string): Promise<void>;
-  runBotAgent(botId: string, prompt: string, initial?: boolean): Promise<AppState>;
+  runBotAgent(botId: string, prompt: string, initial?: boolean, action?: BotWidgetAction): Promise<AppState>;
   onAgentDelta(listener: (delta: AgentStreamDelta) => void): () => void;
   getTeachRecordingStatus(): Promise<TeachRecordingStatus>;
   startTeachRecording(botId: string, entryPoint: TeachEntryPoint): Promise<TeachRecordingStatus>;
@@ -341,7 +366,8 @@ export function initialAppState(): AppState {
     selectedConnectorIds: [],
     bots: [],
     deletedBotIds: [],
-    activeBotId: null
+    activeBotId: null,
+    pendingRuns: []
   };
 }
 
@@ -360,13 +386,32 @@ export function normalizeAppState(value: unknown): AppState {
   const activeBotId = typeof value.activeBotId === "string" && bots.some((bot) => bot.id === value.activeBotId)
     ? value.activeBotId
     : bots[0]?.id ?? null;
+  const botIds = new Set(bots.map((bot) => bot.id));
+  const pendingRuns = Array.isArray(value.pendingRuns)
+    ? value.pendingRuns.slice(0, 100).flatMap((item): PendingAgentRun[] => {
+      if (!isRecord(item) || typeof item.turnId !== "string" || typeof item.idempotencyKey !== "string"
+        || typeof item.botId !== "string" || !botIds.has(item.botId)) return [];
+      const status = item.status === "running" || item.status === "recovering" ? item.status : "pending";
+      return [{
+        turnId: item.turnId.slice(0, 100),
+        idempotencyKey: item.idempotencyKey.slice(0, 100),
+        runId: typeof item.runId === "string" ? item.runId.slice(0, 100) : "",
+        botId: item.botId,
+        status,
+        submittedAt: normalizeDate(item.submittedAt, new Date().toISOString()),
+        lastRecoveryAt: typeof item.lastRecoveryAt === "string" && !Number.isNaN(Date.parse(item.lastRecoveryAt))
+          ? item.lastRecoveryAt : ""
+      }];
+    })
+    : [];
   return {
     version: 2,
     onboardingCompleted: value.onboardingCompleted === true,
     selectedConnectorIds,
     bots,
     deletedBotIds,
-    activeBotId
+    activeBotId,
+    pendingRuns
   };
 }
 
@@ -394,7 +439,12 @@ export function createBotProfile(draft: BotDraft, connectorIds: string[], id: st
     messages: [],
     workflows: [],
     createdAt: timestamp,
-    updatedAt: timestamp
+    updatedAt: timestamp,
+    profileRevision: timestamp,
+    connectorAssignmentRevision: timestamp,
+    notificationRevision: timestamp,
+    conversationRevision: timestamp,
+    workflowRevision: timestamp
   };
 }
 
@@ -408,6 +458,10 @@ export function updateBotProfile(bot: BotProfile, patch: BotPatch): BotProfile {
     ? bot.shape
     : BOT_SHAPES.includes(patch.shape as BotShape) ? patch.shape as BotShape : bot.shape;
   const avatarDataUrl = patch.avatarDataUrl === undefined ? bot.avatarDataUrl : normalizeAvatarDataUrl(patch.avatarDataUrl);
+  const timestamp = new Date().toISOString();
+  const profileChanged = patch.name !== undefined || patch.title !== undefined || patch.description !== undefined
+    || patch.color !== undefined || patch.shape !== undefined || patch.avatarDataUrl !== undefined;
+  const notificationChanged = patch.notificationsEnabled !== undefined;
   return {
     ...bot,
     name,
@@ -417,7 +471,9 @@ export function updateBotProfile(bot: BotProfile, patch: BotPatch): BotProfile {
     shape,
     avatarDataUrl,
     notificationsEnabled: patch.notificationsEnabled === undefined ? bot.notificationsEnabled : patch.notificationsEnabled === true,
-    updatedAt: new Date().toISOString()
+    updatedAt: timestamp,
+    profileRevision: profileChanged ? timestamp : bot.profileRevision,
+    notificationRevision: notificationChanged ? timestamp : bot.notificationRevision
   };
 }
 
@@ -444,7 +500,12 @@ function normalizeBot(value: unknown): BotProfile | null {
       notificationsEnabled: value.notificationsEnabled !== false,
       messages: normalizeBotMessages(value.messages),
       workflows: normalizeBotWorkflows(value.workflows),
-      updatedAt: normalizeDate(value.updatedAt, createdAt.toISOString())
+      updatedAt: normalizeDate(value.updatedAt, createdAt.toISOString()),
+      profileRevision: normalizeDate(value.profileRevision, normalizeDate(value.updatedAt, createdAt.toISOString())),
+      connectorAssignmentRevision: normalizeDate(value.connectorAssignmentRevision, normalizeDate(value.updatedAt, createdAt.toISOString())),
+      notificationRevision: normalizeDate(value.notificationRevision, normalizeDate(value.updatedAt, createdAt.toISOString())),
+      conversationRevision: normalizeDate(value.conversationRevision, normalizeDate(value.updatedAt, createdAt.toISOString())),
+      workflowRevision: normalizeDate(value.workflowRevision, normalizeDate(value.updatedAt, createdAt.toISOString()))
     };
   } catch {
     return null;
@@ -552,14 +613,36 @@ export function normalizeQuestionWidget(value: unknown): BotQuestionWidget | und
     if (!isRecord(item)) return [];
     const label = cleanProfileText(item.label, 120);
     if (!label) return [];
+    const actionValue = isRecord(item.action) ? item.action : null;
+    const approvalId = actionValue?.type === "approval"
+      && typeof actionValue.approvalId === "string"
+      && /^apr_[a-zA-Z0-9_-]{8,120}$/.test(actionValue.approvalId)
+      ? actionValue.approvalId
+      : "";
+    const decision = actionValue?.decision === "approve" || actionValue?.decision === "reject"
+      ? actionValue.decision
+      : undefined;
+    const action: BotWidgetAction | undefined = approvalId && decision
+      ? { type: "approval", approvalId, decision }
+      : undefined;
     return [{
       label,
       value: cleanProfileText(item.value, 300) || label,
-      description: cleanProfileText(item.description, 240)
+      description: cleanProfileText(item.description, 240),
+      ...(action ? { action } : {})
     }];
   });
   if (!options.length) return undefined;
+  const widgetApprovalId = typeof value.approvalId === "string"
+    && /^apr_[a-zA-Z0-9_-]{8,120}$/.test(value.approvalId)
+    ? value.approvalId
+    : undefined;
+  const isApproval = value.type === "approval"
+    && widgetApprovalId
+    && options.every((option) => option.action?.approvalId === widgetApprovalId);
   return {
+    type: isApproval ? "approval" : "question",
+    ...(isApproval ? { approvalId: widgetApprovalId } : {}),
     prompt,
     helpText: cleanProfileText(value.helpText, 500),
     options,

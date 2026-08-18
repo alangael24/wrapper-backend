@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -308,6 +308,29 @@ CREATE TABLE IF NOT EXISTS connector_operations (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS pending_approvals (
+  id             TEXT PRIMARY KEY,
+  action_id      TEXT UNIQUE NOT NULL,
+  user_id        TEXT NOT NULL,
+  bot_id         TEXT NOT NULL,
+  run_id         TEXT NOT NULL,
+  target_type    TEXT NOT NULL CHECK(target_type IN ('connector','computer')),
+  connector_id   TEXT NOT NULL,
+  operation      TEXT NOT NULL,
+  arguments_json TEXT NOT NULL,
+  arguments_hash TEXT NOT NULL,
+  human_summary  TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','approved','rejected','dispatched','succeeded','uncertain','expired')),
+  expires_at     REAL NOT NULL,
+  approved_at    REAL,
+  consumed_at    REAL,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  UNIQUE(user_id, run_id, target_type, connector_id, operation, arguments_hash),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS whatsapp_link_codes (
   code_hash   TEXT PRIMARY KEY,
   user_id     TEXT NOT NULL,
@@ -380,6 +403,10 @@ CREATE INDEX IF NOT EXISTS idx_account_provider_credentials_account
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_status ON agent_runs(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_connector_operations_run
   ON connector_operations(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_run
+  ON pending_approvals(user_id, run_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_bot
+  ON pending_approvals(user_id, bot_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_credit_grants_user_expiry
   ON credit_grants(user_id, expires_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created
@@ -2524,6 +2551,193 @@ class Store:
             (error_code[:100], _now(), user_id, run_id, operation_id),
         )
 
+    @staticmethod
+    def _decode_pending_approval(row: Any) -> dict:
+        value = dict(row)
+        try:
+            arguments = json.loads(value.pop("arguments_json"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("pending_approval_corrupt") from exc
+        if not isinstance(arguments, dict):
+            raise RuntimeError("pending_approval_corrupt")
+        value["arguments"] = arguments
+        return value
+
+    def create_pending_approval(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        run_id: str,
+        target_type: str,
+        connector_id: str,
+        operation: str,
+        arguments: dict,
+        arguments_hash: str,
+        human_summary: str,
+        ttl_seconds: int = 600,
+    ) -> dict:
+        """Persist one exact proposed side effect before asking the user.
+
+        The uniqueness key collapses repeated tool attempts made by the model
+        during the same run. A later run receives a different approval and
+        action id, so consent can never leak between logical user actions.
+        """
+        if target_type not in {"connector", "computer"}:
+            raise ValueError("target_type inválido")
+        encoded = json.dumps(
+            arguments, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        now = _now()
+        approval_id = new_id("apr")
+        action_id = new_id("act")
+        expires_at = now + max(60, min(int(ttl_seconds), 1800))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO pending_approvals("
+                    "id,action_id,user_id,bot_id,run_id,target_type,connector_id,operation,"
+                    "arguments_json,arguments_hash,human_summary,status,expires_at,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?) "
+                    "ON CONFLICT(user_id,run_id,target_type,connector_id,operation,arguments_hash) "
+                    "DO NOTHING",
+                    (
+                        approval_id, action_id, user_id, bot_id, run_id, target_type,
+                        connector_id, operation, encoded, arguments_hash,
+                        human_summary[:1000], expires_at, now, now,
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM pending_approvals WHERE user_id=? AND run_id=? "
+                    "AND target_type=? AND connector_id=? AND operation=? AND arguments_hash=?",
+                    (user_id, run_id, target_type, connector_id, operation, arguments_hash),
+                ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if row is None:
+            raise RuntimeError("pending_approval_not_created")
+        return self._decode_pending_approval(row)
+
+    def pending_approvals_for_run(self, user_id: str, run_id: str) -> list[dict]:
+        now = _now()
+        self._exec(
+            "UPDATE pending_approvals SET status='expired',updated_at=? "
+            "WHERE user_id=? AND run_id=? AND status IN ('pending','approved') AND expires_at<=?",
+            (now, user_id, run_id, now),
+        )
+        return [
+            self._decode_pending_approval(row)
+            for row in self._q(
+                "SELECT * FROM pending_approvals WHERE user_id=? AND run_id=? "
+                "AND status='pending' AND expires_at>? ORDER BY created_at,id",
+                (user_id, run_id, now),
+            )
+        ]
+
+    def approve_pending_approval(
+        self, *, user_id: str, bot_id: str, approval_id: str
+    ) -> dict | None:
+        """Approve exactly one proposal and return its immutable capability."""
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM pending_approvals WHERE id=? AND user_id=? AND bot_id=?",
+                    (approval_id, user_id, bot_id),
+                ).fetchone()
+                if row is None or float(row["expires_at"]) <= now:
+                    if row is not None and row["status"] in {"pending", "approved"}:
+                        self._conn.execute(
+                            "UPDATE pending_approvals SET status='expired',updated_at=? WHERE id=?",
+                            (now, approval_id),
+                        )
+                        self._conn.commit()
+                    else:
+                        self._conn.rollback()
+                    return None
+                if row["status"] == "pending":
+                    changed = self._conn.execute(
+                        "UPDATE pending_approvals SET status='approved',approved_at=?,updated_at=? "
+                        "WHERE id=? AND status='pending' AND expires_at>?",
+                        (now, now, approval_id, now),
+                    )
+                    if changed.rowcount != 1:
+                        self._conn.rollback()
+                        return None
+                    row = self._conn.execute(
+                        "SELECT * FROM pending_approvals WHERE id=?", (approval_id,)
+                    ).fetchone()
+                elif row["status"] != "approved":
+                    self._conn.rollback()
+                    return None
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self._decode_pending_approval(row)
+
+    def reject_pending_approval(
+        self, *, user_id: str, bot_id: str, approval_id: str
+    ) -> bool:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self._conn.execute(
+                    "UPDATE pending_approvals SET status='rejected',consumed_at=?,updated_at=? "
+                    "WHERE id=? AND user_id=? AND bot_id=? AND status='pending' AND expires_at>?",
+                    (now, now, approval_id, user_id, bot_id, now),
+                )
+                self._conn.commit()
+                return changed.rowcount == 1
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def dispatch_pending_approval(
+        self,
+        *,
+        approval_id: str,
+        action_id: str,
+        user_id: str,
+        connector_id: str,
+        operation: str,
+        arguments_hash: str,
+    ) -> bool:
+        """Consume the capability immediately before the provider call."""
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                changed = self._conn.execute(
+                    "UPDATE pending_approvals SET status='dispatched',consumed_at=?,updated_at=? "
+                    "WHERE id=? AND action_id=? AND user_id=? AND connector_id=? AND operation=? "
+                    "AND arguments_hash=? AND status='approved' AND expires_at>?",
+                    (
+                        now, now, approval_id, action_id, user_id, connector_id,
+                        operation, arguments_hash, now,
+                    ),
+                )
+                self._conn.commit()
+                return changed.rowcount == 1
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def settle_pending_approval(
+        self, *, approval_id: str, action_id: str, succeeded: bool
+    ) -> None:
+        now = _now()
+        self._exec(
+            "UPDATE pending_approvals SET status=?,updated_at=? "
+            "WHERE id=? AND action_id=? AND status='dispatched'",
+            ("succeeded" if succeeded else "uncertain", now, approval_id, action_id),
+        )
+
     def get_agent_run_by_token(self, token: str) -> dict | None:
         now = _now()
         row = self._one(
@@ -3062,6 +3276,11 @@ class Store:
                         "DELETE FROM agent_run_tokens WHERE expires_at<=? "
                         "OR (revoked_at IS NOT NULL AND revoked_at<=?)",
                         (current, revoked_session_cutoff),
+                    ),
+                    "pending_approvals": (
+                        "DELETE FROM pending_approvals WHERE expires_at<=? "
+                        "OR (consumed_at IS NOT NULL AND consumed_at<=?)",
+                        (current - 86400, current - 30 * 86400),
                     ),
                     "stripe_events": (
                         "DELETE FROM stripe_events WHERE processed_at<=?",

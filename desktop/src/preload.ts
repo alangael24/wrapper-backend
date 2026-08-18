@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AgentStreamDelta, BotDraft, BotPatch, DesktopApi, TeachCapture, TeachEntryPoint } from "./contracts";
+import type { AgentStreamDelta, BotDraft, BotPatch, BotWidgetAction, DesktopApi, TeachCapture, TeachEntryPoint } from "./contracts";
 
 const api: DesktopApi = Object.freeze({
   bootstrap: () => ipcRenderer.invoke("desktop:bootstrap"),
@@ -27,8 +27,8 @@ const api: DesktopApi = Object.freeze({
   createBot: (draft: BotDraft) => ipcRenderer.invoke("desktop:create-bot", draft),
   updateBot: (botId: string, patch: BotPatch) => ipcRenderer.invoke("desktop:update-bot", botId, patch),
   warmBotAgent: (botId: string) => ipcRenderer.invoke("desktop:warm-bot-agent", botId),
-  runBotAgent: (botId: string, prompt: string, initial?: boolean) => (
-    ipcRenderer.invoke("desktop:run-bot-agent", botId, prompt, initial)
+  runBotAgent: (botId: string, prompt: string, initial?: boolean, action?: BotWidgetAction) => (
+    ipcRenderer.invoke("desktop:run-bot-agent", botId, prompt, initial, action)
   ),
   onAgentDelta: (listener: (delta: AgentStreamDelta) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, delta: AgentStreamDelta): void => listener(delta);

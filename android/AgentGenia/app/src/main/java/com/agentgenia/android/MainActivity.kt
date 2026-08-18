@@ -22,4 +22,9 @@ class MainActivity : ComponentActivity() {
             AgentGeniaTheme { AgentGeniaRoot(model) }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        model.onForeground()
+    }
 }

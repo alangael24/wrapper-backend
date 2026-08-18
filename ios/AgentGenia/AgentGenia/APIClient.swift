@@ -124,6 +124,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     let executionMode: String
     let chatPrompt: String
     let userMessage: String
+    let approval: AgentApprovalRequest?
     let clientTimezone: String
     let browser: Bool
     let computer: Bool
@@ -135,11 +136,18 @@ private struct AgentRunRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
         case executionMode = "execution_mode"; case chatPrompt = "chat_prompt"; case userMessage = "user_message"
+        case approval
         case clientTimezone = "client_timezone"
         case botID = "bot_id"; case connectorIDs = "connector_ids"
         case maxCredits = "max_credits"; case idempotencyKey = "idempotency_key"
         case stream
     }
+}
+
+private struct AgentApprovalRequest: Encodable, Sendable {
+    let approvalID: String
+    let decision: String
+    enum CodingKeys: String, CodingKey { case approvalID = "approval_id"; case decision }
 }
 
 private struct AgentWarmRequest: Encodable, Sendable {
@@ -447,6 +455,7 @@ actor APIClient {
         executionMode: String = "agent",
         chatPrompt: String = "",
         userMessage: String = "",
+        approval: BotWidgetAction? = nil,
         computer: Bool = true,
         onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> AgentRunResponse {
@@ -455,6 +464,7 @@ actor APIClient {
             executionMode: executionMode,
             chatPrompt: chatPrompt,
             userMessage: userMessage,
+            approval: approval.map { AgentApprovalRequest(approvalID: $0.approvalID, decision: $0.decision) },
             clientTimezone: TimeZone.current.identifier,
             browser: false,
             computer: computer,
@@ -836,22 +846,15 @@ actor APIClient {
         // even though the agent completed successfully. Recover by run id
         // instead of deleting an answer that already exists on the server.
         if let runID {
-            do {
-                if let recovered = try await recoverAgentRun(runID: runID) {
-                    return recovered
-                }
-            } catch let error as ServiceError where error.code != "run_still_running" {
-                if streamedText.isEmpty { throw error }
-            } catch {
-                if streamedText.isEmpty { throw error }
+            if let recovered = try await recoverAgentRun(runID: runID) {
+                return recovered
             }
-        }
-        if !streamedText.isEmpty {
-            return AgentRunResponse(answer: streamedText)
         }
         if let transportFailure { throw transportFailure }
         throw ServiceError(
-            message: "La ejecución no entregó una respuesta recuperable.",
+            message: streamedText.isEmpty
+                ? "La ejecución no entregó una respuesta final recuperable."
+                : "La ejecución sigue en curso; el texto parcial no se guardó como respuesta final.",
             code: "incomplete_stream",
             status: 502
         )
@@ -883,7 +886,7 @@ actor APIClient {
         )
     }
 
-    private func recoverAgentRun(idempotencyKey: String) async throws -> AgentRunResponse? {
+    func recoverAgentRun(idempotencyKey: String) async throws -> AgentRunResponse? {
         for attempt in 0..<120 {
             let snapshot: AgentRunStatusResponse = try await request(
                 "/v1/agent/recover",

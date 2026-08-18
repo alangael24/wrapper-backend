@@ -13,6 +13,7 @@ final class AppModel {
     var profile: AccountProfile?
     var bots: [BotProfile] = []
     private var deletedBotIDs: [UUID] = []
+    private var pendingRuns: [PendingAgentRun] = []
     var selectedConnectorIDs: [String] = []
     var connectorStatuses: [String: ConnectorStatus] = [:]
     var billing: BillingSnapshot?
@@ -36,6 +37,7 @@ final class AppModel {
     private var billingRefreshTask: Task<BillingSnapshot, Error>?
     private var whatsAppPollingTask: Task<Void, Never>?
     private var agentWarmTasks: [UUID: Task<Bool, Never>] = [:]
+    private var isRecoveringPendingRuns = false
     private var persistenceTask: Task<Void, Never>?
     private var persistenceRequested = false
     private var warmedBotUntil: [UUID: Date] = [:]
@@ -212,7 +214,10 @@ final class AppModel {
         bots[index].color = botColors.contains(color) ? color : bots[index].color
         bots[index].shape = shape
         bots[index].notificationsEnabled = notificationsEnabled
-        bots[index].updatedAt = Date()
+        let now = Date()
+        bots[index].updatedAt = now
+        bots[index].profileRevision = now
+        bots[index].notificationRevision = now
         await persistLocalState(dirty: true)
         schedulePersist()
     }
@@ -225,7 +230,7 @@ final class AppModel {
         await runAgent(botID: botID, userText: "", initial: true)
     }
 
-    func sendMessage(botID: UUID, text: String) async {
+    func sendMessage(botID: UUID, text: String, action: BotWidgetAction? = nil) async {
         let value = clean(text, maximum: 20_000)
         guard !value.isEmpty else { return }
         // A widget can become visible a few milliseconds before the run that
@@ -240,10 +245,11 @@ final class AppModel {
             }
             guard phase == .ready, bots.contains(where: { $0.id == botID }) else { return }
         }
-        await runAgent(botID: botID, userText: value, initial: false)
+        await runAgent(botID: botID, userText: value, initial: false, action: action)
     }
 
     func prepareBot(botID: UUID) async {
+        await recoverPendingRuns()
         // Generate the visible first turn before starting Pi. Most messages use
         // the direct chat path, so speculative process startup must not compete
         // with the response the user is waiting to see.
@@ -309,6 +315,7 @@ final class AppModel {
                 if reconciled != bots[index].connectorIDs {
                     bots[index].connectorIDs = reconciled
                     bots[index].updatedAt = Date()
+                    bots[index].connectorAssignmentRevision = bots[index].updatedAt
                 }
             }
             if changed {
@@ -346,6 +353,7 @@ final class AppModel {
             for index in bots.indices where bots[index].connectorIDs.contains(connectorID) {
                 bots[index].connectorIDs.removeAll { $0 == connectorID }
                 bots[index].updatedAt = Date()
+                bots[index].connectorAssignmentRevision = bots[index].updatedAt
             }
             await persistLocalState(dirty: true)
             schedulePersist()
@@ -543,6 +551,7 @@ final class AppModel {
                        !bots[index].connectorIDs.contains(connectorID) {
                         bots[index].connectorIDs.append(connectorID)
                         bots[index].updatedAt = Date()
+                        bots[index].connectorAssignmentRevision = bots[index].updatedAt
                     }
                     connectorPollingTask = nil
                     isBusy = false
@@ -582,6 +591,7 @@ final class AppModel {
         accountStateRevision = cache.serverRevision
         bots = cache.state.bots
         deletedBotIDs = cache.state.deletedBotIDs
+        pendingRuns = cache.state.pendingRuns
         selectedConnectorIDs = cache.state.selectedConnectorIDs
         if let active = cache.state.activeBotID, bots.contains(where: { $0.id == active }) {
             destination = .bot(active)
@@ -603,6 +613,7 @@ final class AppModel {
             async let billingRefresh: Void = self.refreshBilling()
             async let whatsAppRefresh: Void = self.refreshWhatsApp()
             _ = await (accountStateRefresh, profileRefresh, connectorRefresh, billingRefresh, whatsAppRefresh)
+            await self.recoverPendingRuns()
         }
     }
 
@@ -689,7 +700,7 @@ final class AppModel {
         }
     }
 
-    private func runAgent(botID: UUID, userText: String, initial: Bool) async {
+    private func runAgent(botID: UUID, userText: String, initial: Bool, action: BotWidgetAction? = nil) async {
         guard !runningBotIDs.contains(botID), let source = bots.first(where: { $0.id == botID }) else { return }
         runningBotIDs.insert(botID)
         defer { runningBotIDs.remove(botID) }
@@ -703,7 +714,19 @@ final class AppModel {
             updated.messages.append(BotMessage(
                 id: UUID(uuidString: turnID) ?? UUID(), role: .user, text: userText, widget: nil, createdAt: Date()
             ))
+            updated.updatedAt = Date()
+            updated.conversationRevision = updated.updatedAt
             bots[index] = updated
+            pendingRuns.removeAll { $0.idempotencyKey == turnID }
+            pendingRuns.append(PendingAgentRun(
+                turnID: turnID,
+                idempotencyKey: turnID,
+                runID: "",
+                botID: botID,
+                status: "pending",
+                submittedAt: Date(),
+                lastRecoveryAt: nil
+            ))
         }
         // All devices use the bot UUID for its single generated first reply,
         // so replaying `initial-<bot>` cannot create duplicate messages.
@@ -714,6 +737,8 @@ final class AppModel {
             updated.messages.append(BotMessage(
                 id: replyID, role: .assistant, text: "", widget: nil, createdAt: replyCreatedAt
             ))
+            updated.updatedAt = Date()
+            updated.conversationRevision = updated.updatedAt
             bots[index] = updated
         }
         // Make the outgoing turn crash-safe locally without blocking dispatch
@@ -732,6 +757,7 @@ final class AppModel {
                         ? prompt
                         : buildDirectChatPrompt(bot: executionBot, userText: userText),
                     userMessage: userText,
+                    approval: action,
                     computer: false,
                     onDelta: { [weak self] delta in
                         await self?.appendAgentDelta(botID: botID, messageID: replyID, delta: delta)
@@ -760,13 +786,15 @@ final class AppModel {
                 throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
             }
             await persistLocalState(dirty: true)
+            pendingRuns.removeAll { $0.idempotencyKey == turnID }
+            await persistLocalState(dirty: true)
             schedulePersist()
         } catch {
             if let index = bots.firstIndex(where: { $0.id == botID }) {
-                // A streamed answer can be useful even when the terminal frame
-                // is lost. Keep visible text; only remove an empty placeholder.
                 var updated = bots[index]
-                updated.messages.removeAll { $0.id == replyID && $0.text.isEmpty }
+                // Partial output is render-only. Without a terminal success it
+                // must never become durable conversation history.
+                updated.messages.removeAll { $0.id == replyID }
                 bots[index] = updated
             }
             await persistLocalState(dirty: true)
@@ -795,6 +823,43 @@ final class AppModel {
         bots[botIndex] = updated
     }
 
+    private func recoverPendingRuns() async {
+        guard !isRecoveringPendingRuns else { return }
+        isRecoveringPendingRuns = true
+        defer { isRecoveringPendingRuns = false }
+        for pending in pendingRuns {
+            guard phase == .ready, bots.contains(where: { $0.id == pending.botID }) else { continue }
+            if let index = pendingRuns.firstIndex(where: { $0.idempotencyKey == pending.idempotencyKey }) {
+                pendingRuns[index].status = "recovering"
+                pendingRuns[index].lastRecoveryAt = Date()
+            }
+            await persistLocalState(dirty: true)
+            runningBotIDs.insert(pending.botID)
+            defer { runningBotIDs.remove(pending.botID) }
+            do {
+                guard let response = try await api.recoverAgentRun(idempotencyKey: pending.idempotencyKey) else { continue }
+                let generated = parseAgentAnswer(response.answer)
+                guard !generated.text.isEmpty || generated.widget != nil else { continue }
+                let now = Date()
+                guard let index = bots.firstIndex(where: { $0.id == pending.botID }) else { continue }
+                var bot = bots[index]
+                bot.messages.append(BotMessage(
+                    id: UUID(), role: .assistant, text: generated.text,
+                    widget: generated.widget, createdAt: now
+                ))
+                bot.messages = Array(bot.messages.suffix(200))
+                bot.updatedAt = now
+                bot.conversationRevision = now
+                bots[index] = bot
+                pendingRuns.removeAll { $0.idempotencyKey == pending.idempotencyKey }
+                await persistLocalState(dirty: true)
+                schedulePersist()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
     private func currentState() -> PersistedAccountState {
         let activeBotID: UUID?
         if case let .bot(id) = destination { activeBotID = id } else { activeBotID = nil }
@@ -802,7 +867,8 @@ final class AppModel {
             bots: bots,
             deletedBotIDs: deletedBotIDs,
             selectedConnectorIDs: selectedConnectorIDs,
-            activeBotID: activeBotID
+            activeBotID: activeBotID,
+            pendingRuns: pendingRuns
         )
     }
 
@@ -886,6 +952,7 @@ final class AppModel {
 
     private func applyRemoteState(_ state: PersistedAccountState) {
         deletedBotIDs = Array(state.deletedBotIDs.suffix(1_000))
+        pendingRuns = Array(state.pendingRuns.suffix(100))
         let deleted = Set(deletedBotIDs)
         bots = state.bots.filter { !deleted.contains($0.id) }
         selectedConnectorIDs = state.selectedConnectorIDs
@@ -1034,6 +1101,8 @@ func installAgentReply(
         updated.messages.append(reply)
     }
     updated.messages = Array(updated.messages.suffix(200))
+    updated.updatedAt = Date()
+    updated.conversationRevision = updated.updatedAt
     bots[botIndex] = updated
     return true
 }
@@ -1058,12 +1127,20 @@ private func mergeAccountStates(
                 workflows[workflow.id] = workflow
             }
         }
-        var merged = localBot.updatedAt >= serverBot.updatedAt ? localBot : serverBot
-        // The device performing the conflict resolution owns mutable
-        // selections. Union would make disconnect/removal impossible forever.
-        merged.connectorIDs = Array(Set(merged.connectorIDs)).sorted()
+        let profile = localBot.profileRevision >= serverBot.profileRevision ? localBot : serverBot
+        let connectors = localBot.connectorAssignmentRevision >= serverBot.connectorAssignmentRevision ? localBot : serverBot
+        let notifications = localBot.notificationRevision >= serverBot.notificationRevision ? localBot : serverBot
+        var merged = profile
+        merged.connectorIDs = Array(Set(connectors.connectorIDs)).sorted()
+        merged.notificationsEnabled = notifications.notificationsEnabled
         merged.messages = Array(messages.values.sorted { $0.createdAt < $1.createdAt }.suffix(200))
         merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
+        merged.updatedAt = max(localBot.updatedAt, serverBot.updatedAt)
+        merged.profileRevision = max(localBot.profileRevision, serverBot.profileRevision)
+        merged.connectorAssignmentRevision = max(localBot.connectorAssignmentRevision, serverBot.connectorAssignmentRevision)
+        merged.notificationRevision = max(localBot.notificationRevision, serverBot.notificationRevision)
+        merged.conversationRevision = max(localBot.conversationRevision, serverBot.conversationRevision)
+        merged.workflowRevision = max(localBot.workflowRevision, serverBot.workflowRevision)
         bots[localBot.id] = merged
     }
     let mergedBots = Array(bots.values.filter { !deleted.contains($0.id) }.sorted { $0.createdAt < $1.createdAt }.suffix(100))
@@ -1071,6 +1148,14 @@ private func mergeAccountStates(
     let active = local.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
         ?? server.activeBotID.flatMap { availableIDs.contains($0) ? $0 : nil }
         ?? mergedBots.first?.id
+    var pendingByKey = Dictionary(uniqueKeysWithValues: server.pendingRuns.map { ($0.idempotencyKey, $0) })
+    local.pendingRuns.forEach { pendingByKey[$0.idempotencyKey] = $0 }
+    let pending = pendingByKey.values.filter { run in
+        guard let bot = mergedBots.first(where: { $0.id == run.botID }),
+              let turn = bot.messages.firstIndex(where: { $0.id.uuidString.lowercased() == run.turnID.lowercased() })
+        else { return false }
+        return !bot.messages.dropFirst(turn + 1).contains { $0.role == .assistant }
+    }
     return PersistedAccountState(
         onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
         bots: mergedBots,
@@ -1078,7 +1163,8 @@ private func mergeAccountStates(
         // OAuth connection state is authoritative on the server. Preferring
         // a stale device here would resurrect a connector after revocation.
         selectedConnectorIDs: Array(Set(server.selectedConnectorIDs)).sorted(),
-        activeBotID: active
+        activeBotID: active,
+        pendingRuns: Array(pending.prefix(100))
     )
 }
 
@@ -1130,10 +1216,9 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
         .replacingOccurrences(of: #"\s*```$"#, with: "", options: .regularExpression)
     guard let object = firstAgentEnvelope(in: candidate)
     else {
-        if let visibleText = visibleTextFromPartialAgentEnvelope(candidate) {
-            return (String(visibleText.prefix(20_000)), nil)
-        }
-        return (String(trimmed.prefix(20_000)), nil)
+        return candidate.hasPrefix("{") || candidate.hasPrefix("[")
+            ? ("", nil)
+            : (String(trimmed.prefix(20_000)), nil)
     }
     let text = ((object["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = object["widget"] as? [String: Any],
@@ -1144,16 +1229,30 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
     let options = optionValues.prefix(6).compactMap { item -> BotQuestionOption? in
         guard let label = item["label"] as? String, !label.isEmpty else { return nil }
         let naturalValue = (item["value"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? label
+        let action: BotWidgetAction?
+        if let rawAction = item["action"] as? [String: Any],
+           rawAction["type"] as? String == "approval",
+           let approvalID = rawAction["approvalId"] as? String,
+           approvalID.range(of: #"^apr_[A-Za-z0-9_-]{8,120}$"#, options: .regularExpression) != nil,
+           let decision = rawAction["decision"] as? String,
+           decision == "approve" || decision == "reject" {
+            action = BotWidgetAction(type: "approval", approvalID: approvalID, decision: decision)
+        } else {
+            action = nil
+        }
         return BotQuestionOption(
             label: String(label.prefix(120)),
             value: String(naturalValue.prefix(300)),
-            description: String(((item["description"] as? String) ?? "").prefix(240))
+            description: String(((item["description"] as? String) ?? "").prefix(240)),
+            action: action
         )
     }
     guard !options.isEmpty else { return (String(text.prefix(20_000)), nil) }
     return (
         String(text.prefix(20_000)),
         BotQuestionWidget(
+            type: value["type"] as? String,
+            approvalID: value["approvalId"] as? String,
             prompt: String(prompt.prefix(300)),
             helpText: String(((value["helpText"] as? String) ?? "").prefix(500)),
             options: options,

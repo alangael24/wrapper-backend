@@ -34,6 +34,7 @@ def empty_account_state() -> dict[str, Any]:
         "bots": [],
         "deletedBotIds": [],
         "activeBotId": None,
+        "pendingRuns": [],
     }
 
 
@@ -53,14 +54,11 @@ def normalize_account_state(value: Any) -> dict[str, Any]:
         raise AccountStateError("state.bots debe ser una lista")
     if len(raw_bots or []) > 100:
         raise AccountStateError("state.bots admite como máximo 100 elementos")
-    for raw in (raw_bots or []):
+    for index, raw in enumerate(raw_bots or []):
         try:
             bot = _bot(raw)
-        except AccountStateError:
-            # One malformed entity must not prevent every unrelated account
-            # change from synchronizing. Invalid bots are isolated here; valid
-            # siblings continue through canonicalization.
-            continue
+        except AccountStateError as exc:
+            raise AccountStateError(f"state.bots[{index}]: {exc}") from exc
         if bot and bot["id"] not in seen and bot["id"] not in deleted:
             seen.add(bot["id"])
             bots.append(bot)
@@ -75,6 +73,7 @@ def normalize_account_state(value: Any) -> dict[str, Any]:
         "bots": bots,
         "deletedBotIds": deleted_bot_ids,
         "activeBotId": active,
+        "pendingRuns": _pending_runs(value.get("pendingRuns"), seen),
     }
     _fit_account_state(state)
     return state
@@ -135,6 +134,19 @@ def _bot(value: Any) -> dict[str, Any] | None:
         updated_at = _date(value.get("updatedAt"))
     except AccountStateError:
         updated_at = created_at
+    profile_revision = _date(value.get("profileRevision"), allow_empty=True) or updated_at
+    connector_revision = _date(
+        value.get("connectorAssignmentRevision"), allow_empty=True
+    ) or updated_at
+    notification_revision = _date(
+        value.get("notificationRevision"), allow_empty=True
+    ) or updated_at
+    conversation_revision = _date(
+        value.get("conversationRevision"), allow_empty=True
+    ) or updated_at
+    workflow_revision = _date(
+        value.get("workflowRevision"), allow_empty=True
+    ) or updated_at
     return {
         "id": bot_id,
         "name": name,
@@ -149,6 +161,11 @@ def _bot(value: Any) -> dict[str, Any] | None:
         "workflows": _workflows(value.get("workflows")),
         "createdAt": created_at,
         "updatedAt": updated_at,
+        "profileRevision": profile_revision,
+        "connectorAssignmentRevision": connector_revision,
+        "notificationRevision": notification_revision,
+        "conversationRevision": conversation_revision,
+        "workflowRevision": workflow_revision,
     }
 
 
@@ -194,28 +211,87 @@ def _widget(value: Any) -> dict[str, Any] | None:
     if not prompt or not isinstance(raw_options, list):
         return None
     options = []
+    widget_type = value.get("type") if value.get("type") == "approval" else "question"
+    approval_id = _text(value.get("approvalId"), 100)
+    if widget_type == "approval" and not approval_id.startswith("apr_"):
+        return None
     for item in raw_options[:6]:
         if not isinstance(item, dict):
             continue
         label = _text(item.get("label"), 120, multiline=True)
         if not label:
             continue
-        options.append(
-            {
-                "label": label,
-                "value": _text(item.get("value"), 300, multiline=True) or label,
-                "description": _text(item.get("description"), 240, multiline=True),
+        option = {
+            "label": label,
+            "value": _text(item.get("value"), 300, multiline=True) or label,
+            "description": _text(item.get("description"), 240, multiline=True),
+        }
+        action = item.get("action")
+        if widget_type == "approval":
+            if (
+                not isinstance(action, dict)
+                or action.get("type") != "approval"
+                or action.get("approvalId") != approval_id
+                or action.get("decision") not in {"approve", "reject"}
+            ):
+                continue
+            option["action"] = {
+                "type": "approval",
+                "approvalId": approval_id,
+                "decision": action["decision"],
             }
-        )
+        options.append(option)
     if not options:
         return None
-    return {
+    result = {
         "prompt": prompt,
         "helpText": _text(value.get("helpText"), 500, multiline=True),
         "options": options,
         "allowCustom": value.get("allowCustom") is True,
         "dismissOnMoveOn": value.get("dismissOnMoveOn") is not False,
     }
+    if widget_type == "approval":
+        result.update({"type": "approval", "approvalId": approval_id})
+    return result
+
+
+def _pending_runs(value: Any, bot_ids: set[str]) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise AccountStateError("state.pendingRuns debe ser una lista")
+    if len(value) > 100:
+        raise AccountStateError("state.pendingRuns admite como máximo 100 elementos")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise AccountStateError(f"state.pendingRuns[{index}] debe ser un objeto")
+        turn_id = _text(item.get("turnId"), 100)
+        key = _text(item.get("idempotencyKey"), 100)
+        bot_id = _text(item.get("botId"), 100)
+        if not turn_id or not key or not bot_id:
+            raise AccountStateError(f"state.pendingRuns[{index}] contiene identificadores inválidos")
+        if bot_id not in bot_ids:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        status = _text(item.get("status"), 20).lower()
+        if status not in {"pending", "running", "recovering"}:
+            raise AccountStateError(f"state.pendingRuns[{index}].status no es válido")
+        submitted_at = _date(item.get("submittedAt"))
+        last_recovery = _date(item.get("lastRecoveryAt"), allow_empty=True)
+        result.append({
+            "turnId": turn_id,
+            "idempotencyKey": key,
+            "runId": _text(item.get("runId"), 100),
+            "botId": bot_id,
+            "status": status,
+            "submittedAt": submitted_at,
+            "lastRecoveryAt": last_recovery or None,
+        })
+    return result
 
 
 def _workflows(value: Any) -> list[dict[str, Any]]:

@@ -91,7 +91,12 @@ from .crypto_utils import (
     encrypt_api_key,
     parse_secret_versions,
 )
-from .connectors import CONNECTOR_CATALOG, ConnectorBroker, ConnectorBrokerError
+from .connectors import (
+    CONNECTOR_CATALOG,
+    ConnectorBroker,
+    ConnectorBrokerError,
+    canonical_arguments_hash,
+)
 from .computers import ComputerConfig, ComputerError, ComputerManager
 from .credits import CreditConfig, CreditService, credits_float
 from .deepseek_prices import estimate_cost_microusd
@@ -159,7 +164,7 @@ MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho m
 MAX_WHATSAPP_WEBHOOK_BODY = 1024 * 1024
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
 JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
-READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "run_query"})
+READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "select_query"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
 READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
 AGENT_RESPONSE_STYLE_INSTRUCTION = (
@@ -172,98 +177,107 @@ AGENT_RESPONSE_STYLE_INSTRUCTION = (
 )
 
 
+def _connector_operation_is_read_only(operation: Any) -> bool:
+    return bool(
+        isinstance(operation, str)
+        and (
+            operation in READ_ONLY_CONNECTOR_OPERATIONS
+            or operation.startswith(READ_ONLY_CONNECTOR_PREFIXES)
+        )
+    )
+
+
+def _action_summary(
+    *, target_type: str, connector_id: str, operation: str, arguments: dict[str, Any]
+) -> str:
+    """Produce a bounded, human-auditable description of the exact action."""
+    if connector_id == "google-workspace" and operation in {"send_email", "draft_email"}:
+        recipient = str(
+            arguments.get("recipient_email")
+            or arguments.get("to")
+            or arguments.get("recipient")
+            or "destinatario no indicado"
+        )[:320]
+        subject = str(arguments.get("subject") or arguments.get("title") or "sin asunto")[:200]
+        body = str(
+            arguments.get("body")
+            or arguments.get("body_text")
+            or arguments.get("message")
+            or ""
+        ).strip()
+        if len(body) > 240:
+            body = body[:237].rstrip() + "..."
+        verb = "Enviar" if operation == "send_email" else "Crear borrador de"
+        return (
+            f"{verb} correo a {recipient} con asunto «{subject}»"
+            f" y contenido «{body}»" if body else
+            f"{verb} correo a {recipient} con asunto «{subject}» y contenido vacío"
+        )
+    if connector_id == "google-workspace" and operation in {
+        "create_calendar_event", "delete_calendar_event",
+    }:
+        if operation == "create_calendar_event":
+            title = str(arguments.get("summary") or arguments.get("title") or "evento")[:200]
+            start = str(arguments.get("start_datetime") or arguments.get("start") or "")[:100]
+            return f"Crear el evento «{title}»{f' para {start}' if start else ''}"
+        event_id = str(arguments.get("event_id") or arguments.get("id") or "")[:200]
+        return f"Eliminar el evento con identificador {event_id}"
+    label = "Computadora" if target_type == "computer" else CONNECTOR_CATALOG.get(
+        connector_id, {"name": connector_id}
+    )["name"]
+    encoded = json.dumps(
+        arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return f"{label}: {operation} con {encoded[:700]}"
+
+
+def _approval_envelope(approval: dict[str, Any]) -> str:
+    approval_id = str(approval["id"])
+    summary = str(approval["human_summary"])
+    return json.dumps(
+        {
+            "text": "Confirma esta acción antes de que la ejecute.",
+            "widget": {
+                "type": "approval",
+                "approvalId": approval_id,
+                "prompt": summary,
+                "helpText": "La autorización sirve una sola vez y solo para estos datos exactos.",
+                "options": [
+                    {
+                        "label": "Autorizar",
+                        "value": "Autorizar esta acción",
+                        "description": "Ejecutar exactamente la acción mostrada",
+                        "action": {
+                            "type": "approval",
+                            "approvalId": approval_id,
+                            "decision": "approve",
+                        },
+                    },
+                    {
+                        "label": "Cancelar",
+                        "value": "Cancelar esta acción",
+                        "description": "No realizar ningún cambio",
+                        "action": {
+                            "type": "approval",
+                            "approvalId": approval_id,
+                            "decision": "reject",
+                        },
+                    },
+                ],
+                "allowCustom": False,
+                "dismissOnMoveOn": False,
+            },
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _plain_intent_text(value: str) -> str:
     folded = unicodedata.normalize("NFKD", value.casefold())
     return " ".join(
         "".join(char for char in folded if not unicodedata.combining(char)).split()
     )
-
-
-def _explicit_write_approvals(
-    connector_ids: tuple[str, ...], user_message: str
-) -> frozenset[tuple[str, str]]:
-    """Grant writes only from the authenticated current human turn.
-
-    Historical prompt text is intentionally excluded: it can contain model,
-    connector or quoted content and is therefore not an authorization source.
-    Grants remain operation-scoped and expire with this single Pi run.
-    """
-    intent = _plain_intent_text(user_message)
-    approved: set[tuple[str, str]] = set()
-    action_patterns = {
-        "create": r"\b(?:crea|crear|creame|agrega|agregar|anade|anadir|agenda|agendar|programa|programar|create|add|schedule)\b",
-        "send": r"\b(?:envia(?:lo|la|le|les)?|enviar|manda(?:lo|la|le|les)?|mandar|publica|publicar|send|post)\b",
-        "reply": r"\b(?:responde|responder|reply)\b",
-        "update": r"\b(?:actualiza|actualizar|modifica|modificar|edita|editar|update|edit)\b",
-        "delete": r"\b(?:elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|delete|remove|cancel)\b",
-        "upload": r"\b(?:sube|subir|upload)\b",
-        "draft": r"\b(?:redacta|redactar|borrador|draft)\b",
-    }
-    requested_actions = {
-        family for family, pattern in action_patterns.items()
-        if re.search(pattern, intent)
-    }
-    if not requested_actions:
-        return frozenset()
-    aliases = {
-        "calendar": {"evento", "calendario", "cita", "reunion", "calendar", "event", "meeting"},
-        "email": {"correo", "email", "mail", "borrador", "draft"},
-        "message": {"mensaje", "message", "slack", "teams", "chat"},
-        "issue": {"issue", "ticket", "incidencia"},
-        "task": {"tarea", "task"},
-        "page": {"pagina", "page", "notion"},
-        "file": {"archivo", "file", "documento", "document"},
-        "record": {"registro", "record", "contacto", "contact", "cliente", "customer"},
-        "sheet": {"hoja", "sheet", "celda", "spreadsheet"},
-    }
-    words = set(re.findall(r"[a-z0-9]+", intent))
-    if re.search(r"\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b", intent):
-        words.add("email")
-    for connector_id in connector_ids:
-        for operation in CONNECTOR_CATALOG[connector_id]["operations"]:
-            if operation in READ_ONLY_CONNECTOR_OPERATIONS or operation.startswith(READ_ONLY_CONNECTOR_PREFIXES):
-                continue
-            verb = operation.split("_", 1)[0]
-            family = {
-                "create": "create", "add": "create", "schedule": "create",
-                "send": "send", "post": "send", "reply": "reply",
-                "update": "update", "edit": "update", "patch": "update",
-                "delete": "delete", "remove": "delete", "cancel": "delete",
-                "upload": "upload", "draft": "draft",
-            }.get(verb)
-            if family not in requested_actions:
-                continue
-            operation_words = set(operation.split("_")) - {
-                "create", "add", "send", "post", "update", "edit", "delete",
-                "remove", "upload", "reply", "cancel", "draft",
-            }
-            expanded = set(operation_words)
-            for word in operation_words:
-                expanded.update(aliases.get(word, set()))
-            if expanded & words:
-                approved.add((connector_id, operation))
-    return frozenset(approved)
-
-
-def _is_explicit_confirmation(value: str) -> bool:
-    intent = _plain_intent_text(value).strip(" .,!¡?¿")
-    intent = re.sub(r"[\s,;:]+", " ", intent)
-    return bool(re.fullmatch(
-        r"(?:(?:si|ok|okay|vale)[ ]+)?(?:si|ok|okay|vale|confirmo|adelante|hazlo|hazlo ya|hazlo tu|"
-        r"hazlo directamente|hazlo tu directamente|envialo|mandalo|"
-        r"do it|yes|go ahead|send it)",
-        intent,
-    ))
-
-
-def _computer_write_intent(value: str) -> bool:
-    intent = _plain_intent_text(value)
-    return bool(re.search(
-        r"\b(?:abre|navega|ve|haz|ejecuta|corre|pulsa|presiona|clic|click|"
-        r"escribe|teclea|rellena|arrastra|sube|descarga|borra|elimina|mueve|"
-        r"open|navigate|go|run|execute|press|type|fill|drag|upload|download|delete|move)\b",
-        intent,
-    ))
 
 
 # OpenAI-compatible routes exposed by the wrapper.
@@ -655,7 +669,7 @@ def _valid_agent_envelope(value: str) -> bool:
         return False
     prompt = widget.get("prompt")
     options = widget.get("options")
-    return (
+    valid_question = (
         isinstance(prompt, str)
         and bool(prompt.strip())
         and isinstance(options, list)
@@ -667,6 +681,22 @@ def _valid_agent_envelope(value: str) -> bool:
             for option in options
         )
     )
+    if not valid_question:
+        return False
+    if widget.get("type") != "approval":
+        return True
+    approval_id = widget.get("approvalId")
+    return bool(
+        isinstance(approval_id, str)
+        and approval_id.startswith("apr_")
+        and all(
+            isinstance(option.get("action"), dict)
+            and option["action"].get("type") == "approval"
+            and option["action"].get("approvalId") == approval_id
+            and option["action"].get("decision") in {"approve", "reject"}
+            for option in options
+        )
+    )
 
 
 def _agent_envelope_text(value: str) -> str:
@@ -674,6 +704,61 @@ def _agent_envelope_text(value: str) -> str:
         return ""
     payload = json.loads(value)
     return str(payload.get("text") or "").strip()
+
+
+def _normalized_agent_envelope(value: str) -> str | None:
+    """Repair bounded presentation mistakes without accepting raw JSON."""
+    candidate = value.strip()
+    candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*```$", "", candidate).strip()
+    if _valid_agent_envelope(candidate):
+        return candidate
+    start = candidate.find("{")
+    if start >= 0:
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(candidate[start:])
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if _valid_agent_envelope(encoded):
+                return encoded
+        except (TypeError, json.JSONDecodeError):
+            pass
+    if candidate and not candidate.startswith(("{", "[")):
+        return json.dumps(
+            {"text": candidate[:20_000], "widget": None},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return None
+
+
+def _bounded_agent_envelope(value: str, limit: int = 20_000) -> str | None:
+    """Return a valid envelope within the synchronization character limit.
+
+    Truncating the serialized JSON would corrupt the final response after it
+    had already passed validation. Shrink only the human-readable text and
+    re-encode the complete envelope instead.
+    """
+    normalized = _normalized_agent_envelope(value)
+    if normalized is None:
+        return None
+    if len(normalized) <= limit:
+        return normalized
+    payload = json.loads(normalized)
+    text = str(payload.get("text") or "")
+    marker = "\n\n[Respuesta truncada por límite de sincronización]"
+    low, high = 0, len(text)
+    bounded: str | None = None
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = dict(payload)
+        candidate["text"] = text[:midpoint].rstrip() + marker
+        encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) <= limit:
+            bounded = encoded
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return bounded
 
 
 def _partial_json_text(value: str) -> str | None:
@@ -2204,38 +2289,6 @@ class Backend:
             item for item in bot.get("connectorIds", []) if item in CONNECTOR_CATALOG
         )
 
-    def _run_write_approvals(
-        self,
-        *,
-        user_id: str,
-        bot_id: str | None,
-        connector_ids: tuple[str, ...],
-        user_message: str,
-    ) -> frozenset[tuple[str, str]]:
-        """Resolve approval from authenticated, structured user turns only."""
-        direct = _explicit_write_approvals(connector_ids, user_message)
-        if direct or not bot_id or not _is_explicit_confirmation(user_message):
-            return direct
-        payload = self._account_state_payload(self.store.get_account_state(user_id))
-        bot = next(
-            (item for item in payload["state"].get("bots", []) if item.get("id") == bot_id),
-            None,
-        )
-        if not isinstance(bot, dict):
-            return frozenset()
-        # The role is a JSON field validated by account_state.py. Newlines or
-        # quoted assistant text cannot manufacture another user turn.
-        for message in reversed(bot.get("messages", [])[-12:]):
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            text = message.get("text")
-            if not isinstance(text, str) or _is_explicit_confirmation(text):
-                continue
-            inferred = _explicit_write_approvals(connector_ids, text)
-            if inferred:
-                return inferred
-        return frozenset()
-
     def _conversation_lock(self, user_id: str, bot_id: str | None) -> threading.Lock | None:
         if not bot_id:
             return None
@@ -3248,6 +3301,46 @@ class Backend:
             error_response(handler, 400, "bot_id no es válido", "bad_bot_id")
             return
         bot_id = bot_id.strip() if isinstance(bot_id, str) else None
+        approved_action: dict[str, Any] | None = None
+        approval_value = body.get("approval")
+        if approval_value is not None:
+            if (
+                not isinstance(approval_value, dict)
+                or not isinstance(approval_value.get("approval_id"), str)
+                or approval_value.get("decision") not in {"approve", "reject"}
+                or not bot_id
+            ):
+                error_response(handler, 400, "approval no es válida", "bad_approval")
+                return
+            approval_id = approval_value["approval_id"].strip()
+            if not approval_id.startswith("apr_") or len(approval_id) > 100:
+                error_response(handler, 400, "approval_id no es válido", "bad_approval")
+                return
+            if approval_value["decision"] == "approve":
+                approved_action = self.store.approve_pending_approval(
+                    user_id=user["id"], bot_id=bot_id, approval_id=approval_id
+                )
+                if approved_action is None:
+                    error_response(
+                        handler,
+                        409,
+                        "La aprobación venció, ya fue usada o no pertenece a este agente",
+                        "approval_unavailable",
+                    )
+                    return
+                if approved_action["target_type"] == "computer":
+                    computer_requested = True
+            else:
+                if not self.store.reject_pending_approval(
+                    user_id=user["id"], bot_id=bot_id, approval_id=approval_id
+                ):
+                    error_response(
+                        handler,
+                        409,
+                        "La aprobación venció, ya fue usada o no pertenece a este agente",
+                        "approval_unavailable",
+                    )
+                    return
         if (
             not isinstance(idempotency_key, str)
             or not 8 <= len(idempotency_key.strip()) <= 200
@@ -3308,6 +3401,15 @@ class Backend:
         connector_ids = tuple(
             item for item in assigned_connector_ids if item in set(connected_connector_ids)
         )
+        if approved_action and approved_action["target_type"] == "connector":
+            if approved_action["connector_id"] not in connector_ids:
+                error_response(
+                    handler,
+                    409,
+                    "El conector aprobado ya no está conectado o asignado a este agente",
+                    "approval_connector_unavailable",
+                )
+                return
 
         direct_chat = self._direct_chat_allowed(
             execution_mode,
@@ -3321,6 +3423,18 @@ class Backend:
         else:
             direct_chat = False
             effective_prompt = prompt
+        if approved_action:
+            direct_chat = False
+            effective_prompt = (
+                f"{prompt}\n\nEl usuario aprobó una acción estructurada de un solo uso. "
+                "Ejecuta exactamente esta operación con exactamente estos argumentos; "
+                "no cambies destinatarios, contenido, comando, URL ni ningún otro campo: "
+                f"target={approved_action['target_type']}; "
+                f"connector={approved_action['connector_id']}; "
+                f"operation={approved_action['operation']}; "
+                f"arguments={json.dumps(approved_action['arguments'], ensure_ascii=False, sort_keys=True)}. "
+                "Si la herramienta rechaza la coincidencia, informa que la aprobación ya no es válida."
+            )
 
         if not direct_chat:
             if AGENT_RESPONSE_STYLE_INSTRUCTION not in effective_prompt:
@@ -3591,24 +3705,13 @@ class Backend:
                         warm_event.wait(timeout=28.0)
                         self._mark_run_timing(run_id, "pi_warm_wait_finished_ms")
                 if connector_ids or computer_enabled:
-                    approved_write_operations = self._run_write_approvals(
-                        user_id=user["id"],
-                        bot_id=bot_id,
-                        connector_ids=connector_ids,
-                        user_message=user_message,
-                    )
                     connector_run_token = self.connectors.issue(
                         user_id=user["id"],
                         run_id=run_id,
                         connector_ids=connector_ids,
+                        bot_id=bot_id,
                         computer_id=bot_id if computer_enabled else None,
-                        approved_write_operations=approved_write_operations,
-                        # A computer mutation needs both the authenticated
-                        # per-run capability and an action verb in the current
-                        # human turn. Model/transcript text is never consulted.
-                        computer_writes_approved=(
-                            computer_enabled and _computer_write_intent(user_message)
-                        ),
+                        approved_action=approved_action,
                     )
                 self._mark_run_timing(run_id, "pi_dispatch_ms")
 
@@ -3724,8 +3827,22 @@ class Backend:
             self.connectors.revoke(connector_run_token)
             self._run_provider(run_id, pop=True)
             self._run_principal(run_api_key, pop=True)
-        if len(result.answer) > 20_000:
-            result.answer = result.answer[:19_940].rstrip() + "\n\n[Respuesta truncada por límite de sincronización]"
+        pending_approvals = self.store.pending_approvals_for_run(user["id"], run_id)
+        if pending_approvals:
+            # The provider/model cannot define the approval UI. Replace any
+            # prose it produced after the denied tool call with a deterministic
+            # typed event owned by the backend.
+            result.answer = _approval_envelope(pending_approvals[0])
+        normalized_answer = _bounded_agent_envelope(result.answer)
+        if normalized_answer is None:
+            settle("failed", "invalid_model_response")
+            agent_error(
+                502,
+                "El agente devolvió una respuesta estructurada incompleta",
+                "invalid_model_response",
+            )
+            return
+        result.answer = normalized_answer
         # Persist the human-visible result before charging or marking success.
         # If persistence fails, release the reservation and return an error;
         # the system can no longer reach a charged-without-result state.
@@ -3869,36 +3986,95 @@ class Backend:
         body = self.read_json(handler) or {}
         connector_id = body.get("connector_id")
         operation = body.get("operation")
+        arguments = body.get("arguments", {})
+        if not isinstance(arguments, dict):
+            error_response(handler, 400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
+            return
+        try:
+            action = self.connectors.approved_action(token)
+            context = self.connectors.grant_context(token)
+        except ConnectorBrokerError as e:
+            error_response(handler, e.status, str(e), e.code)
+            return
         write_is_approved = False
-        if isinstance(connector_id, str) and isinstance(operation, str):
+        if (
+            isinstance(connector_id, str)
+            and isinstance(operation, str)
+            and action is not None
+        ):
             try:
                 write_is_approved = self.connectors.write_is_approved(
-                    token, connector_id, operation
+                    token,
+                    connector_id,
+                    operation,
+                    arguments,
+                    action.approval_id,
+                    action.action_id,
                 )
             except ConnectorBrokerError as e:
                 error_response(handler, e.status, str(e), e.code)
                 return
         if (
-            not self.cfg.external_writes_enabled
-            and isinstance(operation, str)
-            and operation not in READ_ONLY_CONNECTOR_OPERATIONS
-            and not operation.startswith(READ_ONLY_CONNECTOR_PREFIXES)
+            not _connector_operation_is_read_only(operation)
             and not write_is_approved
         ):
-            error_response(
-                handler,
-                409,
-                "Esta operación requiere una aprobación humana específica",
-                "operation_approval_required",
+            if (
+                not isinstance(connector_id, str)
+                or connector_id not in CONNECTOR_CATALOG
+                or not isinstance(operation, str)
+                or operation not in CONNECTOR_CATALOG[connector_id]["operations"]
+            ):
+                error_response(
+                    handler, 400, "Operación de conector inválida", "bad_connector_operation"
+                )
+                return
+            if not context.get("run_id") or not context.get("bot_id"):
+                error_response(
+                    handler, 409,
+                    "Esta operación requiere una aprobación estructurada dentro de una ejecución",
+                    "operation_approval_required",
+                )
+                return
+            approval = self.store.create_pending_approval(
+                user_id=context["user_id"],
+                bot_id=context["bot_id"],
+                run_id=context["run_id"],
+                target_type="connector",
+                connector_id=connector_id,
+                operation=operation,
+                arguments=arguments,
+                arguments_hash=canonical_arguments_hash(arguments),
+                human_summary=_action_summary(
+                    target_type="connector",
+                    connector_id=connector_id,
+                    operation=operation,
+                    arguments=arguments,
+                ),
             )
+            json_response(handler, 409, {
+                "error": {
+                    "message": "Esta operación requiere una aprobación humana específica",
+                    "type": "operation_approval_required",
+                },
+                "approval": {
+                    "approval_id": approval["id"],
+                    "action_id": approval["action_id"],
+                    "summary": approval["human_summary"],
+                    "expires_at": approval["expires_at"],
+                },
+            })
             return
         try:
             result = self.connectors.execute(
                 token=token,
                 connector_id=connector_id,
                 operation=operation,
-                arguments=body.get("arguments", {}),
-                operation_id=body.get("operation_id"),
+                arguments=arguments,
+                operation_id=(
+                    action.action_id if write_is_approved and action else body.get("operation_id")
+                ),
+                approval_id=action.approval_id if write_is_approved and action else None,
+                action_id=action.action_id if write_is_approved and action else None,
             )
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
@@ -3912,30 +4088,127 @@ class Backend:
         user_id, bot_id = self.connectors.computer(token)
         body = self.read_json(handler) or {}
         operation = body.get("operation")
+        arguments = body.get("arguments", {})
+        if not isinstance(operation, str) or not isinstance(arguments, dict):
+            error_response(handler, 400, "Operación de computadora inválida", "bad_computer_operation")
+            return
+        action = self.connectors.approved_action(token)
         write_is_approved = False
         try:
-            write_is_approved = self.connectors.computer_write_is_approved(token)
+            if action is not None:
+                write_is_approved = self.connectors.computer_write_is_approved(
+                    token,
+                    operation,
+                    arguments,
+                    action.approval_id,
+                    action.action_id,
+                )
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
         if (
-            not self.cfg.external_writes_enabled
-            and operation not in READ_ONLY_COMPUTER_OPERATIONS
+            operation not in READ_ONLY_COMPUTER_OPERATIONS
             and not write_is_approved
         ):
-            error_response(
-                handler,
-                409,
-                "Esta operación de computadora requiere aprobación humana específica",
-                "operation_approval_required",
+            context = self.connectors.grant_context(token)
+            approval = self.store.create_pending_approval(
+                user_id=user_id,
+                bot_id=bot_id,
+                run_id=context["run_id"],
+                target_type="computer",
+                connector_id="computer",
+                operation=operation,
+                arguments=arguments,
+                arguments_hash=canonical_arguments_hash(arguments),
+                human_summary=_action_summary(
+                    target_type="computer",
+                    connector_id="computer",
+                    operation=operation,
+                    arguments=arguments,
+                ),
             )
+            json_response(handler, 409, {
+                "error": {
+                    "message": "Esta operación de computadora requiere aprobación humana específica",
+                    "type": "operation_approval_required",
+                },
+                "approval": {
+                    "approval_id": approval["id"],
+                    "action_id": approval["action_id"],
+                    "summary": approval["human_summary"],
+                    "expires_at": approval["expires_at"],
+                },
+            })
             return
-        result = self.computers.execute(
-            user_id=user_id,
-            bot_id=bot_id,
-            operation=operation,
-            arguments=body.get("arguments", {}),
-        )
+        if write_is_approved and action:
+            if not self.store.dispatch_pending_approval(
+                approval_id=action.approval_id,
+                action_id=action.action_id,
+                user_id=user_id,
+                connector_id="computer",
+                operation=operation,
+                arguments_hash=canonical_arguments_hash(arguments),
+            ):
+                error_response(
+                    handler, 409,
+                    "Esta aprobación ya fue consumida o su resultado es incierto",
+                    "approval_consumed",
+                )
+                return
+            reservation = self.store.begin_connector_operation(
+                user_id=user_id,
+                run_id=self.connectors.grant_context(token)["run_id"],
+                operation_id=action.action_id,
+                connector_id="computer",
+                operation=operation,
+                arguments_hash=action.arguments_hash,
+            )
+            if reservation.get("status") != "owner":
+                self.store.settle_pending_approval(
+                    approval_id=action.approval_id,
+                    action_id=action.action_id,
+                    succeeded=False,
+                )
+                error_response(
+                    handler, 409,
+                    "La acción de computadora ya fue enviada y no se repetirá automáticamente",
+                    "computer_operation_uncertain",
+                )
+                return
+        try:
+            result = self.computers.execute(
+                user_id=user_id,
+                bot_id=bot_id,
+                operation=operation,
+                arguments=arguments,
+            )
+        except Exception:
+            if write_is_approved and action:
+                self.store.fail_connector_operation(
+                    user_id=user_id,
+                    run_id=self.connectors.grant_context(token)["run_id"],
+                    operation_id=action.action_id,
+                    error_code="computer_operation_uncertain",
+                )
+                self.store.settle_pending_approval(
+                    approval_id=action.approval_id,
+                    action_id=action.action_id,
+                    succeeded=False,
+                )
+            raise
+        if write_is_approved and action:
+            payload = {"operation": operation, "result": result}
+            self.store.complete_connector_operation(
+                user_id=user_id,
+                run_id=self.connectors.grant_context(token)["run_id"],
+                operation_id=action.action_id,
+                result=payload,
+            )
+            self.store.settle_pending_approval(
+                approval_id=action.approval_id,
+                action_id=action.action_id,
+                succeeded=True,
+            )
         json_response(handler, 200, result)
 
     # ---------- body helpers ----------

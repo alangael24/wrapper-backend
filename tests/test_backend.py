@@ -32,8 +32,7 @@ from go_backend.server import (  # noqa: E402
     Config,
     Handler,
     UnsafeConfigurationError,
-    _explicit_write_approvals,
-    _is_explicit_confirmation,
+    _bounded_agent_envelope,
     _partial_json_text,
     serve,
     validate_runtime_security,
@@ -42,6 +41,7 @@ from go_backend.connectors import (  # noqa: E402
     CONNECTOR_CATALOG,
     ConnectorBroker,
     ConnectorBrokerError,
+    canonical_arguments_hash,
 )
 from go_backend.connector_adapters import (  # noqa: E402
     ComposioConnectorAdapter,
@@ -1096,6 +1096,60 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(replayed["state"]["bots"], [])
         self.assertIsNone(replayed["state"]["activeBotId"])
 
+    def test_account_state_rejects_oversized_child_and_persists_pending_run(self):
+        signup = self.new_user(tier="free")
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        bot_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        base = {
+            "version": 2,
+            "onboardingCompleted": True,
+            "selectedConnectorIds": [],
+            "activeBotId": bot_id,
+            "deletedBotIds": [],
+            "bots": [{
+                "id": bot_id, "name": "Recoverable", "color": "#2f91f5", "shape": "circle",
+                "connectorIds": [], "workflows": [],
+                "messages": [{
+                    "id": turn_id, "role": "user", "text": "Hazlo",
+                    "createdAt": "2026-08-17T20:00:00Z",
+                }],
+                "createdAt": "2026-08-17T19:00:00Z",
+                "updatedAt": "2026-08-17T20:00:00Z",
+            }],
+            "pendingRuns": [{
+                "turnId": turn_id, "idempotencyKey": turn_id, "runId": "",
+                "botId": bot_id, "status": "pending",
+                "submittedAt": "2026-08-17T20:00:00Z", "lastRecoveryAt": None,
+            }],
+        }
+        status, saved = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": 0, "device_id": str(uuid.uuid4()), "state": base},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["state"]["pendingRuns"][0]["idempotencyKey"], turn_id)
+
+        oversized = json.loads(json.dumps(saved["state"]))
+        oversized["bots"][0]["messages"] = [
+            {"id": str(uuid.uuid4()), "role": "user", "text": str(index),
+             "createdAt": "2026-08-17T20:00:00Z"}
+            for index in range(201)
+        ]
+        status, invalid = self.ws.req(
+            "POST", "/v1/account-state",
+            {"base_revision": saved["revision"], "device_id": str(uuid.uuid4()), "state": oversized},
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"]["type"], "invalid_account_state")
+        self.assertIn("state.bots[0]", invalid["error"]["message"])
+
+        status, unchanged = self.ws.req("GET", "/v1/account-state", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(unchanged["state"]["bots"][0]["id"], bot_id)
+
     def test_google_account_auth_flow_issues_rotates_and_revokes_session(self):
         self.configure_fake_google()
         device_id = str(uuid.uuid4())
@@ -2007,7 +2061,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 19)
+        self.assertEqual(migrated.health()["schema_version"], 20)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
@@ -2216,6 +2270,20 @@ class TestBackend(unittest.TestCase):
             "hola 🚀 mundo",
         )
 
+    def test_large_agent_envelope_is_truncated_without_corrupting_json(self):
+        original = json.dumps(
+            {"text": "a" * 30_000, "widget": None},
+            ensure_ascii=False,
+        )
+
+        bounded = _bounded_agent_envelope(original)
+
+        self.assertIsNotNone(bounded)
+        self.assertLessEqual(len(bounded), 20_000)
+        decoded = json.loads(bounded)
+        self.assertIsNone(decoded["widget"])
+        self.assertTrue(decoded["text"].endswith("[Respuesta truncada por límite de sincronización]"))
+
     def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
@@ -2321,7 +2389,7 @@ class TestBackend(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(result["answer"], "hola")
+        self.assertEqual(json.loads(result["answer"]), {"text": "hola", "widget": None})
         self.assertEqual(result["execution_path"], "direct_chat")
         self.assertEqual(result["connector_ids"], [])
         self.assertEqual(self.ws.backend.pi._sessions, {})
@@ -2387,7 +2455,10 @@ class TestBackend(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(result["answer"], "respuesta recuperada")
+        self.assertEqual(
+            json.loads(result["answer"]),
+            {"text": "respuesta recuperada", "widget": None},
+        )
         upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream), 2)
         self.assertTrue(json.loads(upstream[0][3])["stream"])
@@ -2652,91 +2723,64 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["type"], "connector_token_invalid")
 
-    def test_explicit_calendar_request_grants_only_calendar_create_for_one_run(self):
-        approvals = _explicit_write_approvals(
-            ("google-workspace", "github"),
-            "Crea un evento en mi calendario el 20 de agosto a las 7 am",
-        )
-        self.assertEqual(
-            approvals,
-            frozenset({("google-workspace", "create_calendar_event")}),
-        )
-        self.assertEqual(
-            _explicit_write_approvals(
-                ("google-workspace",),
-                "Sí hazlo, ya deberías de poder",
-            ),
-            frozenset(),
-        )
-        self.assertEqual(
-            _explicit_write_approvals(
-                ("google-workspace",),
-                "¿Qué tengo hoy?",
-            ),
-            frozenset(),
-        )
-
+    def test_structured_approval_is_exact_one_shot_and_argument_bound(self):
         signup = self.new_user()
         user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
         adapter = FakeGitHubAdapter(user["id"])
-        self.ws.backend.connectors.register_adapter("google-workspace", adapter)
-        token = self.ws.backend.connectors.issue(
+        arguments = {
+            "summary": "Inicio de trabajo",
+            "start_datetime": "2026-08-20T07:00:00",
+            "timezone": "America/Denver",
+        }
+        prepared = self.ws.backend.store.create_unmetered_agent_run(
             user_id=user["id"],
-            connector_ids=("google-workspace",),
-            approved_write_operations=approvals,
+            idempotency_key="structured-approval-run",
+            model="deepseek-chat",
+            browser=False,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash="structured-approval-token",
+            token_expires_at=time.time() + 600,
         )
-        status, body = self.ws.req(
-            "POST",
-            "/v1/internal/connectors/execute",
-            {
-                "connector_id": "google-workspace",
-                "operation": "create_calendar_event",
-                "arguments": {
-                    "summary": "Inicio de trabajo",
-                    "start_datetime": "2026-08-20T07:00:00",
-                    "timezone": "America/Denver",
-                },
-            },
-            headers={"X-Connector-Run-Token": token},
+        run_id = prepared["run"]["id"]
+        approval = self.ws.backend.store.create_pending_approval(
+            user_id=user["id"], bot_id=str(uuid.uuid4()), run_id=run_id,
+            target_type="connector", connector_id="google-workspace",
+            operation="create_calendar_event", arguments=arguments,
+            arguments_hash=canonical_arguments_hash(arguments),
+            human_summary="Crear evento Inicio de trabajo",
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(body["operation"], "create_calendar_event")
-        self.assertEqual(adapter.calls[0][2]["summary"], "Inicio de trabajo")
-
-    def test_explicit_calendar_delete_grants_only_delete_for_one_run(self):
-        approvals = _explicit_write_approvals(
-            ("google-workspace",),
-            "Elimina el evento Comienzo a trabajar de mi calendario",
+        approved = self.ws.backend.store.approve_pending_approval(
+            user_id=user["id"], bot_id=approval["bot_id"], approval_id=approval["id"],
         )
-        self.assertEqual(
-            approvals,
-            frozenset({("google-workspace", "delete_calendar_event")}),
+        broker = ConnectorBroker(operation_store=self.ws.backend.store)
+        broker.register_adapter("google-workspace", adapter)
+        token = broker.issue(
+            user_id=user["id"], run_id=run_id, connector_ids=("google-workspace",),
+            bot_id=approval["bot_id"], approved_action=approved,
         )
-
-    def test_explicit_email_intent_separates_send_from_draft(self):
-        self.assertEqual(
-            _explicit_write_approvals(
-                ("google-workspace",),
-                "Envía un correo a cliente@example.com con la pregunta del costo",
-            ),
-            frozenset({("google-workspace", "send_email")}),
+        with self.assertRaises(ConnectorBrokerError) as mismatch:
+            broker.execute(
+                token=token, connector_id="google-workspace",
+                operation="create_calendar_event", arguments={**arguments, "summary": "Otro"},
+                approval_id=approval["id"], action_id=approval["action_id"],
+            )
+        self.assertEqual(mismatch.exception.code, "approval_arguments_mismatch")
+        result = broker.execute(
+            token=token, connector_id="google-workspace",
+            operation="create_calendar_event", arguments=arguments,
+            operation_id=approval["action_id"], approval_id=approval["id"],
+            action_id=approval["action_id"],
         )
-        self.assertEqual(
-            _explicit_write_approvals(
-                ("google-workspace",),
-                "Mándale a cliente@example.com la pregunta del costo",
-            ),
-            frozenset({("google-workspace", "send_email")}),
+        self.assertEqual(result["operation"], "create_calendar_event")
+        replay = broker.execute(
+            token=token, connector_id="google-workspace",
+            operation="create_calendar_event", arguments=arguments,
+            operation_id=approval["action_id"], approval_id=approval["id"],
+            action_id=approval["action_id"],
         )
-        self.assertEqual(
-            _explicit_write_approvals(
-                ("google-workspace",),
-                "Redacta un borrador de correo para cliente@example.com",
-            ),
-            frozenset({("google-workspace", "draft_email")}),
-        )
-        self.assertTrue(_is_explicit_confirmation("Hazlo tú directamente"))
-        self.assertTrue(_is_explicit_confirmation("Sí, hazlo directamente"))
+        self.assertEqual(replay, result)
+        self.assertEqual(len(adapter.calls), 1)
 
     def test_connector_grant_expires_without_server_restart(self):
         clock = [time.time()]
@@ -3072,6 +3116,68 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(client.searches, [])
         self.assertEqual(client.executions, [])
 
+    def test_github_read_file_uses_pinned_tool_and_normalizes_aliases(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        gateway.execute(
+            self.new_user("github-read-file")["user_id"],
+            "github",
+            "read_file",
+            {
+                "repository_owner": "alangael24",
+                "repository_name": "wrapper-backend",
+                "file_path": "README.md",
+                "branch": "main",
+            },
+        )
+
+        self.assertEqual(client.executions, [(
+            "GITHUB_GET_REPOSITORY_CONTENT",
+            {
+                "owner": "alangael24",
+                "repo": "wrapper-backend",
+                "path": "README.md",
+                "branch": "main",
+            },
+        )])
+
+    def test_snowflake_select_query_is_pinned_and_rejects_mutation(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            auth_configs={"snowflake": "ac_agentgenia_snowflake"},
+            store=self.ws.backend.store,
+        )
+        user_id = self.new_user("snowflake-select")["user_id"]
+
+        gateway.execute(
+            user_id,
+            "snowflake",
+            "select_query",
+            {"query": "SELECT id, total FROM orders WHERE total > 100;"},
+        )
+
+        self.assertEqual(client.executions, [(
+            "SNOWFLAKE_EXECUTE_SQL",
+            {"statement": "SELECT id, total FROM orders WHERE total > 100"},
+        )])
+        prior_searches = list(client.searches)
+        with self.assertRaises(ConnectorBrokerError) as unsafe:
+            gateway.execute(
+                user_id,
+                "snowflake",
+                "select_query",
+                {"statement": "DELETE FROM orders"},
+            )
+        self.assertEqual(unsafe.exception.code, "unsafe_select_query")
+        self.assertEqual(client.searches, prior_searches)
+
     def test_composio_gateway_fails_closed_without_private_auth_config(self):
         gateway = ComposioConnectorGateway(
             client=FakeComposioClient(), store=self.ws.backend.store
@@ -3362,7 +3468,7 @@ class TestBackend(unittest.TestCase):
             account_state["state"]["selectedConnectorIds"], []
         )
 
-    def test_agent_run_scopes_explicit_calendar_write_to_its_ephemeral_grant(self):
+    def test_agent_run_does_not_infer_calendar_consent_from_text(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi()
@@ -3401,12 +3507,9 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(len(issued), 1, _result)
-        self.assertEqual(
-            issued[0]["approved_write_operations"],
-            frozenset({("google-workspace", "create_calendar_event")}),
-        )
+        self.assertIsNone(issued[0]["approved_action"])
 
-    def test_agent_run_confirmation_recovers_prior_email_send_scope(self):
+    def test_agent_run_confirmation_does_not_recover_prior_email_scope(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi()
@@ -3451,10 +3554,7 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(status, 200, result)
         self.assertEqual(len(issued), 1)
-        self.assertEqual(
-            issued[0]["approved_write_operations"],
-            frozenset({("google-workspace", "send_email")}),
-        )
+        self.assertIsNone(issued[0]["approved_action"])
 
     def test_agent_rejects_unknown_connector_before_starting_pi(self):
         signup = self.new_user()

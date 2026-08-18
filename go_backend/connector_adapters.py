@@ -93,11 +93,21 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "send_email"): "GOOGLESUPER_SEND_EMAIL",
     ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
     ("google-workspace", "delete_calendar_event"): "GOOGLESUPER_DELETE_EVENT",
+    ("github", "read_file"): "GITHUB_GET_REPOSITORY_CONTENT",
+    ("snowflake", "select_query"): "SNOWFLAKE_EXECUTE_SQL",
+    ("snowflake", "execute_sql"): "SNOWFLAKE_EXECUTE_SQL",
+    ("databricks", "select_query"): "DATABRICKS_SQL_STATEMENT_EXEC_EXECUTE_STATEMENT",
+    ("databricks", "execute_sql"): "DATABRICKS_SQL_STATEMENT_EXEC_EXECUTE_STATEMENT",
 }
 
 _ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?$"
 )
+_SQL_FORBIDDEN_READ_TOKENS = frozenset({
+    "alter", "begin", "call", "commit", "copy", "create", "delete", "drop",
+    "execute", "grant", "insert", "merge", "put", "remove", "replace",
+    "revoke", "rollback", "truncate", "undrop", "update", "use",
+})
 
 # Estos proveedores no tienen una app administrada estable para todos los
 # proyectos. Se habilitan solo cuando el servidor recibe un ac_... propio.
@@ -150,6 +160,7 @@ class ComposioConnectorGateway:
         self.store = store
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
         self._snapshot_cache: dict[str, tuple[float, tuple[dict[str, Any], ...]]] = {}
+        self._operation_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self._lock = threading.RLock()
         self.client = client
         self.native_gateway = native_gateway
@@ -452,24 +463,7 @@ class ComposioConnectorGateway:
             normalized_arguments = _normalize_operation_arguments(
                 connector_id, operation, arguments
             )
-            search = session.search(
-                query=(
-                    f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
-                    # Preserve the canonical operation id so the router can
-                    # return an action that we can match exactly.
-                    f"operation '{operation}'."
-                )
-            )
-            results = list(getattr(search, "results", []) or [])
-            slug = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
-            if not slug:
-                slug = _select_composio_tool_slug(connector_id, operation, results)
-                if not slug:
-                    raise ConnectorBrokerError(
-                        404,
-                        "No encontramos una acción inequívoca para esta operación",
-                        "connector_operation_not_found",
-                    )
+            slug, search = self._resolve_operation(session, connector_id, operation)
             input_schema = _composio_input_schema(search, slug)
             if input_schema:
                 try:
@@ -518,6 +512,119 @@ class ComposioConnectorGateway:
             raise _upstream_error(exc, "El proveedor rechazo la operacion") from exc
         finally:
             _delete_session(session)
+
+    def resolvable_operations(
+        self, user_id: str, connector_id: str, operations: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Return only operations backed by the provider's current catalog."""
+        description = self.describe(connector_id)
+        if not description["available"]:
+            return ()
+        if description.get("driver") == "native":
+            return operations
+        with self._lock:
+            cached = {
+                operation: self._operation_cache.get((connector_id, operation))
+                for operation in operations
+            }
+        if cached and all(
+            value is not None and value[0] > self._now()
+            for value in cached.values()
+        ):
+            return tuple(
+                operation
+                for operation in operations
+                if cached[operation] is not None and bool(cached[operation][1])
+            )
+        session = self._session(user_id, connector_id)
+        try:
+            search = session.search(
+                query=(
+                    f"Resolve these exact {CONNECTOR_CATALOG[connector_id]['name']} "
+                    f"operations: {', '.join(operations)}."
+                )
+            )
+            results = list(getattr(search, "results", []) or [])
+            schemas = getattr(search, "tool_schemas", None)
+            available_slugs = {
+                str(raw).upper()
+                for result in results
+                for raw in list(getattr(result, "primary_tool_slugs", []) or [])
+                if isinstance(raw, str) and raw
+            }
+            if isinstance(schemas, dict):
+                available_slugs.update(str(key).upper() for key in schemas)
+            resolved: list[str] = []
+            for operation in operations:
+                pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
+                slug = pinned or _select_composio_tool_slug(
+                    connector_id, operation, results
+                )
+                if not slug or (
+                    pinned and available_slugs and pinned.upper() not in available_slugs
+                ):
+                    logging.warning(
+                        "Hiding unresolved connector operation connector=%s operation=%s",
+                        connector_id,
+                        operation,
+                    )
+                    with self._lock:
+                        self._operation_cache[(connector_id, operation)] = (
+                            self._now() + 300,
+                            "",
+                        )
+                    continue
+                resolved.append(operation)
+                with self._lock:
+                    self._operation_cache[(connector_id, operation)] = (
+                        self._now() + 900,
+                        slug,
+                    )
+            return tuple(resolved)
+        finally:
+            _delete_session(session)
+
+    def _resolve_operation(
+        self, session: Any, connector_id: str, operation: str
+    ) -> tuple[str, Any]:
+        with self._lock:
+            cached = self._operation_cache.get((connector_id, operation))
+        if cached is not None and cached[0] > self._now() and not cached[1]:
+            raise ConnectorBrokerError(
+                404,
+                "No encontramos una acción inequívoca para esta operación",
+                "connector_operation_not_found",
+            )
+        search = session.search(
+            query=(
+                f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
+                f"operation '{operation}'."
+            )
+        )
+        results = list(getattr(search, "results", []) or [])
+        pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
+        available_slugs = {
+            str(raw).upper()
+            for result in results
+            for raw in list(getattr(result, "primary_tool_slugs", []) or [])
+            if isinstance(raw, str) and raw
+        }
+        schemas = getattr(search, "tool_schemas", None)
+        if isinstance(schemas, dict):
+            available_slugs.update(str(key).upper() for key in schemas)
+        slug = pinned or _select_composio_tool_slug(connector_id, operation, results)
+        if not slug:
+            raise ConnectorBrokerError(
+                404,
+                "No encontramos una acción inequívoca para esta operación",
+                "connector_operation_not_found",
+            )
+        with self._lock:
+            self._operation_cache[(connector_id, operation)] = (
+                self._now() + 900,
+                slug,
+            )
+        return slug, search
 
     def _session(self, user_id: str, connector_id: str) -> Any:
         toolkit = self.toolkits[connector_id]
@@ -619,6 +726,11 @@ class ComposioConnectorAdapter:
 
     def execute(self, user_id: str, operation: str, arguments: dict[str, Any]) -> Any:
         return self.gateway.execute(user_id, self.connector_id, operation, arguments)
+
+    def available_operations(
+        self, user_id: str, operations: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return self.gateway.resolvable_operations(user_id, self.connector_id, operations)
 
 
 def parse_config_mapping(raw: str, *, name: str) -> dict[str, str]:
@@ -798,6 +910,48 @@ def _normalize_operation_arguments(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     """Translate friendly aliases into the exact schema of pinned actions."""
+    if connector_id in {"snowflake", "databricks"} and operation in {
+        "select_query", "execute_sql",
+    }:
+        normalized = dict(arguments)
+        statement = normalized.get("statement")
+        if statement is None:
+            statement = normalized.get("query", normalized.get("sql"))
+        normalized.pop("query", None)
+        normalized.pop("sql", None)
+        if not isinstance(statement, str) or not statement.strip() or len(statement) > 100_000:
+            raise ConnectorBrokerError(
+                400, f"{operation} requiere statement", "bad_connector_arguments"
+            )
+        statement = statement.strip()
+        if operation == "select_query":
+            statement = _validated_select_statement(statement)
+        normalized["statement"] = statement
+        return normalized
+
+    if connector_id == "github" and operation == "read_file":
+        normalized = dict(arguments)
+        aliases = {
+            "owner": ("repository_owner", "repo_owner", "org"),
+            "repo": ("repository", "repository_name", "repo_name"),
+            "path": ("file", "file_path"),
+        }
+        for canonical, alternatives in aliases.items():
+            if canonical not in normalized:
+                for alias in alternatives:
+                    if alias in normalized:
+                        normalized[canonical] = normalized[alias]
+                        break
+            for alias in alternatives:
+                normalized.pop(alias, None)
+        for field in ("owner", "repo", "path"):
+            if not isinstance(normalized.get(field), str) or not normalized[field].strip():
+                raise ConnectorBrokerError(
+                    400, f"read_file requiere {field}", "bad_connector_arguments"
+                )
+            normalized[field] = normalized[field].strip()
+        return normalized
+
     if connector_id != "google-workspace":
         return arguments
 
@@ -958,6 +1112,41 @@ def _normalize_operation_arguments(
         normalized["event_duration_minutes"] = 0
     normalized.setdefault("calendar_id", "primary")
     return normalized
+
+
+def _validated_select_statement(value: str) -> str:
+    """Accept one conservative SELECT statement and reject mutating SQL.
+
+    Composio's Execute SQL action accepts arbitrary statements. This parser is
+    deliberately stricter than a general SQL grammar: comments, batches, CTEs
+    and procedural constructs are refused on the read-only path. Customers
+    that need those operations must use ``execute_sql`` and approve the exact
+    statement.
+    """
+    if "--" in value or "/*" in value or "*/" in value:
+        raise ConnectorBrokerError(
+            400, "select_query no admite comentarios SQL", "unsafe_select_query"
+        )
+    trimmed = value.strip()
+    if trimmed.endswith(";"):
+        trimmed = trimmed[:-1].rstrip()
+    if ";" in trimmed:
+        raise ConnectorBrokerError(
+            400, "select_query admite una sola sentencia", "unsafe_select_query"
+        )
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", trimmed.casefold())
+    if not tokens or tokens[0] != "select":
+        raise ConnectorBrokerError(
+            400, "select_query debe comenzar con SELECT", "unsafe_select_query"
+        )
+    forbidden = sorted(_SQL_FORBIDDEN_READ_TOKENS.intersection(tokens))
+    if forbidden:
+        raise ConnectorBrokerError(
+            400,
+            "select_query contiene SQL mutante; usa execute_sql con aprobación explícita",
+            "unsafe_select_query",
+        )
+    return trimmed
 
 
 def _upstream_error(exc: Exception, fallback: str) -> ConnectorBrokerError:

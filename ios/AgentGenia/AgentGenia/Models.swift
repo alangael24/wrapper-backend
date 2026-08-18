@@ -41,14 +41,33 @@ struct BotQuestionOption: Codable, Identifiable, Equatable, Sendable {
     let label: String
     let value: String
     let description: String
+    let action: BotWidgetAction?
+}
+
+struct BotWidgetAction: Codable, Equatable, Sendable {
+    let type: String
+    let approvalID: String
+    let decision: String
+
+    enum CodingKeys: String, CodingKey {
+        case type, decision
+        case approvalID = "approvalId"
+    }
 }
 
 struct BotQuestionWidget: Codable, Equatable, Sendable {
+    let type: String?
+    let approvalID: String?
     let prompt: String
     let helpText: String
     let options: [BotQuestionOption]
     let allowCustom: Bool
     let dismissOnMoveOn: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case type, prompt, helpText, options, allowCustom, dismissOnMoveOn
+        case approvalID = "approvalId"
+    }
 }
 
 struct BotMessage: Codable, Identifiable, Equatable, Sendable {
@@ -111,9 +130,15 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
     var workflows: [BotWorkflow] = []
     var createdAt: Date
     var updatedAt: Date
+    var profileRevision: Date
+    var connectorAssignmentRevision: Date
+    var notificationRevision: Date
+    var conversationRevision: Date
+    var workflowRevision: Date
 
     enum CodingKeys: String, CodingKey {
         case id, name, title, description, color, shape, notificationsEnabled, messages, workflows, createdAt, updatedAt
+        case profileRevision, connectorAssignmentRevision, notificationRevision, conversationRevision, workflowRevision
         case avatarDataURL = "avatarDataUrl"
         case connectorIDs = "connectorIds"
     }
@@ -131,13 +156,23 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
         messages: [BotMessage],
         workflows: [BotWorkflow] = [],
         createdAt: Date,
-        updatedAt: Date? = nil
+        updatedAt: Date? = nil,
+        profileRevision: Date? = nil,
+        connectorAssignmentRevision: Date? = nil,
+        notificationRevision: Date? = nil,
+        conversationRevision: Date? = nil,
+        workflowRevision: Date? = nil
     ) {
         self.id = id; self.name = name; self.title = title; self.description = description
         self.color = color; self.shape = shape; self.avatarDataURL = avatarDataURL
         self.notificationsEnabled = notificationsEnabled; self.connectorIDs = connectorIDs
         self.messages = messages; self.workflows = workflows; self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
+        self.profileRevision = profileRevision ?? updatedAt ?? createdAt
+        self.connectorAssignmentRevision = connectorAssignmentRevision ?? updatedAt ?? createdAt
+        self.notificationRevision = notificationRevision ?? updatedAt ?? createdAt
+        self.conversationRevision = conversationRevision ?? updatedAt ?? createdAt
+        self.workflowRevision = workflowRevision ?? updatedAt ?? createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -155,6 +190,11 @@ struct BotProfile: Codable, Identifiable, Equatable, Sendable {
         workflows = try values.decodeIfPresent([BotWorkflow].self, forKey: .workflows) ?? []
         createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try values.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        profileRevision = try values.decodeIfPresent(Date.self, forKey: .profileRevision) ?? updatedAt
+        connectorAssignmentRevision = try values.decodeIfPresent(Date.self, forKey: .connectorAssignmentRevision) ?? updatedAt
+        notificationRevision = try values.decodeIfPresent(Date.self, forKey: .notificationRevision) ?? updatedAt
+        conversationRevision = try values.decodeIfPresent(Date.self, forKey: .conversationRevision) ?? updatedAt
+        workflowRevision = try values.decodeIfPresent(Date.self, forKey: .workflowRevision) ?? updatedAt
     }
 }
 
@@ -199,9 +239,10 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
     var deletedBotIDs: [UUID] = []
     var selectedConnectorIDs: [String] = []
     var activeBotID: UUID?
+    var pendingRuns: [PendingAgentRun] = []
 
     enum CodingKeys: String, CodingKey {
-        case version, onboardingCompleted, bots
+        case version, onboardingCompleted, bots, pendingRuns
         case deletedBotIDs = "deletedBotIds"
         case selectedConnectorIDs = "selectedConnectorIds"
         case activeBotID = "activeBotId"
@@ -215,7 +256,8 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
         bots: [BotProfile] = [],
         deletedBotIDs: [UUID] = [],
         selectedConnectorIDs: [String] = [],
-        activeBotID: UUID? = nil
+        activeBotID: UUID? = nil,
+        pendingRuns: [PendingAgentRun] = []
     ) {
         self.version = version
         self.onboardingCompleted = onboardingCompleted
@@ -223,6 +265,7 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
         self.deletedBotIDs = deletedBotIDs
         self.selectedConnectorIDs = selectedConnectorIDs
         self.activeBotID = activeBotID
+        self.pendingRuns = pendingRuns
     }
 
     init(from decoder: Decoder) throws {
@@ -236,6 +279,7 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
             ?? []
         activeBotID = try values.decodeIfPresent(UUID.self, forKey: .activeBotID)
             ?? values.decodeIfPresent(UUID.self, forKey: .legacyActiveBotID)
+        pendingRuns = Array((try values.decodeIfPresent([PendingAgentRun].self, forKey: .pendingRuns) ?? []).suffix(100))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -246,6 +290,23 @@ struct PersistedAccountState: Codable, Equatable, Sendable {
         try values.encode(deletedBotIDs, forKey: .deletedBotIDs)
         try values.encode(selectedConnectorIDs, forKey: .selectedConnectorIDs)
         try values.encodeIfPresent(activeBotID, forKey: .activeBotID)
+        try values.encode(pendingRuns, forKey: .pendingRuns)
+    }
+}
+
+struct PendingAgentRun: Codable, Equatable, Sendable {
+    var turnID: String
+    var idempotencyKey: String
+    var runID: String
+    var botID: UUID
+    var status: String
+    var submittedAt: Date
+    var lastRecoveryAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case status, submittedAt, lastRecoveryAt
+        case turnID = "turnId"
+        case idempotencyKey, runID = "runId", botID = "botId"
     }
 }
 

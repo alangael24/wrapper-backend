@@ -70,6 +70,7 @@ import com.agentgenia.android.model.BOT_COLORS
 import com.agentgenia.android.model.BotMessage
 import com.agentgenia.android.model.BotProfile
 import com.agentgenia.android.model.BotQuestionWidget
+import com.agentgenia.android.model.BotWidgetAction
 import com.agentgenia.android.model.BotShape
 import com.agentgenia.android.model.ComputerState
 import com.agentgenia.android.model.MessageRole
@@ -236,7 +237,7 @@ private fun ChatScreen(
         MessageTimeline(
             messages = bot.messages,
             running = running,
-            onWidgetAnswer = { model.sendMessage(bot.id, it) },
+            onWidgetAnswer = { value, action -> model.sendMessage(bot.id, value, action) },
             modifier = Modifier.padding(padding),
         )
     }
@@ -248,7 +249,7 @@ private fun ChatScreen(
 private fun MessageTimeline(
     messages: List<BotMessage>,
     running: Boolean,
-    onWidgetAnswer: (String) -> Unit,
+    onWidgetAnswer: (String, BotWidgetAction?) -> Unit,
     modifier: Modifier,
 ) {
     val listState = rememberLazyListState()
@@ -273,7 +274,7 @@ private fun MessageTimeline(
 }
 
 @Composable
-private fun MessageBubble(message: BotMessage, onWidgetAnswer: (String) -> Unit) {
+private fun MessageBubble(message: BotMessage, onWidgetAnswer: (String, BotWidgetAction?) -> Unit) {
     Row(Modifier.fillMaxWidth()) {
         if (message.role == MessageRole.User) Spacer(Modifier.weight(1f))
         Surface(
@@ -292,13 +293,13 @@ private fun MessageBubble(message: BotMessage, onWidgetAnswer: (String) -> Unit)
 }
 
 @Composable
-private fun QuestionWidget(widget: BotQuestionWidget, submit: (String) -> Unit) {
+private fun QuestionWidget(widget: BotQuestionWidget, submit: (String, BotWidgetAction?) -> Unit) {
     var custom by remember(widget.prompt) { mutableStateOf("") }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(widget.prompt, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         if (widget.helpText.isNotBlank()) Text(widget.helpText, color = MaterialTheme.colorScheme.onSurfaceVariant)
         widget.options.forEachIndexed { index, option ->
-            OutlinedButton(onClick = { submit(option.value) }, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(onClick = { submit(option.value, option.action) }, modifier = Modifier.fillMaxWidth()) {
                 Text(('A'.code + index).toChar().toString())
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
@@ -314,7 +315,7 @@ private fun QuestionWidget(widget: BotQuestionWidget, submit: (String) -> Unit) 
                 modifier = Modifier.fillMaxWidth(),
                 placeholder = { Text("Escribe tu propia respuesta") },
                 trailingIcon = {
-                    IconButton(onClick = { submit(custom); custom = "" }, enabled = custom.isNotBlank()) {
+                    IconButton(onClick = { submit(custom, null); custom = "" }, enabled = custom.isNotBlank()) {
                         Icon(Icons.AutoMirrored.Filled.Send, "Enviar")
                     }
                 },

@@ -13,11 +13,13 @@ import com.agentgenia.android.model.BillingSnapshot
 import com.agentgenia.android.model.BotMessage
 import com.agentgenia.android.model.BotProfile
 import com.agentgenia.android.model.BotShape
+import com.agentgenia.android.model.BotWidgetAction
 import com.agentgenia.android.model.ComputerSnapshot
 import com.agentgenia.android.model.ConnectorCatalog
 import com.agentgenia.android.model.ConnectorStatus
 import com.agentgenia.android.model.MessageRole
 import com.agentgenia.android.model.PersistedAccountState
+import com.agentgenia.android.model.PendingAgentRun
 import com.agentgenia.android.model.WhatsAppStatus
 import kotlinx.coroutines.Job
 import com.agentgenia.android.model.parseAgentAnswer
@@ -67,6 +69,8 @@ class AppViewModel(
     private var stateSyncRequested = false
     private var onboardingCompleted = false
     private var deletedBotIds: List<String> = emptyList()
+    private var pendingRuns: List<PendingAgentRun> = emptyList()
+    private var pendingRecoveryJob: Job? = null
 
     init { bootstrap() }
 
@@ -79,6 +83,10 @@ class AppViewModel(
     fun consumeExternalUrl() = _state.update { it.copy(externalUrl = null) }
     fun dismissComputerViewer() = _state.update { it.copy(computerViewerUrl = null) }
     fun clearError() = _state.update { it.copy(error = null) }
+
+    fun onForeground() {
+        if (_state.value.phase == AppPhase.Ready) recoverPendingRuns()
+    }
 
     fun signOut() = viewModelScope.launch {
         whatsAppPollingJob?.cancel()
@@ -152,6 +160,7 @@ class AppViewModel(
         notifications: Boolean,
     ) {
         mutateBot(botId) { bot ->
+            val now = System.currentTimeMillis()
             bot.copy(
                 name = clean(name, 60, "Nuevo bot"),
                 title = clean(title, 100),
@@ -159,15 +168,17 @@ class AppViewModel(
                 color = color.takeIf(BOT_COLORS::contains) ?: bot.color,
                 shape = shape,
                 notificationsEnabled = notifications,
-                updatedAt = System.currentTimeMillis(),
+                updatedAt = now,
+                profileRevision = now,
+                notificationRevision = now,
             )
         }
     }
 
-    fun sendMessage(botId: String, value: String) {
+    fun sendMessage(botId: String, value: String, action: BotWidgetAction? = null) {
         val message = clean(value, 20_000)
         if (message.isEmpty()) return
-        runAgent(botId, message, initial = false)
+        runAgent(botId, message, initial = false, action = action)
     }
 
     fun refreshConnectors() = viewModelScope.launch {
@@ -191,6 +202,7 @@ class AppViewModel(
                     if (connectorId in it.connectorIds) it.copy(
                         connectorIds = it.connectorIds - connectorId,
                         updatedAt = System.currentTimeMillis(),
+                        connectorAssignmentRevision = System.currentTimeMillis(),
                     ) else it
                 },
             )
@@ -301,6 +313,7 @@ class AppViewModel(
         val persisted = store.readAccountState(account.id)
         onboardingCompleted = persisted.onboardingCompleted
         deletedBotIds = persisted.deletedBotIds
+        pendingRuns = persisted.pendingRuns
         _state.value = AppUiState(
             phase = AppPhase.Ready,
             account = account,
@@ -344,6 +357,7 @@ class AppViewModel(
                 }
             }
         if (connectorResult.isSuccess) _state.update { it.copy(billing = billingValue, whatsApp = whatsAppValue) }
+        recoverPendingRuns()
     }
 
     private fun applyConnectorSnapshot(statuses: List<ConnectorStatus>) {
@@ -362,6 +376,7 @@ class AppViewModel(
                     if (reconciled == bot.connectorIds) bot else bot.copy(
                         connectorIds = reconciled,
                         updatedAt = System.currentTimeMillis(),
+                        connectorAssignmentRevision = System.currentTimeMillis(),
                     )
                 },
                 connectorStatuses = statuses.associateBy(ConnectorStatus::connectorId),
@@ -401,6 +416,7 @@ class AppViewModel(
                                 if (bot.id == current.selectedBotId) bot.copy(
                                     connectorIds = (bot.connectorIds + connectorId).distinct(),
                                     updatedAt = System.currentTimeMillis(),
+                                    connectorAssignmentRevision = System.currentTimeMillis(),
                                 ) else bot
                             },
                         )
@@ -423,14 +439,22 @@ class AppViewModel(
         }
     }
 
-    private fun runAgent(botId: String, userText: String, initial: Boolean) = viewModelScope.launch {
+    private fun runAgent(botId: String, userText: String, initial: Boolean, action: BotWidgetAction? = null) = viewModelScope.launch {
         val original = _state.value.bots.firstOrNull { it.id == botId } ?: return@launch
         if (botId in _state.value.runningBotIds) return@launch
         _state.update { it.copy(runningBotIds = it.runningBotIds + botId) }
         val turnId = if (initial) "initial-$botId" else UUID.randomUUID().toString()
         if (!initial) mutateBot(botId, persistAfter = false) { bot ->
-            bot.copy(messages = (bot.messages + BotMessage(id = turnId, role = MessageRole.User, text = userText)).takeLast(200))
+            val now = System.currentTimeMillis()
+            bot.copy(
+                messages = (bot.messages + BotMessage(id = turnId, role = MessageRole.User, text = userText)).takeLast(200),
+                updatedAt = now,
+                conversationRevision = now,
+            )
         }
+        if (!initial) pendingRuns = (pendingRuns.filterNot { it.idempotencyKey == turnId } + PendingAgentRun(
+            turnId = turnId, idempotencyKey = turnId, botId = botId,
+        )).takeLast(100)
         persist()
         try {
             val current = _state.value
@@ -444,16 +468,20 @@ class AppViewModel(
                 executionMode = if (initial) "chat" else "auto",
                 chatPrompt = if (initial) prompt else buildDirectChatPrompt(original, userText),
                 userMessage = userText,
+                approval = action,
             ))
             if (generated.text.isBlank() && generated.widget == null) {
                 throw ServiceException("El agente no devolvió una respuesta.", "empty_agent_response", 502)
             }
             mutateBot(botId, persistAfter = false) { bot ->
+                val now = System.currentTimeMillis()
                 bot.copy(messages = (bot.messages + BotMessage(
                     id = if (initial) botId else UUID.randomUUID().toString(),
                     role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
-                )).takeLast(200))
+                )).takeLast(200), updatedAt = now, conversationRevision = now)
             }
+            persist()
+            pendingRuns = pendingRuns.filterNot { it.idempotencyKey == turnId }
             persist()
         } catch (error: Throwable) {
             report(error)
@@ -483,7 +511,41 @@ class AppViewModel(
         selectedConnectorIds = _state.value.selectedConnectorIds,
         activeBotId = _state.value.selectedBotId,
         deletedBotIds = deletedBotIds,
+        pendingRuns = pendingRuns,
     )
+
+    private fun recoverPendingRuns() {
+        if (pendingRecoveryJob?.isActive == true) return
+        pendingRecoveryJob = viewModelScope.launch {
+            pendingRuns.toList().forEach { pending ->
+                if (_state.value.bots.none { it.id == pending.botId }) return@forEach
+                pendingRuns = pendingRuns.map { if (it.idempotencyKey == pending.idempotencyKey)
+                    it.copy(status = "recovering", lastRecoveryAt = System.currentTimeMillis()) else it }
+                persist()
+                _state.update { it.copy(runningBotIds = it.runningBotIds + pending.botId) }
+                try {
+                    val answer = api.recoverAgentAnswer(pending.idempotencyKey) ?: return@forEach
+                    val generated = parseAgentAnswer(answer)
+                    if (generated.text.isBlank() && generated.widget == null) return@forEach
+                    mutateBot(pending.botId, persistAfter = false) { bot ->
+                        val now = System.currentTimeMillis()
+                        bot.copy(
+                            messages = (bot.messages + BotMessage(
+                                role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
+                            )).takeLast(200),
+                            updatedAt = now, conversationRevision = now,
+                        )
+                    }
+                    pendingRuns = pendingRuns.filterNot { it.idempotencyKey == pending.idempotencyKey }
+                    persist()
+                } catch (error: Throwable) {
+                    report(error)
+                } finally {
+                    _state.update { it.copy(runningBotIds = it.runningBotIds - pending.botId) }
+                }
+            }
+        }
+    }
 
     private fun writeLocalState(accountId: String, snapshot: PersistedAccountState) {
         store.writeAccountState(accountId, snapshot)
@@ -492,6 +554,7 @@ class AppViewModel(
     private fun applyAccountState(snapshot: PersistedAccountState) {
         onboardingCompleted = snapshot.onboardingCompleted
         deletedBotIds = snapshot.deletedBotIds.takeLast(1_000)
+        pendingRuns = snapshot.pendingRuns.takeLast(100)
         val deleted = deletedBotIds.toSet()
         val bots = snapshot.bots.filterNot { it.id in deleted }
         _state.update { current ->
@@ -642,11 +705,20 @@ internal fun mergeAccountStates(
                 workflows[workflow.id] = workflow
             }
         }
-        val preferred = if (localBot.updatedAt >= remoteBot.updatedAt) localBot else remoteBot
-        bots[localBot.id] = preferred.copy(
-            connectorIds = preferred.connectorIds.distinct().sorted(),
+        val profile = if (localBot.profileRevision >= remoteBot.profileRevision) localBot else remoteBot
+        val connectors = if (localBot.connectorAssignmentRevision >= remoteBot.connectorAssignmentRevision) localBot else remoteBot
+        val notifications = if (localBot.notificationRevision >= remoteBot.notificationRevision) localBot else remoteBot
+        bots[localBot.id] = profile.copy(
+            connectorIds = connectors.connectorIds.distinct().sorted(),
+            notificationsEnabled = notifications.notificationsEnabled,
             messages = messages.values.sortedBy { it.createdAt }.takeLast(200),
             workflows = workflows.values.sortedBy { it.updatedAt }.takeLast(50),
+            updatedAt = maxOf(localBot.updatedAt, remoteBot.updatedAt),
+            profileRevision = maxOf(localBot.profileRevision, remoteBot.profileRevision),
+            connectorAssignmentRevision = maxOf(localBot.connectorAssignmentRevision, remoteBot.connectorAssignmentRevision),
+            notificationRevision = maxOf(localBot.notificationRevision, remoteBot.notificationRevision),
+            conversationRevision = maxOf(localBot.conversationRevision, remoteBot.conversationRevision),
+            workflowRevision = maxOf(localBot.workflowRevision, remoteBot.workflowRevision),
         )
     }
     val mergedBots = bots.values
@@ -657,6 +729,13 @@ internal fun mergeAccountStates(
     val active = local.activeBotId?.takeIf(available::contains)
         ?: server.activeBotId?.takeIf(available::contains)
         ?: mergedBots.firstOrNull()?.id
+    val pendingByKey = server.pendingRuns.associateBy { it.idempotencyKey }.toMutableMap()
+    local.pendingRuns.forEach { pendingByKey[it.idempotencyKey] = it }
+    val pending = pendingByKey.values.filter { run ->
+        val bot = mergedBots.firstOrNull { it.id == run.botId } ?: return@filter false
+        val turnIndex = bot.messages.indexOfFirst { it.id == run.turnId }
+        turnIndex >= 0 && bot.messages.drop(turnIndex + 1).none { it.role == MessageRole.Assistant }
+    }.take(100)
     return PersistedAccountState(
         onboardingCompleted = server.onboardingCompleted || local.onboardingCompleted,
         bots = mergedBots,
@@ -665,5 +744,6 @@ internal fun mergeAccountStates(
         selectedConnectorIds = server.selectedConnectorIds.distinct().sorted(),
         activeBotId = active,
         deletedBotIds = deletedIds,
+        pendingRuns = pending,
     )
 }

@@ -43,6 +43,7 @@ import {
   type BotDraft,
   type BotPatch,
   type BotProfile,
+  type BotWidgetAction,
   type ConnectorConnectionSnapshot,
   type DesktopApi,
   type TeachCapture,
@@ -1400,7 +1401,7 @@ function bindBotChat(bot: BotProfile): void {
       const message = bot.messages.find((item) => item.id === button.dataset.widgetMessage);
       const optionIndex = Number(button.dataset.widgetOption);
       const option = message?.widget?.options[optionIndex];
-      if (option) void sendBotMessage(bot.id, option.value);
+      if (option) void sendBotMessage(bot.id, option.value, option.action);
     });
   }
   for (const customForm of document.querySelectorAll<HTMLFormElement>("[data-widget-custom]")) {
@@ -1467,7 +1468,7 @@ async function initializeBotConversation(botId: string): Promise<void> {
   }
 }
 
-async function sendBotMessage(botId: string, message: string): Promise<void> {
+async function sendBotMessage(botId: string, message: string, action?: BotWidgetAction): Promise<void> {
   if (!connections.account.connected) {
     botMessageDrafts.set(botId, message);
     transientError = "Inicia sesión en Agent Genia para enviar mensajes.";
@@ -1481,7 +1482,7 @@ async function sendBotMessage(botId: string, message: string): Promise<void> {
   transientError = "";
   render();
   try {
-    state = await desktopApi.runBotAgent(botId, message);
+    state = await desktopApi.runBotAgent(botId, message, false, action);
   } catch (error) {
     botMessageDrafts.set(botId, message);
     transientError = errorMessage(error);

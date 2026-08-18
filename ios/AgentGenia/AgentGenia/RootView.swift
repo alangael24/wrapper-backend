@@ -332,8 +332,8 @@ private struct MessageBubble: View {
                 if message.role == .assistant,
                    let widget = message.widget,
                    !hasLaterUserMessage || !widget.dismissOnMoveOn {
-                    QuestionWidgetView(widget: widget, alreadyAnswered: hasLaterUserMessage) { value in
-                        Task { await model.sendMessage(botID: botID, text: value) }
+                    QuestionWidgetView(widget: widget, alreadyAnswered: hasLaterUserMessage) { value, action in
+                        Task { await model.sendMessage(botID: botID, text: value, action: action) }
                     }
                 }
             }
@@ -349,7 +349,7 @@ private struct MessageBubble: View {
 private struct QuestionWidgetView: View {
     let widget: BotQuestionWidget
     let alreadyAnswered: Bool
-    let submit: (String) -> Void
+    let submit: (String, BotWidgetAction?) -> Void
     @State private var custom = ""
     @State private var answered = false
 
@@ -360,7 +360,7 @@ private struct QuestionWidgetView: View {
             ForEach(widget.options) { option in
                 Button {
                     answered = true
-                    submit(option.value)
+                    submit(option.value, option.action)
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -386,7 +386,7 @@ private struct QuestionWidgetView: View {
                         let value = custom
                         custom = ""
                         answered = true
-                        submit(value)
+                        submit(value, nil)
                     }
                     .disabled(custom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || answered)
                 }

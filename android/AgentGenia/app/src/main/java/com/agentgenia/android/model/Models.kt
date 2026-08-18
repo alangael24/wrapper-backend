@@ -32,9 +32,18 @@ data class BotQuestionOption(
     val label: String,
     val value: String,
     val description: String = "",
+    val action: BotWidgetAction? = null,
+)
+
+data class BotWidgetAction(
+    val type: String = "approval",
+    val approvalId: String,
+    val decision: String,
 )
 
 data class BotQuestionWidget(
+    val type: String = "question",
+    val approvalId: String? = null,
     val prompt: String,
     val helpText: String = "",
     val options: List<BotQuestionOption>,
@@ -66,6 +75,11 @@ data class BotProfile(
     val workflows: List<BotWorkflow> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = createdAt,
+    val profileRevision: Long = updatedAt,
+    val connectorAssignmentRevision: Long = updatedAt,
+    val notificationRevision: Long = updatedAt,
+    val conversationRevision: Long = updatedAt,
+    val workflowRevision: Long = updatedAt,
 )
 
 data class BotWorkflow(
@@ -86,6 +100,17 @@ data class PersistedAccountState(
     val selectedConnectorIds: List<String> = emptyList(),
     val activeBotId: String? = null,
     val deletedBotIds: List<String> = emptyList(),
+    val pendingRuns: List<PendingAgentRun> = emptyList(),
+)
+
+data class PendingAgentRun(
+    val turnId: String,
+    val idempotencyKey: String,
+    val runId: String = "",
+    val botId: String,
+    val status: String = "pending",
+    val submittedAt: Long = System.currentTimeMillis(),
+    val lastRecoveryAt: Long? = null,
 )
 
 data class ConnectorDefinition(
@@ -193,17 +218,30 @@ fun PersistedAccountState.toJson() = JSONObject()
     .put("deletedBotIds", JSONArray(deletedBotIds))
     .put("selectedConnectorIds", JSONArray(selectedConnectorIds))
     .put("activeBotId", activeBotId ?: JSONObject.NULL)
+    .put("pendingRuns", JSONArray().also { array -> pendingRuns.forEach { run -> array.put(JSONObject()
+        .put("turnId", run.turnId).put("idempotencyKey", run.idempotencyKey).put("runId", run.runId)
+        .put("botId", run.botId).put("status", run.status).put("submittedAt", run.submittedAt)
+        .put("lastRecoveryAt", run.lastRecoveryAt ?: JSONObject.NULL)) } })
 
 fun JSONObject.toPersistedAccountState(): PersistedAccountState {
     val botArray = optJSONArray("bots") ?: JSONArray()
     val selected = optJSONArray("selectedConnectorIds") ?: JSONArray()
     val deleted = optJSONArray("deletedBotIds") ?: JSONArray()
+    val pending = optJSONArray("pendingRuns") ?: JSONArray()
     return PersistedAccountState(
         onboardingCompleted = optBoolean("onboardingCompleted"),
         bots = List(botArray.length()) { botArray.getJSONObject(it).toBotProfile() },
         selectedConnectorIds = List(selected.length()) { selected.getString(it) },
         activeBotId = optNullableString("activeBotId"),
         deletedBotIds = List(deleted.length()) { deleted.getString(it) }.takeLast(1_000),
+        pendingRuns = List(pending.length().coerceAtMost(100)) { index -> pending.getJSONObject(index).let { run ->
+            PendingAgentRun(
+                turnId = run.getString("turnId"), idempotencyKey = run.getString("idempotencyKey"),
+                runId = run.optString("runId"), botId = run.getString("botId"),
+                status = run.optString("status", "pending"), submittedAt = run.getLong("submittedAt"),
+                lastRecoveryAt = if (run.isNull("lastRecoveryAt")) null else run.getLong("lastRecoveryAt"),
+            )
+        } },
     )
 }
 
@@ -221,6 +259,11 @@ fun BotProfile.toJson() = JSONObject()
     .put("workflows", JSONArray().also { array -> workflows.forEach { array.put(it.toJson()) } })
     .put("createdAt", createdAt)
     .put("updatedAt", updatedAt)
+    .put("profileRevision", profileRevision)
+    .put("connectorAssignmentRevision", connectorAssignmentRevision)
+    .put("notificationRevision", notificationRevision)
+    .put("conversationRevision", conversationRevision)
+    .put("workflowRevision", workflowRevision)
 
 fun JSONObject.toBotProfile(): BotProfile {
     val connectorArray = optJSONArray("connectorIds") ?: JSONArray()
@@ -240,6 +283,11 @@ fun JSONObject.toBotProfile(): BotProfile {
         workflows = List(workflowArray.length()) { workflowArray.getJSONObject(it).toBotWorkflow() },
         createdAt = optLong("createdAt", System.currentTimeMillis()),
         updatedAt = optLong("updatedAt", optLong("createdAt", System.currentTimeMillis())),
+        profileRevision = optLong("profileRevision", optLong("updatedAt", optLong("createdAt", System.currentTimeMillis()))),
+        connectorAssignmentRevision = optLong("connectorAssignmentRevision", optLong("updatedAt", optLong("createdAt", System.currentTimeMillis()))),
+        notificationRevision = optLong("notificationRevision", optLong("updatedAt", optLong("createdAt", System.currentTimeMillis()))),
+        conversationRevision = optLong("conversationRevision", optLong("updatedAt", optLong("createdAt", System.currentTimeMillis()))),
+        workflowRevision = optLong("workflowRevision", optLong("updatedAt", optLong("createdAt", System.currentTimeMillis()))),
     )
 }
 
@@ -285,10 +333,14 @@ fun JSONObject.toBotWorkflow(): BotWorkflow {
 }
 
 fun BotQuestionWidget.toJson() = JSONObject()
+    .put("type", type)
+    .putOpt("approvalId", approvalId)
     .put("prompt", prompt)
     .put("helpText", helpText)
     .put("options", JSONArray().also { array -> options.forEach { option ->
-        array.put(JSONObject().put("label", option.label).put("value", option.value).put("description", option.description))
+        array.put(JSONObject().put("label", option.label).put("value", option.value).put("description", option.description)
+            .also { item -> option.action?.let { item.put("action", JSONObject()
+                .put("type", it.type).put("approvalId", it.approvalId).put("decision", it.decision)) } })
     } })
     .put("allowCustom", allowCustom)
     .put("dismissOnMoveOn", dismissOnMoveOn)
@@ -306,12 +358,22 @@ fun JSONObject.toQuestionWidget(): BotQuestionWidget? {
                     label = label,
                     value = item.optString("value", label).ifBlank { label }.take(300),
                     description = item.optString("description").take(240),
+                    action = item.optJSONObject("action")?.let { action ->
+                        val approvalId = action.optString("approvalId")
+                        val decision = action.optString("decision")
+                        if (action.optString("type") == "approval"
+                            && Regex("^apr_[A-Za-z0-9_-]{8,120}$").matches(approvalId)
+                            && decision in setOf("approve", "reject")
+                        ) BotWidgetAction(approvalId = approvalId, decision = decision) else null
+                    },
                 )
             )
         }
     }
     if (options.isEmpty()) return null
     return BotQuestionWidget(
+        type = optString("type", "question"),
+        approvalId = optString("approvalId").ifBlank { null },
         prompt = prompt,
         helpText = optString("helpText").take(500),
         options = options,
@@ -323,7 +385,7 @@ fun JSONObject.toQuestionWidget(): BotQuestionWidget? {
 fun parseAgentAnswer(raw: String): GeneratedAnswer {
     val trimmed = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
     val parsed = firstAgentEnvelope(trimmed)
-        ?: return GeneratedAnswer(raw.trim().take(20_000), null)
+        ?: return GeneratedAnswer(if (trimmed.startsWith("{")) "" else raw.trim().take(20_000), null)
     return GeneratedAnswer(
         text = parsed.optString("text").trim().take(20_000),
         widget = parsed.optJSONObject("widget")?.toQuestionWidget(),

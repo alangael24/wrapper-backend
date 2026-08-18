@@ -9,6 +9,7 @@ import {
   type AppState,
   type BotDraft,
   type BotPatch,
+  type BotWidgetAction,
   type BotWorkflow,
   type TeachCapture,
   type TeachEntryPoint,
@@ -235,7 +236,12 @@ class DesktopStateStore {
         const connectorIds = bot.connectorIds.filter((item) => connectedSet.has(item));
         return connectorIds.length === bot.connectorIds.length
           ? bot
-          : { ...bot, connectorIds, updatedAt: new Date().toISOString() };
+          : {
+            ...bot,
+            connectorIds,
+            updatedAt: new Date().toISOString(),
+            connectorAssignmentRevision: new Date().toISOString()
+          };
       })
     });
     return JSON.stringify(current) === JSON.stringify(next) ? current : this.update(() => next);
@@ -353,24 +359,37 @@ function mergeAppStates(server: AppState, local: AppState): AppState {
         workflows.set(workflow.id, workflow);
       }
     }
-    const preferred = Date.parse(localBot.updatedAt) >= Date.parse(serverBot.updatedAt)
-      ? localBot
-      : serverBot;
+    const profile = newerBotDomain(localBot, serverBot, "profileRevision");
+    const connectors = newerBotDomain(localBot, serverBot, "connectorAssignmentRevision");
+    const notifications = newerBotDomain(localBot, serverBot, "notificationRevision");
     bots.set(localBot.id, {
-      ...preferred,
-      // The device resolving the conflict owns mutable selections. Union
-      // would resurrect a connector that was removed on this device.
-      connectorIds: normalizeConnectorIds(preferred.connectorIds),
+      ...profile,
+      connectorIds: normalizeConnectorIds(connectors.connectorIds),
+      notificationsEnabled: notifications.notificationsEnabled,
       messages: [...messages.values()]
         .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
         .slice(-200),
-      workflows: [...workflows.values()].slice(-50)
+      workflows: [...workflows.values()].slice(-50),
+      updatedAt: laterDate(localBot.updatedAt, serverBot.updatedAt),
+      profileRevision: laterDate(localBot.profileRevision, serverBot.profileRevision),
+      connectorAssignmentRevision: laterDate(localBot.connectorAssignmentRevision, serverBot.connectorAssignmentRevision),
+      notificationRevision: laterDate(localBot.notificationRevision, serverBot.notificationRevision),
+      conversationRevision: laterDate(localBot.conversationRevision, serverBot.conversationRevision),
+      workflowRevision: laterDate(localBot.workflowRevision, serverBot.workflowRevision)
     });
   }
   const mergedBots = [...bots.values()].filter((bot) => !deletedBots.has(bot.id)).slice(0, 100);
   const activeBotId = local.activeBotId && mergedBots.some((bot) => bot.id === local.activeBotId)
     ? local.activeBotId
     : server.activeBotId;
+  const pendingRuns = new Map(server.pendingRuns.map((run) => [run.idempotencyKey, run]));
+  for (const run of local.pendingRuns) pendingRuns.set(run.idempotencyKey, run);
+  const livePendingRuns = [...pendingRuns.values()].filter((run) => {
+    const bot = mergedBots.find((candidate) => candidate.id === run.botId);
+    const turnIndex = bot?.messages.findIndex((message) => message.id === run.turnId) ?? -1;
+    return Boolean(bot) && turnIndex >= 0
+      && !bot!.messages.slice(turnIndex + 1).some((message) => message.role === "assistant");
+  });
   return normalizeAppState({
     version: 2,
     onboardingCompleted: server.onboardingCompleted || local.onboardingCompleted,
@@ -379,8 +398,21 @@ function mergeAppStates(server: AppState, local: AppState): AppState {
     selectedConnectorIds: normalizeConnectorIds(server.selectedConnectorIds),
     bots: mergedBots,
     deletedBotIds,
-    activeBotId
+    activeBotId,
+    pendingRuns: livePendingRuns
   });
+}
+
+function laterDate(left: string, right: string): string {
+  return Date.parse(left) >= Date.parse(right) ? left : right;
+}
+
+function newerBotDomain(
+  left: AppState["bots"][number],
+  right: AppState["bots"][number],
+  revision: "profileRevision" | "connectorAssignmentRevision" | "notificationRevision"
+): AppState["bots"][number] {
+  return Date.parse(left[revision]) >= Date.parse(right[revision]) ? left : right;
 }
 
 function errorMessage(error: unknown): string {
@@ -492,7 +524,8 @@ function registerDesktopIpc(): void {
         ? {
           ...bot,
           connectorIds: normalizeConnectorIds([...bot.connectorIds, connectorId]),
-          updatedAt: new Date().toISOString()
+          updatedAt: new Date().toISOString(),
+          connectorAssignmentRevision: new Date().toISOString()
         }
         : bot)
     }));
@@ -574,11 +607,14 @@ function registerDesktopIpc(): void {
     event,
     botId: unknown,
     promptValue: unknown,
-    initialValue?: unknown
+    initialValue?: unknown,
+    actionValue?: unknown
   ) => {
     if (typeof botId !== "string") throw new Error("Bot inválido.");
     const prompt = typeof promptValue === "string" ? promptValue.replace(/\s+/g, " ").trim().slice(0, 20_000) : "";
     const initial = initialValue === true;
+    const action = normalizeBotWidgetAction(actionValue);
+    if (actionValue !== undefined && !action) throw new Error("La aprobación no es válida.");
     if (!initial && !prompt) throw new Error("Escribe un mensaje.");
     const before = await stateStore.snapshot();
     const bot = before.bots.find((item) => item.id === botId);
@@ -598,10 +634,21 @@ function registerDesktopIpc(): void {
               role: "user" as const,
               text: prompt,
               createdAt
-            }].slice(-200)
+            }].slice(-200),
+            updatedAt: createdAt,
+            conversationRevision: createdAt
           }
           : item),
-        activeBotId: botId
+        activeBotId: botId,
+        pendingRuns: [...current.pendingRuns.filter((run) => run.idempotencyKey !== turnId), {
+          turnId,
+          idempotencyKey: turnId,
+          runId: "",
+          botId,
+          status: "pending" as const,
+          submittedAt: createdAt,
+          lastRecoveryAt: ""
+        }].slice(-100)
       }));
     }
     try {
@@ -619,6 +666,7 @@ function registerDesktopIpc(): void {
             ? buildBotPrompt({ ...bot, connectorIds }, prompt, true)
             : buildDirectChatPrompt({ ...bot, connectorIds }, prompt),
           userMessage: prompt,
+          approval: action ? { approval_id: action.approvalId, decision: action.decision } : undefined,
           onDelta: (text) => {
             if (!event.sender.isDestroyed()) event.sender.send(CHANNELS.agentDelta, { botId, text });
           }
@@ -641,8 +689,15 @@ function registerDesktopIpc(): void {
           }
         ].slice(-200);
         const bots = [...current.bots];
-        bots[index] = { ...bots[index], messages };
-        return { ...current, bots, activeBotId: botId };
+        bots[index] = { ...bots[index], messages, updatedAt: now, conversationRevision: now };
+        return {
+          ...current,
+          bots,
+          activeBotId: botId,
+          pendingRuns: initial
+            ? current.pendingRuns
+            : current.pendingRuns.filter((run) => run.idempotencyKey !== turnId)
+        };
       });
     } catch (error) {
       // Keep the user's turn on uncertain transport failures. The durable
@@ -733,7 +788,10 @@ function registerDesktopIpc(): void {
             role: "assistant" as const,
             text: `Aprendí “${workflow.title}”. Ya puedo volver a ejecutar sus ${workflow.steps.length} pasos.`,
             createdAt: now
-          }].slice(-200)
+          }].slice(-200),
+          updatedAt: now,
+          workflowRevision: now,
+          conversationRevision: now
         };
         return { ...current, bots, activeBotId: botId };
       });
@@ -782,7 +840,10 @@ function registerDesktopIpc(): void {
           ...bots[index].messages,
           { id: randomUUID(), role: "user" as const, text: `Ejecuta la tarea aprendida: ${workflow.title}`, createdAt: now },
           { id: randomUUID(), role: "assistant" as const, text: generated.text, createdAt: now }
-        ].slice(-200)
+        ].slice(-200),
+        updatedAt: now,
+        workflowRevision: now,
+        conversationRevision: now
       };
       return { ...current, bots, activeBotId: botId };
     });
@@ -802,7 +863,12 @@ function registerDesktopIpc(): void {
     const next = await stateStore.update((current) => ({
       ...current,
       bots: current.bots.map((item) => item.id === botId
-        ? { ...item, workflows: item.workflows.filter((candidate) => candidate.id !== workflowId) }
+        ? {
+          ...item,
+          workflows: item.workflows.filter((candidate) => candidate.id !== workflowId),
+          updatedAt: new Date().toISOString(),
+          workflowRevision: new Date().toISOString()
+        }
         : item),
       activeBotId: botId
     }));
@@ -1014,7 +1080,7 @@ function parseAgentAnswer(value: unknown): {
     const widget = normalizeQuestionWidget(record.widget);
     return { text, ...(widget ? { widget } : {}) };
   }
-  return { text: raw };
+  return { text: candidate.startsWith("{") || candidate.startsWith("[") ? "" : raw };
 }
 
 function firstAgentEnvelope(value: string): Record<string, unknown> | undefined {
@@ -1165,6 +1231,67 @@ function rememberComputerViewerUrl(value: string): void {
   }
 }
 
+function normalizeBotWidgetAction(value: unknown): BotWidgetAction | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.type !== "approval") return undefined;
+  if (candidate.decision !== "approve" && candidate.decision !== "reject") return undefined;
+  if (typeof candidate.approvalId !== "string" || !/^apr_[a-zA-Z0-9_-]{8,120}$/.test(candidate.approvalId)) {
+    return undefined;
+  }
+  return { type: "approval", approvalId: candidate.approvalId, decision: candidate.decision };
+}
+
+let pendingDesktopRecovery: Promise<void> | null = null;
+
+function recoverPendingDesktopRuns(): Promise<void> {
+  if (pendingDesktopRecovery) return pendingDesktopRecovery;
+  pendingDesktopRecovery = performPendingDesktopRecovery().finally(() => {
+    pendingDesktopRecovery = null;
+  });
+  return pendingDesktopRecovery;
+}
+
+async function performPendingDesktopRecovery(): Promise<void> {
+  const snapshot = await stateStore.snapshot();
+  for (const pending of snapshot.pendingRuns) {
+    const recoveryAt = new Date().toISOString();
+    await stateStore.update((current) => ({
+      ...current,
+      pendingRuns: current.pendingRuns.map((run) => run.idempotencyKey === pending.idempotencyKey
+        ? { ...run, status: "recovering" as const, lastRecoveryAt: recoveryAt }
+        : run)
+    }));
+    try {
+      const result = await oauthController.recoverAgent(pending.idempotencyKey);
+      if (!result || typeof result.answer !== "string") continue;
+      const generated = parseAgentAnswer(result.answer);
+      if (!generated.text && !generated.widget) continue;
+      const now = new Date().toISOString();
+      await stateStore.update((current) => ({
+        ...current,
+        bots: current.bots.map((bot) => bot.id === pending.botId
+          ? {
+            ...bot,
+            messages: [...bot.messages, {
+              id: randomUUID(),
+              role: "assistant" as const,
+              text: generated.text,
+              ...(generated.widget ? { widget: generated.widget } : {}),
+              createdAt: now
+            }].slice(-200),
+            updatedAt: now,
+            conversationRevision: now
+          }
+          : bot),
+        pendingRuns: current.pendingRuns.filter((run) => run.idempotencyKey !== pending.idempotencyKey)
+      }));
+    } catch (error) {
+      console.error(`[agent-recovery] ${errorMessage(error)}`);
+    }
+  }
+}
+
 function configureAutoUpdates(): void {
   if (!app.isPackaged || smokeTest || process.env.AGENTGENIA_DISABLE_AUTO_UPDATE === "1") return;
   if (process.platform === "linux" && !process.env.APPIMAGE) return;
@@ -1223,9 +1350,11 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
       loadRemote: false
     });
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
+    void recoverPendingDesktopRuns();
   }
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    void recoverPendingDesktopRuns();
   });
 });
 

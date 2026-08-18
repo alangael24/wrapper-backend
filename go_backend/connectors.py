@@ -270,12 +270,12 @@ CONNECTOR_CATALOG: dict[str, dict[str, Any]] = {
         _connector(
             "snowflake", "Snowflake", "Warehouses, bases de datos y consultas.",
             ("snowflake", "data warehouse", "database", "table", "sql"),
-            ("list_databases", "list_schemas", "list_tables", "describe_table", "run_query"),
+            ("list_databases", "list_schemas", "list_tables", "describe_table", "select_query", "execute_sql"),
         ),
         _connector(
             "databricks", "Databricks", "Lakehouse, notebooks, jobs y consultas.",
             ("databricks", "lakehouse", "notebook", "job", "sql"),
-            ("list_catalogs", "list_schemas", "list_tables", "run_query", "list_jobs"),
+            ("list_catalogs", "list_schemas", "list_tables", "select_query", "execute_sql", "list_jobs"),
         ),
         _connector(
             "mailchimp", "Mailchimp", "Audiencias, campanas y automatizaciones.",
@@ -320,6 +320,38 @@ class ConnectorOperationStore(Protocol):
     def begin_connector_operation(self, **values: Any) -> dict: ...
     def complete_connector_operation(self, **values: Any) -> None: ...
     def fail_connector_operation(self, **values: Any) -> None: ...
+    def dispatch_pending_approval(self, **values: Any) -> bool: ...
+    def settle_pending_approval(self, **values: Any) -> None: ...
+
+
+def canonical_arguments_json(arguments: dict[str, Any]) -> bytes:
+    """Canonical JSON used by approval and idempotency boundaries."""
+    try:
+        return json.dumps(
+            arguments,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ConnectorBrokerError(
+            400, "arguments contiene valores JSON inválidos", "bad_connector_arguments"
+        ) from exc
+
+
+def canonical_arguments_hash(arguments: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_arguments_json(arguments)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ApprovedAction:
+    approval_id: str
+    action_id: str
+    target_type: str
+    connector_id: str
+    operation: str
+    arguments_hash: str
 
 
 @dataclass(frozen=True)
@@ -327,9 +359,9 @@ class ConnectorRunGrant:
     user_id: str
     run_id: str
     connector_ids: frozenset[str]
+    bot_id: str | None
     computer_id: str | None
-    approved_write_operations: frozenset[tuple[str, str]]
-    computer_writes_approved: bool
+    approved_action: ApprovedAction | None
     expires_at: float
 
 
@@ -387,9 +419,9 @@ class ConnectorBroker:
         user_id: str,
         connector_ids: tuple[str, ...],
         run_id: str = "",
+        bot_id: str | None = None,
         computer_id: str | None = None,
-        approved_write_operations: frozenset[tuple[str, str]] = frozenset(),
-        computer_writes_approved: bool = False,
+        approved_action: dict[str, Any] | None = None,
         ttl_seconds: int | None = None,
     ) -> str:
         if not connector_ids and not computer_id:
@@ -397,20 +429,40 @@ class ConnectorBroker:
         expires_in = self.default_ttl_seconds if ttl_seconds is None else max(
             1, min(int(ttl_seconds), self.default_ttl_seconds)
         )
-        scoped_write_operations = frozenset(
-            (connector_id, operation)
-            for connector_id, operation in approved_write_operations
-            if connector_id in connector_ids
-            and operation in CONNECTOR_CATALOG[connector_id]["operations"]
-        )
+        scoped_action: ApprovedAction | None = None
+        if approved_action:
+            candidate = ApprovedAction(
+                approval_id=str(approved_action.get("id") or ""),
+                action_id=str(approved_action.get("action_id") or ""),
+                target_type=str(approved_action.get("target_type") or ""),
+                connector_id=str(approved_action.get("connector_id") or ""),
+                operation=str(approved_action.get("operation") or ""),
+                arguments_hash=str(approved_action.get("arguments_hash") or ""),
+            )
+            valid_target = (
+                candidate.target_type == "computer" and computer_id is not None
+            ) or (
+                candidate.target_type == "connector"
+                and candidate.connector_id in connector_ids
+                and candidate.connector_id in CONNECTOR_CATALOG
+                and candidate.operation
+                in CONNECTOR_CATALOG[candidate.connector_id]["operations"]
+            )
+            if (
+                valid_target
+                and candidate.approval_id.startswith("apr_")
+                and candidate.action_id.startswith("act_")
+                and len(candidate.arguments_hash) == 64
+            ):
+                scoped_action = candidate
         token = secrets.token_urlsafe(32)
         grant = ConnectorRunGrant(
             user_id=user_id,
             run_id=run_id,
             connector_ids=frozenset(connector_ids),
+            bot_id=bot_id,
             computer_id=computer_id,
-            approved_write_operations=scoped_write_operations,
-            computer_writes_approved=bool(computer_id and computer_writes_approved),
+            approved_action=scoped_action,
             expires_at=self._now() + expires_in,
         )
         with self._lock:
@@ -452,7 +504,18 @@ class ConnectorBroker:
                     connected = bool(adapter.is_connected(grant.user_id))
                 except Exception:
                     connected = False
-            result.append({**item, "connected": connected})
+            operations = tuple(item["operations"])
+            resolver = getattr(adapter, "available_operations", None)
+            if connected and callable(resolver):
+                try:
+                    operations = tuple(resolver(grant.user_id, operations))
+                except Exception:
+                    operations = ()
+            # Never advertise an action that cannot be resolved to the
+            # provider's current, versioned catalog.
+            if connected and not operations:
+                continue
+            result.append({**item, "operations": operations, "connected": connected})
         return result
 
     def computer(self, token: str) -> tuple[str, str]:
@@ -469,16 +532,56 @@ class ConnectorBroker:
     def has_computer(self, token: str) -> bool:
         return bool(self._require_grant(token).computer_id)
 
-    def write_is_approved(
-        self, token: str, connector_id: str, operation: str
-    ) -> bool:
-        """Check the exact write permission attached to this short-lived run."""
+    def grant_context(self, token: str) -> dict[str, Any]:
         grant = self._require_grant(token)
-        return (connector_id, operation) in grant.approved_write_operations
+        return {
+            "user_id": grant.user_id,
+            "run_id": grant.run_id,
+            "bot_id": grant.bot_id,
+            "computer_id": grant.computer_id,
+        }
 
-    def computer_write_is_approved(self, token: str) -> bool:
-        """Return the explicit, run-scoped approval for computer mutations."""
-        return self._require_grant(token).computer_writes_approved
+    def approved_action(self, token: str) -> ApprovedAction | None:
+        return self._require_grant(token).approved_action
+
+    def write_is_approved(
+        self,
+        token: str,
+        connector_id: str,
+        operation: str,
+        arguments: dict[str, Any],
+        approval_id: str,
+        action_id: str,
+    ) -> bool:
+        """Require exact approval id, action id, operation and canonical args."""
+        action = self._require_grant(token).approved_action
+        return bool(
+            action
+            and action.target_type == "connector"
+            and action.approval_id == approval_id
+            and action.action_id == action_id
+            and action.connector_id == connector_id
+            and action.operation == operation
+            and action.arguments_hash == canonical_arguments_hash(arguments)
+        )
+
+    def computer_write_is_approved(
+        self,
+        token: str,
+        operation: str,
+        arguments: dict[str, Any],
+        approval_id: str,
+        action_id: str,
+    ) -> bool:
+        action = self._require_grant(token).approved_action
+        return bool(
+            action
+            and action.target_type == "computer"
+            and action.approval_id == approval_id
+            and action.action_id == action_id
+            and action.operation == operation
+            and action.arguments_hash == canonical_arguments_hash(arguments)
+        )
 
     def execute(
         self,
@@ -488,6 +591,8 @@ class ConnectorBroker:
         operation: Any,
         arguments: Any,
         operation_id: Any = None,
+        approval_id: Any = None,
+        action_id: Any = None,
     ) -> dict[str, Any]:
         grant = self._require_grant(token)
         if not isinstance(connector_id, str) or connector_id not in CONNECTOR_CATALOG:
@@ -499,14 +604,7 @@ class ConnectorBroker:
             raise ConnectorBrokerError(400, "Operacion no permitida para el conector", "bad_connector_operation")
         if not isinstance(arguments, dict):
             raise ConnectorBrokerError(400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
-        try:
-            encoded_arguments = json.dumps(
-                arguments, ensure_ascii=False, allow_nan=False
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ConnectorBrokerError(
-                400, "arguments contiene valores JSON inválidos", "bad_connector_arguments"
-            ) from exc
+        encoded_arguments = canonical_arguments_json(arguments)
         if len(encoded_arguments) > MAX_CONNECTOR_ARGUMENTS_BYTES:
             raise ConnectorBrokerError(413, "arguments excede 64 KiB", "connector_arguments_too_large")
 
@@ -515,6 +613,8 @@ class ConnectorBroker:
         operation_key: tuple[str, str, str, str, str] | None = None
         operation_event: threading.Event | None = None
         operation_owner = False
+        approval_dispatched = False
+        approved = grant.approved_action
         if operation_id is not None:
             if not isinstance(operation_id, str) or not operation_id.strip() or len(operation_id) > 200:
                 raise ConnectorBrokerError(400, "operation_id inválido", "bad_operation_id")
@@ -549,6 +649,52 @@ class ConnectorBroker:
             durable_operation_id = operation_id.strip()
 
         try:
+            adapter = self._adapter_for(connector_id)
+            try:
+                connected = bool(adapter.is_connected(grant.user_id))
+            except Exception as exc:
+                raise ConnectorBrokerError(502, "No se pudo consultar la conexion", "connector_adapter_error") from exc
+            if not connected:
+                raise ConnectorBrokerError(
+                    409,
+                    f"{item['name']} todavia no esta autenticado para este usuario",
+                    "connector_not_connected",
+                )
+
+            if (
+                approved
+                and approved.target_type == "connector"
+                and approved.connector_id == connector_id
+                and approved.operation == operation
+            ):
+                if not self.write_is_approved(
+                    token,
+                    connector_id,
+                    operation,
+                    arguments,
+                    str(approval_id or ""),
+                    str(action_id or ""),
+                ):
+                    raise ConnectorBrokerError(
+                        409,
+                        "La acción cambió después de ser aprobada",
+                        "approval_arguments_mismatch",
+                    )
+                if self._operation_store is None or not self._operation_store.dispatch_pending_approval(
+                    approval_id=approved.approval_id,
+                    action_id=approved.action_id,
+                    user_id=grant.user_id,
+                    connector_id=connector_id,
+                    operation=operation,
+                    arguments_hash=approved.arguments_hash,
+                ):
+                    raise ConnectorBrokerError(
+                        409,
+                        "Esta aprobación ya fue consumida o su resultado es incierto",
+                        "approval_consumed",
+                    )
+                approval_dispatched = True
+
             # Reserve only after the in-process owner has been elected. A
             # concurrent duplicate in the same worker waits for that owner;
             # a duplicate after restart is stopped by this durable row.
@@ -585,17 +731,6 @@ class ConnectorBroker:
                     )
                 durable_owner = True
 
-            adapter = self._adapter_for(connector_id)
-            try:
-                connected = bool(adapter.is_connected(grant.user_id))
-            except Exception as exc:
-                raise ConnectorBrokerError(502, "No se pudo consultar la conexion", "connector_adapter_error") from exc
-            if not connected:
-                raise ConnectorBrokerError(
-                    409,
-                    f"{item['name']} todavia no esta autenticado para este usuario",
-                    "connector_not_connected",
-                )
             try:
                 result = adapter.execute(grant.user_id, operation, arguments)
             except ConnectorBrokerError:
@@ -632,6 +767,12 @@ class ConnectorBroker:
                     operation_id=durable_operation_id,
                     result=payload,
                 )
+            if approval_dispatched and approved and self._operation_store is not None:
+                self._operation_store.settle_pending_approval(
+                    approval_id=approved.approval_id,
+                    action_id=approved.action_id,
+                    succeeded=True,
+                )
             return payload
         except Exception as exc:
             if durable_owner and durable_operation_id and self._operation_store is not None:
@@ -642,6 +783,15 @@ class ConnectorBroker:
                         run_id=grant.run_id,
                         operation_id=durable_operation_id,
                         error_code=error_code,
+                    )
+                except Exception:
+                    pass
+            if approval_dispatched and approved and self._operation_store is not None:
+                try:
+                    self._operation_store.settle_pending_approval(
+                        approval_id=approved.approval_id,
+                        action_id=approved.action_id,
+                        succeeded=False,
                     )
                 except Exception:
                     pass

@@ -277,7 +277,10 @@ test("runs bot conversations through wrapper-backend without hardcoded replies",
   assert.match(oauth, /eventName === "done64"/);
   assert.match(preload, /runBotAgent/);
   assert.match(preload, /desktop:agent-delta/);
-  assert.match(renderer, /desktopApi\.runBotAgent\(botId, message\)/);
+  assert.match(renderer, /desktopApi\.runBotAgent\(botId, message, false, action\)/);
+  assert.match(renderer, /option\.action/);
+  assert.match(oauth, /approval: options\.approval/);
+  assert.doesNotMatch(oauth, /if \(streamedText\) return \{ answer: streamedText/);
   assert.match(renderer, /streamingAssistantText/);
   assert.match(renderer, /desktopApi\.warmBotAgent\(botId\)/);
   assert.match(renderer, /void warmBotAgent\(botId\)/);

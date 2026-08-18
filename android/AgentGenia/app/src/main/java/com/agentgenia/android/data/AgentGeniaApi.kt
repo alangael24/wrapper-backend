@@ -6,6 +6,7 @@ import com.agentgenia.android.model.AccountProfile
 import com.agentgenia.android.model.AccountSession
 import com.agentgenia.android.model.BillingPlan
 import com.agentgenia.android.model.BillingSnapshot
+import com.agentgenia.android.model.BotWidgetAction
 import com.agentgenia.android.model.BillingSubscription
 import com.agentgenia.android.model.ComputerSnapshot
 import com.agentgenia.android.model.ComputerState
@@ -198,6 +199,7 @@ class AgentGeniaApi(
     suspend fun runAgent(
         prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
         executionMode: String = "agent", chatPrompt: String = "", userMessage: String = "",
+        approval: BotWidgetAction? = null,
     ): String {
         val body = JSONObject()
                 .put("prompt", prompt)
@@ -211,6 +213,8 @@ class AgentGeniaApi(
                 .put("connector_ids", JSONArray(connectorIds))
                 .put("max_credits", 15)
                 .put("idempotency_key", idempotencyKey)
+        approval?.let { body.put("approval", JSONObject()
+            .put("approval_id", it.approvalId).put("decision", it.decision)) }
         val json = try {
             requestJson("/v1/agent/run", "POST", body)
         } catch (error: ServiceException) {
@@ -239,6 +243,9 @@ class AgentGeniaApi(
         }
         throw ServiceException("La ejecución continúa procesándose.", "run_still_running", 202)
     }
+
+    suspend fun recoverAgentAnswer(idempotencyKey: String): String? =
+        recoverAgentRun(idempotencyKey).optString("answer").takeIf { it.isNotBlank() }
 
     suspend fun computerStatus(botId: String): ComputerSnapshot =
         requestJson("/v1/computers/${path(botId)}").toComputerSnapshot()

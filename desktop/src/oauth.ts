@@ -261,11 +261,16 @@ export class DesktopOAuthController {
       executionMode?: "auto" | "agent" | "chat";
       chatPrompt?: string;
       userMessage?: string;
+      approval?: { approval_id: string; decision: "approve" | "reject" };
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
   ): Promise<Record<string, unknown>> {
     return this.client.runAgent(prompt, connectorIds, options);
+  }
+
+  recoverAgent(idempotencyKey: string, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
+    return this.client.recoverAgent(idempotencyKey, signal);
   }
 
   warmAgent(botId: string, signal?: AbortSignal): Promise<void> {
@@ -494,6 +499,7 @@ class WrapperServiceClient {
       executionMode?: "auto" | "agent" | "chat";
       chatPrompt?: string;
       userMessage?: string;
+      approval?: { approval_id: string; decision: "approve" | "reject" };
       signal?: AbortSignal;
       onDelta?: (text: string) => void;
     } = {}
@@ -507,11 +513,28 @@ class WrapperServiceClient {
       execution_mode: options.executionMode ?? "agent",
       chat_prompt: options.chatPrompt ?? "",
       user_message: options.userMessage ?? "",
+      ...(options.approval ? { approval: options.approval } : {}),
       client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       max_credits: 15,
       idempotency_key: options.idempotencyKey ?? randomUUID(),
       stream: true
     }, options.signal, options.onDelta);
+  }
+
+  async recoverAgent(idempotencyKey: string, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const snapshot = await this.authorizedJson("/v1/agent/recover", {
+        method: "POST",
+        body: { idempotency_key: idempotencyKey },
+        signal
+      });
+      if (snapshot.status === "succeeded" && isRecord(snapshot.result)) return snapshot.result;
+      if (["failed", "cancelled", "budget_exhausted", "expired"].includes(stringValue(snapshot.status))) {
+        throw new Error(`La ejecución terminó con estado ${stringValue(snapshot.status)}.`);
+      }
+      await delay(500, signal);
+    }
+    return null;
   }
 
   async teachWorkflow(
@@ -793,9 +816,10 @@ class WrapperServiceClient {
       const recovered = await this.recoverAgentRun(runId, signal).catch(() => null);
       if (recovered) return recovered;
     }
-    if (streamedText) return { answer: streamedText, run_id: runId };
     if (streamFailure) throw streamFailure;
-    throw new Error("La ejecución no entregó una respuesta recuperable.");
+    throw new Error(runId
+      ? `La ejecución ${runId} sigue en curso; el texto parcial no se guardó como respuesta final.`
+      : "La ejecución no entregó una respuesta final recuperable.");
   }
 
   private async recoverAgentRun(
