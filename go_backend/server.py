@@ -3494,6 +3494,13 @@ class Backend:
                     "en el resultado exitoso de esa herramienta. Si no ejecutaste "
                     "la herramienta o falló, dilo claramente: nunca inventes correos, "
                     "eventos, archivos, registros ni acciones completadas."
+                    " Para una operación de escritura con todos los datos y una "
+                    "solicitud explícita, invoca inmediatamente la herramienta de "
+                    "escritura. No pidas que el usuario responda 'apruebo' ni "
+                    "solicites confirmación en prosa: el backend detendrá esa "
+                    "herramienta y mostrará la aprobación estructurada de un solo "
+                    "uso. Si falta un argumento imprescindible, pregunta únicamente "
+                    "por ese dato."
                 )
                 if local_timezone is not None:
                     local_now = datetime.now(timezone.utc).astimezone(local_timezone)

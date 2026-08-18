@@ -3958,6 +3958,9 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(issued), 1, _result)
         self.assertIsNone(issued[0]["approved_action"])
+        prompt = self.upstream_payloads("/v1/chat/completions")[-1]["messages"][0]["content"]
+        self.assertIn("No pidas que el usuario responda 'apruebo'", prompt)
+        self.assertIn("aprobación estructurada de un solo uso", prompt)
 
     def test_agent_run_confirmation_does_not_recover_prior_email_scope(self):
         signup = self.new_user()
