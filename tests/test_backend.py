@@ -915,9 +915,18 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(queued["accepted"], 1)
-        self.ws.backend._process_whatsapp_message(
-            self.ws.backend.store.claim_whatsapp_message()
-        )
+        with patch.object(
+            self.ws.backend.store,
+            "get_account_state",
+            wraps=self.ws.backend.store.get_account_state,
+        ) as state_reads:
+            self.ws.backend._process_whatsapp_message(
+                self.ws.backend.store.claim_whatsapp_message()
+            )
+        # The processing context already contains the state revision. The
+        # successful optimistic append must not fetch it a second time after
+        # the model returns.
+        self.assertEqual(state_reads.call_count, 1)
         self.assertEqual(sent[-1]["text"], "hola")
         self.assertEqual(self.ws.backend.pi._sessions, {})
         status, state = self.ws.req("GET", "/v1/account-state", headers=auth)

@@ -205,6 +205,7 @@ class WhatsAppCloudAPI:
         # for every message added avoidable latency, especially when an answer
         # is split into several Cloud API requests.
         self._client = client or httpx.Client(
+            http2=True,
             timeout=httpx.Timeout(float(timeout_seconds), connect=min(5.0, float(timeout_seconds))),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             headers={"User-Agent": "AgentGenia-WhatsApp/1.0"},

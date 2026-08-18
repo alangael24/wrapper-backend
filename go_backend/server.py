@@ -2126,18 +2126,31 @@ class Backend:
         # Claim delivery durably before talking to Meta. Cloud API does not
         # accept a caller idempotency key, so a timeout after submission is an
         # uncertain one-shot delivery and must never be sent a second time.
+        delivery_started = time.perf_counter()
         self.store.prepare_whatsapp_outbound(
             message_id=message_id, result_text=answer, user_id=user_id
         )
+        prepared = time.perf_counter()
         outbound = self.whatsapp.send_text(
             to=sender, text=answer, reply_to_message_id=message_id
         )
+        accepted = time.perf_counter()
         self.store.complete_whatsapp_message(
             message_id=message_id,
             status="succeeded",
             result_text=answer,
             outbound_message_id=outbound,
             user_id=user_id,
+        )
+        completed = time.perf_counter()
+        logging.info(
+            "WhatsApp delivery timing message=%s prepare_ms=%.1f meta_ms=%.1f "
+            "complete_ms=%.1f total_ms=%.1f",
+            hashlib.sha256(message_id.encode()).hexdigest()[:12],
+            (prepared - delivery_started) * 1000,
+            (accepted - prepared) * 1000,
+            (completed - accepted) * 1000,
+            (completed - delivery_started) * 1000,
         )
 
     def _process_whatsapp_message(self, message: dict) -> None:
@@ -2493,6 +2506,7 @@ class Backend:
                     "createdAt": self._whatsapp_timestamp(),
                 },
             ],
+            account_state_snapshot=processing_context.get("account_state"),
         )
         self._deliver_whatsapp_answer(
             message_id=message_id, sender=sender, answer=answer, user_id=user_id,
@@ -2624,9 +2638,14 @@ class Backend:
         )
 
     def _append_whatsapp_state_messages(
-        self, *, user_id: str, bot_id: str, messages: list[dict]
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        messages: list[dict],
+        account_state_snapshot: dict | None = None,
     ) -> None:
-        """Persist a complete turn with one optimistic state mutation."""
+        """Persist a complete turn with the fewest safe database round trips."""
         def append(current: dict) -> dict:
             for bot in current["bots"]:
                 if bot.get("id") != bot_id:
@@ -2649,6 +2668,29 @@ class Backend:
                 current["activeBotId"] = bot_id
                 return current
             raise RuntimeError("El agente de WhatsApp ya no existe")
+
+        if account_state_snapshot is not None:
+            snapshot = self._account_state_payload(account_state_snapshot)
+            next_state = normalize_account_state(
+                append(json.loads(json.dumps(snapshot["state"])))
+            )
+            try:
+                self.store.save_account_state(
+                    user_id=user_id,
+                    base_revision=snapshot["revision"],
+                    state_json=json.dumps(
+                        next_state, separators=(",", ":"), ensure_ascii=False
+                    ),
+                    device_hash=hashlib.sha256(
+                        b"account-state-device|whatsapp-channel"
+                    ).hexdigest(),
+                )
+                return
+            except AccountStateConflict:
+                # A desktop or mobile client changed the account while the
+                # agent was running. Re-read and merge rather than dropping
+                # either side of the concurrent edit.
+                pass
         self._mutate_whatsapp_state(user_id, append)
 
     def _add_whatsapp_connector_state(
