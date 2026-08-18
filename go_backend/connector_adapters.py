@@ -99,7 +99,12 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "read_email"): "GOOGLESUPER_FETCH_MESSAGE_BY_MESSAGE_ID",
     ("google-workspace", "draft_email"): "GOOGLESUPER_CREATE_EMAIL_DRAFT",
     ("google-workspace", "send_email"): "GOOGLESUPER_SEND_EMAIL",
-    ("google-workspace", "list_calendar_events"): "GOOGLESUPER_EVENTS_LIST",
+    # ``EVENTS_LIST`` has repeatedly ignored the agent's query/date filters
+    # and returned the provider's default page. ``FIND_EVENT`` exposes the
+    # filters Agent Genia's semantic operation promises (query, time range,
+    # pagination and event types), so verification and delete-by-title can
+    # retrieve the exact event_id instead of scanning an unrelated page.
+    ("google-workspace", "list_calendar_events"): "GOOGLESUPER_FIND_EVENT",
     ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
     ("google-workspace", "delete_calendar_event"): "GOOGLESUPER_DELETE_EVENT",
     ("google-workspace", "search_drive"): "GOOGLESUPER_FIND_FILE",
@@ -528,7 +533,7 @@ class ComposioConnectorGateway:
                 slug,
             )
             result = session.execute(slug, arguments=normalized_arguments)
-            error = getattr(result, "error", None)
+            error = _connector_execution_error(result)
             if (
                 error
                 and connector_id == "microsoft-365"
@@ -550,7 +555,7 @@ class ComposioConnectorGateway:
                 result = session.execute(
                     "OUTLOOK_LIST_MESSAGES", arguments=fallback_arguments
                 )
-                error = getattr(result, "error", None)
+                error = _connector_execution_error(result)
             if error:
                 logging.warning(
                     "Connector provider rejected operation connector=%s operation=%s tool=%s: %s",
@@ -1116,6 +1121,30 @@ def _delete_session(session: Any) -> None:
         pass
 
 
+def _connector_execution_error(result: Any) -> Any:
+    """Return an SDK/provider failure even when it is nested in ``data``.
+
+    Composio SDK versions have represented execution status both as result
+    attributes and inside the returned data envelope. Treat an explicit false
+    success flag as a failure so approved writes cannot receive a deterministic
+    success confirmation when the provider rejected the mutation.
+    """
+    error = getattr(result, "error", None)
+    successful = getattr(result, "successful", None)
+    data = getattr(result, "data", result)
+    if isinstance(result, dict):
+        error = error or result.get("error")
+        successful = result.get("successful", result.get("success", successful))
+    if isinstance(data, dict):
+        error = error or data.get("error")
+        successful = data.get("successful", data.get("success", successful))
+    if error:
+        return error
+    if successful is False:
+        return "provider reported successful=false"
+    return None
+
+
 def _requires_connect_link(exc: Exception) -> bool:
     if exc.__class__.__name__ == "ComposioLegacyConnectedAccountsEndpointRetiredError":
         return True
@@ -1460,6 +1489,99 @@ def _normalize_operation_arguments(
                 400, "read_email requiere message_id", "bad_connector_arguments"
             )
         return {"message_id": message_id.strip()}
+
+    if operation == "list_calendar_events":
+        normalized = dict(arguments)
+        aliases = {
+            "query": ("q", "search", "search_query", "title", "summary"),
+            "time_min": (
+                "timeMin", "start", "start_time", "startTime",
+                "start_datetime", "date_from", "from_datetime",
+            ),
+            "time_max": (
+                "timeMax", "end", "end_time", "endTime",
+                "end_datetime", "date_to", "to_datetime",
+            ),
+            "calendar_id": ("calendar", "calendarId"),
+            "max_results": ("maxResults", "limit", "page_size"),
+            "page_token": ("pageToken", "nextPageToken", "next_page_token"),
+            "order_by": ("orderBy",),
+            "event_types": ("eventTypes",),
+            "updated_min": ("updatedMin",),
+            "show_deleted": ("showDeleted",),
+            "single_events": ("singleEvents",),
+        }
+        for canonical, alternatives in aliases.items():
+            if canonical not in normalized:
+                for alias in alternatives:
+                    if alias in normalized:
+                        normalized[canonical] = normalized[alias]
+                        break
+            for alias in alternatives:
+                normalized.pop(alias, None)
+
+        # FIND_EVENT accepts explicit offsets in time_min/time_max. ``timezone``
+        # is useful context for the model but is not part of the provider
+        # schema and previously caused the filter payload to be discarded.
+        normalized.pop("timezone", None)
+        normalized.pop("time_zone", None)
+
+        result: dict[str, Any] = {
+            "calendar_id": str(normalized.get("calendar_id") or "primary").strip(),
+            "max_results": 10,
+            "single_events": bool(normalized.get("single_events", True)),
+        }
+        if not result["calendar_id"] or len(result["calendar_id"]) > 1024:
+            raise ConnectorBrokerError(
+                400, "calendar_id no es válido", "bad_connector_arguments"
+            )
+        raw_limit = normalized.get("max_results", 10)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, float)):
+            raise ConnectorBrokerError(
+                400, "max_results debe ser numérico", "bad_connector_arguments"
+            )
+        # Keep one provider/model turn bounded. The response carries
+        # nextPageToken when another page is genuinely required.
+        result["max_results"] = max(1, min(int(raw_limit), 50))
+
+        for field in ("query", "time_min", "time_max", "page_token", "updated_min"):
+            value = normalized.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip() or len(value) > 2_048:
+                raise ConnectorBrokerError(
+                    400, f"{field} no es válido", "bad_connector_arguments"
+                )
+            result[field] = value.strip()
+        order_by = normalized.get("order_by")
+        if order_by is not None:
+            if order_by not in {"startTime", "updated"}:
+                raise ConnectorBrokerError(
+                    400, "order_by debe ser startTime o updated", "bad_connector_arguments"
+                )
+            result["order_by"] = order_by
+        event_types = normalized.get("event_types")
+        if event_types is not None:
+            allowed_event_types = {
+                "birthday", "default", "focusTime", "outOfOffice", "workingLocation",
+            }
+            if (
+                not isinstance(event_types, list)
+                or not event_types
+                or any(item not in allowed_event_types for item in event_types)
+            ):
+                raise ConnectorBrokerError(
+                    400, "event_types no es válido", "bad_connector_arguments"
+                )
+            result["event_types"] = event_types
+        show_deleted = normalized.get("show_deleted")
+        if show_deleted is not None:
+            if not isinstance(show_deleted, bool):
+                raise ConnectorBrokerError(
+                    400, "show_deleted debe ser booleano", "bad_connector_arguments"
+                )
+            result["show_deleted"] = show_deleted
+        return result
 
     if operation == "read_sheet":
         normalized = dict(arguments)

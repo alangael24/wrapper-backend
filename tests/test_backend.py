@@ -3494,6 +3494,68 @@ class TestBackend(unittest.TestCase):
             },
         )])
 
+    def test_google_calendar_search_uses_find_event_with_exact_filters(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        gateway.execute(
+            self.new_user("google-calendar-find-routing")["user_id"],
+            "google-workspace",
+            "list_calendar_events",
+            {
+                "title": "AgentGenia E2E",
+                "timeMin": "2026-08-25T00:00:00-06:00",
+                "timeMax": "2026-08-26T00:00:00-06:00",
+                "calendarId": "primary",
+                "limit": 500,
+                "timezone": "America/Denver",
+            },
+        )
+
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_FIND_EVENT",
+            {
+                "calendar_id": "primary",
+                "max_results": 50,
+                "single_events": True,
+                "query": "AgentGenia E2E",
+                "time_min": "2026-08-25T00:00:00-06:00",
+                "time_max": "2026-08-26T00:00:00-06:00",
+            },
+        )])
+
+    def test_connector_provider_false_success_is_rejected(self):
+        client = FakeComposioClient()
+        session = FakeComposioSession(client, "provider-false", "googlesuper")
+        session.execute = lambda _slug, *, arguments: SimpleNamespace(
+            data={"successful": False, "error": "mutation rejected"},
+            error=None,
+        )
+        client.sessions.create = lambda **_options: session
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        with self.assertRaises(ConnectorBrokerError) as rejected:
+            gateway.execute(
+                self.new_user("provider-false-success")["user_id"],
+                "google-workspace",
+                "create_calendar_event",
+                {
+                    "summary": "No debe confirmarse",
+                    "start_datetime": "2026-08-25T14:00:00-06:00",
+                    "timezone": "America/Denver",
+                },
+            )
+        self.assertEqual(rejected.exception.code, "connector_upstream_error")
+
     def test_connected_plugin_reads_use_verified_tools_without_dynamic_search(self):
         client = FakeComposioClient()
         gateway = ComposioConnectorGateway(

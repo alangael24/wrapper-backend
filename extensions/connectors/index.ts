@@ -172,7 +172,15 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
     rule: "Lee primero el rango exacto, no sobrescribas datos no solicitados y usa una sola llamada para celdas adyacentes. Invoca update_sheet directamente para que el backend genere la aprobación estructurada.",
   },
   list_calendar_events: {
-    rule: "Consulta Calendar antes de afirmar qué eventos existen. Resume solo los eventos devueltos.",
+    arguments: {
+      query: "Texto distintivo del título, descripción, ubicación o asistente; úsalo cuando busques un evento concreto",
+      time_min: "Inicio mínimo RFC3339 con offset explícito, por ejemplo 2026-08-25T00:00:00-06:00",
+      time_max: "Fin exclusivo RFC3339 con offset explícito; usa una ventana estrecha alrededor de la fecha solicitada",
+      calendar_id: "Usa primary salvo que el usuario indique otro calendario",
+      max_results: "Máximo de resultados de esta página; mantenlo pequeño",
+      page_token: "nextPageToken exacto de la página anterior cuando haya más resultados",
+    },
+    rule: "Consulta Calendar antes de afirmar qué eventos existen. Para un evento concreto combina query con time_min y time_max, valida título y fecha del resultado, y sigue nextPageToken si existe. Resume solo los eventos devueltos.",
   },
   list_contacts: {
     rule: "No muestres correos ni teléfonos salvo que el usuario los pida explícitamente.",
