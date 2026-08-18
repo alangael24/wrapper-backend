@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 
 const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  "google-workspace": ["search_email", "read_email", "draft_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
+  "google-workspace": ["search_email", "read_email", "draft_email", "send_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
   slack: ["list_channels", "search_messages", "read_thread", "post_message"],
   notion: ["search", "read_page", "create_page", "query_database", "update_page"],
   salesforce: ["search_records", "get_record", "create_record", "update_record"],
@@ -133,6 +133,24 @@ interface SearchMatch {
 }
 
 const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
+  draft_email: {
+    arguments: {
+      recipient_email: "Correo exacto del destinatario",
+      subject: "Asunto del borrador",
+      body: "Contenido del correo en texto plano",
+    },
+    rule: "Úsalo solo cuando el usuario pida preparar o guardar un borrador. Nunca afirmes que se envió.",
+  },
+  send_email: {
+    arguments: {
+      recipient_email: "Correo exacto del destinatario",
+      subject: "Asunto del correo",
+      body: "Contenido final del correo en texto plano",
+      cc: "Lista opcional de correos en copia",
+      bcc: "Lista opcional de correos en copia oculta",
+    },
+    rule: "Úsalo cuando el usuario pida o confirme explícitamente enviar. No crees un borrador en su lugar. Confirma el envío solo después de una respuesta exitosa.",
+  },
   create_calendar_event: {
     arguments: {
       start_datetime: "ISO 8601 exacto, por ejemplo 2026-08-18T15:00:00; no uses texto como 'manana'",
@@ -159,6 +177,7 @@ function providerArgumentDescription(id: string): string {
   if (id !== "google-workspace") return "Argumentos JSON de la operacion";
   return [
     "Argumentos JSON de la operacion.",
+    "Para draft_email y send_email usa recipient_email, subject y body; send_email envía realmente y draft_email solo guarda.",
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
     "Para delete_calendar_event usa event_id exacto y calendar_id; lista eventos primero si falta el ID.",

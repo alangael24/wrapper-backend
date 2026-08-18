@@ -192,7 +192,7 @@ def _explicit_write_approvals(
     approved: set[tuple[str, str]] = set()
     action_patterns = {
         "create": r"\b(?:crea|crear|creame|agrega|agregar|anade|anadir|agenda|agendar|programa|programar|create|add|schedule)\b",
-        "send": r"\b(?:envia|enviar|manda|mandar|publica|publicar|send|post)\b",
+        "send": r"\b(?:envia(?:lo|la|le|les)?|enviar|manda(?:lo|la|le|les)?|mandar|publica|publicar|send|post)\b",
         "reply": r"\b(?:responde|responder|reply)\b",
         "update": r"\b(?:actualiza|actualizar|modifica|modificar|edita|editar|update|edit)\b",
         "delete": r"\b(?:elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|delete|remove|cancel)\b",
@@ -217,6 +217,8 @@ def _explicit_write_approvals(
         "sheet": {"hoja", "sheet", "celda", "spreadsheet"},
     }
     words = set(re.findall(r"[a-z0-9]+", intent))
+    if re.search(r"\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b", intent):
+        words.add("email")
     for connector_id in connector_ids:
         for operation in CONNECTOR_CATALOG[connector_id]["operations"]:
             if operation in READ_ONLY_CONNECTOR_OPERATIONS or operation.startswith(READ_ONLY_CONNECTOR_PREFIXES):
@@ -245,8 +247,11 @@ def _explicit_write_approvals(
 
 def _is_explicit_confirmation(value: str) -> bool:
     intent = _plain_intent_text(value).strip(" .,!¡?¿")
+    intent = re.sub(r"[\s,;:]+", " ", intent)
     return bool(re.fullmatch(
-        r"(?:si|ok|okay|vale|confirmo|adelante|hazlo|hazlo ya|do it|yes|go ahead)",
+        r"(?:(?:si|ok|okay|vale)[ ]+)?(?:si|ok|okay|vale|confirmo|adelante|hazlo|hazlo ya|hazlo tu|"
+        r"hazlo directamente|hazlo tu directamente|envialo|mandalo|"
+        r"do it|yes|go ahead|send it)",
         intent,
     ))
 

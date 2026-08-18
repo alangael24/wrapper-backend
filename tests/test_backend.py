@@ -33,6 +33,7 @@ from go_backend.server import (  # noqa: E402
     Handler,
     UnsafeConfigurationError,
     _explicit_write_approvals,
+    _is_explicit_confirmation,
     _partial_json_text,
     serve,
     validate_runtime_security,
@@ -2712,6 +2713,31 @@ class TestBackend(unittest.TestCase):
             frozenset({("google-workspace", "delete_calendar_event")}),
         )
 
+    def test_explicit_email_intent_separates_send_from_draft(self):
+        self.assertEqual(
+            _explicit_write_approvals(
+                ("google-workspace",),
+                "Envía un correo a cliente@example.com con la pregunta del costo",
+            ),
+            frozenset({("google-workspace", "send_email")}),
+        )
+        self.assertEqual(
+            _explicit_write_approvals(
+                ("google-workspace",),
+                "Mándale a cliente@example.com la pregunta del costo",
+            ),
+            frozenset({("google-workspace", "send_email")}),
+        )
+        self.assertEqual(
+            _explicit_write_approvals(
+                ("google-workspace",),
+                "Redacta un borrador de correo para cliente@example.com",
+            ),
+            frozenset({("google-workspace", "draft_email")}),
+        )
+        self.assertTrue(_is_explicit_confirmation("Hazlo tú directamente"))
+        self.assertTrue(_is_explicit_confirmation("Sí, hazlo directamente"))
+
     def test_connector_grant_expires_without_server_restart(self):
         clock = [time.time()]
         broker = ConnectorBroker(default_ttl_seconds=5, now=lambda: clock[0])
@@ -2938,6 +2964,41 @@ class TestBackend(unittest.TestCase):
                 "event_duration_hour": 1,
                 "event_duration_minutes": 30,
                 "calendar_id": "primary",
+            },
+        )])
+
+    def test_google_workspace_send_email_uses_pinned_tool_and_normalized_schema(
+        self,
+    ):
+        client = FakeComposioClient()
+        user_id = self.new_user("google-email-send")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        gateway.execute(
+            user_id,
+            "google-workspace",
+            "send_email",
+            {
+                "to": "cliente@example.com",
+                "title": "Costo promedio por tarea",
+                "message": "¿Cuál es el costo promedio por tarea?",
+            },
+        )
+
+        self.assertEqual(client.searches, [(
+            "googlesuper",
+            "Use Google Workspace to perform the operation 'send_email'.",
+        )])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_SEND_EMAIL",
+            {
+                "recipient_email": "cliente@example.com",
+                "subject": "Costo promedio por tarea",
+                "body": "¿Cuál es el costo promedio por tarea?",
             },
         )])
 
@@ -3343,6 +3404,56 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(
             issued[0]["approved_write_operations"],
             frozenset({("google-workspace", "create_calendar_event")}),
+        )
+
+    def test_agent_run_confirmation_recovers_prior_email_send_scope(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        bot_id = self.assign_bot_connectors(
+            signup,
+            ["google-workspace"],
+            messages=[{
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "text": "Envía un correo a cliente@example.com preguntando el costo por tarea",
+                "createdAt": "2026-08-17T19:00:00Z",
+            }],
+        )
+        self.ws.backend.connector_gateway.connected_connector_ids = (
+            lambda _user_id: ("google-workspace",)
+        )
+        issued: list[dict] = []
+        original_issue = self.ws.backend.connectors.issue
+
+        def issue_and_capture(**kwargs):
+            issued.append(kwargs)
+            return original_issue(**kwargs)
+
+        self.ws.backend.connectors.issue = issue_and_capture
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "Usuario: Envía el correo\nUsuario: Hazlo tú directamente",
+                "chat_prompt": (
+                    "Usuario: Envía un correo a cliente@example.com preguntando "
+                    "el costo por tarea\nUsuario: Hazlo tú directamente"
+                ),
+                "user_message": "Hazlo tú directamente",
+                "execution_mode": "auto",
+                "bot_id": bot_id,
+                "connector_ids": ["google-workspace"],
+                "idempotency_key": "gmail-send-confirmation-grant",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(len(issued), 1)
+        self.assertEqual(
+            issued[0]["approved_write_operations"],
+            frozenset({("google-workspace", "send_email")}),
         )
 
     def test_agent_rejects_unknown_connector_before_starting_pi(self):

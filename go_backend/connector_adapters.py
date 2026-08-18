@@ -89,6 +89,8 @@ COMPOSIO_TOOLKITS: dict[str, str] = {
 # to the public Composio action documented for the corresponding Agent Genia
 # operation.
 COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
+    ("google-workspace", "draft_email"): "GOOGLESUPER_CREATE_EMAIL_DRAFT",
+    ("google-workspace", "send_email"): "GOOGLESUPER_SEND_EMAIL",
     ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
     ("google-workspace", "delete_calendar_event"): "GOOGLESUPER_DELETE_EVENT",
 }
@@ -798,6 +800,62 @@ def _normalize_operation_arguments(
     """Translate friendly aliases into the exact schema of pinned actions."""
     if connector_id != "google-workspace":
         return arguments
+
+    if operation in {"draft_email", "send_email"}:
+        normalized = dict(arguments)
+        aliases = {
+            "recipient_email": (
+                "to", "recipient", "recipientEmail", "to_email", "email",
+            ),
+            "subject": ("title",),
+            "body": ("message", "content", "text"),
+            "is_html": ("isHtml",),
+        }
+        for canonical, alternatives in aliases.items():
+            if canonical not in normalized:
+                for alias in alternatives:
+                    if alias in normalized:
+                        normalized[canonical] = normalized[alias]
+                        break
+            for alias in alternatives:
+                normalized.pop(alias, None)
+
+        recipient = normalized.get("recipient_email")
+        if (
+            not isinstance(recipient, str)
+            or not recipient.strip()
+            or len(recipient.strip()) > 320
+        ):
+            raise ConnectorBrokerError(
+                400,
+                f"{operation} requiere recipient_email",
+                "bad_connector_arguments",
+            )
+        body = normalized.get("body")
+        if not isinstance(body, str) or not body.strip() or len(body) > 100_000:
+            raise ConnectorBrokerError(
+                400,
+                f"{operation} requiere body",
+                "bad_connector_arguments",
+            )
+        normalized["recipient_email"] = recipient.strip()
+        normalized["body"] = body.strip()
+        subject = normalized.get("subject")
+        if subject is not None:
+            if not isinstance(subject, str) or len(subject) > 998:
+                raise ConnectorBrokerError(
+                    400,
+                    "subject no es válido",
+                    "bad_connector_arguments",
+                )
+            normalized["subject"] = subject.strip()
+        for field in ("cc", "bcc", "extra_recipients"):
+            value = normalized.get(field)
+            if isinstance(value, str):
+                normalized[field] = [
+                    item.strip() for item in value.split(",") if item.strip()
+                ]
+        return normalized
 
     if operation == "delete_calendar_event":
         normalized = dict(arguments)

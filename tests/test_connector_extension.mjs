@@ -36,7 +36,7 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
             name: "Google Workspace",
             description: "Gmail y Calendar.",
             keywords: ["gmail", "calendar"],
-            operations: ["search_email", "create_calendar_event", "delete_calendar_event"],
+            operations: ["search_email", "draft_email", "send_email", "create_calendar_event", "delete_calendar_event"],
             connected: true,
           },
         ],
@@ -105,6 +105,8 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     );
     assert.equal(calendarSearch.isError, undefined);
     const calendarMatches = JSON.parse(calendarSearch.content[0].text);
+    assert.match(calendarMatches[0].operation_guidance.send_email.rule, /respuesta exitosa/);
+    assert.match(calendarMatches[0].operation_guidance.draft_email.rule, /Nunca afirmes que se envió/);
     assert.equal(calendarMatches[0].operation_guidance.create_calendar_event.arguments.timezone.includes("IANA"), true);
     assert.match(calendarMatches[0].operation_guidance.delete_calendar_event.arguments.event_id, /list_calendar_events/);
     assert.match(
@@ -114,6 +116,10 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     assert.match(
       tools.get("connector_google_workspace").parameters.properties.arguments.description,
       /delete_calendar_event usa event_id exacto/,
+    );
+    assert.match(
+      tools.get("connector_google_workspace").parameters.properties.arguments.description,
+      /send_email envía realmente/,
     );
 
     const result = await tools.get("connector_github").execute(
