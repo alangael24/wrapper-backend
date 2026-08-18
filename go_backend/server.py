@@ -1307,9 +1307,14 @@ class Backend:
             time.sleep(6 * 3600)
             self._run_retention_once()
 
-    def _start_run_timing(self, run_id: str, started_at: float) -> None:
+    def _start_run_timing(
+        self,
+        run_id: str,
+        started_at: float,
+        initial: dict[str, float] | None = None,
+    ) -> None:
         with self._run_timing_lock:
-            self._run_timings[run_id] = {"_origin": started_at}
+            self._run_timings[run_id] = {"_origin": started_at, **(initial or {})}
 
     def _mark_run_timing(self, run_id: str, name: str) -> None:
         with self._run_timing_lock:
@@ -3265,9 +3270,18 @@ class Backend:
 
     def handle_agent_run(self, handler: BaseHTTPRequestHandler) -> None:
         request_started_at = time.monotonic()
+        pre_run_timings: dict[str, float] = {}
+
+        def mark_pre_run(name: str) -> None:
+            if name not in pre_run_timings:
+                pre_run_timings[name] = round(
+                    (time.monotonic() - request_started_at) * 1000, 3
+                )
+
         user = self.require_user(handler)
         if not user:
             return
+        mark_pre_run("auth_complete_ms")
         unlimited = self.unlimited_usage(user)
         # Internal unlimited accounts are already protected by authenticated
         # sessions and the concurrent-run reservation. Avoid an additional
@@ -3281,6 +3295,7 @@ class Backend:
         if not rate_allowed:
             error_response(handler, 429, "Demasiadas ejecuciones", "rate_limit")
             return
+        mark_pre_run("rate_limit_complete_ms")
         tier = user.get("tier") or DEFAULT_TIER
         if not unlimited:
             self.ensure_trial(user)
@@ -3457,6 +3472,7 @@ class Backend:
         connector_ids: tuple[str, ...] = ()
         if not direct_chat:
             assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
+            mark_pre_run("connector_assignment_complete_ms")
         # ``connector_ids`` from a client is a hint for backwards
         # compatibility, never an authorization source. A connector must be
         # assigned to this bot in server state and currently connected.
@@ -3483,7 +3499,11 @@ class Backend:
                 )
                 logging.warning("Connector reconciliation failed: %s", exc)
                 return
-            self._replace_connected_connectors_in_state(user["id"], connected_connector_ids)
+            mark_pre_run("connector_verification_complete_ms")
+            # Authorization is the intersection below, not the mutable account
+            # snapshot. Connector list/auth/disconnect endpoints already
+            # reconcile UI state; doing it again on every agent turn performed
+            # a second cross-region account-state read before Pi could start.
         if not direct_chat:
             connected_set = set(connected_connector_ids)
             connector_ids = tuple(
@@ -3654,6 +3674,7 @@ class Backend:
             handler.agent_conversation_lock = conversation_lock
 
         run_api_key = "agrn_" + secrets.token_urlsafe(48)
+        mark_pre_run("pre_reservation_complete_ms")
         try:
             plan = plan_for(tier)
             run_values = {
@@ -3737,7 +3758,7 @@ class Backend:
         run_id = run["id"]
         self._run_principal(run_api_key, value=(user, run))
         started_at = time.monotonic()
-        self._start_run_timing(run_id, request_started_at)
+        self._start_run_timing(run_id, request_started_at, pre_run_timings)
         self._mark_run_timing(run_id, "run_reserved_ms")
         event_stream = _AgentEventStream(handler) if stream_requested else None
         if event_stream:

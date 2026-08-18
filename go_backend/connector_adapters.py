@@ -30,10 +30,12 @@ TERMINAL_CONNECTION_STATES = frozenset({"FAILED", "EXPIRED", "REVOKED", "DELETED
 AUTH_ATTEMPT_TTL_SECONDS = 10 * 60
 AUTH_STARTS_PER_MINUTE = 12
 UPSTREAM_POLL_INTERVAL_SECONDS = 2.0
-# OAuth completion and disconnect explicitly invalidate this cache. Keeping a
-# healthy snapshot for one minute removes a third-party round trip from bursts
-# of tool turns without delaying connection changes made through Agent Genia.
-CONNECTION_SNAPSHOT_TTL_SECONDS = 60.0
+# OAuth completion and disconnect explicitly invalidate this cache. Provider
+# execution remains the final authority and fails if a token was revoked
+# outside Agent Genia, so retaining the verified routing snapshot for five
+# minutes removes a slow third-party round trip from normal multi-turn work
+# without granting access to a disconnected account.
+CONNECTION_SNAPSHOT_TTL_SECONDS = 5 * 60.0
 
 # Nombres verificados contra el catalogo de toolkits de Composio. Los
 # overrides de entorno permiten incorporar o renombrar toolkits sin publicar

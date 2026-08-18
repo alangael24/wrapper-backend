@@ -2348,6 +2348,8 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(timings.startswith("timing:"))
         timing_payload = json.loads(timings.removeprefix("timing:"))
         for name in (
+            "auth_complete_ms", "rate_limit_complete_ms",
+            "connector_assignment_complete_ms", "pre_reservation_complete_ms",
             "run_reserved_ms", "pi_dispatch_ms", "proxy_received_ms",
             "upstream_request_ms", "upstream_complete_ms", "pi_first_text_ms",
             "pi_complete_ms",
