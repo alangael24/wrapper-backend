@@ -354,6 +354,47 @@ class PostgresStore(Store):
         )
         return len(rows)
 
+    def get_whatsapp_processing_context(
+        self, *, wa_user_id: str, phone_number_id: str
+    ) -> dict:
+        """Load link, user and synchronized product state in one DB call."""
+        row = self._one(
+            "SELECT to_jsonb(l) AS link_json,to_jsonb(u) AS user_json,"
+            "ast.user_id AS state_user_id,ast.revision AS state_revision,"
+            "ast.state_json,ast.created_at AS state_created_at,"
+            "ast.updated_at AS state_updated_at "
+            "FROM whatsapp_links l JOIN users u ON u.id=l.user_id "
+            "LEFT JOIN account_states ast ON ast.user_id=u.id "
+            "WHERE l.wa_user_id=? AND l.phone_number_id=? "
+            "AND u.account_status='active'",
+            (wa_user_id, phone_number_id),
+        )
+        if row is None:
+            return {"link": None, "user": None, "account_state": None}
+
+        def decoded(value: Any) -> dict:
+            if isinstance(value, dict):
+                return dict(value)
+            if isinstance(value, str):
+                parsed = json.loads(value)
+                return dict(parsed) if isinstance(parsed, dict) else {}
+            return {}
+
+        account_state = None
+        if row.get("state_user_id") is not None:
+            account_state = {
+                "user_id": row["state_user_id"],
+                "revision": row["state_revision"],
+                "state_json": row["state_json"],
+                "created_at": row["state_created_at"],
+                "updated_at": row["state_updated_at"],
+            }
+        return {
+            "link": decoded(row.get("link_json")),
+            "user": decoded(row.get("user_json")),
+            "account_state": account_state,
+        }
+
     def create_agent_run(
         self,
         *,

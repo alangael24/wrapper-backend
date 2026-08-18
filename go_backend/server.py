@@ -2155,9 +2155,10 @@ class Backend:
             else ""
         )
         display_name = display_name if isinstance(display_name, str) else ""
-        link = self.store.get_whatsapp_link_for_sender(
+        processing_context = self.store.get_whatsapp_processing_context(
             wa_user_id=sender, phone_number_id=phone_number_id
         )
+        link = processing_context.get("link")
         code = extract_link_code(text)
         if code:
             if link:
@@ -2209,7 +2210,9 @@ class Backend:
             )
             return
 
-        state_payload = self._account_state_payload(self.store.get_account_state(user_id))
+        state_payload = self._account_state_payload(
+            processing_context.get("account_state")
+        )
         state = state_payload["state"]
         active_bot = next(
             (
@@ -2428,18 +2431,14 @@ class Backend:
         routing_context = "\n".join(reversed(routing_lines))
         user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:user:{message_id}"))
         assistant_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:assistant:{message_id}"))
-        self._append_whatsapp_state_message(
-            user_id=user_id,
-            bot_id=bot["id"],
-            message={
-                "id": user_message_id,
-                "role": "user",
-                "text": text,
-                "createdAt": self._whatsapp_timestamp(),
-            },
-        )
+        user_state_message = {
+            "id": user_message_id,
+            "role": "user",
+            "text": text,
+            "createdAt": self._whatsapp_timestamp(),
+        }
         internal = _InternalAgentHandler(
-            self.store.get_user_by_id(user_id) or link,
+            processing_context.get("user") or link,
             {
                 "prompt": prompt,
                 "execution_mode": (
@@ -2482,15 +2481,18 @@ class Backend:
             )
         else:
             answer = parse_whatsapp_agent_answer(str(response.get("answer") or ""))
-        self._append_whatsapp_state_message(
+        self._append_whatsapp_state_messages(
             user_id=user_id,
             bot_id=bot["id"],
-            message={
-                "id": assistant_message_id,
-                "role": "assistant",
-                "text": answer,
-                "createdAt": self._whatsapp_timestamp(),
-            },
+            messages=[
+                user_state_message,
+                {
+                    "id": assistant_message_id,
+                    "role": "assistant",
+                    "text": answer,
+                    "createdAt": self._whatsapp_timestamp(),
+                },
+            ],
         )
         self._deliver_whatsapp_answer(
             message_id=message_id, sender=sender, answer=answer, user_id=user_id,
@@ -2617,13 +2619,33 @@ class Backend:
     def _append_whatsapp_state_message(
         self, *, user_id: str, bot_id: str, message: dict
     ) -> None:
+        self._append_whatsapp_state_messages(
+            user_id=user_id, bot_id=bot_id, messages=[message]
+        )
+
+    def _append_whatsapp_state_messages(
+        self, *, user_id: str, bot_id: str, messages: list[dict]
+    ) -> None:
+        """Persist a complete turn with one optimistic state mutation."""
         def append(current: dict) -> dict:
             for bot in current["bots"]:
                 if bot.get("id") != bot_id:
                     continue
-                messages = bot.get("messages") if isinstance(bot.get("messages"), list) else []
-                if not any(item.get("id") == message["id"] for item in messages):
-                    bot["messages"] = (messages + [message])[-200:]
+                existing = (
+                    bot.get("messages")
+                    if isinstance(bot.get("messages"), list)
+                    else []
+                )
+                known_ids = {
+                    item.get("id") for item in existing if isinstance(item, dict)
+                }
+                additions = [
+                    message
+                    for message in messages
+                    if message.get("id") not in known_ids
+                ]
+                if additions:
+                    bot["messages"] = (existing + additions)[-200:]
                 current["activeBotId"] = bot_id
                 return current
             raise RuntimeError("El agente de WhatsApp ya no existe")

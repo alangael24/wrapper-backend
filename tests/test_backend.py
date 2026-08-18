@@ -1104,7 +1104,7 @@ class TestBackend(unittest.TestCase):
         config, sent = self.configure_fake_whatsapp()
         user = self.new_user(tier="pro")
         auth = {"Authorization": f"Bearer {user['api_key']}"}
-        self.assign_bot_connectors(user, ["canva"])
+        bot_id = self.assign_bot_connectors(user, ["canva"])
         status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
         self.assertEqual(status, 201)
         self.send_whatsapp_webhook(
@@ -1125,6 +1125,13 @@ class TestBackend(unittest.TestCase):
             self.ws.backend.store.claim_whatsapp_message()
         )
         self.assertEqual(sent[-1]["text"], "hola")
+        account_state = self.ws.backend.store.get_account_state(user["user_id"])
+        state = json.loads(account_state["state_json"])
+        bot = next(item for item in state["bots"] if item["id"] == bot_id)
+        self.assertEqual(
+            [(item["role"], item["text"]) for item in bot["messages"][-2:]],
+            [("user", "hola"), ("assistant", "hola")],
+        )
 
     def test_account_state_sync_is_account_scoped_versioned_and_validated(self):
         first = self.new_user(tier="free")

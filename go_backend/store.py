@@ -1372,6 +1372,27 @@ class Store:
         )
         return dict(row) if row else None
 
+    def get_whatsapp_processing_context(
+        self, *, wa_user_id: str, phone_number_id: str
+    ) -> dict:
+        """Load the linked account context needed by one inbound turn.
+
+        SQLite keeps the straightforward reads. PostgreSQL overrides this
+        method with one joined query so production does not pay three
+        cross-region round trips before every WhatsApp response.
+        """
+        link = self.get_whatsapp_link_for_sender(
+            wa_user_id=wa_user_id, phone_number_id=phone_number_id
+        )
+        if not link:
+            return {"link": None, "user": None, "account_state": None}
+        user_id = str(link["user_id"])
+        return {
+            "link": link,
+            "user": self.get_user_by_id(user_id),
+            "account_state": self.get_account_state(user_id),
+        }
+
     def update_whatsapp_active_bot(self, *, user_id: str, bot_id: str | None) -> None:
         self._exec(
             "UPDATE whatsapp_links SET active_bot_id=?,updated_at=? WHERE user_id=?",

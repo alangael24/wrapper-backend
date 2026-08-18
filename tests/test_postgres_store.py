@@ -130,6 +130,40 @@ class PostgresStoreConfigurationTests(unittest.TestCase):
         self.assertIn("earlier.wa_user_id=m.wa_user_id", connection.sql)
         self.assertIn("earlier.status IN ('pending','processing','sending')", connection.sql)
 
+    def test_whatsapp_processing_context_uses_one_joined_database_call(self):
+        store = PostgresStore.__new__(PostgresStore)
+        captured = {}
+
+        def one(sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return {
+                "link_json": {
+                    "wa_user_id": "15557654321",
+                    "phone_number_id": "123456789012345",
+                    "user_id": "usr_test",
+                },
+                "user_json": {"id": "usr_test", "tier": "pro"},
+                "state_user_id": "usr_test",
+                "state_revision": 7,
+                "state_json": '{"bots":[]}',
+                "state_created_at": 10.0,
+                "state_updated_at": 20.0,
+            }
+
+        store._one = one
+        context = store.get_whatsapp_processing_context(
+            wa_user_id="15557654321", phone_number_id="123456789012345"
+        )
+
+        self.assertEqual(context["link"]["user_id"], "usr_test")
+        self.assertEqual(context["user"]["tier"], "pro")
+        self.assertEqual(context["account_state"]["revision"], 7)
+        self.assertIn("to_jsonb(l)", captured["sql"])
+        self.assertIn("to_jsonb(u)", captured["sql"])
+        self.assertIn("LEFT JOIN account_states", captured["sql"])
+        self.assertEqual(captured["params"], ("15557654321", "123456789012345"))
+
     def test_unmetered_run_is_settled_in_one_statement(self):
         store = PostgresStore.__new__(PostgresStore)
         captured = {}
