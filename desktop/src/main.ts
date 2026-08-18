@@ -24,7 +24,7 @@ import {
   updateBotProfile
 } from "./contracts";
 import { AccountStateConflictError, DesktopOAuthController, safeComputerViewerUrl } from "./oauth";
-import { LocalAgentRuntime } from "./local-agent-runtime";
+import type { LocalAgentRuntime } from "./local-agent-runtime";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1361,6 +1361,10 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   configureDisplayMedia();
   createWindow();
   if (!smokeTest) {
+    // Pi Chrome and Computer Use pull in platform-native runtimes. Load them
+    // only for a real signed-in desktop session so startup/smoke checks do not
+    // initialize an unused native bridge (notably on Windows CI).
+    const { LocalAgentRuntime } = await import("./local-agent-runtime");
     localAgentRuntime = new LocalAgentRuntime(
       {
         heartbeat: (capabilities, signal) => oauthController.desktopRuntimeHeartbeat(capabilities, signal),
