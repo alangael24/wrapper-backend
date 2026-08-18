@@ -121,6 +121,10 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
       tools.get("connector_google_workspace").parameters.properties.arguments.description,
       /send_email envía realmente/,
     );
+    assert.match(
+      tools.get("connector_google_workspace").parameters.properties.arguments.description,
+      /read_sheet usa spreadsheet_id/,
+    );
 
     const result = await tools.get("connector_github").execute(
       "github-call",

@@ -111,6 +111,24 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("databricks", "execute_sql"): "DATABRICKS_SQL_STATEMENT_EXEC_EXECUTE_STATEMENT",
 }
 
+# Read-only tools with a verified public slug can execute directly. Asking
+# Tool Router to rediscover an already-known action on every invocation adds a
+# second network/model round trip and has caused otherwise valid Google reads
+# to exceed the broker timeout. Writes still fetch the live provider schema
+# before approval so their exact arguments remain fail-closed.
+PINNED_DIRECT_READ_OPERATIONS = frozenset({
+    ("google-workspace", "search_email"),
+    ("google-workspace", "read_email"),
+    ("google-workspace", "list_calendar_events"),
+    ("google-workspace", "search_drive"),
+    ("google-workspace", "read_drive_file"),
+    ("google-workspace", "list_contacts"),
+    ("google-workspace", "read_sheet"),
+    ("github", "read_file"),
+    ("snowflake", "select_query"),
+    ("databricks", "select_query"),
+})
+
 _ISO_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})?$"
 )
@@ -640,6 +658,14 @@ class ComposioConnectorGateway:
                 "No encontramos una acción inequívoca para esta operación",
                 "connector_operation_not_found",
             )
+        pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
+        if pinned and (connector_id, operation) in PINNED_DIRECT_READ_OPERATIONS:
+            with self._lock:
+                self._operation_cache[(connector_id, operation)] = (
+                    self._now() + 900,
+                    pinned,
+                )
+            return pinned, None
         search = session.search(
             query=(
                 f"Use {CONNECTOR_CATALOG[connector_id]['name']} to perform the "
@@ -647,7 +673,6 @@ class ComposioConnectorGateway:
             )
         )
         results = list(getattr(search, "results", []) or [])
-        pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
         available_slugs = {
             str(raw).upper()
             for result in results
@@ -1056,6 +1081,72 @@ def _normalize_operation_arguments(
 
     if connector_id != "google-workspace":
         return arguments
+
+    if operation == "search_email":
+        normalized = dict(arguments)
+        aliases = {
+            "query": ("q", "search", "search_query"),
+            "max_results": ("maxResults", "limit", "page_size"),
+        }
+        for canonical, alternatives in aliases.items():
+            if canonical not in normalized:
+                for alias in alternatives:
+                    if alias in normalized:
+                        normalized[canonical] = normalized[alias]
+                        break
+            for alias in alternatives:
+                normalized.pop(alias, None)
+        query = normalized.get("query")
+        if not isinstance(query, str) or not query.strip() or len(query) > 2_000:
+            raise ConnectorBrokerError(
+                400, "search_email requiere query", "bad_connector_arguments"
+            )
+        raw_limit = normalized.get("max_results", 10)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, float)):
+            raise ConnectorBrokerError(
+                400, "max_results debe ser numérico", "bad_connector_arguments"
+            )
+        normalized["query"] = query.strip()
+        # Email payloads are verbose. Keep one call bounded; the agent can
+        # narrow the Gmail query or issue a second page instead of overflowing
+        # the broker/model context with message bodies.
+        normalized["max_results"] = max(1, min(int(raw_limit), 10))
+        return normalized
+
+    if operation == "read_email":
+        normalized = dict(arguments)
+        message_id = normalized.get(
+            "message_id", normalized.get("messageId", normalized.get("id"))
+        )
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ConnectorBrokerError(
+                400, "read_email requiere message_id", "bad_connector_arguments"
+            )
+        return {"message_id": message_id.strip()}
+
+    if operation == "read_sheet":
+        normalized = dict(arguments)
+        spreadsheet_id = normalized.get(
+            "spreadsheet_id",
+            normalized.get("spreadsheetId", normalized.get("file_id")),
+        )
+        cell_range = normalized.get(
+            "range", normalized.get("cell_range", normalized.get("a1_range"))
+        )
+        if not isinstance(spreadsheet_id, str) or not spreadsheet_id.strip():
+            raise ConnectorBrokerError(
+                400,
+                "read_sheet requiere spreadsheet_id obtenido con search_drive",
+                "bad_connector_arguments",
+            )
+        if not isinstance(cell_range, str) or not cell_range.strip() or len(cell_range) > 500:
+            raise ConnectorBrokerError(
+                400, "read_sheet requiere range en notación A1", "bad_connector_arguments"
+            )
+        return {
+            "spreadsheet_id": spreadsheet_id.strip(),
+            "range": cell_range.strip(),
+        }
 
     if operation in {"draft_email", "send_email"}:
         normalized = dict(arguments)

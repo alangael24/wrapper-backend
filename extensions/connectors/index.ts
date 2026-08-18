@@ -7,7 +7,7 @@ const RUN_TOKEN_ENV = "PI_CONNECTOR_RUN_TOKEN";
 const AUTH_FILE_ENV = "PI_RUNTIME_AUTH_FILE";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_COMPUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 20_000;
+const REQUEST_TIMEOUT_MS = 45_000;
 const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 
 const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -146,6 +146,25 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
     },
     rule: "Usa el ID exacto de search_email. No afirmes haber leído un correo si la herramienta falla.",
   },
+  search_drive: {
+    arguments: {
+      query: "Nombre o consulta del archivo; conserva también su ID exacto",
+    },
+    rule: "Usa el file ID devuelto para cualquier lectura posterior. No confundas el título con el ID.",
+  },
+  read_sheet: {
+    arguments: {
+      spreadsheet_id: "ID exacto de la hoja obtenido con search_drive",
+      range: "Rango pequeño en notación A1, por ejemplo Hoja1!A1:C10",
+    },
+    rule: "Busca primero el archivo para obtener spreadsheet_id. Mantén el rango pequeño y no inventes valores si la lectura falla.",
+  },
+  list_calendar_events: {
+    rule: "Consulta Calendar antes de afirmar qué eventos existen. Resume solo los eventos devueltos.",
+  },
+  list_contacts: {
+    rule: "No muestres correos ni teléfonos salvo que el usuario los pida explícitamente.",
+  },
   draft_email: {
     arguments: {
       recipient_email: "Correo exacto del destinatario",
@@ -195,6 +214,7 @@ function providerArgumentDescription(id: string): string {
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
     "Para delete_calendar_event usa event_id exacto y calendar_id; lista eventos primero si falta el ID.",
+    "Para search_drive usa query; para read_sheet usa spreadsheet_id obtenido de Drive y un range pequeño en notación A1.",
     "Nunca pases fechas naturales como 'tomorrow' o 'manana'.",
   ].join(" ");
 }

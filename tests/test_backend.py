@@ -3415,6 +3415,45 @@ class TestBackend(unittest.TestCase):
             "GOOGLESUPER_FETCH_EMAILS",
             {"query": "CDL OR \"commercial driver's license\"", "max_results": 10},
         )])
+        self.assertEqual(client.searches, [])
+
+    def test_google_email_search_is_bounded_and_normalizes_aliases(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("google-bounded-email-search")["user_id"],
+            "google-workspace",
+            "search_email",
+            {"q": "CDL", "limit": 100},
+        )
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_FETCH_EMAILS",
+            {"query": "CDL", "max_results": 10},
+        )])
+
+    def test_google_sheet_read_uses_exact_id_range_without_tool_search(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("google-sheet-read-routing")["user_id"],
+            "google-workspace",
+            "read_sheet",
+            {"file_id": "sheet_123", "a1_range": "Sheet1!A1:C3"},
+        )
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_VALUES_GET",
+            {"spreadsheet_id": "sheet_123", "range": "Sheet1!A1:C3"},
+        )])
 
     def test_plugin_write_fails_closed_when_provider_schema_is_missing(self):
         client = FakeComposioClient()
