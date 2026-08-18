@@ -4419,6 +4419,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(info["browser_available"])
         self.assertTrue(info["browser_auto_authorize"])
+        self.assertEqual(info["browser_max_concurrent"], 1)
         self.assertEqual(info["browser_isolation"], "per_run")
         self.assertEqual(info["browser_profile_scope"], "ephemeral_run")
         self.assertFalse(
@@ -4484,6 +4485,9 @@ class TestBackend(unittest.TestCase):
             extension_arg = f"--load-extension={run_dir / 'chrome-extension'}"
             self.assertIn(profile_arg, command)
             self.assertIn(extension_arg, command)
+            self.assertIn("--headless=new", command)
+            self.assertIn("--no-sandbox", command)
+            self.assertIn("--disable-dev-shm-usage", command)
             self.assertNotIn("ADMIN_TOKEN", self.ws.backend.pi._chrome_env(run_dir))
             profile_args.append(profile_arg)
         self.assertNotEqual(profile_args[0], profile_args[1])

@@ -776,6 +776,7 @@ runtime se agrupan aquí por función.
 | `PI_CONNECTOR_THINKING` | `off` | Nivel para una sola integración exacta; elimina razonamiento oculto en routing acotado sin afectar navegador, computadora o tareas multi-conector |
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
+| `PI_BROWSER_MAX_CONCURRENT` | `1` | Navegadores Chromium simultáneos por instancia; limita memoria sin reducir capacidades de cada tarea |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
 | `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con activación exacta por grant y fallback diferido para conjuntos grandes |
 | `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |

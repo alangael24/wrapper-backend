@@ -110,6 +110,7 @@ class PiHarness:
         thinking: str,
         timeout_seconds: int,
         max_concurrent: int,
+        max_browser_concurrent: int,
         max_prompt_chars: int,
         warm_sessions_enabled: bool = False,
         session_idle_seconds: int = 900,
@@ -132,6 +133,9 @@ class PiHarness:
         self.thinking = thinking
         self.timeout_seconds = timeout_seconds
         self.max_concurrent = max(1, max_concurrent)
+        self.max_browser_concurrent = max(
+            1, min(self.max_concurrent, max_browser_concurrent)
+        )
         self.max_prompt_chars = max_prompt_chars
         self.warm_sessions_enabled = warm_sessions_enabled
         self.session_idle_seconds = max(0, session_idle_seconds)
@@ -148,6 +152,12 @@ class PiHarness:
         self.chrome_binary = chrome_binary
         self.chrome_isolation = chrome_isolation.strip().lower()
         self._slots = threading.BoundedSemaphore(self.max_concurrent)
+        # Chromium is substantially heavier than a normal Pi process. Keep a
+        # separate admission limit so a burst of browser tasks cannot exhaust
+        # the web service and interrupt unrelated chat/connector runs.
+        self._browser_slots = threading.BoundedSemaphore(
+            self.max_browser_concurrent
+        )
         self._bridge_ports: set[int] = set()
         self._bridge_ports_lock = threading.Lock()
         self._sessions: dict[str, _WarmSession] = {}
@@ -239,6 +249,7 @@ class PiHarness:
             "max_concurrent": self.max_concurrent,
             "node_available": bool(shutil.which("node", path=runtime_path)),
             "browser_available": self._browser_available(),
+            "browser_max_concurrent": self.max_browser_concurrent,
             "browser_auto_authorize": self.chrome_auto_authorize,
             "browser_isolation": self.chrome_isolation,
             "browser_profile_scope": "ephemeral_run",
@@ -289,7 +300,14 @@ class PiHarness:
             "off", "minimal", "low", "medium", "high", "xhigh", "max"
         }:
             raise PiHarnessError("El nivel de razonamiento de Pi no es válido")
+        browser_slot = False
+        if browser:
+            browser_slot = self._browser_slots.acquire(blocking=False)
+            if not browser_slot:
+                raise PiHarnessBusy("El navegador está ocupado; inténtalo de nuevo")
         if not self._slots.acquire(blocking=False):
+            if browser_slot:
+                self._browser_slots.release()
             raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
         try:
             if conversation_key and not browser and self.warm_sessions_enabled:
@@ -319,6 +337,8 @@ class PiHarness:
             )
         finally:
             self._slots.release()
+            if browser_slot:
+                self._browser_slots.release()
 
     def prewarm(self, *, conversation_key: str, timeout_seconds: float = 25.0) -> dict[str, Any]:
         """Start one isolated RPC session and wait until it accepts commands.
@@ -584,6 +604,21 @@ class PiHarness:
             f"--user-data-dir={profile}",
             f"--load-extension={companion}",
             f"--disable-extensions-except={companion}",
+            # Render has no graphical display. Chromium's modern headless mode
+            # retains extension support while avoiding an entire display
+            # server and materially reducing memory pressure.
+            "--headless=new",
+            # Chromium's namespace sandbox is unavailable in Render's
+            # unprivileged container. The browser still runs as the dedicated
+            # non-root service user inside the container and with an ephemeral
+            # profile; without this flag it exits during startup.
+            "--no-sandbox",
+            # Docker's /dev/shm is intentionally small and otherwise causes
+            # renderer crashes on normal marketplace pages.
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-breakpad",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-sync",

@@ -86,6 +86,7 @@ for (const [key, value] of [
   ["EXTERNAL_WRITES_ENABLED", "0"],
   ["PI_ENABLED", "1"],
   ["PI_MAX_CONCURRENT", "4"],
+  ["PI_BROWSER_MAX_CONCURRENT", "1"],
   ["PI_CHROME_AUTO_AUTHORIZE", "1"],
 ]) {
   const pattern = new RegExp(`key: ${key}\\s+value: ["']?${value}["']?`, "u");

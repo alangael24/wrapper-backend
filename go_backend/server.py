@@ -511,6 +511,9 @@ class Config:
         )
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
+        self.pi_browser_max_concurrent = int(
+            os.environ.get("PI_BROWSER_MAX_CONCURRENT", "1")
+        )
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
         self.pi_session_idle_seconds = int(
             os.environ.get("PI_SESSION_IDLE_SECONDS", "900")
@@ -585,6 +588,10 @@ def validate_runtime_security(cfg: Config) -> None:
     if cfg.pi_session_idle_seconds < 0 or cfg.pi_max_warm_sessions < 1:
         raise UnsafeConfigurationError(
             "PI_SESSION_IDLE_SECONDS y PI_MAX_WARM_SESSIONS no son válidos"
+        )
+    if not 1 <= cfg.pi_browser_max_concurrent <= cfg.pi_max_concurrent:
+        raise UnsafeConfigurationError(
+            "PI_BROWSER_MAX_CONCURRENT debe estar entre 1 y PI_MAX_CONCURRENT"
         )
     thinking_levels = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
     if cfg.pi_thinking not in thinking_levels or cfg.pi_connector_thinking not in thinking_levels:
@@ -1258,6 +1265,7 @@ class Backend:
             thinking=cfg.pi_thinking,
             timeout_seconds=cfg.pi_timeout_seconds,
             max_concurrent=cfg.pi_max_concurrent,
+            max_browser_concurrent=cfg.pi_browser_max_concurrent,
             max_prompt_chars=cfg.pi_max_prompt_chars,
             warm_sessions_enabled=cfg.pi_warm_sessions,
             session_idle_seconds=cfg.pi_session_idle_seconds,
