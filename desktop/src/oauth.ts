@@ -540,7 +540,9 @@ class WrapperServiceClient {
     const deviceId = await this.options.deviceStore.getOrCreate();
     const response = await this.authorizedJson("/v1/desktop-runtime/jobs/claim", {
       method: "POST",
-      body: { device_id: deviceId, capabilities },
+      // Hold the authenticated request open until work exists. This removes
+      // the old 0-750 ms pickup delay and avoids repeated TLS/auth round trips.
+      body: { device_id: deviceId, capabilities, wait_ms: 20_000 },
       signal
     });
     if (response.job === null || response.job === undefined) return null;

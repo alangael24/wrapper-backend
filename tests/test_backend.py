@@ -4924,44 +4924,48 @@ class TestBackend(unittest.TestCase):
 
         def desktop_worker():
             try:
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline:
-                    claim_status, claimed = self.ws.req(
-                        "POST", "/v1/desktop-runtime/jobs/claim",
-                        {
-                            "device_id": device_id,
-                            "capabilities": {"browser": True, "computer": True},
-                        },
-                        headers=headers,
-                    )
-                    self.assertEqual(claim_status, 200, claimed)
-                    if claimed["job"] is None:
-                        time.sleep(0.05)
-                        continue
-                    job = claimed["job"]
-                    claimed_payloads.append(job["payload"])
-                    complete_status, complete = self.ws.req(
-                        "POST", f"/v1/desktop-runtime/jobs/{job['id']}/complete",
-                        {
-                            "device_id": device_id,
-                            "status": "succeeded",
-                            "result": {
-                                "answer": '{"text":"Abrí pi.dev en tu Chrome local.","widget":null}',
-                                "model": "deepseek-v4-flash",
-                                "duration_seconds": 0.2,
-                                "usage": {
-                                    "input_tokens": 12,
-                                    "output_tokens": 8,
-                                    "cached_read_tokens": 0,
-                                    "cached_write_tokens": 0,
-                                },
+                claim_status, claimed = self.ws.req(
+                    "POST", "/v1/desktop-runtime/jobs/claim",
+                    {
+                        "device_id": device_id,
+                        "capabilities": {"browser": True, "computer": True},
+                        "wait_ms": 5_000,
+                    },
+                    headers=headers,
+                )
+                self.assertEqual(claim_status, 200, claimed)
+                self.assertIsNotNone(claimed["job"], "long poll did not wake for browser job")
+                job = claimed["job"]
+                claimed_payloads.append(job["payload"])
+                complete_status, complete = self.ws.req(
+                    "POST", f"/v1/desktop-runtime/jobs/{job['id']}/complete",
+                    {
+                        "device_id": device_id,
+                        "status": "succeeded",
+                        "result": {
+                            "answer": '{"text":"Abrí pi.dev en tu Chrome local.","widget":null}',
+                            "model": "deepseek-v4-flash",
+                            "duration_seconds": 0.2,
+                            "timings": {
+                                "model_runtime_ready_ms": 4.0,
+                                "resource_loader_ready_ms": 7.0,
+                                "session_ready_ms": 12.0,
+                                "extensions_ready_ms": 15.0,
+                                "chrome_authorized_ms": 20.0,
+                                "prompt_complete_ms": 200.0,
+                                "ignored_value": 999.0,
+                            },
+                            "usage": {
+                                "input_tokens": 12,
+                                "output_tokens": 8,
+                                "cached_read_tokens": 0,
+                                "cached_write_tokens": 0,
                             },
                         },
-                        headers=headers,
-                    )
-                    self.assertEqual(complete_status, 200, complete)
-                    return
-                raise AssertionError("desktop never received browser job")
+                    },
+                    headers=headers,
+                )
+                self.assertEqual(complete_status, 200, complete)
             except BaseException as exc:
                 worker_errors.append(exc)
 
@@ -4991,6 +4995,11 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200, result)
         self.assertEqual(result["execution_path"], "desktop_pi")
         self.assertTrue(result["browser"])
+        self.assertIn("desktop_job_created_ms", result["timings"])
+        self.assertIn("desktop_job_claimed_ms", result["timings"])
+        self.assertEqual(result["timings"]["desktop_model_runtime_ready_ms"], 4.0)
+        self.assertEqual(result["timings"]["desktop_prompt_complete_ms"], 200.0)
+        self.assertNotIn("desktop_ignored_value", result["timings"])
         self.assertEqual(len(claimed_payloads), 1)
         self.assertTrue(claimed_payloads[0]["run_api_key"].startswith("agrn_"))
         self.assertNotEqual(claimed_payloads[0]["run_api_key"], signup["api_key"])

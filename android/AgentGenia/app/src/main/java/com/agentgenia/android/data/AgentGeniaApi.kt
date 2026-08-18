@@ -196,6 +196,25 @@ class AgentGeniaApi(
         requestJson("/v1/connectors/disconnect", "POST", JSONObject().put("connector_id", connectorId))
     }
 
+    suspend fun warmAgent(botId: String) {
+        val body = JSONObject().put("bot_id", botId)
+        val response = try {
+            requestJson("/v1/agent/warm", "POST", body)
+        } catch (error: ServiceException) {
+            if (error.status != 0) throw error
+            // Render may close the first connection while waking an idle
+            // service. Warming is idempotent, so retry that transport failure
+            // once instead of charging it to the user's first real task.
+            delay(250)
+            requestJson("/v1/agent/warm", "POST", body)
+        }
+        if (!response.optBoolean("ready")) {
+            throw ServiceException(
+                "El agente todavía no está listo.", "pi_warm_incomplete", 502,
+            )
+        }
+    }
+
     suspend fun runAgent(
         prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
         executionMode: String = "agent", chatPrompt: String = "", routingContext: String = "",

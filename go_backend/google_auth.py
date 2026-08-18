@@ -288,11 +288,17 @@ class GoogleAccountAuth:
             "account": self._account_payload(account),
         }
 
-    def authenticate(self, access_token: str) -> dict | None:
+    def authenticate(
+        self, access_token: str, *, agent_bot_id: str | None = None
+    ) -> dict | None:
         if not access_token.startswith("aga_"):
             return None
         # Positive auth caches are intentionally avoided: revocation/logout on
         # one replica must be visible immediately to every other replica.
+        if agent_bot_id is not None:
+            return self.store.get_agent_user_by_access_token(
+                access_token, agent_bot_id
+            )
         return self.store.get_user_by_access_token(access_token)
 
     def logout(self, access_token: str) -> bool:

@@ -1552,6 +1552,15 @@ class Store:
         )
         return dict(row) if row else None
 
+    def get_agent_user_by_api_key(self, api_key: str, bot_id: str | None) -> dict | None:
+        """Authenticate and include only this bot's connector assignment.
+
+        SQLite keeps the simple two-read implementation. Postgres overrides
+        this with one query so the production agent path avoids a second
+        cross-region round trip without transferring the full account state.
+        """
+        return self._agent_user_with_connectors(self.get_user_by_api_key(api_key), bot_id)
+
     def get_user_by_id(self, user_id: str) -> dict | None:
         row = self._one("SELECT * FROM users WHERE id=?", (user_id,))
         return dict(row) if row else None
@@ -1783,6 +1792,45 @@ class Store:
             (_hash_account_token("access", access_token), _now()),
         )
         return dict(row) if row else None
+
+    def get_agent_user_by_access_token(
+        self, access_token: str, bot_id: str | None
+    ) -> dict | None:
+        return self._agent_user_with_connectors(
+            self.get_user_by_access_token(access_token), bot_id
+        )
+
+    def _agent_user_with_connectors(
+        self, user: dict | None, bot_id: str | None
+    ) -> dict | None:
+        if user is None:
+            return None
+        connector_ids: list[str] = []
+        if bot_id:
+            row = self.get_account_state(str(user["id"]))
+            try:
+                state = json.loads(row.get("state_json") or "{}") if row else {}
+            except (TypeError, json.JSONDecodeError):
+                state = {}
+            bots = state.get("bots") if isinstance(state, dict) else None
+            if isinstance(bots, list):
+                bot = next(
+                    (
+                        item for item in bots
+                        if isinstance(item, dict) and item.get("id") == bot_id
+                    ),
+                    None,
+                )
+                if isinstance(bot, dict) and isinstance(bot.get("connectorIds"), list):
+                    connector_ids = [
+                        item for item in bot["connectorIds"] if isinstance(item, str)
+                    ]
+        return {
+            **user,
+            "assigned_connector_ids_json": json.dumps(
+                connector_ids, separators=(",", ":")
+            ),
+        }
 
     def rotate_account_session(
         self,
@@ -3062,9 +3110,17 @@ class Store:
         error_code: str | None = None,
         warnings: list[str] | None = None,
         reservation_status: str = "settled",
+        result: dict | None = None,
     ) -> dict:
         if reservation_status not in {"settled", "released"}:
             raise ValueError("reservation_status inválido")
+        encoded_result = None
+        if result is not None:
+            encoded_result = json.dumps(
+                result, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            )
+            if len(encoded_result.encode("utf-8")) > 1_000_000:
+                raise ValueError("El resultado durable excede 1 MB")
         now = _now()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3126,11 +3182,13 @@ class Store:
                 ).fetchone()
                 self._conn.execute(
                     "UPDATE agent_runs SET status=?,charged_credit_milli=?,llm_cost_microusd=?,"
-                    "duration_seconds=?,error_code=?,warnings_json=?,finished_at=?,heartbeat_at=? WHERE id=?",
+                    "duration_seconds=?,error_code=?,warnings_json=?,"
+                    "result_json=COALESCE(?,result_json),finished_at=?,heartbeat_at=? WHERE id=?",
                     (
                         final_status, charged, int(run_cost["n"] if run_cost else 0),
                         duration_seconds, error_code,
-                        json.dumps(warnings or [], separators=(",", ":")), now, now, run_id,
+                        json.dumps(warnings or [], separators=(",", ":")),
+                        encoded_result, now, now, run_id,
                     ),
                 )
                 self._conn.execute(
@@ -3152,6 +3210,7 @@ class Store:
         duration_seconds: float | None,
         error_code: str | None = None,
         warnings: list[str] | None = None,
+        result: dict | None = None,
     ) -> dict:
         """Settle an unlimited/internal run without credit calculations."""
         return self.settle_agent_run(
@@ -3161,6 +3220,7 @@ class Store:
             duration_seconds=duration_seconds,
             error_code=error_code,
             warnings=warnings,
+            result=result,
         )
 
     def release_agent_run(

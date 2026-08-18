@@ -15,10 +15,20 @@ import {
 import { dialog } from "electron";
 import { app } from "electron";
 
-const POLL_MS = 750;
+// Claims use a server-side long poll. This small pause is only reached after
+// an empty long poll and prevents a reconnect loop from spinning locally.
+const POLL_MS = 50;
 const RETRY_AFTER_ERROR_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCAL_RUN_TIMEOUT_MS = 31 * 60 * 1_000;
+const LOCAL_RUN_KEY_ENV = "AGENTGENIA_LOCAL_RUN_KEY";
+
+type LocalModel = NonNullable<ReturnType<ModelRuntime["getModel"]>>;
+
+interface CachedModelRuntime {
+  runtime: ModelRuntime;
+  model: LocalModel;
+}
 
 export interface DesktopRuntimeJob {
   id: string;
@@ -65,6 +75,8 @@ export class LocalAgentRuntime {
   private abortController: AbortController | null = null;
   private loop: Promise<void> | null = null;
   private chromeAuthorizedUntil = 0;
+  private readonly modelRuntimes = new Map<string, Promise<CachedModelRuntime>>();
+  private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
 
   constructor(
     private readonly transport: DesktopRuntimeTransport,
@@ -136,6 +148,10 @@ export class LocalAgentRuntime {
 
   private async execute(job: DesktopRuntimeJob, signal: AbortSignal): Promise<Record<string, unknown>> {
     const startedAt = performance.now();
+    const timings: Record<string, number> = {};
+    const mark = (name: string): void => {
+      timings[name] = Math.round((performance.now() - startedAt) * 1000) / 1000;
+    };
     const payload = job.payload;
     if (!payload.run_api_key.startsWith("agrn_") || !payload.prompt.trim()) {
       throw new Error("El backend entregó una capacidad local inválida.");
@@ -164,22 +180,152 @@ export class LocalAgentRuntime {
     setEnvironment("PI_CONNECTOR_RUN_TOKEN", payload.connector_run_token ?? undefined);
     setEnvironment("PI_CONNECTOR_IDS", JSON.stringify(payload.connector_ids ?? []));
     setEnvironment("PI_COMPUTER_ENABLED", payload.computer ? "1" : "0");
+    // The run token is a short-lived capability. Resolve it lazily from the
+    // current job environment so the expensive model registry can stay warm
+    // without retaining a previous job's credential.
+    setEnvironment(LOCAL_RUN_KEY_ENV, payload.run_api_key);
 
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | null = null;
     try {
-      const modelRuntime = await ModelRuntime.create({
-        modelsPath: null,
-        refreshOnCreate: false,
+      const { runtime: modelRuntime, model } = await this.modelRuntime(
+        payload.model,
+        payload.backend_url,
         signal
+      );
+      mark("model_runtime_ready_ms");
+
+      const resourceLoader = await this.resourceLoader(
+        payload.browser,
+        payload.computer,
+        (payload.connector_ids?.length ?? 0) > 0,
+        signal
+      );
+      mark("resource_loader_ready_ms");
+      ({ session } = await createAgentSession({
+        cwd: this.workspaceDirectory,
+        agentDir: this.workspaceDirectory,
+        modelRuntime,
+        model,
+        thinkingLevel: payload.thinking_level,
+        noTools: "builtin",
+        resourceLoader,
+        sessionManager: SessionManager.inMemory(this.workspaceDirectory)
+      }));
+      mark("session_ready_ms");
+      let chromeAuthorizationGranted = false;
+      await session.bindExtensions({
+        mode: "rpc",
+        uiContext: electronExtensionUi((granted) => {
+          chromeAuthorizationGranted = granted;
+        })
       });
-      modelRuntime.registerProvider("wrapper-backend", {
+      mark("extensions_ready_ms");
+      if (payload.browser && this.chromeAuthorizedUntil <= Date.now()) {
+        // Native pi-chrome keeps authorization scoped to this Pi process and
+        // asks the user before touching their authenticated Chrome profile.
+        await session.prompt("/chrome authorize 30m", { source: "rpc" });
+        if (chromeAuthorizationGranted) {
+          this.chromeAuthorizedUntil = Date.now() + 29 * 60 * 1_000;
+        }
+        mark("chrome_authorized_ms");
+      }
+      await session.prompt(payload.prompt, { source: "rpc" });
+      mark("prompt_complete_ms");
+      const assistant = [...session.state.messages].reverse().find((message) => message.role === "assistant");
+      if (!assistant) throw new Error("Pi terminó sin una respuesta final.");
+      const assistantRecord = assistant as unknown as Record<string, unknown>;
+      const stopReason = stringValue(assistantRecord.stopReason);
+      if (["error", "aborted"].includes(stopReason)) {
+        throw new Error(stringValue(assistantRecord.errorMessage) || `Pi terminó con estado ${stopReason}.`);
+      }
+      const answer = assistantText(assistantRecord).trim();
+      if (!answer) throw new Error("Pi terminó sin texto final.");
+      return {
+        answer,
+        model: payload.model,
+        duration_seconds: Math.max(0, (performance.now() - startedAt) / 1000),
+        timings,
+        usage: assistantUsage(assistantRecord),
+        browser: payload.browser
+      };
+    } finally {
+      session?.dispose();
+      for (const [name, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  private modelRuntime(
+    modelId: string,
+    backendUrl: string,
+    signal: AbortSignal
+  ): Promise<CachedModelRuntime> {
+    const cacheKey = `${backendUrl.replace(/\/$/, "")}\0${modelId}`;
+    const existing = this.modelRuntimes.get(cacheKey);
+    if (existing) return withAbort(existing, signal);
+
+    const pending = this.createModelRuntime(modelId, backendUrl);
+    this.modelRuntimes.set(cacheKey, pending);
+    pending.catch(() => {
+      if (this.modelRuntimes.get(cacheKey) === pending) this.modelRuntimes.delete(cacheKey);
+    });
+    return withAbort(pending, signal);
+  }
+
+  private resourceLoader(
+    browser: boolean,
+    computer: boolean,
+    connectors: boolean,
+    signal: AbortSignal
+  ): Promise<DefaultResourceLoader> {
+    const cacheKey = `${browser ? 1 : 0}${computer ? 1 : 0}${connectors ? 1 : 0}`;
+    const existing = this.resourceLoaders.get(cacheKey);
+    if (existing) return withAbort(existing, signal);
+    const pending = this.createResourceLoader(browser, computer, connectors);
+    this.resourceLoaders.set(cacheKey, pending);
+    pending.catch(() => {
+      if (this.resourceLoaders.get(cacheKey) === pending) this.resourceLoaders.delete(cacheKey);
+    });
+    return withAbort(pending, signal);
+  }
+
+  private async createResourceLoader(
+    browser: boolean,
+    computer: boolean,
+    connectors: boolean
+  ): Promise<DefaultResourceLoader> {
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: this.workspaceDirectory,
+      agentDir: this.workspaceDirectory,
+      extensionFactories: [
+        ...(browser ? [piChromeExtension] : []),
+        ...(computer ? [computerUseExtension] : []),
+        ...(connectors ? [connectorExtension] : [])
+      ]
+    });
+    await resourceLoader.reload();
+    return resourceLoader;
+  }
+
+  private async createModelRuntime(
+    modelId: string,
+    backendUrl: string
+  ): Promise<CachedModelRuntime> {
+    const modelRuntime = await ModelRuntime.create({
+      modelsPath: null,
+      refreshOnCreate: false
+    });
+    modelRuntime.registerProvider("wrapper-backend", {
         name: "Agent Genia",
-        baseUrl: `${payload.backend_url.replace(/\/$/, "")}/v1`,
+        baseUrl: `${backendUrl.replace(/\/$/, "")}/v1`,
         api: "openai-completions",
+        apiKey: `$${LOCAL_RUN_KEY_ENV}`,
         authHeader: true,
         models: [{
-          id: payload.model,
-          name: `${payload.model} (Agent Genia)`,
+          id: modelId,
+          name: `${modelId} (Agent Genia)`,
           reasoning: true,
           // The bundled DeepSeek provider is text-only. Pi Chrome and the
           // semantic Computer Use path return structured text/tool results.
@@ -207,70 +353,32 @@ export class LocalAgentRuntime {
           }
         }]
       });
-      await modelRuntime.setRuntimeApiKey("wrapper-backend", payload.run_api_key, { signal });
-      const model = modelRuntime.getModel("wrapper-backend", payload.model);
-      if (!model) throw new Error(`El modelo local ${payload.model} no está disponible.`);
-
-      const resourceLoader = new DefaultResourceLoader({
-        cwd: this.workspaceDirectory,
-        agentDir: this.workspaceDirectory,
-        extensionFactories: [
-          ...(payload.browser ? [piChromeExtension] : []),
-          ...(payload.computer ? [computerUseExtension] : []),
-          ...((payload.connector_ids?.length ?? 0) > 0 ? [connectorExtension] : [])
-        ]
-      });
-      await resourceLoader.reload();
-      ({ session } = await createAgentSession({
-        cwd: this.workspaceDirectory,
-        agentDir: this.workspaceDirectory,
-        modelRuntime,
-        model,
-        thinkingLevel: payload.thinking_level,
-        noTools: "builtin",
-        resourceLoader,
-        sessionManager: SessionManager.inMemory(this.workspaceDirectory)
-      }));
-      let chromeAuthorizationGranted = false;
-      await session.bindExtensions({
-        mode: "rpc",
-        uiContext: electronExtensionUi((granted) => {
-          chromeAuthorizationGranted = granted;
-        })
-      });
-      if (payload.browser && this.chromeAuthorizedUntil <= Date.now()) {
-        // Native pi-chrome keeps authorization scoped to this Pi process and
-        // asks the user before touching their authenticated Chrome profile.
-        await session.prompt("/chrome authorize 30m", { source: "rpc" });
-        if (chromeAuthorizationGranted) {
-          this.chromeAuthorizedUntil = Date.now() + 29 * 60 * 1_000;
-        }
-      }
-      await session.prompt(payload.prompt, { source: "rpc" });
-      const assistant = [...session.state.messages].reverse().find((message) => message.role === "assistant");
-      if (!assistant) throw new Error("Pi terminó sin una respuesta final.");
-      const assistantRecord = assistant as unknown as Record<string, unknown>;
-      const stopReason = stringValue(assistantRecord.stopReason);
-      if (["error", "aborted"].includes(stopReason)) {
-        throw new Error(stringValue(assistantRecord.errorMessage) || `Pi terminó con estado ${stopReason}.`);
-      }
-      const answer = assistantText(assistantRecord).trim();
-      if (!answer) throw new Error("Pi terminó sin texto final.");
-      return {
-        answer,
-        model: payload.model,
-        duration_seconds: Math.max(0, (performance.now() - startedAt) / 1000),
-        usage: assistantUsage(assistantRecord),
-        browser: payload.browser
-      };
-    } finally {
-      session?.dispose();
-      for (const [name, value] of previousEnvironment) {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
-      }
-    }
+    // registerProvider refreshes its registry asynchronously. Await the local,
+    // network-free pass once while creating the cached runtime so the first
+    // job cannot race getModel(); later jobs reuse the already-ready registry.
+    await modelRuntime.refresh({ allowNetwork: false });
+    const model = modelRuntime.getModel("wrapper-backend", modelId);
+    if (!model) throw new Error(`El modelo local ${modelId} no está disponible.`);
+    return { runtime: modelRuntime, model };
   }
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException("La operación fue cancelada.", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
 }
 
 function electronExtensionUi(

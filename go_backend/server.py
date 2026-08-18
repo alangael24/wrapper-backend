@@ -1254,6 +1254,13 @@ class Backend:
         self._conversation_locks: dict[str, threading.Lock] = {}
         self._local_rate_limit_lock = threading.Lock()
         self._local_rate_limits: dict[str, tuple[int, int]] = {}
+        # Local browser/computer work is relayed through the authenticated
+        # desktop. Conditions wake same-replica long polls immediately while
+        # the bounded database fallback still works across multiple replicas.
+        self._desktop_job_condition = threading.Condition()
+        self._desktop_job_generation = 0
+        self._desktop_result_condition = threading.Condition()
+        self._desktop_result_generation = 0
         self._whatsapp_wake = threading.Event()
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
@@ -1450,6 +1457,32 @@ class Backend:
                 return
             timing[name] = round((time.monotonic() - timing["_origin"]) * 1000, 3)
 
+    def _record_desktop_runtime_timings(
+        self, run_id: str, values: object
+    ) -> None:
+        """Attach bounded local-stage durations to the normal run timeline."""
+        if not isinstance(values, dict):
+            return
+        allowed = {
+            "model_runtime_ready_ms",
+            "resource_loader_ready_ms",
+            "session_ready_ms",
+            "extensions_ready_ms",
+            "chrome_authorized_ms",
+            "prompt_complete_ms",
+        }
+        with self._run_timing_lock:
+            timing = self._run_timings.get(run_id)
+            if timing is None:
+                return
+            for name in allowed:
+                value = values.get(name)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                normalized = float(value)
+                if 0 <= normalized <= 31 * 60 * 1000:
+                    timing[f"desktop_{name}"] = round(normalized, 3)
+
     def _start_upstream_call_timing(self, run_id: str) -> int:
         """Number and timestamp every model round within one Pi run."""
         with self._run_timing_lock:
@@ -1639,7 +1672,12 @@ class Backend:
             return auth[7:].strip()
         return None
 
-    def require_user(self, handler: BaseHTTPRequestHandler) -> dict | None:
+    def require_user(
+        self,
+        handler: BaseHTTPRequestHandler,
+        *,
+        agent_bot_id: str | None = None,
+    ) -> dict | None:
         internal_user = getattr(handler, "agentgenia_internal_user", None)
         if isinstance(internal_user, dict) and internal_user.get("account_status") == "active":
             return internal_user
@@ -1650,9 +1688,13 @@ class Backend:
         # Token prefixes are disjoint. Avoid a guaranteed-miss Postgres query
         # for every mobile request before checking the Agent Genia session.
         if key.startswith("aga_"):
-            user = self.google_auth.authenticate(key)
+            user = self.google_auth.authenticate(key, agent_bot_id=agent_bot_id)
         else:
-            user = self.store.get_user_by_api_key(key)
+            user = (
+                self.store.get_agent_user_by_api_key(key, agent_bot_id)
+                if agent_bot_id is not None
+                else self.store.get_user_by_api_key(key)
+            )
         if not user:
             error_response(handler, 401, "Sesión o API key del wrapper inválida", "unauthorized")
             return None
@@ -2471,10 +2513,28 @@ class Backend:
             user_id, replace, source="connector-reconciliation"
         )
 
-    def _assigned_connector_ids(self, user_id: str, bot_id: str | None) -> tuple[str, ...]:
+    def _assigned_connector_ids(
+        self,
+        user_id: str,
+        bot_id: str | None,
+        *,
+        authenticated_user: dict | None = None,
+    ) -> tuple[str, ...]:
         """Return only connector ids assigned to this bot in server state."""
         if not bot_id:
             return ()
+        if authenticated_user is not None and "assigned_connector_ids_json" in authenticated_user:
+            try:
+                preloaded = json.loads(
+                    authenticated_user.get("assigned_connector_ids_json") or "[]"
+                )
+            except (TypeError, json.JSONDecodeError):
+                preloaded = []
+            return tuple(
+                item
+                for item in preloaded
+                if isinstance(item, str) and item in CONNECTOR_CATALOG
+            ) if isinstance(preloaded, list) else ()
         payload = self._account_state_payload(self.store.get_account_state(user_id))
         bot = next(
             (item for item in payload["state"].get("bots", []) if item.get("id") == bot_id),
@@ -3112,18 +3172,39 @@ class Backend:
         body = self.read_json(handler) or {}
         device_id = self._desktop_device_id(body.get("device_id"))
         capabilities = body.get("capabilities")
+        wait_ms = body.get("wait_ms", 0)
         if not device_id or not isinstance(capabilities, dict):
             error_response(handler, 400, "Solicitud de runtime inválida", "bad_desktop_runtime")
+            return
+        if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or not 0 <= wait_ms <= 25_000:
+            error_response(handler, 400, "wait_ms no es válido", "bad_desktop_runtime")
             return
         normalized = {
             "browser": capabilities.get("browser") is True,
             "computer": capabilities.get("computer") is True,
         }
-        job = self.store.claim_desktop_runtime_job(
-            user_id=user["id"],
-            device_id_hash=hash_desktop_device_id(device_id),
-            capabilities=normalized,
-        )
+        deadline = time.monotonic() + wait_ms / 1000
+        with self._desktop_job_condition:
+            observed_generation = self._desktop_job_generation
+        job = None
+        while True:
+            job = self.store.claim_desktop_runtime_job(
+                user_id=user["id"],
+                device_id_hash=hash_desktop_device_id(device_id),
+                capabilities=normalized,
+            )
+            if job is not None or wait_ms == 0:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._desktop_job_condition:
+                if self._desktop_job_generation == observed_generation:
+                    # One-second fallback discovers a job created on another
+                    # Render replica without returning to Electron and paying
+                    # another auth/TLS request.
+                    self._desktop_job_condition.wait(timeout=min(1.0, remaining))
+                observed_generation = self._desktop_job_generation
         if job is None:
             json_response(handler, 200, {"job": None})
             return
@@ -3144,6 +3225,9 @@ class Backend:
             )
             error_response(handler, 500, "Internal server error", "desktop_job_corrupt")
             return
+        run_id = payload.get("run_id") if isinstance(payload, dict) else None
+        if isinstance(run_id, str):
+            self._mark_run_timing(run_id, "desktop_job_claimed_ms")
         json_response(handler, 200, {
             "job": {
                 "id": job["id"],
@@ -3198,6 +3282,9 @@ class Backend:
                 "desktop_job_unavailable",
             )
             return
+        with self._desktop_result_condition:
+            self._desktop_result_generation += 1
+            self._desktop_result_condition.notify_all()
         json_response(handler, 200, {"completed": True})
 
     def _run_on_desktop(
@@ -3245,7 +3332,13 @@ class Backend:
             key_version=self.cfg.wrapper_secret_version,
             expires_at=expires_at,
         )
+        self._mark_run_timing(run_id, "desktop_job_created_ms")
+        with self._desktop_job_condition:
+            self._desktop_job_generation += 1
+            self._desktop_job_condition.notify_all()
         deadline = time.monotonic() + max(30, self.cfg.pi_timeout_seconds)
+        with self._desktop_result_condition:
+            observed_generation = self._desktop_result_generation
         while time.monotonic() < deadline:
             current = self.store.get_desktop_runtime_job(job["id"], user_id)
             if not current:
@@ -3258,6 +3351,7 @@ class Backend:
                 answer = result.get("answer") if isinstance(result, dict) else None
                 if not isinstance(answer, str) or not answer.strip():
                     raise PiHarnessError("El desktop no devolvió una respuesta final")
+                self._record_desktop_runtime_timings(run_id, result.get("timings"))
                 usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
                 return PiRunResult(
                     run_id=run_id,
@@ -3277,7 +3371,13 @@ class Backend:
             if current["status"] in {"failed", "cancelled", "expired"}:
                 message = str(current.get("error_message") or "El desktop no pudo completar la tarea")
                 raise PiHarnessError(message)
-            time.sleep(0.25)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._desktop_result_condition:
+                if self._desktop_result_generation == observed_generation:
+                    self._desktop_result_condition.wait(timeout=min(1.0, remaining))
+                observed_generation = self._desktop_result_generation
         self.store.expire_desktop_runtime_job(job["id"], user_id)
         raise PiHarnessTimeout("El desktop tardó demasiado en completar la tarea")
 
@@ -3737,7 +3837,16 @@ class Backend:
                     (time.monotonic() - request_started_at) * 1000, 3
                 )
 
-        user = self.require_user(handler)
+        body = self.read_json(handler) or {}
+        raw_bot_id = body.get("bot_id")
+        agent_bot_id = (
+            raw_bot_id.strip()
+            if isinstance(raw_bot_id, str)
+            and raw_bot_id.strip()
+            and len(raw_bot_id.strip()) <= 200
+            else None
+        )
+        user = self.require_user(handler, agent_bot_id=agent_bot_id)
         if not user:
             return
         mark_pre_run("auth_complete_ms")
@@ -3764,7 +3873,6 @@ class Backend:
             error_response(handler, 503, str(exc), "model_unavailable")
             return
 
-        body = self.read_json(handler) or {}
         prompt = body.get("prompt")
         browser = body.get("browser", False)
         computer_requested = body.get("computer", False)
@@ -3934,7 +4042,9 @@ class Backend:
         connected_connector_ids: tuple[str, ...] = ()
         connector_ids: tuple[str, ...] = ()
         if not direct_chat and not approval_rejected:
-            assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
+            assigned_connector_ids = self._assigned_connector_ids(
+                user["id"], bot_id, authenticated_user=user
+            )
             mark_pre_run("connector_assignment_complete_ms")
         # ``connector_ids`` from a client is a hint for backwards
         # compatibility, never an authorization source. A connector must be
@@ -4255,7 +4365,12 @@ class Backend:
                 error_response(handler, status, message, code)
             self._run_timing_snapshot(run_id, pop=True)
 
-        def settle(final_status: str, error_code: str | None = None) -> tuple[dict, dict]:
+        def settle(
+            final_status: str,
+            error_code: str | None = None,
+            *,
+            durable_result: dict | None = None,
+        ) -> tuple[dict, dict]:
             timing_warning = "timing:" + json.dumps(
                 self._run_timing_snapshot(run_id), separators=(",", ":")
             )
@@ -4266,6 +4381,7 @@ class Backend:
                     duration_seconds=max(0.0, time.monotonic() - started_at),
                     error_code=error_code,
                     warnings=[timing_warning],
+                    result=durable_result,
                 )
                 return settled, {
                     "mode": "unlimited",
@@ -4541,7 +4657,11 @@ class Backend:
             self.connectors.revoke(connector_run_token)
             self._run_provider(run_id, pop=True)
             self._run_principal(run_api_key, pop=True)
-        pending_approvals = self.store.pending_approvals_for_run(user["id"], run_id)
+        pending_approvals = (
+            self.store.pending_approvals_for_run(user["id"], run_id)
+            if (connector_ids or computer_enabled) and not approval_rejected
+            else []
+        )
         if pending_approvals:
             # The provider/model cannot define the approval UI. Replace any
             # prose it produced after the denied tool call with a deterministic
@@ -4563,27 +4683,34 @@ class Backend:
         provisional = result.as_dict()
         provisional.update({
             "run_id": run_id,
-            "status": "running",
+            "status": "succeeded" if unlimited else "running",
             "connector_ids": [] if direct_chat else list(connector_ids),
             "computer_enabled": computer_enabled,
             "execution_path": (
                 "direct_chat" if direct_chat else "desktop_pi" if local_runtime else "pi"
             ),
         })
-        try:
-            self.store.save_agent_run_result(run_id, provisional)
-        except Exception:
-            self.store.release_agent_run(
-                run_id=run_id,
-                final_status="failed",
-                error_code="result_persistence_failed",
-                duration_seconds=max(0.0, time.monotonic() - started_at),
-            )
-            logging.exception("Could not persist agent result run_id=%s", run_id)
-            agent_error(500, "No pudimos guardar el resultado de la ejecución", "result_persistence_failed")
-            return
+        if not unlimited:
+            try:
+                self.store.save_agent_run_result(run_id, provisional)
+            except Exception:
+                self.store.release_agent_run(
+                    run_id=run_id,
+                    final_status="failed",
+                    error_code="result_persistence_failed",
+                    duration_seconds=max(0.0, time.monotonic() - started_at),
+                )
+                logging.exception("Could not persist agent result run_id=%s", run_id)
+                agent_error(500, "No pudimos guardar el resultado de la ejecución", "result_persistence_failed")
+                return
 
-        settled, credits = settle("succeeded")
+        # Unlimited/internal runs persist the answer in the same Postgres
+        # statement that settles the run and revokes its capability token.
+        # This preserves crash recovery while removing a cross-region write
+        # from the latency-sensitive path used for exhaustive evaluation.
+        settled, credits = settle(
+            "succeeded", durable_result=provisional if unlimited else None
+        )
         payload = provisional
         payload["run_id"] = run_id
         payload["status"] = settled["status"]
@@ -4601,6 +4728,11 @@ class Backend:
         )
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
+        if event_stream:
+            # The durable answer and terminal run status already exist. Flush
+            # the UI terminal event before refreshing optional accounting
+            # metadata so the user does not wait for one more database RTT.
+            event_stream.done_text(result.answer)
         try:
             self.store.save_agent_run_result(run_id, payload)
         except Exception:
@@ -4612,18 +4744,7 @@ class Backend:
             run_id,
             json.dumps(payload["timings"], separators=(",", ":")),
         )
-        if event_stream:
-            # The terminal frame is intentionally minimal and contains the
-            # same human-readable text emitted by `delta`. Runtime metadata is
-            # already persisted server-side; putting the full accounting
-            # payload in this frame made mobile clients decode unrelated
-            # optional fields before they could accept the answer.
-            # Base64 keeps the terminal frame decoder-safe without throwing
-            # away the structured widget next to the visible text. The iOS UI
-            # has already streamed the human-readable ``text`` field and uses
-            # this raw envelope to install the final widget atomically.
-            event_stream.done_text(result.answer)
-        else:
+        if not event_stream:
             json_response(handler, 200, payload)
         self._run_timing_snapshot(run_id, pop=True)
 

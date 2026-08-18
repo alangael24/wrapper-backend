@@ -10,7 +10,14 @@ from contextlib import nullcontext
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .store import SCHEMA_VERSION, Store, hash_whatsapp_link_code, new_id
+from .store import (
+    SCHEMA_VERSION,
+    Store,
+    _hash_account_token,
+    hash_whatsapp_link_code,
+    hash_wrapper_key,
+    new_id,
+)
 
 
 def normalize_database_url(value: str) -> str:
@@ -173,6 +180,53 @@ class PostgresStore(Store):
         except Exception:
             self._conn.rollback()
             raise
+
+    @staticmethod
+    def _agent_connector_projection() -> str:
+        return (
+            "COALESCE((SELECT bot.value->'connectorIds' FROM account_states ast "
+            "CROSS JOIN LATERAL jsonb_array_elements("
+            "COALESCE((ast.state_json::jsonb)->'bots','[]'::jsonb)) AS bot(value) "
+            "WHERE ast.user_id=u.id AND bot.value->>'id'=? LIMIT 1),"
+            "'[]'::jsonb)::text AS assigned_connector_ids_json "
+        )
+
+    def get_agent_user_by_api_key(self, api_key: str, bot_id: str | None) -> dict | None:
+        row = self._one(
+            "SELECT u.*,gs.id AS provider_subscription_id,"
+            "gs.api_key_enc AS provider_api_key_enc,gs.key_id AS provider_key_id,"
+            "gs.key_version AS provider_key_version,gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id,"
+            + self._agent_connector_projection()
+            + "FROM users u LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+            "WHERE u.api_key_hash=? AND u.account_status='active'",
+            (bot_id or "", hash_wrapper_key(api_key)),
+        )
+        return dict(row) if row else None
+
+    def get_agent_user_by_access_token(
+        self, access_token: str, bot_id: str | None
+    ) -> dict | None:
+        row = self._one(
+            "SELECT u.*,s.access_expires_at AS authenticated_until,"
+            "gs.id AS provider_subscription_id,"
+            "gs.api_key_enc AS provider_api_key_enc,gs.key_id AS provider_key_id,"
+            "gs.key_version AS provider_key_version,gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id,"
+            + self._agent_connector_projection()
+            + "FROM account_sessions s "
+            "JOIN account_identities a ON a.id=s.account_id "
+            "JOIN users u ON u.id=a.user_id "
+            "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+            "WHERE s.access_token_hash=? AND s.revoked_at IS NULL AND s.access_expires_at>? "
+            "AND u.account_status='active'",
+            (
+                bot_id or "",
+                _hash_account_token("access", access_token),
+                time.time(),
+            ),
+        )
+        return dict(row) if row else None
 
     def consume_whatsapp_link_code(
         self,
@@ -339,9 +393,17 @@ class PostgresStore(Store):
         duration_seconds: float | None,
         error_code: str | None = None,
         warnings: list[str] | None = None,
+        result: dict | None = None,
     ) -> dict:
         """Finish an unlimited run and revoke its token in one statement."""
         now = time.time()
+        encoded_result = None
+        if result is not None:
+            encoded_result = json.dumps(
+                result, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            )
+            if len(encoded_result.encode("utf-8")) > 1_000_000:
+                raise ValueError("El resultado durable excede 1 MB")
         row = self._one(
             "WITH revoked AS ("
             " UPDATE agent_run_tokens SET revoked_at=? "
@@ -353,7 +415,7 @@ class PostgresStore(Store):
             " UPDATE agent_runs SET status=?,charged_credit_milli=0,"
             " llm_cost_microusd=(SELECT COALESCE(SUM(estimated_cost_microusd),0) "
             " FROM usage_events WHERE run_id=?),duration_seconds=?,error_code=?,"
-            " warnings_json=?,finished_at=?,heartbeat_at=? "
+            " warnings_json=?,result_json=COALESCE(?,result_json),finished_at=?,heartbeat_at=? "
             " WHERE id=? AND status IN ('reserved','running') RETURNING *"
             ") SELECT to_jsonb(updated) AS run FROM updated",
             (
@@ -366,6 +428,7 @@ class PostgresStore(Store):
                 duration_seconds,
                 error_code,
                 json.dumps(warnings or [], separators=(",", ":")),
+                encoded_result,
                 now,
                 now,
                 run_id,

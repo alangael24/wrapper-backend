@@ -80,12 +80,36 @@ class PostgresStoreConfigurationTests(unittest.TestCase):
             final_status="succeeded",
             duration_seconds=1.25,
             warnings=["timing:{}"],
+            result={"run_id": "run_test", "status": "succeeded", "answer": "listo"},
         )
 
         self.assertEqual(settled["status"], "succeeded")
         self.assertIn("UPDATE agent_run_tokens", captured["sql"])
         self.assertIn("UPDATE credit_reservations", captured["sql"])
         self.assertIn("UPDATE agent_runs", captured["sql"])
+        self.assertIn("result_json=COALESCE", captured["sql"])
+        self.assertEqual(captured["sql"].count("?"), len(captured["params"]))
+
+    def test_agent_auth_reads_only_bot_connectors_in_the_same_statement(self):
+        store = PostgresStore.__new__(PostgresStore)
+        captured = {}
+
+        def one(sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return {
+                "id": "usr_test",
+                "account_status": "active",
+                "assigned_connector_ids_json": '["google-workspace"]',
+            }
+
+        store._one = one
+        user = store.get_agent_user_by_access_token("aga_test-token", "bot_test")
+
+        self.assertEqual(user["assigned_connector_ids_json"], '["google-workspace"]')
+        self.assertIn("jsonb_array_elements", captured["sql"])
+        self.assertIn("account_sessions", captured["sql"])
+        self.assertNotIn("SELECT ast.state_json", captured["sql"])
         self.assertEqual(captured["sql"].count("?"), len(captured["params"]))
 
 

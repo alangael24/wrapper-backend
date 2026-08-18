@@ -72,6 +72,8 @@ class AppViewModel(
     private var deletedBotIds: List<String> = emptyList()
     private var pendingRuns: List<PendingAgentRun> = emptyList()
     private var pendingRecoveryJob: Job? = null
+    private val warmedBotUntil = mutableMapOf<String, Long>()
+    private val agentWarmJobs = mutableMapOf<String, Job>()
 
     init { bootstrap() }
 
@@ -86,7 +88,12 @@ class AppViewModel(
     fun clearError() = _state.update { it.copy(error = null) }
 
     fun onForeground() {
-        if (_state.value.phase == AppPhase.Ready) recoverPendingRuns()
+        if (_state.value.phase == AppPhase.Ready) {
+            recoverPendingRuns()
+            _state.value.bots.firstOrNull { bot ->
+                bot.id == _state.value.selectedBotId && bot.messages.isNotEmpty()
+            }?.id?.let(::scheduleAgentWarm)
+        }
     }
 
     fun signOut() = viewModelScope.launch {
@@ -96,6 +103,9 @@ class AppViewModel(
         stateSyncJob = null
         stateSyncRequested = false
         accountStateRevision = 0
+        agentWarmJobs.values.forEach { it.cancel() }
+        agentWarmJobs.clear()
+        warmedBotUntil.clear()
         api.signOut()
         _state.value = AppUiState(phase = AppPhase.SignedOut)
     }
@@ -138,13 +148,13 @@ class AppViewModel(
         )
         _state.update { it.copy(bots = it.bots + created, selectedBotId = created.id, section = MainSection.Agents) }
         persist()
-        sendInitialMessageIfNeeded(created.id)
+        prepareBot(created.id)
     }
 
     fun selectBot(botId: String) {
         _state.update { it.copy(selectedBotId = botId, section = MainSection.Agents) }
         persist()
-        sendInitialMessageIfNeeded(botId)
+        prepareBot(botId)
     }
 
     fun showAgentList() {
@@ -435,10 +445,34 @@ class AppViewModel(
         throw ServiceException("La conexión expiró.", "connector_timeout", 408)
     }
 
-    private fun sendInitialMessageIfNeeded(botId: String) {
-        val bot = _state.value.bots.firstOrNull { it.id == botId } ?: return
+    private fun prepareBot(botId: String) {
+        val initialRun = sendInitialMessageIfNeeded(botId)
+        viewModelScope.launch {
+            // Do not make the generated first turn compete with Pi startup.
+            // Once it is visible, prewarm the persistent bot session so the
+            // first real task does not pay the process cold-start cost.
+            initialRun?.join()
+            delay(1_000)
+            scheduleAgentWarm(botId)
+        }
+    }
+
+    private fun sendInitialMessageIfNeeded(botId: String): Job? {
+        val bot = _state.value.bots.firstOrNull { it.id == botId } ?: return null
         if (shouldSendInitialBotMessage(_state.value.profile?.tier, bot)) {
-            runAgent(botId, "", initial = true)
+            return runAgent(botId, "", initial = true)
+        }
+        return null
+    }
+
+    private fun scheduleAgentWarm(botId: String) {
+        if (_state.value.phase != AppPhase.Ready || _state.value.account == null) return
+        val now = System.currentTimeMillis()
+        if ((warmedBotUntil[botId] ?: 0L) > now || agentWarmJobs[botId]?.isActive == true) return
+        agentWarmJobs[botId] = viewModelScope.launch {
+            val ready = runCatching { api.warmAgent(botId) }.isSuccess
+            if (ready) warmedBotUntil[botId] = System.currentTimeMillis() + 10 * 60_000L
+            agentWarmJobs.remove(botId)
         }
     }
 
@@ -485,7 +519,6 @@ class AppViewModel(
                     role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
                 )).takeLast(200), updatedAt = now, conversationRevision = now)
             }
-            persist()
             pendingRuns = pendingRuns.filterNot { it.idempotencyKey == turnId }
             persist()
         } catch (error: Throwable) {
