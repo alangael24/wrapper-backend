@@ -137,7 +137,11 @@ class AppleAuthTests(unittest.TestCase):
 
     def test_native_login_is_rate_limited_before_provider_exchange(self):
         nonce = "secure-nonce-value-123456789"
-        with patch.object(self.auth, "_exchange_code", return_value="refresh-token-from-apple-123"):
+        # Keep the fixed-window bucket deterministic even when the full CI suite
+        # happens to cross a wall-clock minute boundary while this test runs.
+        with patch("go_backend.store._now", return_value=1_700_000_000.0), patch.object(
+            self.auth, "_exchange_code", return_value="refresh-token-from-apple-123"
+        ):
             for attempt in range(5):
                 self.auth.login(
                     identity_token=self.token(nonce, subject=f"apple-user-{attempt}"),
