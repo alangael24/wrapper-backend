@@ -3465,6 +3465,70 @@ class TestBackend(unittest.TestCase):
             {"spreadsheet_id": "sheet_123", "range": "Sheet1!A1:C3"},
         )])
 
+    def test_google_sheet_update_normalizes_friendly_arguments_for_provider_schema(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("google-sheet-update-routing")["user_id"],
+            "google-workspace",
+            "update_sheet",
+            {
+                "file_id": "sheet_123",
+                "a1_range": "Sheet1!C100",
+                "value": "AgentGenia E2E",
+            },
+        )
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_VALUES_UPDATE",
+            {
+                "spreadsheet_id": "sheet_123",
+                "range": "Sheet1!C100",
+                "value_input_option": "USER_ENTERED",
+                "values": [["AgentGenia E2E"]],
+            },
+        )])
+
+    def test_google_sheet_update_matches_provider_schema_before_approval(self):
+        client = FakeComposioClient()
+        client.tool_schemas = {
+            "GOOGLESUPER_VALUES_UPDATE": {
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "spreadsheet_id": {"type": "string", "minLength": 1},
+                        "range": {"type": "string", "minLength": 1},
+                        "value_input_option": {"enum": ["RAW", "USER_ENTERED"]},
+                        "values": {"type": "array", "minItems": 1},
+                    },
+                    "required": ["spreadsheet_id", "range", "value_input_option", "values"],
+                    "additionalProperties": False,
+                }
+            }
+        }
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        self.assertEqual(
+            gateway.validate_arguments(
+                self.new_user("google-sheet-update-schema")["user_id"],
+                "google-workspace",
+                "update_sheet",
+                {"spreadsheetId": "sheet_123", "range": "C100", "values": ["ok"]},
+            ),
+            {
+                "spreadsheet_id": "sheet_123",
+                "range": "C100",
+                "value_input_option": "USER_ENTERED",
+                "values": [["ok"]],
+            },
+        )
+
     def test_plugin_write_fails_closed_when_provider_schema_is_missing(self):
         client = FakeComposioClient()
         gateway = ComposioConnectorGateway(

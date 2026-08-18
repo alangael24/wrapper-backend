@@ -1153,6 +1153,56 @@ def _normalize_operation_arguments(
             "range": cell_range.strip(),
         }
 
+    if operation == "update_sheet":
+        normalized = dict(arguments)
+        spreadsheet_id = normalized.get(
+            "spreadsheet_id",
+            normalized.get("spreadsheetId", normalized.get("file_id")),
+        )
+        cell_range = normalized.get(
+            "range", normalized.get("cell_range", normalized.get("a1_range"))
+        )
+        values = normalized.get("values", normalized.get("value", normalized.get("data")))
+        value_input_option = normalized.get(
+            "value_input_option",
+            normalized.get("valueInputOption", "USER_ENTERED"),
+        )
+        if not isinstance(spreadsheet_id, str) or not spreadsheet_id.strip():
+            raise ConnectorBrokerError(
+                400,
+                "update_sheet requiere spreadsheet_id obtenido con search_drive",
+                "bad_connector_arguments",
+            )
+        if not isinstance(cell_range, str) or not cell_range.strip() or len(cell_range) > 500:
+            raise ConnectorBrokerError(
+                400, "update_sheet requiere range en notación A1", "bad_connector_arguments"
+            )
+        if not isinstance(values, list):
+            values = [[values]]
+        elif not values or not isinstance(values[0], list):
+            values = [values]
+        if (
+            not values
+            or any(not isinstance(row, list) or not row for row in values)
+            or len(values) > 10_000
+            or any(len(row) > 10_000 for row in values)
+        ):
+            raise ConnectorBrokerError(
+                400, "update_sheet requiere values como una matriz no vacía", "bad_connector_arguments"
+            )
+        if value_input_option not in {"RAW", "USER_ENTERED"}:
+            raise ConnectorBrokerError(
+                400,
+                "value_input_option debe ser RAW o USER_ENTERED",
+                "bad_connector_arguments",
+            )
+        return {
+            "spreadsheet_id": spreadsheet_id.strip(),
+            "range": cell_range.strip(),
+            "value_input_option": value_input_option,
+            "values": values,
+        }
+
     if operation in {"draft_email", "send_email"}:
         normalized = dict(arguments)
         aliases = {

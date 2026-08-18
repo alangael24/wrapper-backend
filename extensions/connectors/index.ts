@@ -157,7 +157,16 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
       spreadsheet_id: "ID exacto de la hoja obtenido con search_drive",
       range: "Rango pequeño en notación A1, por ejemplo Hoja1!A1:C10",
     },
-    rule: "Busca primero el archivo para obtener spreadsheet_id. Mantén el rango pequeño y no inventes valores si la lectura falla.",
+    rule: "Busca primero el archivo para obtener spreadsheet_id. Mantén el rango pequeño y agrupa celdas adyacentes en una sola lectura. Si la herramienta falla, responde que la lectura falló: nunca presentes celdas como vacías ni inventes valores.",
+  },
+  update_sheet: {
+    arguments: {
+      spreadsheet_id: "ID exacto de la hoja obtenido con search_drive",
+      range: "Una sola celda o rango pequeño en notación A1",
+      values: "Matriz bidimensional de filas; para una celda usa [[valor]] y para vaciarla usa [[\"\"]]",
+      value_input_option: "USER_ENTERED por defecto; RAW solo si el usuario lo necesita",
+    },
+    rule: "Lee primero el rango exacto, no sobrescribas datos no solicitados y usa una sola llamada para celdas adyacentes. Invoca update_sheet directamente para que el backend genere la aprobación estructurada.",
   },
   list_calendar_events: {
     rule: "Consulta Calendar antes de afirmar qué eventos existen. Resume solo los eventos devueltos.",
@@ -215,6 +224,7 @@ function providerArgumentDescription(id: string): string {
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
     "Para delete_calendar_event usa event_id exacto y calendar_id; lista eventos primero si falta el ID.",
     "Para search_drive usa query; para read_sheet usa spreadsheet_id obtenido de Drive y un range pequeño en notación A1.",
+    "Para update_sheet usa spreadsheet_id, range, values como matriz bidimensional y value_input_option USER_ENTERED.",
     "Nunca pases fechas naturales como 'tomorrow' o 'manana'.",
   ].join(" ");
 }
@@ -369,7 +379,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
           }, signal);
           if (!response.ok) {
             return {
-              content: [{ type: "text", text: errorText(response.status, response.body) }],
+              content: [{ type: "text", text: `CONNECTOR_OPERATION_FAILED: ${errorText(response.status, response.body)} No infieras que no existen datos ni afirmes que una acción se completó.` }],
               details: { connectorId: item.id, operation: params.operation, status: response.status },
               isError: true,
             };
