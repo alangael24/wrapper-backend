@@ -18,7 +18,11 @@ class StateJsonTest {
             connectorIds = listOf("github", "slack"),
             messages = listOf(BotMessage(id = "message-1", role = MessageRole.User, text = "Hola")),
         )
-        val original = PersistedAccountState(listOf(bot), listOf("github"), "bot-1")
+        val original = PersistedAccountState(
+            bots = listOf(bot),
+            selectedConnectorIds = listOf("github"),
+            activeBotId = "bot-1",
+        )
         val restored = original.toJson().toPersistedAccountState()
         assertEquals(original, restored)
     }

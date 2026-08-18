@@ -2,6 +2,8 @@ package com.agentgenia.android
 
 import com.agentgenia.android.model.BotProfile
 import com.agentgenia.android.model.BotShape
+import com.agentgenia.android.model.BotMessage
+import com.agentgenia.android.model.MessageRole
 import com.agentgenia.android.model.parseAgentAnswer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
