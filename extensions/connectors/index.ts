@@ -136,9 +136,9 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
   search_email: {
     arguments: {
       query: "Consulta Gmail real; combina términos con OR y usa comillas para frases exactas",
-      max_results: "Cantidad máxima de resultados, normalmente entre 10 y 25",
+      max_results: "Cantidad máxima de resultados; el backend la limita a 10 por llamada",
     },
-    rule: "Ejecuta la búsqueda y basa la respuesta únicamente en sus resultados. Si no hay coincidencias, dilo; nunca inventes asuntos o remitentes.",
+    rule: "Ejecuta una sola búsqueda amplia y basa la respuesta únicamente en sus metadatos. Si necesitas el cuerpo, usa read_email para un message_id concreto. Si no hay coincidencias, dilo; nunca inventes asuntos o remitentes.",
   },
   read_email: {
     arguments: {

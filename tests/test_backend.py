@@ -3413,7 +3413,12 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(client.executions, [(
             "GOOGLESUPER_FETCH_EMAILS",
-            {"query": "CDL OR \"commercial driver's license\"", "max_results": 10},
+            {
+                "query": "CDL OR \"commercial driver's license\"",
+                "max_results": 10,
+                "include_payload": False,
+                "verbose": False,
+            },
         )])
         self.assertEqual(client.searches, [])
 
@@ -3433,7 +3438,12 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(client.searches, [])
         self.assertEqual(client.executions, [(
             "GOOGLESUPER_FETCH_EMAILS",
-            {"query": "CDL", "max_results": 10},
+            {
+                "query": "CDL",
+                "max_results": 10,
+                "include_payload": False,
+                "verbose": False,
+            },
         )])
 
     def test_google_sheet_read_uses_exact_id_range_without_tool_search(self):

@@ -1111,6 +1111,11 @@ def _normalize_operation_arguments(
         # narrow the Gmail query or issue a second page instead of overflowing
         # the broker/model context with message bodies.
         normalized["max_results"] = max(1, min(int(raw_limit), 10))
+        # GOOGLESUPER_FETCH_EMAILS defaults to verbose MIME payloads. A search
+        # must return lean metadata only; ``read_email`` hydrates one selected
+        # message when the user actually needs its body.
+        normalized["include_payload"] = False
+        normalized["verbose"] = False
         return normalized
 
     if operation == "read_email":
