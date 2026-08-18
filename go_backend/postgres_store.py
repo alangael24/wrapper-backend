@@ -110,6 +110,7 @@ class PostgresStore(Store):
         self._path = "postgres"
         self._lock = nullcontext()
         self._operational_error = psycopg.OperationalError
+        self._undefined_function_error = psycopg.errors.UndefinedFunction
         self._pool = ConnectionPool(
             conninfo=normalize_database_url(database_url),
             kwargs={
@@ -141,10 +142,10 @@ class PostgresStore(Store):
                 "SELECT v FROM agentgenia.kv WHERE k='schema_version'"
             ).fetchone()
             self._conn.commit()
-            if row is None or int(row["v"]) != SCHEMA_VERSION:
+            if row is None or int(row["v"]) not in {SCHEMA_VERSION - 1, SCHEMA_VERSION}:
                 raise RuntimeError(
                     "El esquema Supabase de Agent Genia no está migrado a la versión "
-                    f"{SCHEMA_VERSION}"
+                    f"{SCHEMA_VERSION - 1} o {SCHEMA_VERSION}"
                 )
         except Exception:
             self._conn.rollback()
@@ -285,13 +286,20 @@ class PostgresStore(Store):
             raise
 
     def claim_whatsapp_message(self) -> dict | None:
-        """Atomically lease one webhook with SKIP LOCKED."""
+        """Atomically lease one webhook while preserving per-chat order."""
         now = time.time()
         try:
             row = self._conn.execute(
                 "WITH candidate AS ("
-                " SELECT message_id FROM whatsapp_messages WHERE status='pending' "
-                " AND next_attempt_at<=? ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+                " SELECT m.message_id FROM whatsapp_messages m "
+                " WHERE m.status='pending' AND m.next_attempt_at<=? AND NOT EXISTS ("
+                " SELECT 1 FROM whatsapp_messages earlier "
+                " WHERE earlier.phone_number_id=m.phone_number_id "
+                " AND earlier.wa_user_id=m.wa_user_id "
+                " AND earlier.status IN ('pending','processing','sending') AND ("
+                " earlier.created_at<m.created_at OR "
+                " (earlier.created_at=m.created_at AND earlier.message_id<m.message_id))) "
+                " ORDER BY m.created_at,m.message_id FOR UPDATE SKIP LOCKED LIMIT 1"
                 ") UPDATE whatsapp_messages m SET status='processing',"
                 "attempts=m.attempts+1,updated_at=? FROM candidate "
                 "WHERE m.message_id=candidate.message_id RETURNING m.*",
@@ -302,6 +310,116 @@ class PostgresStore(Store):
         except Exception:
             self._conn.rollback()
             raise
+
+    def enqueue_whatsapp_messages(self, messages: list[dict]) -> int:
+        """Insert a complete Meta webhook batch in one PostgreSQL round trip."""
+        if not messages:
+            return 0
+        now = time.time()
+        encoded = json.dumps(
+            [
+                {
+                    "message_id": str(item["message_id"])[:300],
+                    "phone_number_id": str(item["phone_number_id"])[:100],
+                    "wa_user_id": str(item["wa_user_id"])[:100],
+                    "message_type": str(item["message_type"])[:40],
+                    "text": str(item.get("text") or "")[:20_000],
+                    "payload_json": json.dumps(
+                        item.get("payload") or {},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                }
+                for item in messages
+            ],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        rows = self._q(
+            "WITH incoming AS ("
+            " SELECT * FROM jsonb_to_recordset(?::jsonb) AS x("
+            " message_id text,phone_number_id text,wa_user_id text,"
+            " message_type text,text text,payload_json text)"
+            ") INSERT INTO whatsapp_messages("
+            " message_id,user_id,phone_number_id,wa_user_id,message_type,text,payload_json,"
+            " status,next_attempt_at,created_at,updated_at) "
+            "SELECT i.message_id,CASE WHEN u.id IS NOT NULL THEN l.user_id END,"
+            "i.phone_number_id,i.wa_user_id,"
+            "i.message_type,i.text,i.payload_json,'pending',?,?,? FROM incoming i "
+            "LEFT JOIN whatsapp_links l ON l.wa_user_id=i.wa_user_id "
+            " AND l.phone_number_id=i.phone_number_id "
+            "LEFT JOIN users u ON u.id=l.user_id AND u.account_status='active' "
+            "ON CONFLICT(message_id) DO NOTHING RETURNING message_id",
+            (encoded, now, now, now),
+        )
+        return len(rows)
+
+    def create_agent_run(
+        self,
+        *,
+        user_id: str,
+        idempotency_key: str,
+        model: str,
+        browser: bool,
+        max_credit_milli: int,
+        max_concurrent_runs: int,
+        token_hash: str,
+        token_expires_at: float,
+        enforce: bool,
+        five_hour_credit_milli: int | None = None,
+        seven_day_credit_milli: int | None = None,
+    ) -> dict:
+        """Reserve a metered run in one cross-region database call."""
+        now = time.time()
+        try:
+            row = self._one(
+                "SELECT * FROM reserve_agent_run(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    user_id,
+                    idempotency_key,
+                    model,
+                    int(browser),
+                    max_credit_milli,
+                    max_concurrent_runs,
+                    token_hash,
+                    token_expires_at,
+                    bool(enforce),
+                    five_hour_credit_milli,
+                    seven_day_credit_milli,
+                    new_id("run"),
+                    new_id("rsv"),
+                    new_id("led"),
+                    now,
+                ),
+            )
+        except Exception as exc:
+            undefined_function = getattr(self, "_undefined_function_error", ())
+            if undefined_function and isinstance(exc, undefined_function):
+                # Rolling-deploy bridge: code can safely reach production
+                # before schema v23, using the previous transaction until the
+                # additive function migration is applied.
+                return super().create_agent_run(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    model=model,
+                    browser=browser,
+                    max_credit_milli=max_credit_milli,
+                    max_concurrent_runs=max_concurrent_runs,
+                    token_hash=token_hash,
+                    token_expires_at=token_expires_at,
+                    enforce=enforce,
+                    five_hour_credit_milli=five_hour_credit_milli,
+                    seven_day_credit_milli=seven_day_credit_milli,
+                )
+            raise
+        if row is None:
+            raise RuntimeError("agent_run_reservation_failed")
+        if row.get("outcome") == "error":
+            raise RuntimeError(str(row.get("error_code") or "agent_run_reservation_failed"))
+        return {
+            "duplicate": row["outcome"] == "duplicate",
+            "run": dict(row["run"]),
+        }
 
     def create_unmetered_agent_run(
         self,
@@ -447,7 +565,9 @@ class PostgresStore(Store):
                 row = connection.execute(
                     "SELECT v FROM agentgenia.kv WHERE k='schema_version'"
                 ).fetchone()
-            ready = bool(row and int(row["v"]) == SCHEMA_VERSION)
+            ready = bool(
+                row and int(row["v"]) in {SCHEMA_VERSION - 1, SCHEMA_VERSION}
+            )
             return {
                 "ready": ready,
                 "schema_version": int(row["v"]) if row else None,

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -606,6 +606,10 @@ class Store:
             }
             if "result_json" not in run_columns:
                 self._conn.execute("ALTER TABLE agent_runs ADD COLUMN result_json TEXT")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_chat_order "
+                "ON whatsapp_messages(phone_number_id,wa_user_id,status,created_at,message_id)"
+            )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_run "
                 "ON usage_events(run_id, created_at)"
@@ -1395,31 +1399,67 @@ class Store:
         text: str,
         payload: dict,
     ) -> bool:
+        return bool(self.enqueue_whatsapp_messages([{
+            "message_id": message_id,
+            "phone_number_id": phone_number_id,
+            "wa_user_id": wa_user_id,
+            "message_type": message_type,
+            "text": text,
+            "payload": payload,
+        }]))
+
+    def enqueue_whatsapp_messages(self, messages: list[dict]) -> int:
+        """Persist one Meta webhook batch in a single transaction."""
+        if not messages:
+            return 0
         now = _now()
-        link = self.get_whatsapp_link_for_sender(
-            wa_user_id=wa_user_id, phone_number_id=phone_number_id
-        )
         with self._lock:
-            cursor = self._conn.execute(
-                "INSERT INTO whatsapp_messages("
-                "message_id,user_id,phone_number_id,wa_user_id,message_type,text,payload_json,"
-                "status,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?,?) "
-                "ON CONFLICT(message_id) DO NOTHING",
-                (
-                    message_id,
-                    link["user_id"] if link else None,
-                    phone_number_id,
-                    wa_user_id,
-                    message_type[:40],
-                    text[:20_000],
-                    json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
-                    now,
-                    now,
-                    now,
-                ),
-            )
-            self._conn.commit()
-            return bool(cursor.rowcount)
+            self._conn.execute("BEGIN IMMEDIATE")
+            inserted = 0
+            link_cache: dict[tuple[str, str], str | None] = {}
+            try:
+                for message in messages:
+                    phone_number_id = str(message["phone_number_id"])
+                    wa_user_id = str(message["wa_user_id"])
+                    key = (wa_user_id, phone_number_id)
+                    if key not in link_cache:
+                        link = self._conn.execute(
+                            "SELECT l.user_id FROM whatsapp_links l "
+                            "JOIN users u ON u.id=l.user_id "
+                            "WHERE l.wa_user_id=? AND l.phone_number_id=? "
+                            "AND u.account_status='active'",
+                            key,
+                        ).fetchone()
+                        link_cache[key] = str(link["user_id"]) if link else None
+                    cursor = self._conn.execute(
+                        "INSERT INTO whatsapp_messages("
+                        "message_id,user_id,phone_number_id,wa_user_id,message_type,text,payload_json,"
+                        "status,next_attempt_at,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,'pending',?,?,?) "
+                        "ON CONFLICT(message_id) DO NOTHING",
+                        (
+                            str(message["message_id"])[:300],
+                            link_cache[key],
+                            phone_number_id[:100],
+                            wa_user_id[:100],
+                            str(message["message_type"])[:40],
+                            str(message.get("text") or "")[:20_000],
+                            json.dumps(
+                                message.get("payload") or {},
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted += max(0, int(cursor.rowcount or 0))
+                self._conn.commit()
+                return inserted
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def claim_whatsapp_message(self) -> dict | None:
         now = _now()
@@ -1427,8 +1467,15 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT * FROM whatsapp_messages WHERE status='pending' "
-                    "AND next_attempt_at<=? ORDER BY created_at LIMIT 1",
+                    "SELECT m.* FROM whatsapp_messages m WHERE m.status='pending' "
+                    "AND m.next_attempt_at<=? AND NOT EXISTS ("
+                    "SELECT 1 FROM whatsapp_messages earlier "
+                    "WHERE earlier.phone_number_id=m.phone_number_id "
+                    "AND earlier.wa_user_id=m.wa_user_id "
+                    "AND earlier.status IN ('pending','processing','sending') AND ("
+                    "earlier.created_at<m.created_at OR "
+                    "(earlier.created_at=m.created_at AND earlier.message_id<m.message_id))) "
+                    "ORDER BY m.created_at,m.message_id LIMIT 1",
                     (now,),
                 ).fetchone()
                 if row is None:
@@ -1497,8 +1544,15 @@ class Store:
             raise RuntimeError("whatsapp_delivery_already_claimed")
 
     def retry_whatsapp_message(
-        self, *, message_id: str, error: str, maximum_attempts: int = 3
-    ) -> None:
+        self,
+        *,
+        message_id: str,
+        error: str,
+        maximum_attempts: int = 4,
+        retryable: bool | None = None,
+        delivery_uncertain: bool | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> float | None:
         row = self._one(
             "SELECT attempts,status FROM whatsapp_messages WHERE message_id=?", (message_id,)
         )
@@ -1506,9 +1560,17 @@ class Store:
         # Once delivery entered ``sending`` the provider outcome is uncertain.
         # Never resend automatically: that would create duplicate WhatsApp
         # replies after a timeout or process crash.
-        uncertain_delivery = bool(row and row["status"] == "sending")
-        terminal = uncertain_delivery or attempts >= maximum_attempts
-        delay = min(300, 5 * (2 ** max(0, attempts - 1)))
+        inferred_uncertain = bool(row and row["status"] == "sending")
+        uncertain_delivery = (
+            inferred_uncertain if delivery_uncertain is None else bool(delivery_uncertain)
+        )
+        safe_to_retry = (
+            not uncertain_delivery if retryable is None else bool(retryable)
+        )
+        terminal = uncertain_delivery or not safe_to_retry or attempts >= maximum_attempts
+        delay = min(300.0, 1.0 * (2 ** max(0, attempts - 1)))
+        if retry_after_seconds is not None:
+            delay = max(delay, min(300.0, max(0.0, float(retry_after_seconds))))
         self._exec(
             "UPDATE whatsapp_messages SET status=?,next_attempt_at=?,last_error=?,updated_at=? "
             "WHERE message_id=?",
@@ -1520,6 +1582,7 @@ class Store:
                 message_id,
             ),
         )
+        return None if terminal else delay
 
     # ---------- usuarios ----------
     def create_user(self, api_key: str, name: str | None, email: str | None,
@@ -2958,6 +3021,30 @@ class Store:
                 "SELECT * FROM pending_approvals WHERE user_id=? AND run_id=? "
                 "AND status='pending' AND expires_at>? ORDER BY created_at,id",
                 (user_id, run_id, now),
+            )
+        ]
+
+    def pending_approvals_for_bot(self, user_id: str, bot_id: str) -> list[dict]:
+        """Return live approvals newest-first for a text-only channel.
+
+        Desktop and mobile submit a typed approval id from their widget. A
+        WhatsApp reply cannot carry that hidden payload, so the backend must
+        resolve the latest proposal inside the already authenticated account
+        and bot boundary.
+        """
+        now = _now()
+        self._exec(
+            "UPDATE pending_approvals SET status='expired',updated_at=? "
+            "WHERE user_id=? AND bot_id=? AND status IN ('pending','approved') "
+            "AND expires_at<=?",
+            (now, user_id, bot_id, now),
+        )
+        return [
+            self._decode_pending_approval(row)
+            for row in self._q(
+                "SELECT * FROM pending_approvals WHERE user_id=? AND bot_id=? "
+                "AND status='pending' AND expires_at>? ORDER BY created_at DESC,id DESC",
+                (user_id, bot_id, now),
             )
         ]
 

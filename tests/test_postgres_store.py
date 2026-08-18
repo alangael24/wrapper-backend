@@ -65,6 +65,71 @@ class PostgresStoreConfigurationTests(unittest.TestCase):
         self.assertIn("pg_advisory_xact_lock", captured["sql"])
         self.assertEqual(captured["sql"].count("?"), len(captured["params"]))
 
+    def test_metered_run_uses_one_server_side_reservation_call(self):
+        store = PostgresStore.__new__(PostgresStore)
+        captured = {}
+
+        def one(sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return {
+                "outcome": "inserted",
+                "run": {"id": "run_metered", "status": "reserved"},
+                "error_code": None,
+            }
+
+        store._one = one
+        prepared = store.create_agent_run(
+            user_id="usr_test",
+            idempotency_key="request-metered",
+            model="deepseek-v4-flash",
+            browser=False,
+            max_credit_milli=1000,
+            max_concurrent_runs=2,
+            token_hash="token-hash",
+            token_expires_at=1234.0,
+            enforce=True,
+            five_hour_credit_milli=200_000,
+            seven_day_credit_milli=500_000,
+        )
+
+        self.assertFalse(prepared["duplicate"])
+        self.assertEqual(prepared["run"]["status"], "reserved")
+        self.assertEqual(
+            captured["sql"],
+            "SELECT * FROM reserve_agent_run(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        self.assertEqual(captured["sql"].count("?"), len(captured["params"]))
+
+    def test_whatsapp_claim_query_serializes_each_chat(self):
+        store = PostgresStore.__new__(PostgresStore)
+
+        class Connection:
+            def __init__(self):
+                self.sql = ""
+                self.params = ()
+
+            def execute(self, sql, params=()):
+                self.sql = sql
+                self.params = params
+                return self
+
+            def fetchone(self):
+                return None
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        connection = Connection()
+        store._conn = connection
+        self.assertIsNone(store.claim_whatsapp_message())
+        self.assertIn("FOR UPDATE SKIP LOCKED", connection.sql)
+        self.assertIn("earlier.wa_user_id=m.wa_user_id", connection.sql)
+        self.assertIn("earlier.status IN ('pending','processing','sending')", connection.sql)
+
     def test_unmetered_run_is_settled_in_one_statement(self):
         store = PostgresStore.__new__(PostgresStore)
         captured = {}

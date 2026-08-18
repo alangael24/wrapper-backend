@@ -136,10 +136,12 @@ from .whatsapp import (
     verify_webhook_signature,
 )
 from .whatsapp_agent import (
+    approval_decision as whatsapp_approval_decision,
     build_bot_prompt as build_whatsapp_bot_prompt,
     connector_command as whatsapp_connector_command,
     create_bot_from_request,
     extract_link_code,
+    likely_connector_action as whatsapp_likely_connector_action,
     parse_agent_answer as parse_whatsapp_agent_answer,
     requested_bot,
     wants_bot_list,
@@ -2054,21 +2056,21 @@ class Backend:
             payload = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RequestBodyError("Webhook de WhatsApp inválido") from exc
-        accepted = 0
+        queued_messages: list[dict] = []
         for message in parse_webhook_messages(payload):
             if message["phone_number_id"] != self.whatsapp.config.phone_number_id:
                 continue
             durable_payload = dict(message["payload"])
             durable_payload["_agentgenia_display_name"] = message["display_name"]
-            if self.store.enqueue_whatsapp_message(
-                message_id=message["message_id"],
-                phone_number_id=message["phone_number_id"],
-                wa_user_id=message["wa_user_id"],
-                message_type=message["message_type"],
-                text=message["text"],
-                payload=durable_payload,
-            ):
-                accepted += 1
+            queued_messages.append({
+                "message_id": message["message_id"],
+                "phone_number_id": message["phone_number_id"],
+                "wa_user_id": message["wa_user_id"],
+                "message_type": message["message_type"],
+                "text": message["text"],
+                "payload": durable_payload,
+            })
+        accepted = self.store.enqueue_whatsapp_messages(queued_messages)
         if accepted:
             self._whatsapp_wake.set()
         # Meta needs an immediate 2xx. Durable processing happens after this.
@@ -2090,16 +2092,24 @@ class Backend:
                         message.get("message_id"),
                         exc,
                     )
-                    self.store.retry_whatsapp_message(
-                        message_id=message["message_id"], error=str(exc)
+                    retry_delay = self.store.retry_whatsapp_message(
+                        message_id=message["message_id"],
+                        error=str(exc),
+                        retryable=exc.retryable,
+                        delivery_uncertain=exc.delivery_uncertain,
+                        retry_after_seconds=exc.retry_after_seconds,
                     )
+                    if retry_delay is not None:
+                        threading.Timer(retry_delay, self._whatsapp_wake.set).start()
                 except Exception as exc:
                     logging.exception(
                         "WhatsApp worker failure message_id=%s", message.get("message_id")
                     )
-                    self.store.retry_whatsapp_message(
+                    retry_delay = self.store.retry_whatsapp_message(
                         message_id=message["message_id"], error=type(exc).__name__
                     )
+                    if retry_delay is not None:
+                        threading.Timer(retry_delay, self._whatsapp_wake.set).start()
             except Exception:
                 logging.exception("WhatsApp queue polling failed")
                 self._whatsapp_wake.wait(5)
@@ -2286,7 +2296,10 @@ class Backend:
                 }:
                     # Let the durable queue retry provider outages instead of
                     # finalizing a transient failure as a successful turn.
-                    raise WhatsAppError(f"Conector temporalmente no disponible: {exc.code}") from exc
+                    raise WhatsAppError(
+                        f"Conector temporalmente no disponible: {exc.code}",
+                        retryable=True,
+                    ) from exc
                 else:
                     answer = f"No pude gestionar {connector_name} en este momento. Inténtalo de nuevo."
             self._deliver_whatsapp_answer(
@@ -2367,11 +2380,52 @@ class Backend:
             )
             return
 
+        approval_request = None
+        decision = whatsapp_approval_decision(text)
+        if decision:
+            pending = self.store.pending_approvals_for_bot(user_id, str(bot["id"]))
+            if not pending:
+                answer = "No hay ninguna acción pendiente de autorización para este agente."
+                self._deliver_whatsapp_answer(
+                    message_id=message_id,
+                    sender=sender,
+                    answer=answer,
+                    user_id=user_id,
+                )
+                return
+            approval_request = {
+                "approval_id": pending[0]["id"],
+                "decision": decision,
+            }
+
         # The bot assignment is the sole scope. Account-wide connected tools
         # are intentionally not inherited by every agent.
         connector_ids = list(dict.fromkeys(bot.get("connectorIds", [])))
         bot_for_run = {**bot, "connectorIds": connector_ids}
         prompt = build_whatsapp_bot_prompt(bot_for_run, text)
+        # Simple conversation does not need tens of thousands of historical
+        # characters. Keep the full prompt for tool/complex work and give the
+        # direct-chat router a compact equivalent for the latency-sensitive
+        # path. The routing hint intentionally excludes connector/profile text
+        # so owning Gmail does not force every "hola" through Pi.
+        chat_prompt = build_whatsapp_bot_prompt(
+            bot_for_run,
+            text,
+            history_message_limit=8,
+            history_char_limit=12_000,
+        )
+        routing_lines: list[str] = []
+        routing_chars = 0
+        bot_messages = bot.get("messages") if isinstance(bot.get("messages"), list) else []
+        for recent in reversed(bot_messages[-6:]):
+            if not isinstance(recent, dict) or not isinstance(recent.get("text"), str):
+                continue
+            line = str(recent["text"])[:2_000]
+            if routing_chars + len(line) + 1 > 6_000:
+                break
+            routing_lines.append(line)
+            routing_chars += len(line) + 1
+        routing_context = "\n".join(reversed(routing_lines))
         user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:user:{message_id}"))
         assistant_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentgenia:whatsapp:assistant:{message_id}"))
         self._append_whatsapp_state_message(
@@ -2388,8 +2442,13 @@ class Backend:
             self.store.get_user_by_id(user_id) or link,
             {
                 "prompt": prompt,
-                "execution_mode": "auto",
-                "chat_prompt": prompt,
+                "execution_mode": (
+                    "agent"
+                    if connector_ids and whatsapp_likely_connector_action(text)
+                    else "auto"
+                ),
+                "chat_prompt": chat_prompt,
+                "routing_context": routing_context,
                 "user_message": text,
                 "browser": False,
                 "computer": False,
@@ -2397,6 +2456,7 @@ class Backend:
                 "bot_id": bot["id"],
                 "connector_ids": connector_ids,
                 "idempotency_key": "whatsapp:" + hashlib.sha256(message_id.encode()).hexdigest(),
+                **({"approval": approval_request} if approval_request else {}),
             },
         )
         try:
@@ -2413,7 +2473,8 @@ class Backend:
             error = response.get("error") if isinstance(response.get("error"), dict) else {}
             if internal.status in {408, 409, 425, 429, 500, 502, 503, 504}:
                 raise WhatsAppError(
-                    str(error.get("message") or f"agent_http_{internal.status}")
+                    str(error.get("message") or f"agent_http_{internal.status}"),
+                    retryable=True,
                 )
             answer = (
                 "No pude completar esa tarea: "

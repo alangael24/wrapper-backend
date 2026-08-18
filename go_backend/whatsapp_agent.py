@@ -37,6 +37,24 @@ CONNECTOR_LIST_RE = re.compile(
 CONNECTOR_REFRESH_RE = re.compile(
     r"^(?:listo|ya conecte|ya lo conecte|ya autorice|termine|done|connected)$"
 )
+APPROVAL_DECISION_RE = {
+    "approve": re.compile(
+        r"^(?:autorizar|autorizo|aprobar|apruebo|confirmar|confirmo|"
+        r"si,?\s+(?:autoriza|aprueba|confirmo)|authorize|approve|confirm)$"
+    ),
+    "reject": re.compile(
+        r"^(?:cancelar|cancelo|rechazar|rechazo|no,?\s+(?:cancelar|cancela)|"
+        r"cancel|reject)$"
+    ),
+}
+LIKELY_CONNECTOR_ACTION_RE = re.compile(
+    r"\b(?:haz|hacer|prepara|preparar|genera|generar|crea|crear|organiza|organizar|"
+    r"actualiza|actualizar|modifica|modificar|publica|publicar|envia|enviar|manda|mandar|"
+    r"agenda|agendar|programa|programar|elimina|eliminar|borra|borrar|sube|subir|"
+    r"descarga|descargar|sincroniza|sincronizar|importa|importar|exporta|exportar|"
+    r"make|prepare|generate|create|organize|update|edit|publish|post|send|schedule|"
+    r"delete|remove|upload|download|sync|import|export)\b"
+)
 
 _CONNECTOR_ALIASES: dict[str, tuple[str, ...]] = {
     "google-workspace": (
@@ -101,6 +119,29 @@ def connector_command(text: str) -> tuple[str, str | None] | None:
     return action, max(candidates)[1]
 
 
+def approval_decision(text: str) -> str | None:
+    """Recognize only explicit, standalone consent or rejection.
+
+    Generic replies such as ``sí`` are deliberately insufficient for a side
+    effect. WhatsApp has no typed approval action payload, so this strict text
+    boundary is the equivalent of tapping the app's one-shot approval card.
+    """
+    normalized = _normalized(text).strip(" .!¡?¿")
+    return next(
+        (
+            decision
+            for decision, pattern in APPROVAL_DECISION_RE.items()
+            if pattern.fullmatch(normalized)
+        ),
+        None,
+    )
+
+
+def likely_connector_action(text: str) -> bool:
+    """Conservatively route imperative work to assigned connector tools."""
+    return bool(LIKELY_CONNECTOR_ACTION_RE.search(_normalized(text)))
+
+
 def requested_bot(state: dict[str, Any], text: str) -> dict[str, Any] | None:
     normalized_text = _normalized(text)
     candidates = sorted(
@@ -148,20 +189,28 @@ def create_bot_from_request(text: str) -> dict[str, Any] | None:
     }
 
 
-def build_bot_prompt(bot: dict[str, Any], user_prompt: str) -> str:
+def build_bot_prompt(
+    bot: dict[str, Any],
+    user_prompt: str,
+    *,
+    history_message_limit: int = 20,
+    history_char_limit: int = 60_000,
+) -> str:
     messages = bot.get("messages") if isinstance(bot.get("messages"), list) else []
     history_lines: list[str] = []
     history_chars = 0
     # Build backwards so the newest context wins, with a hard total budget
     # below the backend's final prompt limit.
-    for message in reversed(messages[-20:]):
+    message_limit = max(0, min(int(history_message_limit), 40))
+    char_limit = max(0, min(int(history_char_limit), 80_000))
+    for message in reversed(messages[-message_limit:] if message_limit else []):
         if not isinstance(message, dict) or not isinstance(message.get("text"), str):
             continue
         line = (
             f"{'Usuario' if message.get('role') == 'user' else bot['name']}: "
             f"{message.get('text', '')[:8_000]}"
         )
-        if history_chars + len(line) + 1 > 60_000:
+        if history_chars + len(line) + 1 > char_limit:
             break
         history_lines.append(line)
         history_chars += len(line) + 1
@@ -203,6 +252,14 @@ def parse_agent_answer(value: str) -> str:
         if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
             text = parsed["text"].strip()
             if text:
+                widget = parsed.get("widget")
+                if isinstance(widget, dict) and widget.get("type") == "approval":
+                    prompt = widget.get("prompt")
+                    if isinstance(prompt, str) and prompt.strip():
+                        return (
+                            f"{text}\n\n{prompt.strip()}\n\n"
+                            "Responde “AUTORIZAR” para ejecutarla o “CANCELAR” para descartarla."
+                        )[:20_000]
                 return text[:20_000]
     except json.JSONDecodeError:
         pass

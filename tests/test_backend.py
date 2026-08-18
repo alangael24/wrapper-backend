@@ -979,6 +979,153 @@ class TestBackend(unittest.TestCase):
         self.assertIn("outbound_delivery_uncertain", stored["last_error"])
         self.assertIsNone(self.ws.backend.store.claim_whatsapp_message())
 
+    def test_whatsapp_webhook_batch_is_durable_fast_and_concurrently_idempotent(self):
+        config, _sent = self.configure_fake_whatsapp()
+        payload = self.whatsapp_payload("wamid.batch.0", "mensaje 0")
+        messages = payload["entry"][0]["changes"][0]["value"]["messages"]
+        messages[:] = [
+            {
+                "from": "15557654321",
+                "id": f"wamid.batch.{index}",
+                "timestamp": str(1786680000 + index),
+                "text": {"body": f"mensaje {index} 🚀"},
+                "type": "text",
+            }
+            for index in range(100)
+        ]
+        started = time.monotonic()
+        status, result = self.send_whatsapp_webhook(payload, config.app_secret)
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, 200)
+        self.assertEqual(result["accepted"], 100)
+        # This includes signature validation, JSON parsing and a durable SQLite
+        # commit; it intentionally excludes agent work.
+        self.assertLess(elapsed, 1.0)
+
+        duplicate_payload = self.whatsapp_payload("wamid.concurrent", "hola")
+        outcomes: list[tuple[int, dict]] = []
+        outcome_lock = threading.Lock()
+
+        def deliver_duplicate():
+            outcome = self.send_whatsapp_webhook(
+                duplicate_payload, config.app_secret
+            )
+            with outcome_lock:
+                outcomes.append(outcome)
+
+        threads = [threading.Thread(target=deliver_duplicate) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(len(outcomes), 12)
+        self.assertTrue(all(status == 200 for status, _ in outcomes))
+        self.assertEqual(sum(body["accepted"] for _, body in outcomes), 1)
+
+    def test_whatsapp_text_authorization_carries_the_exact_pending_approval(self):
+        config, sent = self.configure_fake_whatsapp()
+        user = self.new_user(tier="pro")
+        auth = {"Authorization": f"Bearer {user['api_key']}"}
+        bot_id = self.assign_bot_connectors(user, ["google-workspace"])
+        status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
+        self.assertEqual(status, 201)
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload(
+                "wamid.approval.link",
+                f"Vincular Agentgenia {started['code']}",
+            ),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+
+        prepared = self.ws.backend.store.create_agent_run(
+            user_id=user["user_id"],
+            idempotency_key="whatsapp-approval-source",
+            model="deepseek-v4",
+            browser=False,
+            max_credit_milli=1,
+            max_concurrent_runs=4,
+            token_hash="whatsapp-approval-token",
+            token_expires_at=time.time() + 600,
+            enforce=False,
+        )
+        approval = self.ws.backend.store.create_pending_approval(
+            user_id=user["user_id"],
+            bot_id=bot_id,
+            run_id=prepared["run"]["id"],
+            target_type="connector",
+            connector_id="google-workspace",
+            operation="send_email",
+            arguments={
+                "recipient_email": "ana@example.com",
+                "subject": "Hola",
+                "body": "Mensaje",
+            },
+            arguments_hash="approval-hash",
+            human_summary="Enviar un correo a ana@example.com con asunto «Hola»",
+        )
+        captured: dict = {}
+
+        def fake_agent_run(internal):
+            body = json.loads(internal.rfile.read())
+            captured.update(body)
+            approved = self.ws.backend.store.approve_pending_approval(
+                user_id=user["user_id"],
+                bot_id=body["bot_id"],
+                approval_id=body["approval"]["approval_id"],
+            )
+            self.assertIsNotNone(approved)
+            internal.send_response(200)
+            internal.wfile.write(json.dumps({
+                "answer": '{"text":"Listo. Envié el correo.","widget":null}'
+            }).encode())
+
+        with patch.object(self.ws.backend, "handle_agent_run", fake_agent_run):
+            self.send_whatsapp_webhook(
+                self.whatsapp_payload("wamid.approval.confirm", "AUTORIZAR"),
+                config.app_secret,
+            )
+            self.ws.backend._process_whatsapp_message(
+                self.ws.backend.store.claim_whatsapp_message()
+            )
+        self.assertEqual(captured["approval"], {
+            "approval_id": approval["id"],
+            "decision": "approve",
+        })
+        self.assertEqual(sent[-1]["text"], "Listo. Envié el correo.")
+
+    def test_whatsapp_simple_chat_skips_connector_reconciliation(self):
+        class ConnectorGatewayMustNotRun:
+            def connected_connector_ids(self, _user_id):
+                raise AssertionError("simple WhatsApp chat must use the direct path")
+
+        config, sent = self.configure_fake_whatsapp()
+        user = self.new_user(tier="pro")
+        auth = {"Authorization": f"Bearer {user['api_key']}"}
+        self.assign_bot_connectors(user, ["canva"])
+        status, started = self.ws.req("POST", "/v1/whatsapp/link", {}, headers=auth)
+        self.assertEqual(status, 201)
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload(
+                "wamid.fast.link", f"Vincular Agentgenia {started['code']}"
+            ),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.ws.backend.connector_gateway = ConnectorGatewayMustNotRun()
+        self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.fast.chat", "hola"),
+            config.app_secret,
+        )
+        self.ws.backend._process_whatsapp_message(
+            self.ws.backend.store.claim_whatsapp_message()
+        )
+        self.assertEqual(sent[-1]["text"], "hola")
+
     def test_account_state_sync_is_account_scoped_versioned_and_validated(self):
         first = self.new_user(tier="free")
         second = self.new_user(tier="free")
@@ -2215,7 +2362,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 22)
+        self.assertEqual(migrated.health()["schema_version"], 23)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)

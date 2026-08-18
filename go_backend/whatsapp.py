@@ -11,15 +11,34 @@ import hashlib
 import hmac
 import json
 import re
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 
 class WhatsAppError(RuntimeError):
-    pass
+    """A transport failure with enough detail to make a safe retry decision.
+
+    Meta does not accept a caller-provided idempotency key for message sends.
+    A timeout after bytes were written is therefore materially different from
+    an explicit 429/5xx response: the former may already have delivered the
+    message and must never be retried automatically.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        delivery_uncertain: bool = False,
+        retry_after_seconds: float | None = None,
+    ):
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.delivery_uncertain = bool(delivery_uncertain)
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -170,10 +189,26 @@ def _message_text(message: dict[str, Any], message_type: str) -> str:
 
 
 class WhatsAppCloudAPI:
-    def __init__(self, config: WhatsAppConfig, *, timeout_seconds: int = 15):
+    def __init__(
+        self,
+        config: WhatsAppConfig,
+        *,
+        timeout_seconds: int = 15,
+        api_base_url: str = "https://graph.facebook.com",
+        client: httpx.Client | None = None,
+    ):
         config.validate()
         self.config = config
         self.timeout_seconds = timeout_seconds
+        self.api_base_url = api_base_url.rstrip("/")
+        # Reuse TLS connections across replies. Establishing a new connection
+        # for every message added avoidable latency, especially when an answer
+        # is split into several Cloud API requests.
+        self._client = client or httpx.Client(
+            timeout=httpx.Timeout(float(timeout_seconds), connect=min(5.0, float(timeout_seconds))),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            headers={"User-Agent": "AgentGenia-WhatsApp/1.0"},
+        )
 
     def link_url(self, code: str) -> str:
         query = urllib.parse.urlencode({"text": f"Vincular Agentgenia {code}"})
@@ -199,48 +234,99 @@ class WhatsAppCloudAPI:
             }
             if index == 0 and reply_to_message_id:
                 payload["context"] = {"message_id": reply_to_message_id}
-            response = self._request(payload)
+            try:
+                response = self._request(payload)
+            except WhatsAppError as exc:
+                if index:
+                    # At least one earlier chunk was accepted. Retrying the
+                    # complete answer would duplicate it, regardless of how
+                    # definitive the later provider error looks.
+                    raise WhatsAppError(
+                        str(exc), delivery_uncertain=True
+                    ) from exc
+                raise
             messages = response.get("messages") if isinstance(response, dict) else None
             if isinstance(messages, list) and messages and isinstance(messages[0], dict):
                 value = messages[0].get("id")
                 if isinstance(value, str):
                     last_message_id = value
+            if not last_message_id:
+                # A 2xx without Meta's accepted message id cannot be proven
+                # safe to retry; fail closed to avoid duplicate replies.
+                raise WhatsAppError(
+                    "Meta aceptó una respuesta sin identificador de mensaje",
+                    delivery_uncertain=True,
+                )
         return last_message_id
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = (
-            f"https://graph.facebook.com/{self.config.graph_version}/"
+            f"{self.api_base_url}/{self.config.graph_version}/"
             f"{self.config.phone_number_id}/messages"
         )
-        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.config.access_token}",
-                "Content-Type": "application/json",
-                "User-Agent": "AgentGenia-WhatsApp/1.0",
-            },
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read(1024 * 1024)
-                parsed = json.loads(body) if body else {}
-                if not isinstance(parsed, dict):
-                    raise WhatsAppError("Meta devolvió una respuesta inválida")
-                return parsed
-        except urllib.error.HTTPError as exc:
+            response = self._client.post(
+                url,
+                content=json.dumps(
+                    payload, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.config.access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # No connection was established, so Meta could not have accepted
+            # the payload. This is the only network error that is safe to retry.
+            raise WhatsAppError(
+                "No fue posible conectar con WhatsApp Cloud API",
+                retryable=True,
+            ) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            # The request may have reached Meta before the socket failed.
+            raise WhatsAppError(
+                "Se perdió la respuesta de WhatsApp Cloud API",
+                delivery_uncertain=True,
+            ) from exc
+
+        if response.status_code < 200 or response.status_code >= 300:
             try:
-                detail = json.loads(exc.read(64 * 1024)).get("error", {})
+                parsed_error = response.json()
+                detail = parsed_error.get("error", {}) if isinstance(parsed_error, dict) else {}
                 code = detail.get("code") if isinstance(detail, dict) else None
             except Exception:
                 code = None
+            retryable = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
             raise WhatsAppError(
-                f"WhatsApp Cloud API rechazó el mensaje (HTTP {exc.code}, código {code or 'unknown'})"
+                f"WhatsApp Cloud API rechazó el mensaje "
+                f"(HTTP {response.status_code}, código {code or 'unknown'})",
+                retryable=retryable,
+                retry_after_seconds=retry_after,
+            )
+        try:
+            parsed = response.json() if response.content else {}
+        except json.JSONDecodeError as exc:
+            raise WhatsAppError(
+                "Meta devolvió una respuesta inválida",
+                delivery_uncertain=True,
             ) from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise WhatsAppError("No fue posible contactar WhatsApp Cloud API") from exc
+        if not isinstance(parsed, dict):
+            raise WhatsAppError(
+                "Meta devolvió una respuesta inválida",
+                delivery_uncertain=True,
+            )
+        return parsed
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = float(value.strip())
+    except ValueError:
+        return None
+    return max(0.0, min(parsed, 300.0))
 
 
 def _split_text(value: str, maximum: int) -> list[str]:
