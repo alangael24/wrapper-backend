@@ -1526,6 +1526,34 @@ class TestBackend(unittest.TestCase):
         with self.assertRaisesRegex(UnsafeConfigurationError, "pi-render-safe"):
             validate_runtime_security(cfg)
 
+    def test_production_desktop_runtime_requires_a_public_https_wrapper_url(self):
+        cfg = Config()
+        cfg.environment = "production"
+        cfg.database_url = "postgresql://example.invalid/agentgenia"
+        cfg.wrapper_secret = "w" * 32
+        cfg.admin_token = "a" * 32
+        cfg.deepseek_api_key = "sk-production-test"
+        cfg.deepseek_base_url = "https://api.deepseek.com/v1"
+        cfg.opencode_base_url = "https://opencode.ai/zen/v1"
+        cfg.google_oauth_client_id = "google-client"
+        cfg.google_oauth_client_secret = "google-secret"
+        cfg.google_oauth_redirect_uri = "https://agentgenia.example/oauth/google"
+        cfg.apple_client_id = "com.agentgenia.app"
+        cfg.apple_team_id = "TEAMID"
+        cfg.apple_key_id = "KEYID"
+        cfg.apple_private_key_base64 = "cHJpdmF0ZS1rZXk="
+        cfg.pi_enabled = True
+        cfg.desktop_runtime_public_url = "http://127.0.0.1:8787"
+        with self.assertRaisesRegex(
+            UnsafeConfigurationError, "DESKTOP_RUNTIME_PUBLIC_URL debe ser una URL HTTPS pública"
+        ):
+            validate_runtime_security(cfg)
+
+    def test_browser_concurrency_can_be_disabled_on_the_server(self):
+        cfg = Config()
+        cfg.pi_browser_max_concurrent = 0
+        validate_runtime_security(cfg)
+
     def test_models_proxy(self):
         ws = self.ws
         signup = self.new_user()
@@ -1879,7 +1907,7 @@ class TestBackend(unittest.TestCase):
             set(body["checks"]),
             {
                 "database", "google_auth", "apple_auth", "stripe", "connectors",
-                "computers", "pi", "pi_chrome", "model_provider", "whatsapp",
+                "computers", "pi", "desktop_relay", "model_provider", "whatsapp",
             },
         )
         self.assertFalse(all(body["checks"].values()))
@@ -1927,7 +1955,7 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(readiness["checks"]["connectors"])
         self.assertTrue(readiness["checks"]["computers"])
 
-    def test_readiness_rejects_pi_chrome_when_container_memory_is_insufficient(self):
+    def test_readiness_does_not_require_chromium_memory_on_render(self):
         self.ws.cfg.environment = "production"
         self.ws.cfg.pi_browser_min_memory_mb = 1024
         with (
@@ -1948,9 +1976,8 @@ class TestBackend(unittest.TestCase):
         ):
             readiness = self.ws.backend.readiness()
 
-        self.assertFalse(readiness["checks"]["pi_chrome"])
-        self.assertFalse(readiness["pi"]["browser_resource_ready"])
-        self.assertFalse(readiness["ready"])
+        self.assertTrue(readiness["checks"]["desktop_relay"])
+        self.assertEqual(readiness["pi"]["browser_execution"], "authenticated_desktop")
 
     def test_readiness_requires_computers_when_feature_is_enabled(self):
         self.ws.cfg.computers_enabled = True
@@ -2188,7 +2215,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 20)
+        self.assertEqual(migrated.health()["schema_version"], 21)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
@@ -4838,12 +4865,19 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["type"], "bad_connector")
 
-    def test_browser_run_fails_closed_before_chromium_can_oom_small_container(self):
+    def test_browser_run_requires_online_authenticated_desktop_and_never_starts_server_chrome(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
         self.ws.enable_fake_pi(browser=True)
 
-        with patch("go_backend.server.runtime_memory_limit_mb", return_value=512):
+        with (
+            patch("go_backend.server.runtime_memory_limit_mb", return_value=512),
+            patch.object(
+                self.ws.backend.pi,
+                "run",
+                side_effect=AssertionError("Render must never start browser Pi"),
+            ),
+        ):
             status, body = self.ws.req(
                 "POST",
                 "/v1/agent/run",
@@ -4855,99 +4889,118 @@ class TestBackend(unittest.TestCase):
                 headers=headers,
             )
 
-        self.assertEqual(status, 503)
-        self.assertEqual(body["error"]["type"], "pi_browser_insufficient_memory")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "desktop_runtime_offline")
 
-    def test_pi_chrome_uses_a_fresh_profile_and_bridge_for_each_run(self):
+    def test_local_runtime_intent_keeps_connector_only_work_remote_and_routes_explicit_desktop_work(self):
+        self.assertFalse(self.ws.backend._local_browser_intent("revisa mis correos de Gmail"))
+        self.assertFalse(self.ws.backend._local_computer_intent("crea un evento en Calendar"))
+        self.assertTrue(self.ws.backend._local_browser_intent("abre el marketplace en Chrome"))
+        self.assertTrue(self.ws.backend._local_computer_intent("abre Excel en mi computadora"))
+
+    def test_browser_run_with_connectors_is_relayed_to_same_account_desktop_with_one_time_run_key(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
-        self.ws.enable_fake_pi(browser=True)
-        chrome_commands: list[list[str]] = []
-        original_chrome_command = self.ws.backend.pi._chrome_command
-
-        def capture_chrome_command(run_dir, companion):
-            command = original_chrome_command(run_dir, companion)
-            chrome_commands.append(command)
-            return command
-
-        self.ws.backend.pi._chrome_command = capture_chrome_command
-
-        status, info = self.ws.req("GET", "/v1/agent/status", headers=headers)
-        self.assertEqual(status, 200)
-        self.assertTrue(info["browser_available"])
-        self.assertTrue(info["browser_auto_authorize"])
-        self.assertEqual(info["browser_max_concurrent"], 1)
-        self.assertEqual(info["browser_isolation"], "per_run")
-        self.assertEqual(info["browser_profile_scope"], "ephemeral_run")
-        self.assertFalse(
-            self.ws.backend.pi._supports_unpacked_extensions(
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            )
+        bot_id = self.assign_bot_connectors(signup, ["google-workspace"])
+        self.ws.backend.connector_gateway.connected_connector_ids = (
+            lambda _user_id: ("google-workspace",)
         )
-        self.assertTrue(
-            self.ws.backend.pi._supports_unpacked_extensions(
-                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-            )
+        device_id = str(uuid.uuid4())
+        status, heartbeat = self.ws.req(
+            "POST", "/v1/desktop-runtime/heartbeat",
+            {
+                "device_id": device_id,
+                "platform": "darwin",
+                "app_version": "1.1.1-test",
+                "capabilities": {"browser": True, "computer": True},
+            },
+            headers=headers,
         )
-        command = self.ws.backend.pi._command(browser=True)
-        extension_paths = [
-            command[index + 1]
-            for index, value in enumerate(command[:-1])
-            if value == "--extension"
-        ]
-        self.assertEqual(len(extension_paths), 2)
-        self.assertEqual(extension_paths[0], str(Path("extensions/connectors/index.ts").resolve()))
-        self.assertEqual(extension_paths[1], str(Path(self.ws.backend.pi.chrome_extension).resolve()))
+        self.assertEqual(status, 200, heartbeat)
+        self.assertTrue(heartbeat["online"])
 
-        results = []
-        for prompt in ("revisa la pagina", "abre otra sesion"):
+        worker_errors: list[BaseException] = []
+        claimed_payloads: list[dict] = []
+
+        def desktop_worker():
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    claim_status, claimed = self.ws.req(
+                        "POST", "/v1/desktop-runtime/jobs/claim",
+                        {
+                            "device_id": device_id,
+                            "capabilities": {"browser": True, "computer": True},
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(claim_status, 200, claimed)
+                    if claimed["job"] is None:
+                        time.sleep(0.05)
+                        continue
+                    job = claimed["job"]
+                    claimed_payloads.append(job["payload"])
+                    complete_status, complete = self.ws.req(
+                        "POST", f"/v1/desktop-runtime/jobs/{job['id']}/complete",
+                        {
+                            "device_id": device_id,
+                            "status": "succeeded",
+                            "result": {
+                                "answer": '{"text":"Abrí pi.dev en tu Chrome local.","widget":null}',
+                                "model": "deepseek-v4-flash",
+                                "duration_seconds": 0.2,
+                                "usage": {
+                                    "input_tokens": 12,
+                                    "output_tokens": 8,
+                                    "cached_read_tokens": 0,
+                                    "cached_write_tokens": 0,
+                                },
+                            },
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(complete_status, 200, complete)
+                    return
+                raise AssertionError("desktop never received browser job")
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        worker = threading.Thread(target=desktop_worker, daemon=True)
+        worker.start()
+        with patch.object(
+            self.ws.backend.pi,
+            "run",
+            side_effect=AssertionError("Render must never execute browser Pi"),
+        ):
             status, result = self.ws.req(
-                "POST",
-                "/v1/agent/run",
+                "POST", "/v1/agent/run",
                 {
-                    "prompt": prompt,
-                    "browser": True,
-                    "idempotency_key": f"chrome-run-{len(results)}",
+                    "prompt": "revisa Gmail y abre https://pi.dev en Chrome",
+                    "user_message": "revisa Gmail y abre https://pi.dev en Chrome",
+                    "bot_id": bot_id,
+                    "connector_ids": ["google-workspace"],
+                    "browser": False,
+                    "computer": False,
+                    "idempotency_key": "desktop-native-chrome-relay",
                 },
                 headers=headers,
             )
-            self.assertEqual(status, 200)
-            self.assertTrue(result["browser"])
-            self.assertIn("fake-pi uso deepseek-v4-flash: hola", result["answer"])
-            results.append(result)
+        worker.join(timeout=2)
 
-        run_dirs = [self.ws.backend.pi.runs_dir / result["run_id"] for result in results]
-        self.assertNotEqual(run_dirs[0], run_dirs[1])
-        bridge_ports = []
-        for run_dir in run_dirs:
-            self.assertFalse((run_dir / "chrome-profile").exists())
-            worker = (run_dir / "chrome-extension" / "service_worker.js").read_text()
-            self.assertNotIn("127.0.0.1:17318", worker)
-            bridge_port = (run_dir / "config" / "chrome-bridge-port.txt").read_text().strip()
-            self.assertIn(f"127.0.0.1:{bridge_port}", worker)
-            manifest = json.loads(
-                (run_dir / "chrome-extension" / "manifest.json").read_text()
-            )
-            self.assertIn(
-                f"http://127.0.0.1:{bridge_port}/*", manifest["host_permissions"]
-            )
-            bridge_ports.append(bridge_port)
-
-        # Capture commands before Popen so this assertion cannot race the
-        # short-lived fake Chrome child on a loaded CI host.
-        self.assertEqual(len(chrome_commands), 2)
-        profile_args = []
-        for command, run_dir in zip(chrome_commands, run_dirs):
-            profile_arg = f"--user-data-dir={run_dir / 'chrome-profile'}"
-            extension_arg = f"--load-extension={run_dir / 'chrome-extension'}"
-            self.assertIn(profile_arg, command)
-            self.assertIn(extension_arg, command)
-            self.assertIn("--headless=new", command)
-            self.assertIn("--no-sandbox", command)
-            self.assertIn("--disable-dev-shm-usage", command)
-            self.assertNotIn("ADMIN_TOKEN", self.ws.backend.pi._chrome_env(run_dir))
-            profile_args.append(profile_arg)
-        self.assertNotEqual(profile_args[0], profile_args[1])
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["execution_path"], "desktop_pi")
+        self.assertTrue(result["browser"])
+        self.assertEqual(len(claimed_payloads), 1)
+        self.assertTrue(claimed_payloads[0]["run_api_key"].startswith("agrn_"))
+        self.assertNotEqual(claimed_payloads[0]["run_api_key"], signup["api_key"])
+        self.assertEqual(
+            claimed_payloads[0]["backend_url"],
+            self.ws.cfg.desktop_runtime_public_url,
+        )
+        self.assertTrue(claimed_payloads[0]["browser"])
+        self.assertEqual(claimed_payloads[0]["connector_ids"], ["google-workspace"])
+        self.assertTrue(claimed_payloads[0]["connector_run_token"])
 
 
 if __name__ == "__main__":

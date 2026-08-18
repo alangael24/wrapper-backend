@@ -86,14 +86,15 @@ for (const [key, value] of [
   ["EXTERNAL_WRITES_ENABLED", "0"],
   ["PI_ENABLED", "1"],
   ["PI_MAX_CONCURRENT", "4"],
-  ["PI_BROWSER_MAX_CONCURRENT", "1"],
-  ["PI_CHROME_AUTO_AUTHORIZE", "1"],
+  ["PI_BROWSER_MAX_CONCURRENT", "0"],
+  ["PI_CHROME_AUTO_AUTHORIZE", "0"],
+  ["DESKTOP_RUNTIME_PUBLIC_URL", "https://agentgenia-api.onrender.com"],
 ]) {
   const pattern = new RegExp(`key: ${key}\\s+value: ["']?${value}["']?`, "u");
   if (!pattern.test(render)) throw new Error(`render.yaml must set ${key}=${value}`);
 }
 if (!/key: PI_CHROME_ISOLATION\s+value: per_run/u.test(render)) {
-  throw new Error("Production pi-chrome must use per_run isolation");
+  throw new Error("The legacy server-side pi-chrome guard must remain per_run");
 }
 if (!render.includes("autoDeployTrigger: checksPass")) {
   throw new Error("Render must wait for GitHub CI before deploying");

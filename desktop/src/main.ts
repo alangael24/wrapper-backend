@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from "electron";
 import { autoUpdater } from "electron-updater";
 import {
@@ -23,6 +24,9 @@ import {
   updateBotProfile
 } from "./contracts";
 import { AccountStateConflictError, DesktopOAuthController, safeComputerViewerUrl } from "./oauth";
+import { LocalAgentRuntime } from "./local-agent-runtime";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CHANNELS = Object.freeze({
   bootstrap: "desktop:bootstrap",
@@ -427,6 +431,7 @@ let computerWindow: BrowserWindow | null = null;
 const issuedComputerViewerUrls = new Set<string>();
 let stateStore: DesktopStateStore;
 let oauthController: DesktopOAuthController;
+let localAgentRuntime: LocalAgentRuntime | null = null;
 let teachRecordingsDirectory = "";
 let activeTeachRecording: ActiveTeachRecording | null = null;
 const smokeTest = process.argv.includes("--smoke-test");
@@ -1355,6 +1360,17 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   registerDesktopIpc();
   configureDisplayMedia();
   createWindow();
+  if (!smokeTest) {
+    localAgentRuntime = new LocalAgentRuntime(
+      {
+        heartbeat: (capabilities, signal) => oauthController.desktopRuntimeHeartbeat(capabilities, signal),
+        claim: (capabilities, signal) => oauthController.desktopRuntimeClaim(capabilities, signal),
+        complete: (jobId, result, signal) => oauthController.desktopRuntimeComplete(jobId, result, signal)
+      },
+      path.join(userDataPath, "local-agent-runtime")
+    );
+    localAgentRuntime.start();
+  }
   configureAutoUpdates();
   const startupWindow = mainWindow;
   if (startupWindow && startupWindow.webContents.isLoadingMainFrame()) {
@@ -1383,5 +1399,6 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 app.on("will-quit", () => {
+  void localAgentRuntime?.stop();
   if (smokeUserDataPath) rmSync(smokeUserDataPath, { recursive: true, force: true });
 });

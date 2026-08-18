@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -292,6 +292,42 @@ CREATE TABLE IF NOT EXISTS agent_run_tokens (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS desktop_runtime_devices (
+  user_id             TEXT NOT NULL,
+  device_id_hash      TEXT NOT NULL,
+  platform            TEXT NOT NULL,
+  app_version         TEXT NOT NULL DEFAULT '',
+  capabilities_json   TEXT NOT NULL DEFAULT '{}',
+  last_seen_at        REAL NOT NULL,
+  lease_expires_at    REAL NOT NULL,
+  created_at          REAL NOT NULL,
+  updated_at          REAL NOT NULL,
+  PRIMARY KEY(user_id, device_id_hash),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS desktop_runtime_jobs (
+  id                    TEXT PRIMARY KEY,
+  user_id               TEXT NOT NULL,
+  run_id                TEXT NOT NULL UNIQUE,
+  bot_id                TEXT,
+  job_kind              TEXT NOT NULL CHECK(job_kind IN ('browser','computer')),
+  status                TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','claimed','succeeded','failed','expired','cancelled')),
+  payload_enc           BLOB NOT NULL,
+  key_id                TEXT NOT NULL,
+  key_version           INTEGER NOT NULL DEFAULT 1,
+  claimed_device_hash   TEXT,
+  claim_expires_at      REAL,
+  result_json           TEXT,
+  error_code            TEXT,
+  error_message         TEXT,
+  expires_at            REAL NOT NULL,
+  created_at            REAL NOT NULL,
+  updated_at            REAL NOT NULL,
+  finished_at           REAL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS connector_operations (
   user_id       TEXT NOT NULL,
   run_id        TEXT NOT NULL,
@@ -401,6 +437,12 @@ CREATE INDEX IF NOT EXISTS idx_account_identity_tokens_expires
 CREATE INDEX IF NOT EXISTS idx_account_provider_credentials_account
   ON account_provider_credentials(account_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_user_status ON agent_runs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_desktop_runtime_devices_online
+  ON desktop_runtime_devices(user_id, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_desktop_runtime_jobs_pending
+  ON desktop_runtime_jobs(user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_desktop_runtime_jobs_expiry
+  ON desktop_runtime_jobs(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_connector_operations_run
   ON connector_operations(run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_run
@@ -452,6 +494,10 @@ def _hash_ephemeral(kind: str, value: str) -> str:
 
 def hash_agent_run_token(token: str) -> str:
     return _hash_ephemeral("run-token", token)
+
+
+def hash_desktop_device_id(device_id: str) -> str:
+    return _hash_ephemeral("desktop-device", device_id)
 
 
 def hash_whatsapp_link_code(code: str) -> str:
@@ -2470,6 +2516,236 @@ class Store:
             "UPDATE agent_runs SET result_json=? WHERE id=? "
             "AND status IN ('reserved','running','succeeded')",
             (encoded, run_id),
+        )
+
+    # ---------- desktop runtime relay ----------
+    def upsert_desktop_runtime_device(
+        self,
+        *,
+        user_id: str,
+        device_id_hash: str,
+        platform: str,
+        app_version: str,
+        capabilities: dict,
+        lease_seconds: int = 45,
+    ) -> dict:
+        now = _now()
+        lease_expires_at = now + max(15, min(int(lease_seconds), 120))
+        encoded = json.dumps(capabilities, separators=(",", ":"), sort_keys=True)
+        self._exec(
+            "INSERT INTO desktop_runtime_devices("
+            "user_id,device_id_hash,platform,app_version,capabilities_json,"
+            "last_seen_at,lease_expires_at,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(user_id,device_id_hash) DO UPDATE SET "
+            "platform=excluded.platform,app_version=excluded.app_version,"
+            "capabilities_json=excluded.capabilities_json,"
+            "last_seen_at=excluded.last_seen_at,lease_expires_at=excluded.lease_expires_at,"
+            "updated_at=excluded.updated_at",
+            (
+                user_id,
+                device_id_hash,
+                platform,
+                app_version,
+                encoded,
+                now,
+                lease_expires_at,
+                now,
+                now,
+            ),
+        )
+        return {
+            "online": True,
+            "lease_expires_at": lease_expires_at,
+            "capabilities": capabilities,
+        }
+
+    def desktop_runtime_available(self, user_id: str, capability: str) -> bool:
+        rows = self._q(
+            "SELECT capabilities_json FROM desktop_runtime_devices "
+            "WHERE user_id=? AND lease_expires_at>? ORDER BY last_seen_at DESC",
+            (user_id, _now()),
+        )
+        for row in rows:
+            try:
+                capabilities = json.loads(row["capabilities_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(capabilities, dict) and capabilities.get(capability) is True:
+                return True
+        return False
+
+    def create_desktop_runtime_job(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        bot_id: str | None,
+        job_kind: str,
+        payload_enc: bytes,
+        key_id: str,
+        key_version: int,
+        expires_at: float,
+    ) -> dict:
+        if job_kind not in {"browser", "computer"}:
+            raise ValueError("job_kind inválido")
+        now = _now()
+        job_id = new_id("djob")
+        self._exec(
+            "INSERT INTO desktop_runtime_jobs("
+            "id,user_id,run_id,bot_id,job_kind,status,payload_enc,key_id,key_version,"
+            "expires_at,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?,?,?,?)",
+            (
+                job_id,
+                user_id,
+                run_id,
+                bot_id,
+                job_kind,
+                payload_enc,
+                key_id,
+                key_version,
+                expires_at,
+                now,
+                now,
+            ),
+        )
+        row = self._one("SELECT * FROM desktop_runtime_jobs WHERE id=?", (job_id,))
+        if row is None:
+            raise RuntimeError("No se pudo crear el trabajo local")
+        return dict(row)
+
+    def claim_desktop_runtime_job(
+        self,
+        *,
+        user_id: str,
+        device_id_hash: str,
+        capabilities: dict,
+        lease_seconds: int = 1_900,
+    ) -> dict | None:
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                device = self._conn.execute(
+                    "SELECT capabilities_json FROM desktop_runtime_devices "
+                    "WHERE user_id=? AND device_id_hash=? AND lease_expires_at>?",
+                    (user_id, device_id_hash, now),
+                ).fetchone()
+                if device is None:
+                    self._conn.rollback()
+                    return None
+                try:
+                    registered = json.loads(device["capabilities_json"])
+                except (TypeError, json.JSONDecodeError):
+                    registered = {}
+                supported = tuple(
+                    kind for kind in ("computer", "browser")
+                    if capabilities.get(kind) is True
+                    and isinstance(registered, dict)
+                    and registered.get(kind) is True
+                )
+                if not supported:
+                    self._conn.rollback()
+                    return None
+                placeholders = ",".join("?" for _ in supported)
+                # A desktop can disappear while it owns a job (sleep, crash or
+                # network change). Make the claim recoverable after its lease
+                # instead of leaving the mobile/WhatsApp request stuck forever.
+                self._conn.execute(
+                    "UPDATE desktop_runtime_jobs SET status='pending',"
+                    "claimed_device_hash=NULL,claim_expires_at=NULL,updated_at=? "
+                    "WHERE user_id=? AND status='claimed' AND claim_expires_at<=? "
+                    "AND expires_at>?",
+                    (now, user_id, now, now),
+                )
+                rows = self._conn.execute(
+                    "SELECT * FROM desktop_runtime_jobs WHERE user_id=? "
+                    "AND status='pending' AND expires_at>? "
+                    f"AND job_kind IN ({placeholders}) ORDER BY created_at ASC LIMIT 8",
+                    (user_id, now, *supported),
+                ).fetchall()
+                for candidate in rows:
+                    job_id = candidate["id"]
+                    cursor = self._conn.execute(
+                        "UPDATE desktop_runtime_jobs SET status='claimed',"
+                        "claimed_device_hash=?,claim_expires_at=?,updated_at=? "
+                        "WHERE id=? AND status='pending'",
+                        (
+                            device_id_hash,
+                            min(
+                                float(candidate["expires_at"]),
+                                now + max(30, min(int(lease_seconds), 3_600)),
+                            ),
+                            now,
+                            job_id,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        claimed = self._conn.execute(
+                            "SELECT * FROM desktop_runtime_jobs WHERE id=?", (job_id,)
+                        ).fetchone()
+                        self._conn.commit()
+                        return dict(claimed) if claimed else None
+                self._conn.commit()
+                return None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_desktop_runtime_job(self, job_id: str, user_id: str) -> dict | None:
+        row = self._one(
+            "SELECT * FROM desktop_runtime_jobs WHERE id=? AND user_id=?",
+            (job_id, user_id),
+        )
+        return dict(row) if row else None
+
+    def finish_desktop_runtime_job(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        device_id_hash: str,
+        status: str,
+        result: dict | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> bool:
+        if status not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError("status de trabajo local inválido")
+        encoded = None
+        if result is not None:
+            encoded = json.dumps(
+                result, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            )
+            if len(encoded.encode("utf-8")) > 1_000_000:
+                raise ValueError("El resultado local excede 1 MB")
+        now = _now()
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE desktop_runtime_jobs SET status=?,result_json=?,error_code=?,"
+                "error_message=?,finished_at=?,updated_at=? WHERE id=? AND user_id=? "
+                "AND claimed_device_hash=? AND status='claimed'",
+                (
+                    status,
+                    encoded,
+                    error_code,
+                    error_message,
+                    now,
+                    now,
+                    job_id,
+                    user_id,
+                    device_id_hash,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def expire_desktop_runtime_job(self, job_id: str, user_id: str) -> None:
+        now = _now()
+        self._exec(
+            "UPDATE desktop_runtime_jobs SET status='expired',finished_at=?,updated_at=? "
+            "WHERE id=? AND user_id=? AND status IN ('pending','claimed')",
+            (now, now, job_id, user_id),
         )
 
     def begin_connector_operation(

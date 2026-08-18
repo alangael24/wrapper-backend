@@ -56,6 +56,33 @@ test("keeps Electron, the Python broker, and the Pi extension connector ids alig
   assert.deepEqual(extensionIds, desktopIds);
 });
 
+test("ships and starts the account-scoped native Pi Chrome runtime", async () => {
+  const [main, oauth, runtime, loader, builder, packageJson] = await Promise.all([
+    readFile(new URL("../desktop/src/main.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/oauth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/local-agent-runtime.ts", import.meta.url), "utf8"),
+    readFile(new URL("../desktop/src/pi-extension-loader.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../electron-builder.yml", import.meta.url), "utf8"),
+    readFile(new URL("../package.json", import.meta.url), "utf8")
+  ]);
+  assert.match(main, /new LocalAgentRuntime/);
+  assert.match(main, /localAgentRuntime\.start\(\)/);
+  assert.match(oauth, /\/v1\/desktop-runtime\/heartbeat/);
+  assert.match(oauth, /\/v1\/desktop-runtime\/jobs\/claim/);
+  assert.match(oauth, /\/v1\/desktop-runtime\/jobs\/\$\{encodeURIComponent\(jobId\)\}\/complete/);
+  assert.match(runtime, /createAgentSession/);
+  assert.match(runtime, /noTools: "builtin"/);
+  assert.match(runtime, /PI_CHROME_BRIDGE_HOST", "127\.0\.0\.1"/);
+  assert.match(runtime, /connectorExtension/);
+  assert.match(runtime, /input: \["text"\]/);
+  assert.match(loader, /pi-chrome\/extensions\/chrome-profile-bridge/);
+  assert.match(loader, /@injaneity\/pi-computer-use/);
+  assert.match(builder, /to: pi-runtime\/pi-chrome\/browser-extension/);
+  assert.match(builder, /to: pi-runtime\/pi-computer-use/);
+  assert.match(packageJson, /"pi-chrome": "0\.15\.46"/);
+  assert.match(packageJson, /"@injaneity\/pi-computer-use": "0\.5\.0"/);
+});
+
 test("normalizes connector selection and persisted bot state", () => {
   const normalized = contracts.normalizeConnectorIds([
     "slack", "slack", "not-real", "shopify", 42
@@ -499,7 +526,12 @@ test("runs packaged smoke tests with isolated temporary user data on every deskt
   assert.match(main, /mkdtempSync\(path\.join\(tmpdir\(\), "agentgenia-smoke-"\)\)/);
   assert.match(main, /app\.setPath\("userData", smokeUserDataPath\)/);
   assert.match(main, /Create the first BrowserWindow before touching Keychain-backed session/);
-  assert.match(main, /createWindow\(\);[\s\S]{0,360}did-finish-load[\s\S]{0,180}oauthController\.accountId\(\)/);
+  const windowCreated = main.indexOf("createWindow();");
+  const rendererLoaded = main.indexOf('did-finish-load', windowCreated);
+  const accountUnlocked = main.indexOf("oauthController.accountId()", rendererLoaded);
+  assert.ok(windowCreated >= 0 && rendererLoaded > windowCreated && accountUnlocked > rendererLoaded);
+  assert.match(main, /new LocalAgentRuntime\(/);
+  assert.match(main, /localAgentRuntime\.start\(\)/);
   assert.match(oauth, /safeStorage\.isAsyncEncryptionAvailable/);
   assert.match(workflow, /Launch packaged macOS application/);
   assert.match(workflow, /Launch packaged Windows application/);

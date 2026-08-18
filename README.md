@@ -521,44 +521,40 @@ pnpm test:connectors
 python3 -m unittest tests.test_backend -v
 ```
 
-## Navegación con pi-chrome
+## Navegación local con Pi Chrome
 
-`pi-chrome` está fijado en `package.json` y Pi carga automáticamente su extensión
-desde `node_modules`. El backend **no usa ni acepta un perfil Chrome compartido**.
-Para cada llamada con `browser:true` crea:
+La navegación autenticada no corre en Render. La app de escritorio incorpora el
+SDK de Pi y `pi-chrome`, y usa el companion **Pi Chrome Connector** instalado en
+el Chrome normal del usuario (`127.0.0.1:17318`). Así conserva sus sesiones sin
+copiar cookies, perfiles ni credenciales al servidor.
 
-- un proceso Chrome separado;
-- un `--user-data-dir` nuevo y vacío;
-- una copia privada de la extensión companion;
-- un puerto bridge local exclusivo.
+El flujo es el mismo sin importar dónde se origine la petición:
 
-El proceso y sus cookies se eliminan al terminar la ejecución. No cargues la
-extensión companion manualmente en tu Chrome real. Para verificar la instalación:
+1. Electron mantiene un heartbeat autenticado ligado al `user_id` y al
+   dispositivo local.
+2. Una tarea web enviada desde Electron, iOS, Android o WhatsApp crea un trabajo
+   cifrado y temporal para esa misma cuenta.
+3. Solo un desktop activo de la cuenta puede reclamarlo. Recibe una API key de
+   modelo de un solo uso y, cuando corresponde, un grant efímero de conectores.
+4. Pi corre dentro de Electron y usa las herramientas `chrome_*` nativas. Puede
+   combinar Chrome y conectores en la misma ejecución.
+5. El resultado vuelve al canal original. Render coordina y sirve el modelo;
+   nunca abre Chromium ni accede al perfil del usuario.
 
-```bash
-pnpm install
-./scripts/setup-pi-chrome.sh
-```
+La primera vez, el usuario carga el companion incluido con Agent Genia. Antes de
+controlar Chrome, Pi muestra la autorización explícita de 30 minutos de
+`/chrome authorize`; rechazarla deja las herramientas bloqueadas. Cada cuenta y
+sesión del sistema operativo conserva su propio perfil: Agent Genia no comparte
+un Chrome del servidor entre clientes.
 
-Después:
+Si no hay un desktop autenticado y despierto, el backend falla cerrado con
+`desktop_runtime_offline` y pide abrir Agent Genia en la computadora. El estado
+puede consultarse en `GET /v1/desktop-runtime/status`.
 
-1. Configura `PI_ENABLED=1`.
-2. Mantén `PI_CHROME_ISOLATION=per_run` y, si no se autodetecta, define
-   `PI_CHROME_BIN` con el ejecutable de Chrome for Testing o Chromium. Chrome
-   estable no sirve: [desde v137 ignora `--load-extension`](https://developer.chrome.com/blog/extension-news-june-2025).
-   Puedes instalar [Chrome for Testing](https://developer.chrome.com/blog/chrome-for-testing/)
-   con `npx @puppeteer/browsers install chrome@stable`.
-3. Configura `PI_CHROME_AUTO_AUTHORIZE=1`. Esta autorización solo cubre el
-   perfil efímero de la ejecución actual.
-4. Reserva al menos `PI_BROWSER_MIN_MEMORY_MB=1024` para el proceso. Si el
-   contenedor informa un límite menor, el backend rechaza solo la navegación
-   con `pi_browser_insufficient_memory` antes de iniciar Chromium; chat,
-   autenticación y conectores permanecen disponibles.
-5. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
-
-El servidor se niega a arrancar con `PI_CHROME_ISOLATION=shared` o cualquier
-otro modo. Un perfil nuevo no contiene sesiones autenticadas: si una tarea debe
-iniciar sesión, debe hacerlo dentro de esa ejecución y esos datos no se conservan.
+Computer Use local se carga con `@injaneity/pi-computer-use` para solicitudes
+explícitas sobre Finder, Terminal, Excel y otras aplicaciones. Pi Chrome sigue
+siendo la ruta preferida para páginas web; Computer Use cubre la interfaz del
+sistema y no sustituye al sandbox persistente opcional por bot.
 
 DeepSeek recibe texto y resultados estructurados de herramientas. Sin un modelo
 visual activo, capturas o adjuntos de imagen no se anuncian como input soportado.
@@ -771,6 +767,7 @@ runtime se agrupan aquí por función.
 | `PI_BIN` en Render | `/app/scripts/pi-render-safe` | Launcher sin tools locales para hosts sin user namespaces; conserva solo extensiones autorizadas |
 | `PI_NODE_BIN_DIR` | vacío | Directorio de `node` si no está en PATH |
 | `PI_BACKEND_URL` | `http://127.0.0.1:$PORT` | URL que Pi usa para volver al wrapper |
+| `DESKTOP_RUNTIME_PUBLIC_URL` | `CONNECTOR_PUBLIC_URL`, `COMPOSIO_PUBLIC_URL` o `PI_BACKEND_URL` | URL HTTPS pública que recibe Pi cuando el trabajo corre en Electron; nunca debe apuntar al loopback de Render |
 | `PI_RUNS_DIR` | `data/pi-runs` | Workspaces y logs por ejecución |
 | `PI_WARM_SESSIONS` | `0` (`1` en Render) | Reutiliza un proceso y la sesión nativa de Pi por `(usuario, bot)`; solo con `pi-render-safe` |
 | `PI_SESSION_IDLE_SECONDS` | `900` | Cierra una sesión cálida después de este tiempo sin actividad |
@@ -780,16 +777,16 @@ runtime se agrupan aquí por función.
 | `PI_CONNECTOR_THINKING` | `off` | Nivel para una sola integración exacta; elimina razonamiento oculto en routing acotado sin afectar navegador, computadora o tareas multi-conector |
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
-| `PI_BROWSER_MAX_CONCURRENT` | `1` | Navegadores Chromium simultáneos por instancia; limita memoria sin reducir capacidades de cada tarea |
-| `PI_BROWSER_MIN_MEMORY_MB` | `1024` | Memoria mínima del contenedor para admitir Chromium; `0` desactiva la protección solo en desarrollo controlado |
+| `PI_BROWSER_MAX_CONCURRENT` | `0` en producción | Compatibilidad del harness legado; Render no ejecuta navegadores |
+| `PI_BROWSER_MIN_MEMORY_MB` | `0` en producción | Compatibilidad del harness legado; la admisión web depende del heartbeat del desktop |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
 | `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con activación exacta por grant y fallback diferido para conjuntos grandes |
 | `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |
-| `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Extensión Pi de pi-chrome |
-| `PI_CHROME_BIN` | autodetectado | Ejecutable de Chrome for Testing/Chromium; no es una ruta de perfil |
-| `PI_CHROME_ISOLATION` | `per_run` | Único modo válido: proceso, perfil y bridge nuevos por ejecución |
-| `PI_CHROME_AUTO_AUTHORIZE` | `0` | Autorizar automáticamente solo el Chrome efímero de esa ejecución |
-| `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración máxima; el proceso se cierra antes si termina la tarea |
+| `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Compatibilidad del harness; Electron empaqueta y carga la extensión nativa directamente |
+| `PI_CHROME_BIN` | vacío | Solo para pruebas antiguas con Chromium aislado; no se usa en Render ni para el Chrome del usuario |
+| `PI_CHROME_ISOLATION` | `per_run` | Guardia del harness legado; no habilita un perfil compartido |
+| `PI_CHROME_AUTO_AUTHORIZE` | `0` | Debe permanecer apagado; Electron solicita autorización interactiva |
+| `PI_CHROME_AUTHORIZE_MINUTES` | `30` | Duración de la autorización interactiva de Chrome local |
 
 ### Computadoras persistentes
 

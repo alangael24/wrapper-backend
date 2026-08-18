@@ -15,6 +15,10 @@ import type {
   WhatsAppStatus
 } from "./contracts";
 import { CONNECTOR_CATALOG, normalizeAppState } from "./contracts";
+import type {
+  DesktopRuntimeCapabilities,
+  DesktopRuntimeJob
+} from "./local-agent-runtime";
 
 const SESSION_REFRESH_SKEW_MS = 60_000;
 const ACCOUNT_AUTH_ATTEMPTS = 120;
@@ -278,6 +282,29 @@ export class DesktopOAuthController {
     return this.client.warmAgent(botId, signal);
   }
 
+  desktopRuntimeHeartbeat(
+    capabilities: DesktopRuntimeCapabilities,
+    signal?: AbortSignal
+  ): Promise<void> {
+    return this.client.desktopRuntimeHeartbeat(capabilities, signal);
+  }
+
+  desktopRuntimeClaim(
+    capabilities: DesktopRuntimeCapabilities,
+    signal?: AbortSignal
+  ): Promise<DesktopRuntimeJob | null> {
+    return this.client.desktopRuntimeClaim(capabilities, signal);
+  }
+
+  desktopRuntimeComplete(
+    jobId: string,
+    result: { status: "succeeded"; result: Record<string, unknown> }
+      | { status: "failed" | "cancelled"; error_code: string; error_message: string },
+    signal?: AbortSignal
+  ): Promise<void> {
+    return this.client.desktopRuntimeComplete(jobId, result, signal);
+  }
+
   teachWorkflow(botName: string, frames: string[], durationMs: number, signal?: AbortSignal): Promise<BotWorkflowDraft> {
     return this.client.teachWorkflow(botName, frames, durationMs, signal);
   }
@@ -487,6 +514,53 @@ class WrapperServiceClient {
       signal
     });
     if (result.ready !== true) throw new Error("El agente todavía no está listo.");
+  }
+
+  async desktopRuntimeHeartbeat(
+    capabilities: DesktopRuntimeCapabilities,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const deviceId = await this.options.deviceStore.getOrCreate();
+    await this.authorizedJson("/v1/desktop-runtime/heartbeat", {
+      method: "POST",
+      body: {
+        device_id: deviceId,
+        platform: process.platform,
+        app_version: this.options.appVersion,
+        capabilities
+      },
+      signal
+    });
+  }
+
+  async desktopRuntimeClaim(
+    capabilities: DesktopRuntimeCapabilities,
+    signal?: AbortSignal
+  ): Promise<DesktopRuntimeJob | null> {
+    const deviceId = await this.options.deviceStore.getOrCreate();
+    const response = await this.authorizedJson("/v1/desktop-runtime/jobs/claim", {
+      method: "POST",
+      body: { device_id: deviceId, capabilities },
+      signal
+    });
+    if (response.job === null || response.job === undefined) return null;
+    if (!isDesktopRuntimeJob(response.job)) {
+      throw new Error("El servicio devolvió un trabajo local inválido.");
+    }
+    return response.job;
+  }
+
+  async desktopRuntimeComplete(
+    jobId: string,
+    result: { status: "succeeded"; result: Record<string, unknown> }
+      | { status: "failed" | "cancelled"; error_code: string; error_message: string },
+    signal?: AbortSignal
+  ): Promise<void> {
+    const deviceId = await this.options.deviceStore.getOrCreate();
+    await this.authorizedJson(
+      `/v1/desktop-runtime/jobs/${encodeURIComponent(jobId)}/complete`,
+      { method: "POST", body: { device_id: deviceId, ...result }, signal }
+    );
   }
 
   runAgent(
@@ -1093,6 +1167,20 @@ function parseComputerSnapshot(value: Record<string, unknown>): BotComputerSnaps
     viewer_expires_at: numberValue(value.viewer_expires_at),
     reason: stringValue(value.reason)
   };
+}
+
+function isDesktopRuntimeJob(value: unknown): value is DesktopRuntimeJob {
+  if (!isRecord(value) || typeof value.id !== "string") return false;
+  if (value.kind !== "browser" && value.kind !== "computer") return false;
+  if (typeof value.expires_at !== "number" || !isRecord(value.payload)) return false;
+  const payload = value.payload;
+  return typeof payload.run_id === "string"
+    && typeof payload.run_api_key === "string"
+    && typeof payload.prompt === "string"
+    && typeof payload.model === "string"
+    && typeof payload.backend_url === "string"
+    && typeof payload.browser === "boolean"
+    && typeof payload.computer === "boolean";
 }
 
 export function safeComputerViewerUrl(value: string): string {

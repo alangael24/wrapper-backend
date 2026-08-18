@@ -30,6 +30,10 @@ Endpoints publicos (Bearer = api key del usuario del wrapper):
   GET  /v1/agent/status    Estado del harness de Pi
   POST /v1/agent/warm      Precalentar la sesión aislada de un bot
   POST /v1/agent/run       Ejecutar una tarea con Pi
+  POST /v1/desktop-runtime/heartbeat Registrar el Pi local de Electron
+  POST /v1/desktop-runtime/jobs/claim Reclamar una tarea local de la cuenta
+  POST /v1/desktop-runtime/jobs/<id>/complete Completar una tarea local
+  GET  /v1/desktop-runtime/status Estado del runtime local de la cuenta
   GET  /v1/computers/<bot_id> Estado de la computadora persistente del bot
   POST /v1/computers/<bot_id>/ensure Crear/despertar y obtener un viewer firmado
   POST /v1/computers/<bot_id>/hand-back Hibernar conservando el filesystem
@@ -113,7 +117,7 @@ from .pi_harness import (
     PiRunResult,
 )
 from .postgres_store import create_store
-from .store import AccountStateConflict, hash_agent_run_token
+from .store import AccountStateConflict, hash_agent_run_token, hash_desktop_device_id
 from .tiers import (
     DEFAULT_TIER,
     effective_limits,
@@ -523,6 +527,15 @@ class Config:
         self.pi_backend_url = os.environ.get(
             "PI_BACKEND_URL", f"http://127.0.0.1:{self.port}"
         ).rstrip("/")
+        # PI_BACKEND_URL intentionally remains loopback for server-side Pi.
+        # Desktop jobs need the public wrapper URL because they execute on the
+        # user's machine, not inside the Render container.
+        self.desktop_runtime_public_url = (
+            os.environ.get("DESKTOP_RUNTIME_PUBLIC_URL")
+            or self.connector_public_url
+            or self.composio_public_url
+            or self.pi_backend_url
+        ).strip().rstrip("/")
         self.pi_runs_dir = Path(os.environ.get("PI_RUNS_DIR", str(DEFAULT_PI_RUNS)))
         self.pi_model = os.environ.get("PI_MODEL", "deepseek-v4-flash")
         # DeepSeek currently maps both `low` and `medium` to `high`. Keep the
@@ -619,9 +632,9 @@ def validate_runtime_security(cfg: Config) -> None:
         raise UnsafeConfigurationError(
             "PI_SESSION_IDLE_SECONDS y PI_MAX_WARM_SESSIONS no son válidos"
         )
-    if not 1 <= cfg.pi_browser_max_concurrent <= cfg.pi_max_concurrent:
+    if not 0 <= cfg.pi_browser_max_concurrent <= cfg.pi_max_concurrent:
         raise UnsafeConfigurationError(
-            "PI_BROWSER_MAX_CONCURRENT debe estar entre 1 y PI_MAX_CONCURRENT"
+            "PI_BROWSER_MAX_CONCURRENT debe estar entre 0 y PI_MAX_CONCURRENT"
         )
     if cfg.pi_browser_min_memory_mb < 0:
         raise UnsafeConfigurationError(
@@ -692,6 +705,19 @@ def validate_runtime_security(cfg: Config) -> None:
             "PI_BACKEND_URL",
             allowed_hosts={"localhost", "127.0.0.1", "::1"},
         )
+        if cfg.pi_enabled:
+            _validate_service_url(
+                cfg.desktop_runtime_public_url,
+                "DESKTOP_RUNTIME_PUBLIC_URL",
+            )
+            desktop_runtime_url = urlparse(cfg.desktop_runtime_public_url)
+            if (
+                desktop_runtime_url.scheme != "https"
+                or desktop_runtime_url.hostname in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise UnsafeConfigurationError(
+                    "DESKTOP_RUNTIME_PUBLIC_URL debe ser una URL HTTPS pública en producción"
+                )
         if cfg.daytona_api_url:
             _validate_service_url(cfg.daytona_api_url, "DAYTONA_API_URL")
 
@@ -2673,13 +2699,10 @@ class Backend:
         database = self.store.health()
         pi = self.pi.status()
         pi.pop("binary", None)
-        memory_limit = runtime_memory_limit_mb()
-        browser_resource_ready = bool(
-            memory_limit is None
-            or self.cfg.pi_browser_min_memory_mb == 0
-            or memory_limit >= self.cfg.pi_browser_min_memory_mb
-        )
-        pi["browser_resource_ready"] = browser_resource_ready
+        # Browser and GUI automation execute only on an authenticated desktop.
+        # Render therefore never needs Chromium, a display server or browser
+        # memory in order for the API itself to be ready.
+        pi["browser_execution"] = "authenticated_desktop"
         connectors = self.connector_gateway.health()
         computers = self.computers.health()
         checks = {
@@ -2703,10 +2726,7 @@ class Backend:
             and bool(pi.get("available"))
             and bool(pi.get("node_available"))
             and bool(pi.get("connectors_available")),
-            "pi_chrome": bool(pi.get("browser_available"))
-            and bool(pi.get("browser_auto_authorize"))
-            and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN
-            and browser_resource_ready,
+            "desktop_relay": bool(database.get("ready")),
             "model_provider": bool(self.cfg.deepseek_api_key),
             "whatsapp": (
                 not self.cfg.whatsapp_enabled or self.whatsapp.config.configured
@@ -3027,6 +3047,240 @@ class Backend:
             cost, status, run_id=run_id, estimated_cost_microusd=cost_microusd,
         )
 
+    # ---------- local desktop runtime ----------
+    @staticmethod
+    def _desktop_device_id(value: object) -> str | None:
+        if not isinstance(value, str) or len(value) > 80:
+            return None
+        try:
+            parsed = uuid.UUID(value.strip())
+        except (ValueError, AttributeError):
+            return None
+        return str(parsed)
+
+    def handle_desktop_runtime_heartbeat(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        device_id = self._desktop_device_id(body.get("device_id"))
+        platform = body.get("platform")
+        app_version = body.get("app_version", "")
+        capabilities = body.get("capabilities")
+        if not device_id:
+            error_response(handler, 400, "device_id no es válido", "bad_device_id")
+            return
+        if platform not in {"darwin", "win32", "linux"}:
+            error_response(handler, 400, "platform no es válida", "bad_platform")
+            return
+        if not isinstance(app_version, str) or len(app_version) > 80:
+            error_response(handler, 400, "app_version no es válida", "bad_app_version")
+            return
+        if not isinstance(capabilities, dict) or any(
+            capabilities.get(name) not in {True, False, None}
+            for name in ("browser", "computer")
+        ):
+            error_response(handler, 400, "capabilities no es válido", "bad_capabilities")
+            return
+        normalized = {
+            "browser": capabilities.get("browser") is True,
+            "computer": capabilities.get("computer") is True,
+        }
+        status = self.store.upsert_desktop_runtime_device(
+            user_id=user["id"],
+            device_id_hash=hash_desktop_device_id(device_id),
+            platform=platform,
+            app_version=app_version,
+            capabilities=normalized,
+        )
+        json_response(handler, 200, status)
+
+    def handle_desktop_runtime_status(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        json_response(handler, 200, {
+            "online": self.store.desktop_runtime_available(user["id"], "browser"),
+            "browser": self.store.desktop_runtime_available(user["id"], "browser"),
+            "computer": self.store.desktop_runtime_available(user["id"], "computer"),
+        })
+
+    def handle_desktop_runtime_claim(self, handler: BaseHTTPRequestHandler) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        body = self.read_json(handler) or {}
+        device_id = self._desktop_device_id(body.get("device_id"))
+        capabilities = body.get("capabilities")
+        if not device_id or not isinstance(capabilities, dict):
+            error_response(handler, 400, "Solicitud de runtime inválida", "bad_desktop_runtime")
+            return
+        normalized = {
+            "browser": capabilities.get("browser") is True,
+            "computer": capabilities.get("computer") is True,
+        }
+        job = self.store.claim_desktop_runtime_job(
+            user_id=user["id"],
+            device_id_hash=hash_desktop_device_id(device_id),
+            capabilities=normalized,
+        )
+        if job is None:
+            json_response(handler, 200, {"job": None})
+            return
+        try:
+            cleartext = self.decrypt_secret(
+                bytes(job["payload_enc"]), job["key_id"], int(job.get("key_version") or 1)
+            )
+            payload = json.loads(cleartext)
+        except (CryptoError, TypeError, ValueError, json.JSONDecodeError):
+            logging.exception("Could not decrypt desktop runtime job job_id=%s", job["id"])
+            self.store.finish_desktop_runtime_job(
+                job_id=job["id"],
+                user_id=user["id"],
+                device_id_hash=hash_desktop_device_id(device_id),
+                status="failed",
+                error_code="desktop_job_corrupt",
+                error_message="El trabajo local no pudo descifrarse.",
+            )
+            error_response(handler, 500, "Internal server error", "desktop_job_corrupt")
+            return
+        json_response(handler, 200, {
+            "job": {
+                "id": job["id"],
+                "kind": job["job_kind"],
+                "expires_at": job["expires_at"],
+                "payload": payload,
+            }
+        })
+
+    def handle_desktop_runtime_complete(
+        self, handler: BaseHTTPRequestHandler, job_id: str
+    ) -> None:
+        user = self.require_user(handler)
+        if not user:
+            return
+        if not re.fullmatch(r"djob_[0-9a-f]{16}", job_id):
+            error_response(handler, 404, "Trabajo local no encontrado", "desktop_job_not_found")
+            return
+        body = self.read_json(handler) or {}
+        device_id = self._desktop_device_id(body.get("device_id"))
+        status = body.get("status")
+        result = body.get("result")
+        error_code = body.get("error_code")
+        error_message = body.get("error_message")
+        if not device_id or status not in {"succeeded", "failed", "cancelled"}:
+            error_response(handler, 400, "Resultado de runtime inválido", "bad_desktop_result")
+            return
+        if status == "succeeded" and not isinstance(result, dict):
+            error_response(handler, 400, "Falta el resultado local", "bad_desktop_result")
+            return
+        if error_code is not None and (not isinstance(error_code, str) or len(error_code) > 100):
+            error_response(handler, 400, "error_code no es válido", "bad_desktop_result")
+            return
+        if error_message is not None and (
+            not isinstance(error_message, str) or len(error_message) > 2000
+        ):
+            error_response(handler, 400, "error_message no es válido", "bad_desktop_result")
+            return
+        updated = self.store.finish_desktop_runtime_job(
+            job_id=job_id,
+            user_id=user["id"],
+            device_id_hash=hash_desktop_device_id(device_id),
+            status=status,
+            result=result if isinstance(result, dict) else None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        if not updated:
+            error_response(
+                handler, 409,
+                "El trabajo local venció, ya terminó o pertenece a otro dispositivo",
+                "desktop_job_unavailable",
+            )
+            return
+        json_response(handler, 200, {"completed": True})
+
+    def _run_on_desktop(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        bot_id: str | None,
+        run_api_key: str,
+        prompt: str,
+        browser: bool,
+        computer: bool,
+        connector_run_token: str | None,
+        connector_ids: tuple[str, ...],
+        thinking_level: str,
+    ) -> PiRunResult:
+        job_kind = "computer" if computer else "browser"
+        key_id = f"desktop-runtime:{run_id}"
+        payload = {
+            "run_id": run_id,
+            "run_api_key": run_api_key,
+            "prompt": prompt,
+            "model": self.cfg.pi_model,
+            "thinking_level": thinking_level,
+            "backend_url": self.cfg.desktop_runtime_public_url,
+            "browser": browser,
+            "computer": computer,
+            "connector_run_token": connector_run_token,
+            "connector_ids": list(connector_ids),
+        }
+        payload_enc = self.encrypt_secret(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")), key_id
+        )
+        expires_at = time.time() + min(
+            self.cfg.credits.reservation_ttl_seconds,
+            max(60, self.cfg.pi_timeout_seconds + 30),
+        )
+        job = self.store.create_desktop_runtime_job(
+            user_id=user_id,
+            run_id=run_id,
+            bot_id=bot_id,
+            job_kind=job_kind,
+            payload_enc=payload_enc,
+            key_id=key_id,
+            key_version=self.cfg.wrapper_secret_version,
+            expires_at=expires_at,
+        )
+        deadline = time.monotonic() + max(30, self.cfg.pi_timeout_seconds)
+        while time.monotonic() < deadline:
+            current = self.store.get_desktop_runtime_job(job["id"], user_id)
+            if not current:
+                raise PiHarnessError("El trabajo local desapareció antes de terminar")
+            if current["status"] == "succeeded":
+                try:
+                    result = json.loads(current.get("result_json") or "{}")
+                except json.JSONDecodeError as exc:
+                    raise PiHarnessError("El desktop devolvió un resultado inválido") from exc
+                answer = result.get("answer") if isinstance(result, dict) else None
+                if not isinstance(answer, str) or not answer.strip():
+                    raise PiHarnessError("El desktop no devolvió una respuesta final")
+                usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+                return PiRunResult(
+                    run_id=run_id,
+                    answer=answer,
+                    model=str(result.get("model") or self.cfg.pi_model),
+                    duration_seconds=max(0.0, float(result.get("duration_seconds") or 0)),
+                    usage={
+                        "input_tokens": max(0, int(usage.get("input_tokens") or 0)),
+                        "output_tokens": max(0, int(usage.get("output_tokens") or 0)),
+                        "cached_read_tokens": max(0, int(usage.get("cached_read_tokens") or 0)),
+                        "cached_write_tokens": max(0, int(usage.get("cached_write_tokens") or 0)),
+                    },
+                    browser=browser,
+                    event_log="",
+                    stderr_log="",
+                )
+            if current["status"] in {"failed", "cancelled", "expired"}:
+                message = str(current.get("error_message") or "El desktop no pudo completar la tarea")
+                raise PiHarnessError(message)
+            time.sleep(0.25)
+        self.store.expire_desktop_runtime_job(job["id"], user_id)
+        raise PiHarnessTimeout("El desktop tardó demasiado en completar la tarea")
+
     # ---------- Pi agent harness ----------
     def handle_agent_status(self, handler: BaseHTTPRequestHandler) -> None:
         user = self.require_user(handler)
@@ -3034,6 +3288,15 @@ class Backend:
             return
         status = self.pi.status()
         status.pop("binary", None)  # no exponer rutas internas del servidor
+        local_browser = self.store.desktop_runtime_available(user["id"], "browser")
+        local_computer = self.store.desktop_runtime_available(user["id"], "computer")
+        status["browser_execution"] = "authenticated_desktop"
+        status["browser_available"] = local_browser
+        status["desktop_runtime"] = {
+            "online": local_browser or local_computer,
+            "browser": local_browser,
+            "computer": local_computer,
+        }
         status["model_provider"] = (
             "opencode" if user.get("model_provider_override") == "opencode" else "deepseek"
         )
@@ -3141,6 +3404,47 @@ class Backend:
         # generic bot instructions are deliberately excluded by callers.
         context = conversation_context.strip().lower()
         return not context or tool_intent.search(context) is None
+
+    @staticmethod
+    def _local_browser_intent(user_message: str) -> bool:
+        """Conservatively recognize requests that require the user's browser.
+
+        Provider-specific work such as Gmail or Calendar alone stays on its
+        connector. A request may still combine those connectors with explicit
+        local web navigation in the same desktop Pi run.
+        """
+        message = user_message.strip().lower()
+        if not message:
+            return False
+        return bool(re.search(
+            r"(?:https?://|\b(?:chrome|navegador|browser|sitio\s+web|p[aá]gina\s+web|"
+            r"internet|marketplace|tienda\s+online|web\s+app|inicia\s+sesi[oó]n\s+en|"
+            r"abre\s+(?:la\s+)?(?:web|p[aá]gina|sitio)|navega\s+(?:a|en)|"
+            r"open\s+(?:the\s+)?(?:website|site|page)|browse\s+(?:to|the)|"
+            r"log\s+in\s+to\s+(?:the\s+)?(?:website|site))\b)",
+            message,
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _local_computer_intent(user_message: str) -> bool:
+        """Recognize explicit requests to operate a local desktop application."""
+        message = user_message.strip().lower()
+        if not message:
+            return False
+        return bool(re.search(
+            r"\b(?:mi\s+computadora|mi\s+pc|mi\s+mac|computadora\s+local|"
+            r"desktop|finder|explorador\s+de\s+archivos|textedit|notepad|"
+            r"bloc\s+de\s+notas|calculadora|terminal|powershell|"
+            r"abre\s+(?:la\s+app(?:licaci[oó]n)?\s+)?(?:excel|word|powerpoint|"
+            r"textedit|notepad|calculadora|terminal)|"
+            r"controla\s+(?:mi\s+)?(?:computadora|pc|mac)|"
+            r"usa\s+(?:mi\s+)?(?:computadora|pc|mac)|"
+            r"on\s+my\s+(?:computer|pc|mac)|local\s+(?:computer|desktop)|"
+            r"open\s+(?:the\s+)?(?:finder|file\s+explorer|notepad|calculator|terminal))\b",
+            message,
+            re.IGNORECASE,
+        ))
 
     def _run_direct_chat(
         self,
@@ -3482,24 +3786,8 @@ class Backend:
         if not isinstance(browser, bool):
             error_response(handler, 400, "browser debe ser true o false", "bad_browser")
             return
-        if browser and self.cfg.pi_browser_min_memory_mb > 0:
-            memory_limit = runtime_memory_limit_mb()
-            if (
-                memory_limit is not None
-                and memory_limit < self.cfg.pi_browser_min_memory_mb
-            ):
-                logging.warning(
-                    "Browser run rejected: container memory %sMB is below %sMB",
-                    memory_limit,
-                    self.cfg.pi_browser_min_memory_mb,
-                )
-                error_response(
-                    handler,
-                    503,
-                    "La navegación web está temporalmente fuera de servicio; el resto de Agentgenia sigue disponible",
-                    "pi_browser_insufficient_memory",
-                )
-                return
+        # Browser/computer requests are executed by the authenticated desktop
+        # runtime. Render never starts Chromium for a customer task.
         if not isinstance(computer_requested, bool):
             error_response(handler, 400, "computer debe ser true o false", "bad_computer")
             return
@@ -3790,6 +4078,32 @@ class Backend:
                 elif connector_context not in effective_prompt:
                     effective_prompt = f"{effective_prompt}\n\n{connector_context}"
 
+        if (
+            not direct_chat
+            and not approval_rejected
+            and self._local_computer_intent(user_message)
+        ):
+            computer_requested = True
+        if (
+            not direct_chat
+            and not approval_rejected
+            and self._local_browser_intent(user_message)
+        ):
+            browser = True
+        computer_enabled = bool(computer_requested)
+        local_runtime_kind = "computer" if computer_enabled else "browser"
+        local_runtime = bool(browser or computer_enabled)
+        if local_runtime and not self.store.desktop_runtime_available(
+            user["id"], local_runtime_kind
+        ):
+            error_response(
+                handler,
+                409,
+                "Abre Agent Genia en tu computadora para usar Chrome o controlar aplicaciones locales",
+                "desktop_runtime_offline",
+            )
+            return
+
         if len(effective_prompt) > self.cfg.pi_max_prompt_chars:
             error_response(
                 handler,
@@ -3800,29 +4114,21 @@ class Backend:
             return
 
         pi_status = self.pi.status()
-        if not direct_chat and not approved_connector_execution and not approval_rejected:
+        if (
+            not local_runtime
+            and not direct_chat
+            and not approved_connector_execution
+            and not approval_rejected
+        ):
             if not pi_status["enabled"]:
                 error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
                 return
             if not pi_status["available"]:
                 error_response(handler, 503, "Pi no esta instalado o PI_BIN es invalido", "pi_unavailable")
                 return
-            if browser and not (
-                pi_status["browser_available"] and pi_status["browser_auto_authorize"]
-            ):
-                error_response(handler, 409, "Chrome no esta configurado para Pi", "pi_browser_unavailable")
-                return
-        if computer_requested and not self.computers.configured:
-            error_response(
-                handler,
-                409,
-                "La computadora solicitada no está disponible en este despliegue",
-                "computer_unavailable",
-            )
-            return
-        computer_enabled = bool(computer_requested)
         if (
-            not direct_chat
+            not local_runtime
+            and not direct_chat
             and not approved_connector_execution
             and not approval_rejected
             and (connector_ids or computer_enabled)
@@ -4041,7 +4347,11 @@ class Backend:
                 )
                 self._mark_run_timing(run_id, "direct_complete_ms")
             else:
-                if bot_id is not None and not approved_connector_execution:
+                if (
+                    not local_runtime
+                    and bot_id is not None
+                    and not approved_connector_execution
+                ):
                     conversation_key = f"{user['id']}\0{bot_id}"
                     with self._pi_warm_lock:
                         warm_event = self._pi_warm_events.pop(conversation_key, None)
@@ -4104,29 +4414,45 @@ class Backend:
                             if len(event_stream.visible_sent) > before:
                                 self._mark_run_timing(run_id, "first_visible_delta_ms")
 
-                    result = self.pi.run(
-                        run_id=run_id,
-                        run_api_key=run_api_key,
-                        prompt=effective_prompt,
-                        browser=browser,
-                        connector_run_token=connector_run_token,
-                        connector_ids=connector_ids,
-                        computer_enabled=computer_enabled,
-                        thinking_level=(
-                            self.cfg.pi_connector_thinking
-                            if len(connector_ids) == 1 and not browser and not computer_enabled
-                            else self.cfg.pi_thinking
-                        ),
-                        conversation_key=(
-                            f"{user['id']}\0{bot_id}" if bot_id is not None else None
-                        ),
-                        on_text_delta=on_text_delta,
-                        # Transport loss is not cancellation. The run remains
-                        # durable and recoverable by run_id, avoiding duplicate
-                        # external side effects when a mobile/desktop stream drops.
-                        is_cancelled=None,
+                    thinking_level = (
+                        self.cfg.pi_connector_thinking
+                        if len(connector_ids) == 1 and not browser and not computer_enabled
+                        else self.cfg.pi_thinking
                     )
-                    self._mark_run_timing(run_id, "pi_complete_ms")
+                    if local_runtime:
+                        result = self._run_on_desktop(
+                            user_id=user["id"],
+                            run_id=run_id,
+                            bot_id=bot_id,
+                            run_api_key=run_api_key,
+                            prompt=effective_prompt,
+                            browser=browser,
+                            computer=computer_enabled,
+                            connector_run_token=connector_run_token,
+                            connector_ids=connector_ids,
+                            thinking_level=thinking_level,
+                        )
+                        self._mark_run_timing(run_id, "desktop_pi_complete_ms")
+                    else:
+                        result = self.pi.run(
+                            run_id=run_id,
+                            run_api_key=run_api_key,
+                            prompt=effective_prompt,
+                            browser=False,
+                            connector_run_token=connector_run_token,
+                            connector_ids=connector_ids,
+                            computer_enabled=False,
+                            thinking_level=thinking_level,
+                            conversation_key=(
+                                f"{user['id']}\0{bot_id}" if bot_id is not None else None
+                            ),
+                            on_text_delta=on_text_delta,
+                            # Transport loss is not cancellation. The run remains
+                            # durable and recoverable by run_id, avoiding duplicate
+                            # external side effects when a mobile/desktop stream drops.
+                            is_cancelled=None,
+                        )
+                        self._mark_run_timing(run_id, "pi_complete_ms")
         except DirectChatError as e:
             _settled, _credits = settle("failed", e.code)
             agent_error(e.status, str(e), e.code)
@@ -4240,7 +4566,9 @@ class Backend:
             "status": "running",
             "connector_ids": [] if direct_chat else list(connector_ids),
             "computer_enabled": computer_enabled,
-            "execution_path": "direct_chat" if direct_chat else "pi",
+            "execution_path": (
+                "direct_chat" if direct_chat else "desktop_pi" if local_runtime else "pi"
+            ),
         })
         try:
             self.store.save_agent_run_result(run_id, provisional)
@@ -4268,7 +4596,9 @@ class Backend:
         })
         payload["connector_ids"] = [] if direct_chat else list(connector_ids)
         payload["computer_enabled"] = computer_enabled
-        payload["execution_path"] = "direct_chat" if direct_chat else "pi"
+        payload["execution_path"] = (
+            "direct_chat" if direct_chat else "desktop_pi" if local_runtime else "pi"
+        )
         self._mark_run_timing(run_id, "response_ready_ms")
         payload["timings"] = self._run_timing_snapshot(run_id)
         try:
@@ -4347,8 +4677,17 @@ class Backend:
 
     def _connector_token(self, handler: BaseHTTPRequestHandler) -> str | None:
         if not self._is_loopback_request(handler):
-            error_response(handler, 403, "El broker solo acepta trafico loopback", "connector_loopback_only")
-            return None
+            # A native Pi session can run on the user's authenticated desktop.
+            # Its random run-scoped token is the capability; require TLS at the
+            # public edge before allowing that capability over the network.
+            forwarded_proto = (handler.headers.get("X-Forwarded-Proto") or "").lower()
+            if forwarded_proto != "https":
+                error_response(
+                    handler, 403,
+                    "El broker remoto requiere HTTPS",
+                    "connector_tls_required",
+                )
+                return None
         token = (handler.headers.get("X-Connector-Run-Token") or "").strip()
         if not token:
             error_response(handler, 401, "Falta el token interno de ejecucion", "connector_token_required")
@@ -4970,6 +5309,15 @@ class Handler(BaseHTTPRequestHandler):
                 backend.handle_agent_run_recover(self)
             elif self.command == "GET" and path.startswith("/v1/agent/runs/"):
                 backend.handle_agent_run_status(self, path.rsplit("/", 1)[-1])
+            elif self.command == "POST" and path == "/v1/desktop-runtime/heartbeat":
+                backend.handle_desktop_runtime_heartbeat(self)
+            elif self.command == "GET" and path == "/v1/desktop-runtime/status":
+                backend.handle_desktop_runtime_status(self)
+            elif self.command == "POST" and path == "/v1/desktop-runtime/jobs/claim":
+                backend.handle_desktop_runtime_claim(self)
+            elif self.command == "POST" and path.startswith("/v1/desktop-runtime/jobs/") and path.endswith("/complete"):
+                job_id = path.split("/")[4]
+                backend.handle_desktop_runtime_complete(self, job_id)
             elif path.startswith("/v1/computers/"):
                 parts = path.strip("/").split("/")
                 bot_id = parts[2] if len(parts) >= 3 else ""

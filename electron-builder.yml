@@ -20,6 +20,12 @@ removePackageScripts: true
 generateUpdatesFilesForAllChannels: true
 
 extraResources:
+  - from: node_modules/pi-chrome/extensions/chrome-profile-bridge/browser-extension
+    to: pi-runtime/pi-chrome/browser-extension
+  - from: node_modules/@injaneity/pi-computer-use
+    to: pi-runtime/pi-computer-use
+    filter:
+      - "**/*"
   - from: EULA.md
     to: legal/EULA.md
   - from: PRIVACY.md
