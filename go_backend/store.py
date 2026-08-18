@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .crypto_utils import hash_wrapper_key
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (

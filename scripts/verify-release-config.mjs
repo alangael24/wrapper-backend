@@ -170,6 +170,9 @@ const expectedMigrations = [
   ["20260814123000_whatsapp_channel_rls.sql", 17],
   ["20260817120000_connector_operation_idempotency.sql", 18],
   ["20260817123000_account_bot_tombstones.sql", 19],
+  ["20260818013000_structured_action_approvals.sql", 20],
+  ["20260818173000_desktop_runtime_relay.sql", 21],
+  ["20260818214612_whatsapp_outbound_status.sql", 22],
 ];
 const migrationContents = await Promise.all(
   expectedMigrations.map(([name]) => readFile(`supabase/migrations/${name}`, "utf8")),
@@ -179,6 +182,11 @@ for (const [index, contents] of migrationContents.entries()) {
   if (!contents.includes(`values ('schema_version', '${expectedVersion}')`)) {
     throw new Error(`${name} must set schema_version=${expectedVersion}`);
   }
+}
+const whatsappOutboundMigration = migrationContents.at(-1);
+if (!whatsappOutboundMigration.includes("'sending'")
+  || !whatsappOutboundMigration.includes("whatsapp_messages_status_check")) {
+  throw new Error("WhatsApp delivery migration must permit the durable sending state");
 }
 for (const file of workflowFiles) {
   const workflow = await readFile(file, "utf8");

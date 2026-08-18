@@ -2215,7 +2215,7 @@ class TestBackend(unittest.TestCase):
         }
         self.assertIn("run_id", usage_columns)
         self.assertIn("estimated_cost_microusd", usage_columns)
-        self.assertEqual(migrated.health()["schema_version"], 21)
+        self.assertEqual(migrated.health()["schema_version"], 22)
         migrated_user = migrated.get_user_by_id(user["id"])
         self.assertIsNone(migrated_user["model_provider_override"])
         self.assertEqual(migrated_user["unlimited_usage"], 0)
