@@ -5,6 +5,12 @@ y versionado semántico para los clientes distribuidos.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-08-18
+
+- Reduce desktop end-to-end agent latency by long-polling relay jobs, reusing the local model runtime and resource loader, and removing redundant backend state reads and writes.
+- Align Android agent prewarming with desktop and iOS.
+- Gate desktop releases on the production local-computer relay instead of the retired server-side Pi Chrome runtime.
+
 ## [1.1.1] - 2026-08-14
 
 ### Fixed

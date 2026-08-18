@@ -20,7 +20,7 @@ REQUIRED_CHECKS = (
     "connectors",
     "computers",
     "pi",
-    "pi_chrome",
+    "desktop_relay",
     "model_provider",
 )
 
