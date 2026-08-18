@@ -8,6 +8,8 @@ los tokens OAuth de cada usuario.
 
 from __future__ import annotations
 
+import base64
+import html
 import json
 import jsonschema
 import logging
@@ -573,6 +575,12 @@ class ComposioConnectorGateway:
                 connector_id,
                 operation,
                 _json_value(getattr(result, "data", result)),
+                include_email_content=bool(
+                    connector_id == "google-workspace"
+                    and operation == "search_email"
+                    and normalized_arguments.get("include_payload")
+                    and normalized_arguments.get("verbose")
+                ),
             )
         except ConnectorBrokerError:
             raise
@@ -1157,7 +1165,7 @@ _LEAN_COLLECTION_FIELDS: dict[str, set[str]] = {
         "id", "messageid", "threadid", "subject", "from", "sender", "to",
         "date", "timestamp", "internaldate", "snippet", "labelids", "labels",
         "historyid", "messages", "threads", "items", "results", "data",
-        "nextpagetoken", "resultsizeestimate", "count", "total", "success",
+        "bodytext", "nextpagetoken", "resultsizeestimate", "count", "total", "success",
     },
     "list_calendar_events": {
         "id", "eventid", "calendarid", "status", "summary", "title",
@@ -1200,7 +1208,11 @@ _LEAN_PROVIDER_COLLECTION_FIELDS: dict[tuple[str, str], set[str]] = {
 
 
 def _compact_connector_result(
-    connector_id: str, operation: str, value: Any
+    connector_id: str,
+    operation: str,
+    value: Any,
+    *,
+    include_email_content: bool = False,
 ) -> Any:
     """Keep actionable collection metadata while dropping provider wire noise.
 
@@ -1209,6 +1221,9 @@ def _compact_connector_result(
     fields into the model slows the summarization round and can expose content
     the user did not ask to read. Point reads intentionally remain untouched.
     """
+    if connector_id == "google-workspace" and operation == "search_email" and include_email_content:
+        value = _inject_gmail_body_text(value)
+
     collection_fields = (
         _LEAN_COLLECTION_FIELDS.get(operation)
         if connector_id == "google-workspace"
@@ -1278,6 +1293,9 @@ def _compact_connector_result(
             normalized = normalized_key(key)
             if normalized == "headers" or normalized in heavy:
                 continue
+            if normalized == "bodytext" and isinstance(item, str):
+                compacted[str(key)] = item[:40_000]
+                continue
             if (
                 not preserve_scalars
                 and normalized not in allowed
@@ -1297,6 +1315,64 @@ def _compact_connector_result(
         return compacted
 
     return walk(value)
+
+
+def _inject_gmail_body_text(value: Any) -> Any:
+    """Replace verbose Gmail MIME payloads with bounded, decoded message text."""
+
+    def decode_part(data: Any) -> str:
+        if not isinstance(data, str) or not data or len(data) > 1_000_000:
+            return ""
+        try:
+            padded = data + ("=" * (-len(data) % 4))
+            return base64.urlsafe_b64decode(padded.encode("ascii")).decode(
+                "utf-8", errors="replace"
+            )
+        except (ValueError, UnicodeEncodeError):
+            return ""
+
+    def payload_text(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        plain: list[str] = []
+        rich: list[str] = []
+
+        def visit(part: Any) -> None:
+            if not isinstance(part, dict) or part.get("filename"):
+                return
+            mime_type = str(part.get("mimeType") or part.get("mime_type") or "").lower()
+            body = part.get("body")
+            if isinstance(body, dict):
+                decoded = decode_part(body.get("data"))
+                if decoded:
+                    if mime_type == "text/plain":
+                        plain.append(decoded)
+                    elif mime_type == "text/html":
+                        rich.append(decoded)
+            for child in part.get("parts") or []:
+                visit(child)
+
+        visit(payload)
+        selected = "\n".join(plain) if plain else "\n".join(rich)
+        if not plain and selected:
+            selected = re.sub(r"<[^>]+>", " ", selected)
+            selected = html.unescape(selected)
+        return re.sub(r"[ \t]+", " ", selected).strip()[:40_000]
+
+    def visit(candidate: Any) -> Any:
+        if isinstance(candidate, list):
+            return [visit(item) for item in candidate]
+        if not isinstance(candidate, dict):
+            return candidate
+        transformed = {key: visit(item) for key, item in candidate.items()}
+        payload = candidate.get("payload")
+        if isinstance(payload, dict):
+            body_text = payload_text(payload)
+            if body_text:
+                transformed["body_text"] = body_text
+        return transformed
+
+    return visit(value)
 
 
 def _normalize_operation_arguments(
@@ -1468,15 +1544,25 @@ def _normalize_operation_arguments(
                 400, "max_results debe ser numérico", "bad_connector_arguments"
             )
         normalized["query"] = query.strip()
-        # Email payloads are verbose. Keep one call bounded; the agent can
-        # narrow the Gmail query or issue a second page instead of overflowing
-        # the broker/model context with message bodies.
-        normalized["max_results"] = max(1, min(int(raw_limit), 10))
-        # GOOGLESUPER_FETCH_EMAILS defaults to verbose MIME payloads. A search
-        # must return lean metadata only; ``read_email`` hydrates one selected
-        # message when the user actually needs its body.
-        normalized["include_payload"] = False
-        normalized["verbose"] = False
+        include_content = normalized.pop(
+            "include_content", normalized.pop("includeContent", None)
+        )
+        if include_content is None:
+            include_content = bool(
+                normalized.get("include_payload") and normalized.get("verbose")
+            )
+        if not isinstance(include_content, bool):
+            raise ConnectorBrokerError(
+                400, "include_content debe ser booleano", "bad_connector_arguments"
+            )
+        # Metadata searches remain the default and fastest path. A tightly
+        # bounded content search can hydrate up to three likely messages in the
+        # same provider call, avoiding a separate model -> read_email round.
+        normalized["max_results"] = max(
+            1, min(int(raw_limit), 3 if include_content else 10)
+        )
+        normalized["include_payload"] = include_content
+        normalized["verbose"] = include_content
         return normalized
 
     if operation == "read_email":

@@ -1323,6 +1323,19 @@ class Backend:
                 return
             timing[name] = round((time.monotonic() - timing["_origin"]) * 1000, 3)
 
+    def _start_upstream_call_timing(self, run_id: str) -> int:
+        """Number and timestamp every model round within one Pi run."""
+        with self._run_timing_lock:
+            timing = self._run_timings.get(run_id)
+            if timing is None:
+                return 0
+            call_index = int(timing.get("_upstream_call_count", 0)) + 1
+            timing["_upstream_call_count"] = call_index
+            timing[f"upstream_{call_index}_request_ms"] = round(
+                (time.monotonic() - timing["_origin"]) * 1000, 3
+            )
+            return call_index
+
     def _run_timing_snapshot(self, run_id: str, *, pop: bool = False) -> dict[str, float]:
         with self._run_timing_lock:
             timing = self._run_timings.pop(run_id, None) if pop else self._run_timings.get(run_id)
@@ -2650,8 +2663,10 @@ class Backend:
             return
         user, run = principal
         run_id = run["id"] if run else None
+        upstream_call_index = 0
         if run_id:
             self._mark_run_timing(run_id, "proxy_received_ms")
+            upstream_call_index = self._start_upstream_call_timing(run_id)
         unlimited = self.unlimited_usage(user)
         if run and path != "/chat/completions":
             error_response(
@@ -2742,6 +2757,9 @@ class Backend:
         def on_headers(status: int, out_headers: dict) -> None:
             if run_id:
                 self._mark_run_timing(run_id, "upstream_headers_ms")
+                self._mark_run_timing(
+                    run_id, f"upstream_{upstream_call_index}_headers_ms"
+                )
             stream_state["started"] = True
             try:
                 handler.send_response(status)
@@ -2761,7 +2779,12 @@ class Backend:
         def on_chunk(chunk: bytes) -> None:
             if run_id and chunk.strip():
                 self._mark_run_timing(run_id, "upstream_first_byte_ms")
-                self._inspect_upstream_delta_timing(run_id, chunk)
+                self._mark_run_timing(
+                    run_id, f"upstream_{upstream_call_index}_first_byte_ms"
+                )
+                self._inspect_upstream_delta_timing(
+                    run_id, chunk, upstream_call_index=upstream_call_index
+                )
             try:
                 handler.wfile.write(chunk)
                 handler.wfile.flush()
@@ -2781,6 +2804,9 @@ class Backend:
         )
         if run_id:
             self._mark_run_timing(run_id, "upstream_complete_ms")
+            self._mark_run_timing(
+                run_id, f"upstream_{upstream_call_index}_complete_ms"
+            )
             logging.info(
                 "model timing run_id=%s provider=%s timings=%s",
                 run_id,
@@ -2820,7 +2846,9 @@ class Backend:
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _inspect_upstream_delta_timing(self, run_id: str, chunk: bytes) -> None:
+    def _inspect_upstream_delta_timing(
+        self, run_id: str, chunk: bytes, *, upstream_call_index: int = 0
+    ) -> None:
         line = chunk.decode("utf-8", errors="replace").strip()
         if not line.startswith("data:"):
             return
@@ -2842,11 +2870,23 @@ class Backend:
             reasoning = delta.get("reasoning")
         if isinstance(reasoning, str) and reasoning:
             self._mark_run_timing(run_id, "upstream_first_reasoning_ms")
+            if upstream_call_index:
+                self._mark_run_timing(
+                    run_id, f"upstream_{upstream_call_index}_first_reasoning_ms"
+                )
         content = delta.get("content")
         if isinstance(content, str) and content:
             self._mark_run_timing(run_id, "upstream_first_content_ms")
+            if upstream_call_index:
+                self._mark_run_timing(
+                    run_id, f"upstream_{upstream_call_index}_first_content_ms"
+                )
         if delta.get("tool_calls"):
             self._mark_run_timing(run_id, "upstream_first_tool_call_ms")
+            if upstream_call_index:
+                self._mark_run_timing(
+                    run_id, f"upstream_{upstream_call_index}_first_tool_call_ms"
+                )
 
     def record(
         self,

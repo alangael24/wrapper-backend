@@ -2352,7 +2352,7 @@ class TestBackend(unittest.TestCase):
             "connector_assignment_complete_ms", "pre_reservation_complete_ms",
             "run_reserved_ms", "pi_dispatch_ms", "proxy_received_ms",
             "upstream_request_ms", "upstream_complete_ms", "pi_first_text_ms",
-            "pi_complete_ms",
+            "upstream_1_request_ms", "upstream_1_complete_ms", "pi_complete_ms",
         ):
             self.assertIn(name, timing_payload)
         self.assertLessEqual(timing_payload["upstream_request_ms"], timing_payload["upstream_complete_ms"])
@@ -3493,6 +3493,75 @@ class TestBackend(unittest.TestCase):
                 "verbose": False,
             },
         )])
+
+    def test_google_email_content_search_decodes_body_without_mime_noise(self):
+        client = FakeComposioClient()
+        session = FakeComposioSession(client, "google-content", "googlesuper")
+        encoded_body = base64.urlsafe_b64encode(
+            b"Flight 4521 departs DEN at 10:15 and arrives BUR at 11:42."
+        ).decode("ascii").rstrip("=")
+
+        def execute(slug, *, arguments):
+            client.executions.append((slug, arguments))
+            return SimpleNamespace(
+                data={
+                    "messages": [{
+                        "id": "msg_flight",
+                        "threadId": "thread_flight",
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": "Flight receipt"},
+                                {"name": "From", "value": "airline@example.com"},
+                            ],
+                            "mimeType": "multipart/alternative",
+                            "parts": [{
+                                "mimeType": "text/plain",
+                                "body": {"data": encoded_body},
+                            }, {
+                                "filename": "ticket.pdf",
+                                "mimeType": "application/pdf",
+                                "body": {"data": "private-attachment"},
+                            }],
+                        },
+                    }],
+                },
+                error=None,
+            )
+
+        session.execute = execute
+        client.sessions.create = lambda **_options: session
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        result = gateway.execute(
+            self.new_user("google-content-search")["user_id"],
+            "google-workspace",
+            "search_email",
+            {
+                "query": 'subject:(flight OR itinerary)',
+                "max_results": 20,
+                "include_content": True,
+            },
+        )
+
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_FETCH_EMAILS",
+            {
+                "query": 'subject:(flight OR itinerary)',
+                "max_results": 3,
+                "include_payload": True,
+                "verbose": True,
+            },
+        )])
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertIn("Flight 4521 departs DEN", serialized)
+        self.assertIn("Flight receipt", serialized)
+        self.assertIn("msg_flight", serialized)
+        self.assertNotIn("private-attachment", serialized)
+        self.assertNotIn(encoded_body, serialized)
+        self.assertNotIn('"payload"', serialized)
 
     def test_google_calendar_search_uses_find_event_with_exact_filters(self):
         client = FakeComposioClient()

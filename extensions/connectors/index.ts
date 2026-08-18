@@ -140,8 +140,9 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
     arguments: {
       query: "Consulta Gmail real; combina términos con OR y usa comillas para frases exactas",
       max_results: "Cantidad máxima de resultados; el backend la limita a 10 por llamada",
+      include_content: "true solo cuando necesites extraer el cuerpo de hasta 3 correos probables en esta misma llamada",
     },
-    rule: "Ejecuta una sola búsqueda amplia y basa la respuesta únicamente en sus metadatos. Si necesitas el cuerpo, usa read_email para un message_id concreto. Si no hay coincidencias, dilo; nunca inventes asuntos o remitentes.",
+    rule: "Ejecuta una búsqueda precisa. Para clasificar o contar usa metadatos; si la tarea necesita datos del cuerpo y la consulta ya es estrecha, usa include_content=true con máximo 3 resultados para evitar otra ronda. Si el cuerpo no aparece, usa read_email para un message_id concreto. Si no hay coincidencias, dilo; nunca inventes asuntos o remitentes.",
   },
   read_email: {
     arguments: {
@@ -229,7 +230,7 @@ function providerArgumentDescription(id: string): string {
   if (id !== "google-workspace") return "Argumentos JSON de la operacion";
   return [
     "Argumentos JSON de la operacion.",
-    "Para search_email usa query con sintaxis de Gmail y max_results; para read_email usa message_id obtenido de la búsqueda.",
+    "Para search_email usa query con sintaxis de Gmail y max_results; activa include_content solo en búsquedas estrechas de hasta 3 resultados. Para read_email usa message_id obtenido de la búsqueda cuando el contenido no vino.",
     "Para draft_email y send_email usa recipient_email, subject y body; send_email envía realmente y draft_email solo guarda.",
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
