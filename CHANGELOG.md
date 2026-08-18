@@ -5,6 +5,10 @@ y versionado semántico para los clientes distribuidos.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-08-18
+
+- Preserve both architecture-specific computer-use helpers when producing the universal signed macOS application.
+
 ## [1.1.2] - 2026-08-18
 
 - Reduce desktop end-to-end agent latency by long-polling relay jobs, reusing the local model runtime and resource loader, and removing redundant backend state reads and writes.

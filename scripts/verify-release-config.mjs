@@ -75,6 +75,9 @@ for (const artifact of ["lifecycle-runtime-compose", "lifecycle-viewmodel-compos
 for (const token of ["target: dmg", "target: pkg", "target: nsis", "target: appx", "AppImage", "deb", "rpm"]) {
   if (!builder.includes(token)) throw new Error(`Missing Electron target: ${token}`);
 }
+if (!builder.includes("x64ArchFiles: Contents/Resources/pi-runtime/pi-computer-use/prebuilt/macos/**/bridge")) {
+  throw new Error("Universal macOS releases must preserve the architecture-specific computer-use helpers");
+}
 if (!/linux:\s+[\s\S]*?executableName: agent-genia/u.test(builder)) {
   throw new Error("Linux executable name must match the packaged smoke test");
 }

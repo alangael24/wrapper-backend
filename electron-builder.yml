@@ -45,6 +45,9 @@ mac:
   appId: com.agentgenia.desktop
   category: public.app-category.productivity
   icon: desktop/resources/icon.icns
+  # pi-computer-use ships both native helpers inside extraResources. They must
+  # remain separate files in a universal app instead of being merged by lipo.
+  x64ArchFiles: Contents/Resources/pi-runtime/pi-computer-use/prebuilt/macos/**/bridge
   hardenedRuntime: true
   gatekeeperAssess: false
   notarize: true
