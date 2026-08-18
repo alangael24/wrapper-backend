@@ -616,6 +616,13 @@ class PiHarness:
             # Docker's /dev/shm is intentionally small and otherwise causes
             # renderer crashes on normal marketplace pages.
             "--disable-dev-shm-usage",
+            # A public Render instance can execute only one isolated browser
+            # run at a time. Cap Chromium's renderer fan-out as well; without
+            # this a single modern marketplace page can spawn enough renderer
+            # processes to exhaust a 512 MB service before Pi emits an error.
+            "--renderer-process-limit=1",
+            "--disable-gpu",
+            "--js-flags=--max-old-space-size=128",
             "--disable-background-networking",
             "--disable-component-update",
             "--disable-breakpad",

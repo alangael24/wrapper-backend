@@ -226,8 +226,95 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
   },
 });
 
+const CONNECTOR_GUIDANCE: Readonly<Record<string, Readonly<Record<string, unknown>>>> = Object.freeze({
+  "google-workspace": GOOGLE_WORKSPACE_GUIDANCE,
+  notion: Object.freeze({
+    search: {
+      rule: "Busca primero la página o base para obtener su ID exacto. No inventes IDs de Notion.",
+    },
+    read_page: {
+      arguments: { page_id: "ID exacto devuelto por search" },
+      rule: "Lee la página antes de resumir su contenido.",
+    },
+    create_page: {
+      arguments: {
+        parent_id: "ID exacto de una página padre accesible, obtenido con search",
+        title: "Título de la nueva página",
+      },
+      rule: "La API crea una página vacía bajo un parent_id. Si falta el padre, búscalo o pide solo ese dato. Invoca la escritura para mostrar la aprobación estructurada.",
+    },
+    update_page: {
+      arguments: { page_id: "ID exacto", archived: "boolean opcional", properties: "propiedades opcionales" },
+      rule: "No uses update_page para reemplazar el contenido de texto de una página.",
+    },
+  }),
+  canva: Object.freeze({
+    search_designs: {
+      arguments: { query: "Texto del título del diseño" },
+      rule: "Conserva el designId exacto para get_design.",
+    },
+    get_design: { arguments: { designId: "ID exacto obtenido con search_designs" } },
+    create_design: {
+      arguments: {
+        title: "Título del diseño",
+        design_type: "Preset doc, email, presentation o whiteboard; para tamaño libre usa {type:'custom',width,height}",
+      },
+      rule: "create_design crea un diseño en blanco, no contenido terminado. Invócalo directamente para la aprobación.",
+    },
+  }),
+  "microsoft-365": Object.freeze({
+    search_email: {
+      arguments: { query: "Consulta de Outlook", size: "1 a 10" },
+      rule: "No afirmes haber leído correo si la búsqueda no devuelve mensajes.",
+    },
+    create_calendar_event: {
+      arguments: {
+        subject: "Título del evento",
+        start_datetime: "ISO 8601 exacto",
+        end_datetime: "ISO 8601 exacto; si se omite el backend usa una hora",
+        time_zone: "Zona IANA, por ejemplo America/Denver",
+        body: "Descripción opcional",
+      },
+      rule: "No uses nombres de parámetros de Google. Invoca la escritura cuando estén título, inicio y zona horaria para mostrar la aprobación.",
+    },
+  }),
+  figma: Object.freeze({
+    search_files: {
+      arguments: {
+        figma_url: "URL de archivo, diseño, nodo o equipo de Figma",
+        team_id: "Alternativa: ID de equipo",
+        project_id: "Alternativa: ID de proyecto",
+        file_key: "Alternativa: clave de archivo",
+      },
+      rule: "La API de Figma no ofrece búsqueda global por título. Usa una URL o ID real; si falta, pide únicamente ese dato.",
+    },
+    get_file: { arguments: { file_key: "Clave exacta obtenida de una URL o search_files" } },
+    list_comments: { arguments: { file_key: "Clave exacta del archivo" } },
+    post_comment: {
+      arguments: { file_key: "Clave exacta", message: "Comentario final" },
+      rule: "Invoca directamente para la aprobación estructurada.",
+    },
+  }),
+  calendly: Object.freeze({
+    list_event_types: {
+      rule: "No pidas el URI del usuario: el backend lo obtiene de la cuenta autenticada.",
+    },
+    list_scheduled_events: {
+      arguments: { min_start_time: "ISO 8601 opcional", max_start_time: "ISO 8601 opcional", count: "1 a 100" },
+      rule: "No pidas el URI del usuario: el backend lo obtiene de la cuenta autenticada.",
+    },
+    get_event: { arguments: { uuid: "UUID o URI exacto del evento listado" } },
+    cancel_event: {
+      arguments: { uuid: "UUID o URI exacto", reason: "Motivo opcional" },
+      rule: "Invoca directamente para mostrar la aprobación estructurada.",
+    },
+  }),
+});
+
 function providerArgumentDescription(id: string): string {
-  if (id !== "google-workspace") return "Argumentos JSON de la operacion";
+  if (id !== "google-workspace") {
+    return "Argumentos JSON según operation_guidance. Usa IDs exactos devueltos por lecturas anteriores; no inventes identificadores ni nombres de parámetros del proveedor.";
+  }
   return [
     "Argumentos JSON de la operacion.",
     "Para search_email usa query con sintaxis de Gmail y max_results; activa include_content solo en búsquedas estrechas de hasta 3 resultados. Para read_email usa message_id obtenido de la búsqueda cuando el contenido no vino.",
@@ -430,7 +517,13 @@ export default function connectorExtension(pi: ExtensionAPI): void {
     pi.registerTool({
       name: item.toolName,
       label: item.name,
-      description: `Usa ${item.name} para ${item.capabilities}. Solo admite operaciones listadas por connector_search.`,
+      description: [
+        `Usa ${item.name} para ${item.capabilities}.`,
+        "Solo admite operaciones del catálogo autorizado.",
+        CONNECTOR_GUIDANCE[item.id]
+          ? `Contratos semánticos: ${JSON.stringify(CONNECTOR_GUIDANCE[item.id])}`
+          : "Usa IDs exactos devueltos por lecturas previas y no inventes parámetros.",
+      ].join(" "),
       parameters: Type.Object({
         operation: Type.String({
           description: "Operacion exacta anunciada por connector_search",
@@ -543,7 +636,7 @@ export default function connectorExtension(pi: ExtensionAPI): void {
             connected: match.connected,
             operations: match.operations,
             tool,
-            ...(match.id === "google-workspace" ? { operation_guidance: GOOGLE_WORKSPACE_GUIDANCE } : {}),
+            ...(CONNECTOR_GUIDANCE[match.id] ? { operation_guidance: CONNECTOR_GUIDANCE[match.id] } : {}),
           }] : [];
         });
         if (computerAvailable && wantsComputer) {

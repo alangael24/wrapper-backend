@@ -18,6 +18,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
@@ -116,7 +117,9 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "update_sheet"): "GOOGLESUPER_VALUES_UPDATE",
     ("notion", "search"): "NOTION_SEARCH_NOTION_PAGE",
     ("notion", "read_page"): "NOTION_GET_PAGE_MARKDOWN",
+    ("notion", "create_page"): "NOTION_CREATE_NOTION_PAGE",
     ("notion", "query_database"): "NOTION_QUERY_DATABASE",
+    ("notion", "update_page"): "NOTION_UPDATE_PAGE",
     ("microsoft-365", "search_email"): "OUTLOOK_SEARCH_MESSAGES",
     ("microsoft-365", "read_email"): "OUTLOOK_GET_MESSAGE",
     ("microsoft-365", "draft_email"): "OUTLOOK_CREATE_DRAFT",
@@ -125,11 +128,134 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("canva", "search_designs"): "CANVA_LIST_USER_DESIGNS",
     ("canva", "get_design"): "CANVA_FETCH_DESIGN_METADATA_AND_ACCESS_INFORMATION",
     ("canva", "create_design"): "CANVA_POST_DESIGNS",
+    ("figma", "search_files"): "FIGMA_DISCOVER_FIGMA_RESOURCES",
+    ("figma", "get_file"): "FIGMA_GET_FILE_METADATA",
+    ("figma", "list_comments"): "FIGMA_GET_COMMENTS_IN_A_FILE",
+    ("figma", "post_comment"): "FIGMA_ADD_A_COMMENT_TO_A_FILE",
+    ("calendly", "list_event_types"): "CALENDLY_LIST_EVENT_TYPES",
+    ("calendly", "list_scheduled_events"): "CALENDLY_LIST_SCHEDULED_EVENTS",
+    ("calendly", "get_event"): "CALENDLY_GET_EVENT",
+    ("calendly", "cancel_event"): "CALENDLY_CANCEL_SCHEDULED_EVENT",
     ("github", "read_file"): "GITHUB_GET_REPOSITORY_CONTENT",
     ("snowflake", "select_query"): "SNOWFLAKE_EXECUTE_SQL",
     ("snowflake", "execute_sql"): "SNOWFLAKE_EXECUTE_SQL",
     ("databricks", "select_query"): "DATABRICKS_SQL_STATEMENT_EXEC_EXECUTE_STATEMENT",
     ("databricks", "execute_sql"): "DATABRICKS_SQL_STATEMENT_EXEC_EXECUTE_STATEMENT",
+}
+
+# Provider writes are approved against a closed, version-controlled contract.
+# Tool Router search does not always return schemas for an explicitly pinned
+# action, which previously made valid writes fail before the user could even
+# see the approval card. These schemas mirror the public provider contracts;
+# an upstream change still fails safely during execution instead of widening
+# what the user approved.
+COMPOSIO_STATIC_INPUT_SCHEMAS: dict[tuple[str, str], dict[str, Any]] = {
+    ("google-workspace", "update_sheet"): {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": {"type": "string", "minLength": 1},
+            "range": {"type": "string", "minLength": 1},
+            "values": {"type": "array", "minItems": 1, "items": {"type": "array"}},
+            "value_input_option": {"enum": ["RAW", "USER_ENTERED"]},
+        },
+        "required": ["spreadsheet_id", "range", "values", "value_input_option"],
+        "additionalProperties": False,
+    },
+    ("notion", "create_page"): {
+        "type": "object",
+        "properties": {
+            "parent_id": {"type": "string", "minLength": 1},
+            "title": {"type": "string", "minLength": 1},
+            "cover": {"type": "string"},
+            "icon": {"type": "string"},
+        },
+        "required": ["parent_id", "title"],
+        "additionalProperties": False,
+    },
+    ("notion", "update_page"): {
+        "type": "object",
+        "properties": {
+            "page_id": {"type": "string", "minLength": 1},
+            "archived": {"type": "boolean"},
+            "cover": {"type": ["string", "object", "null"]},
+            "icon": {"type": ["string", "object", "null"]},
+            "properties": {"type": "object"},
+        },
+        "required": ["page_id"],
+        "additionalProperties": False,
+    },
+    ("microsoft-365", "create_calendar_event"): {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "minLength": 1},
+            "body": {"type": "string"},
+            "start_datetime": {"type": "string", "minLength": 1},
+            "end_datetime": {"type": "string", "minLength": 1},
+            "time_zone": {"type": "string", "minLength": 1},
+            "attendees_info": {"type": "array"},
+            "categories": {"type": "array"},
+            "is_html": {"type": "boolean"},
+            "is_online_meeting": {"type": "boolean"},
+            "location": {"type": "string"},
+            "online_meeting_provider": {"type": "string"},
+            "show_as": {"type": "string"},
+            "user_id": {"type": "string"},
+        },
+        "required": ["subject", "body", "start_datetime", "end_datetime", "time_zone"],
+        "additionalProperties": False,
+    },
+    ("canva", "create_design"): {
+        "type": "object",
+        "properties": {
+            "type": {"enum": ["type_and_asset"]},
+            "design_type": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": {"enum": ["preset"]},
+                            "name": {"enum": ["doc", "email", "presentation", "whiteboard"]},
+                        },
+                        "required": ["type", "name"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": {"enum": ["custom"]},
+                            "width": {"type": "integer", "minimum": 40, "maximum": 8000},
+                            "height": {"type": "integer", "minimum": 40, "maximum": 8000},
+                        },
+                        "required": ["type", "width", "height"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+            "asset_id": {"type": "string"},
+            "title": {"type": "string", "minLength": 1, "maxLength": 255},
+        },
+        "required": ["type", "design_type"],
+        "additionalProperties": False,
+    },
+    ("figma", "post_comment"): {
+        "type": "object",
+        "properties": {
+            "file_key": {"type": "string", "minLength": 1},
+            "message": {"type": "string", "minLength": 1},
+            "comment_id": {"type": "string"},
+        },
+        "required": ["file_key", "message"],
+        "additionalProperties": False,
+    },
+    ("calendly", "cancel_event"): {
+        "type": "object",
+        "properties": {
+            "uuid": {"type": "string", "minLength": 1},
+            "reason": {"type": "string"},
+        },
+        "required": ["uuid"],
+        "additionalProperties": False,
+    },
 }
 
 # Read-only tools with a verified public slug can execute directly. Asking
@@ -153,6 +279,12 @@ PINNED_DIRECT_READ_OPERATIONS = frozenset({
     ("microsoft-365", "list_calendar_events"),
     ("canva", "search_designs"),
     ("canva", "get_design"),
+    ("figma", "search_files"),
+    ("figma", "get_file"),
+    ("figma", "list_comments"),
+    ("calendly", "list_event_types"),
+    ("calendly", "list_scheduled_events"),
+    ("calendly", "get_event"),
     ("github", "read_file"),
     ("snowflake", "select_query"),
     ("databricks", "select_query"),
@@ -524,6 +656,40 @@ class ComposioConnectorGateway:
         )
         session = self._session(user_id, connector_id)
         try:
+            if (
+                connector_id == "calendly"
+                and operation in {"list_event_types", "list_scheduled_events"}
+                and not any(
+                    normalized_arguments.get(field)
+                    for field in ("user", "organization", "group")
+                )
+            ):
+                # Calendly's list endpoints require the authenticated user's
+                # URI (or organization URI), but the end user should not need
+                # to discover/copy that opaque identifier. Resolve it inside
+                # the same isolated provider session before the requested
+                # read. This is deterministic and never widens authorization.
+                identity = session.execute("CALENDLY_GET_CURRENT_USER", arguments={})
+                identity_error = _connector_execution_error(identity)
+                if identity_error:
+                    raise ConnectorBrokerError(
+                        502,
+                        "Calendly no pudo identificar la cuenta conectada",
+                        "connector_upstream_error",
+                    )
+                user_uri, organization_uri = _calendly_identity_scope(
+                    _json_value(getattr(identity, "data", identity))
+                )
+                if user_uri:
+                    normalized_arguments["user"] = user_uri
+                elif organization_uri:
+                    normalized_arguments["organization"] = organization_uri
+                else:
+                    raise ConnectorBrokerError(
+                        502,
+                        "Calendly no devolvió el alcance de la cuenta conectada",
+                        "connector_upstream_error",
+                    )
             slug, search = self._resolve_operation(session, connector_id, operation)
             normalized_arguments = _validated_operation_arguments(
                 connector_id, operation, normalized_arguments, search, slug
@@ -754,6 +920,22 @@ class ComposioConnectorGateway:
                 tool_schemas={cached[1]: {"input_schema": cached_schema[1]}}
             )
         pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
+        static_schema = COMPOSIO_STATIC_INPUT_SCHEMAS.get(
+            (connector_id, operation)
+        )
+        if pinned and static_schema is not None:
+            with self._lock:
+                self._operation_cache[(connector_id, operation)] = (
+                    self._now() + 900,
+                    pinned,
+                )
+                self._operation_schema_cache[(connector_id, operation)] = (
+                    self._now() + 900,
+                    static_schema,
+                )
+            return pinned, SimpleNamespace(
+                tool_schemas={pinned: {"input_schema": static_schema}}
+            )
         if (
             not require_schema
             and pinned
@@ -1153,6 +1335,45 @@ def _connector_execution_error(result: Any) -> Any:
     return None
 
 
+def _calendly_identity_scope(value: Any) -> tuple[str, str]:
+    """Extract only the authenticated user/organization URIs from Calendly."""
+    user_uri = ""
+    organization_uri = ""
+
+    def visit(candidate: Any, depth: int = 0) -> None:
+        nonlocal user_uri, organization_uri
+        if depth > 6 or (user_uri and organization_uri):
+            return
+        if isinstance(candidate, list):
+            for item in candidate[:20]:
+                visit(item, depth + 1)
+            return
+        if not isinstance(candidate, dict):
+            return
+        for key, item in candidate.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if (
+                not organization_uri
+                and normalized in {"currentorganization", "organizationuri"}
+                and isinstance(item, str)
+                and item.startswith("https://api.calendly.com/")
+            ):
+                organization_uri = item
+            elif (
+                not user_uri
+                and normalized in {"uri", "useruri"}
+                and isinstance(item, str)
+                and "/users/" in item
+                and item.startswith("https://api.calendly.com/")
+            ):
+                user_uri = item
+            elif isinstance(item, (dict, list)):
+                visit(item, depth + 1)
+
+    visit(value)
+    return user_uri, organization_uri
+
+
 def _requires_connect_link(exc: Exception) -> bool:
     if exc.__class__.__name__ == "ComposioLegacyConnectedAccountsEndpointRetiredError":
         return True
@@ -1457,6 +1678,99 @@ def _normalize_operation_arguments(
             )
         return {"designId": raw_id.strip()}
 
+    if connector_id == "canva" and operation == "create_design":
+        normalized = dict(arguments)
+        title = normalized.get("title", normalized.get("name"))
+        raw_design_type = normalized.get(
+            "design_type", normalized.get("designType", normalized.get("preset"))
+        )
+        width = normalized.get("width")
+        height = normalized.get("height")
+        if isinstance(raw_design_type, str):
+            preset = raw_design_type.strip().lower().replace(" ", "_")
+            aliases = {
+                "document": "doc",
+                "presentation_16:9": "presentation",
+                "presentation_4:3": "presentation",
+            }
+            preset = aliases.get(preset, preset)
+            raw_design_type = {"type": "preset", "name": preset}
+        elif raw_design_type is None and width is not None and height is not None:
+            raw_design_type = {"type": "custom", "width": width, "height": height}
+        elif raw_design_type is None:
+            raw_design_type = {"type": "preset", "name": "doc"}
+        result: dict[str, Any] = {
+            "type": "type_and_asset",
+            "design_type": raw_design_type,
+        }
+        if title is not None:
+            if not isinstance(title, str) or not title.strip() or len(title.strip()) > 255:
+                raise ConnectorBrokerError(
+                    400, "title no es válido", "bad_connector_arguments"
+                )
+            result["title"] = title.strip()
+        asset_id = normalized.get("asset_id", normalized.get("assetId"))
+        if asset_id is not None:
+            if not isinstance(asset_id, str) or not asset_id.strip():
+                raise ConnectorBrokerError(
+                    400, "asset_id no es válido", "bad_connector_arguments"
+                )
+            result["asset_id"] = asset_id.strip()
+        return result
+
+    if connector_id == "notion" and operation == "create_page":
+        parent_id = arguments.get(
+            "parent_id",
+            arguments.get(
+                "parentId",
+                arguments.get(
+                    "parentPageId",
+                    arguments.get("parent_page_id", arguments.get("parent")),
+                ),
+            ),
+        )
+        title = arguments.get("title", arguments.get("name"))
+        if not isinstance(parent_id, str) or not parent_id.strip():
+            raise ConnectorBrokerError(
+                400,
+                "create_page requiere parent_id obtenido con search",
+                "bad_connector_arguments",
+            )
+        if not isinstance(title, str) or not title.strip() or len(title) > 2_000:
+            raise ConnectorBrokerError(
+                400, "create_page requiere title", "bad_connector_arguments"
+            )
+        result = {"parent_id": parent_id.strip(), "title": title.strip()}
+        for field in ("cover", "icon"):
+            value = arguments.get(field)
+            if value is not None:
+                if not isinstance(value, str) or len(value) > 2_048:
+                    raise ConnectorBrokerError(
+                        400, f"{field} no es válido", "bad_connector_arguments"
+                    )
+                result[field] = value
+        return result
+
+    if connector_id == "notion" and operation == "update_page":
+        page_id = arguments.get(
+            "page_id", arguments.get("pageId", arguments.get("id"))
+        )
+        if not isinstance(page_id, str) or not page_id.strip():
+            raise ConnectorBrokerError(
+                400, "update_page requiere page_id", "bad_connector_arguments"
+            )
+        result = {"page_id": page_id.strip()}
+        for field in ("archived", "cover", "icon", "properties"):
+            if field in arguments:
+                result[field] = arguments[field]
+        if len(result) == 1:
+            raise ConnectorBrokerError(
+                400,
+                "update_page requiere archived, cover, icon o properties",
+                "bad_connector_arguments",
+            )
+        return result
+
     if connector_id == "microsoft-365" and operation == "search_email":
         normalized = dict(arguments)
         query = normalized.get(
@@ -1515,6 +1829,171 @@ def _normalize_operation_arguments(
                 400, "timezone no es válido", "bad_connector_arguments"
             )
         return normalized
+
+    if connector_id == "microsoft-365" and operation == "create_calendar_event":
+        normalized = dict(arguments)
+        subject = normalized.get(
+            "subject", normalized.get("summary", normalized.get("title"))
+        )
+        start = normalized.get(
+            "start_datetime", normalized.get("start", normalized.get("start_time"))
+        )
+        end = normalized.get(
+            "end_datetime", normalized.get("end", normalized.get("end_time"))
+        )
+        timezone_name = normalized.get(
+            "time_zone", normalized.get("timezone", normalized.get("timeZone"))
+        )
+        if not isinstance(subject, str) or not subject.strip():
+            raise ConnectorBrokerError(
+                400, "create_calendar_event requiere subject", "bad_connector_arguments"
+            )
+        if not isinstance(start, str) or not _ISO_DATETIME_RE.fullmatch(start.strip()):
+            raise ConnectorBrokerError(
+                400,
+                "create_calendar_event requiere start_datetime ISO 8601",
+                "bad_connector_arguments",
+            )
+        if not isinstance(timezone_name, str) or not timezone_name.strip():
+            raise ConnectorBrokerError(
+                400, "create_calendar_event requiere time_zone IANA", "bad_connector_arguments"
+            )
+        try:
+            ZoneInfo(timezone_name.strip())
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConnectorBrokerError(
+                400, "time_zone debe ser una zona IANA válida", "bad_connector_arguments"
+            ) from exc
+        if end is None:
+            parsed_start = datetime.fromisoformat(start.strip().replace("Z", "+00:00"))
+            end = (parsed_start + timedelta(hours=1)).isoformat()
+        if not isinstance(end, str) or not _ISO_DATETIME_RE.fullmatch(end.strip()):
+            raise ConnectorBrokerError(
+                400, "end_datetime debe usar ISO 8601", "bad_connector_arguments"
+            )
+        result = {
+            "subject": subject.strip(),
+            "body": str(normalized.get("body") or ""),
+            "start_datetime": start.strip(),
+            "end_datetime": end.strip(),
+            "time_zone": timezone_name.strip(),
+        }
+        aliases = {
+            "attendees_info": ("attendees",),
+            "is_online_meeting": ("online_meeting",),
+            "online_meeting_provider": ("meeting_provider",),
+        }
+        for field in (
+            "attendees_info", "categories", "is_html", "is_online_meeting",
+            "location", "online_meeting_provider", "show_as", "user_id",
+        ):
+            value = normalized.get(field)
+            if value is None:
+                for alias in aliases.get(field, ()):
+                    if alias in normalized:
+                        value = normalized[alias]
+                        break
+            if value is not None:
+                result[field] = value
+        return result
+
+    if connector_id == "figma":
+        if operation == "search_files":
+            result: dict[str, Any] = {}
+            figma_url = arguments.get(
+                "figma_url", arguments.get("url", arguments.get("query"))
+            )
+            if isinstance(figma_url, str) and "figma.com/" in figma_url:
+                result["figma_url"] = figma_url.strip()
+            for field, aliases in {
+                "team_id": ("teamId",),
+                "project_id": ("projectId",),
+                "file_key": ("fileKey", "file_id"),
+            }.items():
+                value = arguments.get(field)
+                if value is None:
+                    value = next((arguments.get(alias) for alias in aliases if arguments.get(alias)), None)
+                if value is not None:
+                    if not isinstance(value, str) or not value.strip():
+                        raise ConnectorBrokerError(
+                            400, f"{field} no es válido", "bad_connector_arguments"
+                        )
+                    result[field] = value.strip()
+            if not result:
+                raise ConnectorBrokerError(
+                    400,
+                    "Figma requiere una URL de Figma o team_id, project_id o file_key; su API no busca todos los archivos por texto",
+                    "bad_connector_arguments",
+                )
+            raw_depth = arguments.get("max_depth", arguments.get("maxDepth"))
+            if raw_depth is not None:
+                if isinstance(raw_depth, bool) or not isinstance(raw_depth, (int, float)):
+                    raise ConnectorBrokerError(
+                        400, "max_depth debe ser numérico", "bad_connector_arguments"
+                    )
+                result["max_depth"] = max(1, min(int(raw_depth), 4))
+            return result
+        file_key = arguments.get(
+            "file_key", arguments.get("fileKey", arguments.get("file_id", arguments.get("id")))
+        )
+        if not isinstance(file_key, str) or not file_key.strip():
+            raise ConnectorBrokerError(
+                400, f"{operation} requiere file_key", "bad_connector_arguments"
+            )
+        if operation in {"get_file", "list_comments"}:
+            return {"file_key": file_key.strip()}
+        if operation == "post_comment":
+            message = arguments.get("message", arguments.get("comment", arguments.get("text")))
+            if not isinstance(message, str) or not message.strip() or len(message) > 10_000:
+                raise ConnectorBrokerError(
+                    400, "post_comment requiere message", "bad_connector_arguments"
+                )
+            result = {"file_key": file_key.strip(), "message": message.strip()}
+            comment_id = arguments.get("comment_id", arguments.get("commentId"))
+            if comment_id is not None:
+                result["comment_id"] = str(comment_id)
+            return result
+
+    if connector_id == "calendly":
+        if operation in {"list_event_types", "list_scheduled_events"}:
+            result: dict[str, Any] = {}
+            allowed = {
+                "user", "organization", "group", "page_token", "sort",
+                "active", "admin_managed", "invitee_email", "status",
+                "min_start_time", "max_start_time",
+            }
+            for field in allowed:
+                if field in arguments:
+                    result[field] = arguments[field]
+            raw_count = arguments.get(
+                "count", arguments.get("limit", arguments.get("max_results", 20))
+            )
+            if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)):
+                raise ConnectorBrokerError(
+                    400, "count debe ser numérico", "bad_connector_arguments"
+                )
+            result["count"] = max(1, min(int(raw_count), 100))
+            # The provider requires exactly one scope. If none is supplied,
+            # execute() hydrates the authenticated user's URI.
+            supplied_scopes = [field for field in ("user", "organization", "group") if result.get(field)]
+            if len(supplied_scopes) > 1:
+                raise ConnectorBrokerError(
+                    400,
+                    "Calendly admite solo uno de user, organization o group",
+                    "bad_connector_arguments",
+                )
+            return result
+        event_uri = arguments.get(
+            "uuid", arguments.get("event_uuid", arguments.get("event_id", arguments.get("uri")))
+        )
+        if not isinstance(event_uri, str) or not event_uri.strip():
+            raise ConnectorBrokerError(
+                400, f"{operation} requiere uuid", "bad_connector_arguments"
+            )
+        result = {"uuid": event_uri.strip().rsplit("/", 1)[-1]}
+        if operation == "cancel_event" and isinstance(arguments.get("reason"), str):
+            result["reason"] = arguments["reason"].strip()
+        return result
 
     if connector_id != "google-workspace":
         return arguments

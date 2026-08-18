@@ -480,6 +480,10 @@ class FakeComposioSession:
 
     def execute(self, slug, *, arguments):
         self.client.executions.append((slug, arguments))
+        if slug in self.client.execution_results:
+            return SimpleNamespace(
+                data=self.client.execution_results[slug], error=None
+            )
         return SimpleNamespace(data={"items": [{"name": "wrapper-backend"}]}, error=None)
 
     def delete(self):
@@ -521,6 +525,7 @@ class FakeComposioClient:
         self.searches: list[tuple[str, str]] = []
         self.executions: list[tuple[str, dict]] = []
         self.tool_schemas: dict[str, dict] = {}
+        self.execution_results: dict[str, dict] = {}
 
 
 class TestBackend(unittest.TestCase):
@@ -3915,13 +3920,142 @@ class TestBackend(unittest.TestCase):
         with self.assertRaises(ConnectorBrokerError) as missing:
             gateway.validate_arguments(
                 self.new_user("missing-provider-schema")["user_id"],
-                "notion",
-                "create_page",
-                {"title": "Página"},
+                "slack",
+                "post_message",
+                {"channel": "C123", "text": "Prueba"},
             )
         self.assertEqual(missing.exception.code, "connector_schema_unavailable")
         self.assertEqual(missing.exception.status, 503)
         self.assertEqual(client.executions, [])
+
+    def test_notion_create_page_uses_static_approval_contract(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        arguments = gateway.validate_arguments(
+            self.new_user("notion-create-contract")["user_id"],
+            "notion",
+            "create_page",
+            {"parentPageId": "parent_123", "name": "Auditoría E2E"},
+        )
+        self.assertEqual(
+            arguments,
+            {"parent_id": "parent_123", "title": "Auditoría E2E"},
+        )
+        self.assertEqual(client.searches, [])
+
+    def test_canva_create_design_normalizes_preset_before_approval(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        arguments = gateway.validate_arguments(
+            self.new_user("canva-create-contract")["user_id"],
+            "canva",
+            "create_design",
+            {"name": "Auditoría E2E", "designType": "presentation"},
+        )
+        self.assertEqual(
+            arguments,
+            {
+                "type": "type_and_asset",
+                "design_type": {"type": "preset", "name": "presentation"},
+                "title": "Auditoría E2E",
+            },
+        )
+        self.assertEqual(client.searches, [])
+
+    def test_outlook_create_event_normalizes_google_style_aliases(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        arguments = gateway.validate_arguments(
+            self.new_user("outlook-create-contract")["user_id"],
+            "microsoft-365",
+            "create_calendar_event",
+            {
+                "summary": "Auditoría E2E",
+                "start": "2026-08-20T09:00:00-06:00",
+                "timezone": "America/Denver",
+            },
+        )
+        self.assertEqual(arguments["subject"], "Auditoría E2E")
+        self.assertEqual(arguments["body"], "")
+        self.assertEqual(arguments["time_zone"], "America/Denver")
+        self.assertEqual(arguments["end_datetime"], "2026-08-20T10:00:00-06:00")
+        self.assertEqual(client.searches, [])
+
+    def test_calendly_lists_with_authenticated_user_scope(self):
+        client = FakeComposioClient()
+        client.execution_results["CALENDLY_GET_CURRENT_USER"] = {
+            "resource": {
+                "uri": "https://api.calendly.com/users/user_123",
+                "current_organization": "https://api.calendly.com/organizations/org_123",
+            }
+        }
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("calendly-scope")["user_id"],
+            "calendly",
+            "list_scheduled_events",
+            {"max_results": 5},
+        )
+        self.assertEqual(
+            client.executions,
+            [
+                ("CALENDLY_GET_CURRENT_USER", {}),
+                (
+                    "CALENDLY_LIST_SCHEDULED_EVENTS",
+                    {
+                        "count": 5,
+                        "user": "https://api.calendly.com/users/user_123",
+                    },
+                ),
+            ],
+        )
+
+    def test_figma_search_requires_real_resource_locator(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        with self.assertRaises(ConnectorBrokerError) as missing:
+            gateway.execute(
+                self.new_user("figma-resource-required")["user_id"],
+                "figma",
+                "search_files",
+                {"query": "mi archivo reciente"},
+            )
+        self.assertEqual(missing.exception.code, "bad_connector_arguments")
+        gateway.execute(
+            self.new_user("figma-resource-url")["user_id"],
+            "figma",
+            "search_files",
+            {"url": "https://www.figma.com/design/abc123/Auditoria"},
+        )
+        self.assertEqual(
+            client.executions,
+            [
+                (
+                    "FIGMA_DISCOVER_FIGMA_RESOURCES",
+                    {"figma_url": "https://www.figma.com/design/abc123/Auditoria"},
+                )
+            ],
+        )
 
     def test_google_calendar_create_rejects_natural_language_before_upstream(self):
         client = FakeComposioClient()

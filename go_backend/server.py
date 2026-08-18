@@ -174,7 +174,10 @@ AGENT_RESPONSE_STYLE_INSTRUCTION = (
     "solicitud, no añadas preámbulos, cierres o preguntas genéricas. Tras una "
     "acción confirma solo qué hiciste y los datos esenciales. No muestres URLs "
     "crudas ni detalles internos salvo que se pidan. No agregues Meet, invitados, "
-    "ubicación, duración u otros datos que el usuario no haya solicitado."
+    "ubicación, duración u otros datos que el usuario no haya solicitado. Nunca "
+    "muestres razonamiento interno, deliberación, planes de herramientas, intentos "
+    "intermedios ni frases como 'let me think/reconsider'; entrega solo la conclusión "
+    "visible y honesta."
 )
 
 
@@ -1297,6 +1300,11 @@ class Backend:
     def _run_retention_once(self) -> None:
         try:
             self.store.purge_expired_ephemeral_data()
+            # A hard process/container exit cannot run the normal settlement
+            # path. Release reservations whose durable run token has expired
+            # so a dead browser/Pi process cannot consume a concurrency slot
+            # indefinitely after the service restarts.
+            self.store.expire_stale_reservations()
             self.store.expire_past_due_entitlements()
             self.pi.purge_expired_runs()
         except Exception:
