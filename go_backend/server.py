@@ -177,7 +177,8 @@ AGENT_RESPONSE_STYLE_INSTRUCTION = (
     "ubicación, duración u otros datos que el usuario no haya solicitado. Nunca "
     "muestres razonamiento interno, deliberación, planes de herramientas, intentos "
     "intermedios ni frases como 'let me think/reconsider'; entrega solo la conclusión "
-    "visible y honesta."
+    "visible y honesta. En el campo text, comienza la conclusión exactamente con "
+    "'FINAL: '; ese marcador es de transporte y no será visible para el usuario."
 )
 
 
@@ -800,6 +801,17 @@ _VISIBLE_DELIBERATION_BOUNDARY_RE = re.compile(
     r")\s*(?:\n\s*\n|$)",
     flags=re.IGNORECASE,
 )
+_VISIBLE_FINAL_SENTINEL_RE = re.compile(
+    r"(?:^|\n\s*\n)\s*FINAL\s*:\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _sentinel_visible_agent_text(value: str) -> str | None:
+    boundaries = list(_VISIBLE_FINAL_SENTINEL_RE.finditer(value))
+    if not boundaries:
+        return None
+    return value[boundaries[-1].end():].strip()
 
 
 def _sanitize_visible_agent_text(value: str) -> str:
@@ -813,6 +825,9 @@ def _sanitize_visible_agent_text(value: str) -> str:
     requested explanations remain untouched.
     """
     candidate = value.strip()
+    sentinel_text = _sentinel_visible_agent_text(candidate)
+    if sentinel_text is not None:
+        return sentinel_text
     boundaries = list(_VISIBLE_DELIBERATION_BOUNDARY_RE.finditer(candidate))
     if not boundaries:
         return candidate
@@ -850,7 +865,7 @@ def _normalized_agent_envelope(value: str) -> str | None:
             pass
     if candidate and not candidate.startswith(("{", "[")):
         return json.dumps(
-            {"text": candidate[:20_000], "widget": None},
+            {"text": _sanitize_visible_agent_text(candidate)[:20_000], "widget": None},
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -1029,6 +1044,7 @@ class _AgentEventStream:
     def model_delta(self, delta: str) -> None:
         self.raw_answer += delta
         visible = _partial_json_text(self.raw_answer)
+        visible = _sentinel_visible_agent_text(visible or "")
         if visible is None or len(visible) <= len(self.visible_sent):
             return
         next_delta = visible[len(self.visible_sent):]
@@ -1036,11 +1052,16 @@ class _AgentEventStream:
         self.send("delta", {"text": next_delta})
 
     def text_delta(self, delta: str) -> None:
-        """Publish already-visible text from the direct chat fast path."""
+        """Publish direct-chat text only after its explicit final boundary."""
         if not delta:
             return
-        self.visible_sent += delta
-        self.send("delta", {"text": delta})
+        self.raw_answer += delta
+        visible = _sentinel_visible_agent_text(self.raw_answer)
+        if visible is None or len(visible) <= len(self.visible_sent):
+            return
+        next_delta = visible[len(self.visible_sent):]
+        self.visible_sent = visible
+        self.send("delta", {"text": next_delta})
 
     def error(self, status: int, message: str, code: str) -> None:
         self._heartbeat_stop.set()
@@ -2652,6 +2673,13 @@ class Backend:
         database = self.store.health()
         pi = self.pi.status()
         pi.pop("binary", None)
+        memory_limit = runtime_memory_limit_mb()
+        browser_resource_ready = bool(
+            memory_limit is None
+            or self.cfg.pi_browser_min_memory_mb == 0
+            or memory_limit >= self.cfg.pi_browser_min_memory_mb
+        )
+        pi["browser_resource_ready"] = browser_resource_ready
         connectors = self.connector_gateway.health()
         computers = self.computers.health()
         checks = {
@@ -2677,7 +2705,8 @@ class Backend:
             and bool(pi.get("connectors_available")),
             "pi_chrome": bool(pi.get("browser_available"))
             and bool(pi.get("browser_auto_authorize"))
-            and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN,
+            and pi.get("browser_isolation") == CHROME_ISOLATION_PER_RUN
+            and browser_resource_ready,
             "model_provider": bool(self.cfg.deepseek_api_key),
             "whatsapp": (
                 not self.cfg.whatsapp_enabled or self.whatsapp.config.configured

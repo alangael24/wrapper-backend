@@ -137,7 +137,7 @@ class MockUpstream(BaseHTTPRequestHandler):
                 self._send(
                     200,
                     b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n'
-                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"hola"},"finish_reason":null}]}\n\n'
+                    b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"FINAL: hola"},"finish_reason":null}]}\n\n'
                     b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
                     b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n'
                     b'data: [DONE]\n\n',
@@ -1927,6 +1927,31 @@ class TestBackend(unittest.TestCase):
         self.assertTrue(readiness["checks"]["connectors"])
         self.assertTrue(readiness["checks"]["computers"])
 
+    def test_readiness_rejects_pi_chrome_when_container_memory_is_insufficient(self):
+        self.ws.cfg.environment = "production"
+        self.ws.cfg.pi_browser_min_memory_mb = 1024
+        with (
+            patch("go_backend.server.runtime_memory_limit_mb", return_value=512),
+            patch.object(
+                self.ws.backend.pi,
+                "status",
+                return_value={
+                    "enabled": True,
+                    "available": True,
+                    "node_available": True,
+                    "connectors_available": True,
+                    "browser_available": True,
+                    "browser_auto_authorize": True,
+                    "browser_isolation": "per_run",
+                },
+            ),
+        ):
+            readiness = self.ws.backend.readiness()
+
+        self.assertFalse(readiness["checks"]["pi_chrome"])
+        self.assertFalse(readiness["pi"]["browser_resource_ready"])
+        self.assertFalse(readiness["ready"])
+
     def test_readiness_requires_computers_when_feature_is_enabled(self):
         self.ws.cfg.computers_enabled = True
         with patch.object(
@@ -2424,6 +2449,23 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(
             json.loads(bounded)["text"],
             "Correos revisados: sin_resultados\n\nEventos próximos: 0",
+        )
+
+    def test_agent_envelope_uses_explicit_final_sentinel_for_arbitrary_deliberation(self):
+        original = json.dumps({
+            "text": (
+                "I need to inspect several tool results and reconcile them.\n\n"
+                "Given the requested format I should avoid guessing.\n\n"
+                "FINAL: Correos revisados: no confirmado\nEventos próximos: 0"
+            ),
+            "widget": None,
+        })
+
+        bounded = _bounded_agent_envelope(original)
+
+        self.assertEqual(
+            json.loads(bounded)["text"],
+            "Correos revisados: no confirmado\nEventos próximos: 0",
         )
 
     def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):

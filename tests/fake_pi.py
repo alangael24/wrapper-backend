@@ -116,7 +116,7 @@ for line in sys.stdin:
     answer_text = f"fake-pi{session_label} uso {model}: {upstream_text}"
     if "__stream_json__" in str(command.get("message", "")):
         answer_text = json.dumps(
-            {"text": "hola rápido", "widget": None}, ensure_ascii=False
+            {"text": "FINAL: hola rápido", "widget": None}, ensure_ascii=False
         )
     midpoint = max(1, len(answer_text) // 2)
     events = [
