@@ -335,7 +335,9 @@ private fun firstAgentEnvelope(value: String): JSONObject? {
         val parsed = runCatching { org.json.JSONTokener(candidate).nextValue() }.getOrNull()
         return when (parsed) {
             is JSONObject -> parsed
-            is String -> firstAgentEnvelope(parsed)
+            is String -> parsed.trim()
+                .takeIf { it.isNotEmpty() && it != candidate.trim() }
+                ?.let(::firstAgentEnvelope)
             else -> null
         }
     }
