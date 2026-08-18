@@ -23,25 +23,6 @@ on:
       - "docs/**"
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/**"
-      - "electron-builder.yml"
-      - "package.json"
-      - "requirements.in"
-      - "requirements.txt"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "scripts/verify-release-config.mjs"
-      - "Dockerfile"
-      - ".dockerignore"
-      - "render.yaml"
-      - "supabase/migrations/**"
-      - "ios/AgentGenia/AgentGenia.xcodeproj/**"
-      - "ios/AgentGenia/AgentGenia/PrivacyInfo.xcprivacy"
-      - "android/AgentGenia/app/build.gradle.kts"
-      - "LICENSE"
-      - "*.md"
-      - "docs/**"
 
 permissions:
   contents: read
