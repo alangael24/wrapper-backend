@@ -2793,6 +2793,41 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(model["thinkingLevelMap"]["off"], "off")
         self.assertNotIn("extraBody", model)
+        command = self.ws.backend.pi._command(False, thinking_level="off")
+        self.assertEqual(command[command.index("--thinking") + 1], "off")
+
+    def test_single_connector_run_uses_fast_thinking_without_weakening_complex_runs(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        bot_id = self.assign_bot_connectors(signup, ["google-workspace"])
+        self.ws.backend.connector_gateway.connected_connector_ids = (
+            lambda _user_id: ("google-workspace",)
+        )
+        captured: list[str | None] = []
+        original_run = self.ws.backend.pi.run
+
+        def capture_thinking(**kwargs):
+            captured.append(kwargs.get("thinking_level"))
+            return original_run(**kwargs)
+
+        self.ws.backend.pi.run = capture_thinking
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "Busca mis correos recientes",
+                "user_message": "Busca mis correos recientes",
+                "execution_mode": "agent",
+                "bot_id": bot_id,
+                "connector_ids": ["google-workspace"],
+                "idempotency_key": "single-connector-fast-thinking",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(captured, ["off"])
 
     def test_connector_broker_scopes_catalog_and_execution_to_run_grant(self):
         signup = self.new_user()

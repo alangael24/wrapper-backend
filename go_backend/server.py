@@ -502,6 +502,13 @@ class Config:
         # agent/tool path honest and deliberate; the latency-sensitive direct
         # chat path explicitly disables thinking in `_run_direct_chat`.
         self.pi_thinking = os.environ.get("PI_THINKING", "high")
+        # One exact connector is a bounded operation-selection task. Running
+        # DeepSeek's hidden high-effort reasoning there dominated latency while
+        # adding no authorization or schema safety; complex/multi-tool work
+        # continues to use PI_THINKING.
+        self.pi_connector_thinking = os.environ.get(
+            "PI_CONNECTOR_THINKING", "off"
+        )
         self.pi_timeout_seconds = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
         self.pi_max_concurrent = int(os.environ.get("PI_MAX_CONCURRENT", "4"))
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
@@ -578,6 +585,11 @@ def validate_runtime_security(cfg: Config) -> None:
     if cfg.pi_session_idle_seconds < 0 or cfg.pi_max_warm_sessions < 1:
         raise UnsafeConfigurationError(
             "PI_SESSION_IDLE_SECONDS y PI_MAX_WARM_SESSIONS no son válidos"
+        )
+    thinking_levels = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+    if cfg.pi_thinking not in thinking_levels or cfg.pi_connector_thinking not in thinking_levels:
+        raise UnsafeConfigurationError(
+            "PI_THINKING y PI_CONNECTOR_THINKING no son válidos"
         )
     try:
         WhatsAppConfig(
@@ -3870,6 +3882,11 @@ class Backend:
                         connector_run_token=connector_run_token,
                         connector_ids=connector_ids,
                         computer_enabled=computer_enabled,
+                        thinking_level=(
+                            self.cfg.pi_connector_thinking
+                            if len(connector_ids) == 1 and not browser and not computer_enabled
+                            else self.cfg.pi_thinking
+                        ),
                         conversation_key=(
                             f"{user['id']}\0{bot_id}" if bot_id is not None else None
                         ),

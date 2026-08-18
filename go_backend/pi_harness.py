@@ -262,6 +262,7 @@ class PiHarness:
         connector_run_token: str | None = None,
         connector_ids: tuple[str, ...] = (),
         computer_enabled: bool = False,
+        thinking_level: str | None = None,
         conversation_key: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
@@ -283,6 +284,11 @@ class PiHarness:
             )
         if connector_run_token and not self._resolved_connector_extension():
             raise PiHarnessError("La extension de conectores no esta instalada")
+        effective_thinking = thinking_level or self.thinking
+        if effective_thinking not in {
+            "off", "minimal", "low", "medium", "high", "xhigh", "max"
+        }:
+            raise PiHarnessError("El nivel de razonamiento de Pi no es válido")
         if not self._slots.acquire(blocking=False):
             raise PiHarnessBusy("Todos los slots de Pi estan ocupados")
         try:
@@ -294,6 +300,7 @@ class PiHarness:
                     connector_run_token=connector_run_token,
                     connector_ids=connector_ids,
                     computer_enabled=computer_enabled,
+                    thinking_level=effective_thinking,
                     conversation_key=conversation_key,
                     on_text_delta=on_text_delta,
                     is_cancelled=is_cancelled,
@@ -306,6 +313,7 @@ class PiHarness:
                 connector_run_token=connector_run_token,
                 connector_ids=connector_ids,
                 computer_enabled=computer_enabled,
+                thinking_level=effective_thinking,
                 on_text_delta=on_text_delta,
                 is_cancelled=is_cancelled,
             )
@@ -600,13 +608,19 @@ class PiHarness:
         # El perfil siempre se crea dentro del run_id aleatorio y nunca se reutiliza.
         shutil.rmtree(run_dir / "chrome-profile", ignore_errors=True)
 
-    def _command(self, browser: bool, *, session_id: str | None = None) -> list[str]:
+    def _command(
+        self,
+        browser: bool,
+        *,
+        session_id: str | None = None,
+        thinking_level: str | None = None,
+    ) -> list[str]:
         command = [
             self._resolved_binary() or self.binary,
             "--mode", "rpc",
             "--provider", PROVIDER_NAME,
             "--model", self.model,
-            "--thinking", self.thinking,
+            "--thinking", thinking_level or self.thinking,
             "--no-skills",
             "--no-prompt-templates",
             "--no-themes",
@@ -867,6 +881,7 @@ class PiHarness:
         connector_run_token: str | None,
         connector_ids: tuple[str, ...],
         computer_enabled: bool,
+        thinking_level: str,
         conversation_key: str,
         on_text_delta: Callable[[str], None] | None,
         is_cancelled: Callable[[], bool] | None,
@@ -968,6 +983,59 @@ class PiHarness:
                 fatal = True
                 raise PiHarnessTimeout(
                     f"Pi excedio el timeout de {self.timeout_seconds}s al preparar el contexto"
+                )
+
+            # A single connector with a closed operation catalog is a bounded
+            # routing task, not an open-ended research problem. The caller can
+            # disable hidden reasoning for that turn while computer/browser or
+            # multi-connector work retains the configured high-effort mode.
+            thinking_id = f"thinking-{run_id}"
+            send({
+                "id": thinking_id,
+                "type": "set_thinking_level",
+                "level": thinking_level,
+            })
+            while deadline is None or time.monotonic() < deadline:
+                wait = 0.5 if deadline is None else min(
+                    0.5, max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    line = events.get(timeout=wait)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        fatal = True
+                        raise PiHarnessError(
+                            "La sesión de Pi se cerró al configurar el razonamiento"
+                        )
+                    continue
+                if line is None:
+                    fatal = True
+                    raise PiHarnessError(
+                        "La sesión de Pi se cerró al configurar el razonamiento"
+                    )
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "extension_ui_request":
+                    send({
+                        "type": "extension_ui_response",
+                        "id": event.get("id"),
+                        "cancelled": True,
+                    })
+                    continue
+                if event.get("type") != "response" or event.get("id") != thinking_id:
+                    continue
+                if not event.get("success"):
+                    fatal = True
+                    raise PiHarnessError(
+                        str(event.get("error") or "Pi rechazó el nivel de razonamiento")
+                    )
+                break
+            else:
+                fatal = True
+                raise PiHarnessTimeout(
+                    f"Pi excedio el timeout de {self.timeout_seconds}s al configurar el razonamiento"
                 )
 
             send({"id": f"agent-task-{run_id}", "type": "prompt", "message": prompt})
@@ -1147,6 +1215,7 @@ class PiHarness:
         connector_run_token: str | None,
         connector_ids: tuple[str, ...],
         computer_enabled: bool,
+        thinking_level: str,
         on_text_delta: Callable[[str], None] | None,
         is_cancelled: Callable[[], bool] | None,
     ) -> PiRunResult:
@@ -1196,7 +1265,7 @@ class PiHarness:
                             "Chrome se cerró antes de que Pi pudiera autorizarlo"
                         )
                 process = subprocess.Popen(
-                    self._command(browser),
+                    self._command(browser, thinking_level=thinking_level),
                     cwd=work_dir,
                     env=self._child_env(
                         run_dir,

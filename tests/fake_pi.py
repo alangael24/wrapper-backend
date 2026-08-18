@@ -61,6 +61,15 @@ for line in sys.stdin:
             "data": {"isStreaming": False},
         }), flush=True)
         continue
+    if command.get("type") == "set_thinking_level":
+        print(json.dumps({
+            "id": command.get("id"),
+            "type": "response",
+            "command": "set_thinking_level",
+            "success": True,
+            "data": {"level": command.get("level")},
+        }), flush=True)
+        continue
     if command.get("type") == "extension_ui_response" and command.get("id") == "fake-chrome-confirm":
         print(json.dumps({
             "id": "chrome-authorize",

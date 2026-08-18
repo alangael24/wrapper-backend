@@ -773,6 +773,7 @@ runtime se agrupan aquí por función.
 | `PI_MAX_WARM_SESSIONS` | `PI_MAX_CONCURRENT` | Máximo de procesos Pi inactivos/activos conservados por instancia |
 | `PI_MODEL` | `deepseek-v4-flash` | Modelo configurado en Pi |
 | `PI_THINKING` | `high` | Nivel de razonamiento de Pi |
+| `PI_CONNECTOR_THINKING` | `off` | Nivel para una sola integración exacta; elimina razonamiento oculto en routing acotado sin afectar navegador, computadora o tareas multi-conector |
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
