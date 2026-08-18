@@ -131,6 +131,26 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(generated.widget?.options.first?.value, "Ponle Inicio de trabajo")
     }
 
+    func testPartialAgentEnvelopeShowsOnlyCompletedVisibleText() {
+        let generated = parseAgentAnswer(
+            #"{"text":"¡Hola! Soy Nuevo bot, agente de Agent Genia.","widget":{"prompt":"¿Qué deseas lograr?","help"#
+        )
+
+        XCTAssertEqual(generated.text, "¡Hola! Soy Nuevo bot, agente de Agent Genia.")
+        XCTAssertNil(generated.widget)
+    }
+
+    func testPersistedPartialEnvelopeIsSanitizedWhenDecoded() throws {
+        let id = UUID()
+        let stored = """
+        {"id":"\(id.uuidString)","role":"assistant","text":"{\\\"text\\\":\\\"Hola visible\\\",\\\"widget\\\":{" ,"widget":null,"createdAt":0}
+        """
+        let message = try JSONDecoder().decode(BotMessage.self, from: Data(stored.utf8))
+
+        XCTAssertEqual(message.text, "Hola visible")
+        XCTAssertNil(message.widget)
+    }
+
     func testWidgetOnlyReplyReplacesThinkingPlaceholder() throws {
         let botID = UUID()
         let replyID = UUID()

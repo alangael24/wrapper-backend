@@ -603,6 +603,51 @@ def _completion_message_text(body: bytes | None) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
+def _expects_agent_envelope(prompt: str) -> bool:
+    """Identify our internal text/widget response contract, not arbitrary JSON."""
+    return (
+        "Devuelve exclusivamente JSON válido" in prompt
+        and '"text":"respuesta visible"' in prompt
+        and '"widget"' in prompt
+    )
+
+
+def _valid_agent_envelope(value: str) -> bool:
+    """Reject partial/model-invented envelopes before clients persist them."""
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        return False
+    widget = payload.get("widget")
+    if widget is None:
+        return True
+    if not isinstance(widget, dict):
+        return False
+    prompt = widget.get("prompt")
+    options = widget.get("options")
+    return (
+        isinstance(prompt, str)
+        and bool(prompt.strip())
+        and isinstance(options, list)
+        and 1 <= len(options) <= 6
+        and all(
+            isinstance(option, dict)
+            and isinstance(option.get("label"), str)
+            and bool(option["label"].strip())
+            for option in options
+        )
+    )
+
+
+def _agent_envelope_text(value: str) -> str:
+    if not _valid_agent_envelope(value):
+        return ""
+    payload = json.loads(value)
+    return str(payload.get("text") or "").strip()
+
+
 def _partial_json_text(value: str) -> str | None:
     """Decode the completed prefix of a top-level JSON ``text`` string.
 
@@ -2816,6 +2861,8 @@ class Backend:
         started = time.monotonic()
         answer_parts: list[str] = []
         pending = ""
+        finish_reason = ""
+        structured_answer = _expects_agent_envelope(prompt)
         secret = (self.cfg.wrapper_secret or "development-only").encode("utf-8")
         provider_user_id = hmac.new(
             secret,
@@ -2845,6 +2892,7 @@ class Backend:
         ).encode("utf-8")
 
         def process_line(line: str) -> None:
+            nonlocal finish_reason
             line = line.strip()
             if not line.startswith("data:"):
                 return
@@ -2858,6 +2906,9 @@ class Backend:
             choices = payload.get("choices") if isinstance(payload, dict) else None
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                 return
+            reason = choices[0].get("finish_reason")
+            if isinstance(reason, str) and reason:
+                finish_reason = reason
             delta = choices[0].get("delta")
             if not isinstance(delta, dict):
                 return
@@ -2871,7 +2922,10 @@ class Backend:
             answer_parts.append(content)
             if event_stream:
                 self._mark_run_timing(run_id, "first_visible_delta_ms")
-                event_stream.text_delta(content)
+                if structured_answer:
+                    event_stream.model_delta(content)
+                else:
+                    event_stream.text_delta(content)
 
         def on_headers(_status: int, _headers: dict) -> None:
             self._mark_run_timing(run_id, "upstream_headers_ms")
@@ -2922,15 +2976,35 @@ class Backend:
                     pass
             raise DirectChatError(status, message)
         answer = "".join(answer_parts).strip()
-        if not answer:
+        if not answer or (
+            structured_answer
+            and (finish_reason == "length" or not _valid_agent_envelope(answer))
+        ):
             # Some OpenAI-compatible gateways occasionally acknowledge an SSE
             # request with a terminal/usage frame but no content frame. Retry
             # once as ordinary JSON so a valid model response is not surfaced
             # to the app as "El modelo no devolvió texto".
-            logging.warning("Empty direct-chat stream; retrying as JSON run_id=%s", run_id)
+            logging.warning(
+                "Invalid direct-chat stream; retrying as JSON run_id=%s structured=%s finish_reason=%s",
+                run_id,
+                structured_answer,
+                finish_reason or "unknown",
+            )
             retry_payload = dict(request_payload)
             retry_payload["stream"] = False
             retry_payload.pop("stream_options", None)
+            if structured_answer:
+                retry_payload["messages"] = [
+                    *request_payload["messages"],
+                    {
+                        "role": "user",
+                        "content": (
+                            "La respuesta anterior quedó incompleta o no respetó el contrato. "
+                            "Devuelve nuevamente y exclusivamente el objeto JSON completo, "
+                            "válido y sin markdown."
+                        ),
+                    },
+                ]
             retry_status, _retry_headers, retry_body, retry_usage = proxy_request(
                 "POST",
                 provider["base_url"],
@@ -2964,12 +3038,23 @@ class Backend:
             answer = _completion_message_text(retry_body)
             if answer and event_stream:
                 self._mark_run_timing(run_id, "first_visible_delta_ms")
-                event_stream.text_delta(answer)
+                if structured_answer:
+                    visible = _agent_envelope_text(answer)
+                    if visible and len(visible) > len(event_stream.visible_sent):
+                        event_stream.text_delta(visible[len(event_stream.visible_sent):])
+                else:
+                    event_stream.text_delta(answer)
         self.record(user, provider, "/chat/completions", status, usage, run_id=run_id)
         if status < 200 or status >= 300:
             raise DirectChatError(status, "El proveedor no pudo completar la respuesta.")
         if not answer:
             raise DirectChatError(502, "El modelo no devolvió texto.", "empty_model_response")
+        if structured_answer and not _valid_agent_envelope(answer):
+            raise DirectChatError(
+                502,
+                "El modelo devolvió una respuesta estructurada incompleta.",
+                "invalid_model_response",
+            )
         return PiRunResult(
             run_id=run_id,
             answer=answer,

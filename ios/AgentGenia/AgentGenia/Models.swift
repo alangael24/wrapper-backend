@@ -62,6 +62,39 @@ struct BotMessage: Codable, Identifiable, Equatable, Sendable {
     let text: String
     let widget: BotQuestionWidget?
     let createdAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, text, widget, createdAt
+    }
+
+    init(id: UUID, role: Role, text: String, widget: BotQuestionWidget?, createdAt: Date) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.widget = widget
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        role = try values.decode(Role.self, forKey: .role)
+        let storedText = try values.decode(String.self, forKey: .text)
+        text = role == .assistant
+            ? (visibleTextFromPartialAgentEnvelope(storedText) ?? storedText)
+            : storedText
+        widget = try values.decodeIfPresent(BotQuestionWidget.self, forKey: .widget)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(role, forKey: .role)
+        try values.encode(text, forKey: .text)
+        try values.encodeIfPresent(widget, forKey: .widget)
+        try values.encode(createdAt, forKey: .createdAt)
+    }
 }
 
 struct BotProfile: Codable, Identifiable, Equatable, Sendable {

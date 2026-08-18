@@ -1127,7 +1127,12 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
         .replacingOccurrences(of: #"^```(?:json)?\s*"#, with: "", options: .regularExpression)
         .replacingOccurrences(of: #"\s*```$"#, with: "", options: .regularExpression)
     guard let object = firstAgentEnvelope(in: candidate)
-    else { return (String(trimmed.prefix(20_000)), nil) }
+    else {
+        if let visibleText = visibleTextFromPartialAgentEnvelope(candidate) {
+            return (String(visibleText.prefix(20_000)), nil)
+        }
+        return (String(trimmed.prefix(20_000)), nil)
+    }
     let text = ((object["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = object["widget"] as? [String: Any],
           let prompt = value["prompt"] as? String,
@@ -1154,6 +1159,34 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
             dismissOnMoveOn: value["dismissOnMoveOn"] as? Bool ?? true
         )
     )
+}
+
+func visibleTextFromPartialAgentEnvelope(_ value: String) -> String? {
+    guard value.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") else { return nil }
+    guard let fieldRange = value.range(of: #"\"text\"\s*:\s*"#, options: .regularExpression) else { return nil }
+    var openingQuote = fieldRange.upperBound
+    while openingQuote < value.endIndex, value[openingQuote].isWhitespace {
+        openingQuote = value.index(after: openingQuote)
+    }
+    guard openingQuote < value.endIndex, value[openingQuote] == "\"" else { return nil }
+    var index = value.index(after: openingQuote)
+    var escaped = false
+    while index < value.endIndex {
+        let character = value[index]
+        if escaped {
+            escaped = false
+        } else if character == "\\" {
+            escaped = true
+        } else if character == "\"" {
+            let literal = value[openingQuote...index]
+            guard let data = String(literal).data(using: .utf8),
+                  let text = try? JSONDecoder().decode(String.self, from: data)
+            else { return nil }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        index = value.index(after: index)
+    }
+    return nil
 }
 
 private func firstAgentEnvelope(in value: String) -> [String: Any]? {

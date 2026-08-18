@@ -106,6 +106,27 @@ class MockUpstream(BaseHTTPRequestHandler):
                         ctype="text/event-stream",
                     )
                     return
+                if "__partial_structured__" in content:
+                    partial = '{"text":"Saludo visible","widget":{"prompt":"¿Qué deseas hacer?"'
+                    frame = {
+                        "id": "cmpl-partial",
+                        "object": "chat.completion.chunk",
+                        "model": "deepseek-v4-flash",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": partial},
+                            "finish_reason": "length",
+                        }],
+                    }
+                    self._send(
+                        200,
+                        (
+                            f"data: {json.dumps(frame)}\n\n"
+                            "data: [DONE]\n\n"
+                        ).encode(),
+                        ctype="text/event-stream",
+                    )
+                    return
                 self._send(
                     200,
                     b'data: {"id":"cmpl-stream","object":"chat.completion.chunk","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n'
@@ -117,11 +138,24 @@ class MockUpstream(BaseHTTPRequestHandler):
                 )
             else:
                 content = str(payload.get("messages", [{}])[0].get("content", ""))
+                expects_agent_envelope = (
+                    "Devuelve exclusivamente JSON válido" in content
+                    and '"text":"respuesta visible"' in content
+                    and '"widget"' in content
+                )
                 resp = {
                     "id": "cmpl-test", "model": "deepseek-v4-flash",
                     "choices": [{"message": {
                         "role": "assistant",
-                        "content": "respuesta recuperada" if "__empty_stream_retry__" in content else "hola",
+                        "content": (
+                            "respuesta recuperada"
+                            if "__empty_stream_retry__" in content
+                            else '{"text":"Saludo reparado","widget":{"prompt":"¿Qué deseas hacer?","options":[{"label":"Empezar"}]}}'
+                            if "__partial_structured__" in content
+                            else '{"text":"hola","widget":null}'
+                            if expects_agent_envelope
+                            else "hola"
+                        ),
                     }}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                               "total_tokens": 15,
@@ -2344,6 +2378,38 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(result["answer"], "respuesta recuperada")
+        upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
+        self.assertEqual(len(upstream), 2)
+        self.assertTrue(json.loads(upstream[0][3])["stream"])
+        self.assertFalse(json.loads(upstream[1][3])["stream"])
+
+    def test_direct_chat_repairs_partial_structured_envelope(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        structured_prompt = (
+            '__partial_structured__ Devuelve exclusivamente JSON válido con esta forma: '
+            '{"text":"respuesta visible","widget":null}. '
+            'Cuando haga falta una elección, incluye "widget" con prompt y options.'
+        )
+
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy full agent prompt",
+                "chat_prompt": structured_prompt,
+                "user_message": "hola",
+                "execution_mode": "auto",
+                "bot_id": "bot-partial-structured",
+                "idempotency_key": "direct-chat-partial-structured",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        envelope = json.loads(result["answer"])
+        self.assertEqual(envelope["text"], "Saludo reparado")
+        self.assertEqual(envelope["widget"]["prompt"], "¿Qué deseas hacer?")
         upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream), 2)
         self.assertTrue(json.loads(upstream[0][3])["stream"])
