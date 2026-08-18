@@ -14,7 +14,7 @@ const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 const MAX_EAGER_CONNECTORS = 8;
 
 const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  "google-workspace": ["search_email", "read_email", "draft_email", "send_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
+  "google-workspace": ["search_email", "read_email", "draft_email", "send_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "list_sheet_names", "read_sheet", "update_sheet"],
   slack: ["list_channels", "search_messages", "read_thread", "post_message"],
   notion: ["search", "read_page", "create_page", "query_database", "update_page"],
   salesforce: ["search_records", "get_record", "create_record", "update_record"],
@@ -155,6 +155,12 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
       query: "Nombre o consulta del archivo; conserva también su ID exacto",
     },
     rule: "Usa el file ID devuelto para cualquier lectura posterior. No confundas el título con el ID.",
+  },
+  list_sheet_names: {
+    arguments: {
+      spreadsheet_id: "ID exacto de la hoja de cálculo obtenido con search_drive",
+    },
+    rule: "Llama esta operación antes de read_sheet o update_sheet cuando no conozcas el nombre real de la pestaña. Usa uno de los nombres devueltos en el rango A1; no adivines Sheet1 ni Hoja 1.",
   },
   read_sheet: {
     arguments: {
@@ -322,7 +328,7 @@ function providerArgumentDescription(id: string): string {
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
     "Para delete_calendar_event usa event_id exacto y calendar_id; lista eventos primero si falta el ID.",
-    "Para search_drive usa query; para read_sheet usa spreadsheet_id obtenido de Drive y un range pequeño en notación A1.",
+    "Para search_drive usa query. Antes de leer o escribir una hoja cuyo nombre de pestaña no conozcas, usa list_sheet_names con el spreadsheet_id. Para read_sheet usa spreadsheet_id y un range pequeño en notación A1 con el nombre real devuelto.",
     "Para update_sheet usa spreadsheet_id, range, values como matriz bidimensional y value_input_option USER_ENTERED.",
     "Nunca pases fechas naturales como 'tomorrow' o 'manana'.",
   ].join(" ");

@@ -51,7 +51,7 @@ CONNECTOR_CATALOG: dict[str, dict[str, Any]] = {
             (
                 "search_email", "read_email", "draft_email", "send_email", "list_calendar_events",
                 "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file",
-                "list_contacts", "read_sheet", "update_sheet",
+                "list_contacts", "list_sheet_names", "read_sheet", "update_sheet",
             ),
         ),
         _connector(

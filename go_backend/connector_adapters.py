@@ -113,6 +113,7 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "search_drive"): "GOOGLESUPER_FIND_FILE",
     ("google-workspace", "read_drive_file"): "GOOGLESUPER_PARSE_FILE",
     ("google-workspace", "list_contacts"): "GOOGLESUPER_GET_CONTACTS",
+    ("google-workspace", "list_sheet_names"): "GOOGLESUPER_GET_SHEET_NAMES",
     ("google-workspace", "read_sheet"): "GOOGLESUPER_VALUES_GET",
     ("google-workspace", "update_sheet"): "GOOGLESUPER_VALUES_UPDATE",
     ("notion", "search"): "NOTION_SEARCH_NOTION_PAGE",
@@ -270,6 +271,7 @@ PINNED_DIRECT_READ_OPERATIONS = frozenset({
     ("google-workspace", "search_drive"),
     ("google-workspace", "read_drive_file"),
     ("google-workspace", "list_contacts"),
+    ("google-workspace", "list_sheet_names"),
     ("google-workspace", "read_sheet"),
     ("notion", "search"),
     ("notion", "read_page"),
@@ -2147,6 +2149,20 @@ def _normalize_operation_arguments(
                 )
             result["show_deleted"] = show_deleted
         return result
+
+    if operation == "list_sheet_names":
+        normalized = dict(arguments)
+        spreadsheet_id = normalized.get(
+            "spreadsheet_id",
+            normalized.get("spreadsheetId", normalized.get("file_id")),
+        )
+        if not isinstance(spreadsheet_id, str) or not spreadsheet_id.strip():
+            raise ConnectorBrokerError(
+                400,
+                "list_sheet_names requiere spreadsheet_id obtenido con search_drive",
+                "bad_connector_arguments",
+            )
+        return {"spreadsheet_id": spreadsheet_id.strip()}
 
     if operation == "read_sheet":
         normalized = dict(arguments)

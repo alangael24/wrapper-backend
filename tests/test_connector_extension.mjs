@@ -110,6 +110,7 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     assert.equal(calendarMatches[0].operation_guidance.create_calendar_event.arguments.timezone.includes("IANA"), true);
     assert.match(calendarMatches[0].operation_guidance.update_sheet.rule, /aprobación estructurada/);
     assert.match(calendarMatches[0].operation_guidance.read_sheet.rule, /nunca presentes celdas como vacías/);
+    assert.match(calendarMatches[0].operation_guidance.list_sheet_names.rule, /no adivines Sheet1/);
     assert.match(calendarMatches[0].operation_guidance.delete_calendar_event.arguments.event_id, /list_calendar_events/);
     assert.match(
       tools.get("connector_google_workspace").parameters.properties.arguments.description,

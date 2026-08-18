@@ -550,7 +550,11 @@ Después:
    con `npx @puppeteer/browsers install chrome@stable`.
 3. Configura `PI_CHROME_AUTO_AUTHORIZE=1`. Esta autorización solo cubre el
    perfil efímero de la ejecución actual.
-4. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
+4. Reserva al menos `PI_BROWSER_MIN_MEMORY_MB=1024` para el proceso. Si el
+   contenedor informa un límite menor, el backend rechaza solo la navegación
+   con `pi_browser_insufficient_memory` antes de iniciar Chromium; chat,
+   autenticación y conectores permanecen disponibles.
+5. Reinicia el backend y llama `/v1/agent/run` con `{"browser": true}`.
 
 El servidor se niega a arrancar con `PI_CHROME_ISOLATION=shared` o cualquier
 otro modo. Un perfil nuevo no contiene sesiones autenticadas: si una tarea debe
@@ -777,6 +781,7 @@ runtime se agrupan aquí por función.
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
 | `PI_BROWSER_MAX_CONCURRENT` | `1` | Navegadores Chromium simultáneos por instancia; limita memoria sin reducir capacidades de cada tarea |
+| `PI_BROWSER_MIN_MEMORY_MB` | `1024` | Memoria mínima del contenedor para admitir Chromium; `0` desactiva la protección solo en desarrollo controlado |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
 | `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con activación exacta por grant y fallback diferido para conjuntos grandes |
 | `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |

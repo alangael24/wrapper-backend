@@ -348,6 +348,29 @@ def build_commit() -> str:
     return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else ""
 
 
+def runtime_memory_limit_mb() -> int | None:
+    """Return the container memory ceiling without exposing host telemetry."""
+    limits: list[int] = []
+    for candidate in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            raw = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if raw.lower() == "max":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # Some cgroup v1 hosts expose an enormous sentinel instead of `max`.
+        if 0 < value < (1 << 60):
+            limits.append(value // (1024 * 1024))
+    return min(limits) if limits else None
+
+
 class DirectChatError(RuntimeError):
     def __init__(self, status: int, message: str, code: str = "upstream_error"):
         super().__init__(message)
@@ -517,6 +540,9 @@ class Config:
         self.pi_browser_max_concurrent = int(
             os.environ.get("PI_BROWSER_MAX_CONCURRENT", "1")
         )
+        self.pi_browser_min_memory_mb = int(
+            os.environ.get("PI_BROWSER_MIN_MEMORY_MB", "1024")
+        )
         self.pi_max_prompt_chars = int(os.environ.get("PI_MAX_PROMPT_CHARS", "100000"))
         self.pi_session_idle_seconds = int(
             os.environ.get("PI_SESSION_IDLE_SECONDS", "900")
@@ -595,6 +621,10 @@ def validate_runtime_security(cfg: Config) -> None:
     if not 1 <= cfg.pi_browser_max_concurrent <= cfg.pi_max_concurrent:
         raise UnsafeConfigurationError(
             "PI_BROWSER_MAX_CONCURRENT debe estar entre 1 y PI_MAX_CONCURRENT"
+        )
+    if cfg.pi_browser_min_memory_mb < 0:
+        raise UnsafeConfigurationError(
+            "PI_BROWSER_MIN_MEMORY_MB no puede ser negativo"
         )
     thinking_levels = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
     if cfg.pi_thinking not in thinking_levels or cfg.pi_connector_thinking not in thinking_levels:
@@ -760,20 +790,61 @@ def _agent_envelope_text(value: str) -> str:
     return str(payload.get("text") or "").strip()
 
 
+_VISIBLE_DELIBERATION_BOUNDARY_RE = re.compile(
+    r"(?:^|\n\s*\n)\s*(?:"
+    r"let me report (?:that |this )?accordingly[.!]?|"
+    r"here (?:is|are) (?:the )?final (?:answer|result)s?[.:]?|"
+    r"the final answer is[.:]?|"
+    r"final answer[.:]?"
+    r")\s*(?:\n\s*\n|$)",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_visible_agent_text(value: str) -> str:
+    """Remove unmistakable model deliberation accidentally emitted as content.
+
+    Some OpenAI-compatible model gateways occasionally place a short analysis
+    preamble in ``content`` instead of ``reasoning_content``. Prompting alone
+    cannot make that transport bug fail closed. We only cut at explicit final
+    answer boundaries, then collapse a repeated first section heading. This is
+    intentionally narrower than a general prose rewriter so legitimate user-
+    requested explanations remain untouched.
+    """
+    candidate = value.strip()
+    boundaries = list(_VISIBLE_DELIBERATION_BOUNDARY_RE.finditer(candidate))
+    if not boundaries:
+        return candidate
+    candidate = candidate[boundaries[-1].end():].strip()
+    first_heading = re.match(r"^([^\n:]{1,48}:)", candidate)
+    if first_heading:
+        heading = first_heading.group(1)
+        last_heading = candidate.rfind(heading)
+        if last_heading > 0:
+            candidate = candidate[last_heading:].strip()
+    return candidate
+
+
+def _sanitize_agent_envelope(value: str) -> str:
+    payload = json.loads(value)
+    payload["text"] = _sanitize_visible_agent_text(str(payload.get("text") or ""))
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalized_agent_envelope(value: str) -> str | None:
     """Repair bounded presentation mistakes without accepting raw JSON."""
     candidate = value.strip()
     candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\s*```$", "", candidate).strip()
     if _valid_agent_envelope(candidate):
-        return candidate
+        return _sanitize_agent_envelope(candidate)
     start = candidate.find("{")
     if start >= 0:
         try:
             payload, _end = json.JSONDecoder().raw_decode(candidate[start:])
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             if _valid_agent_envelope(encoded):
-                return encoded
+                return _sanitize_agent_envelope(encoded)
         except (TypeError, json.JSONDecodeError):
             pass
     if candidate and not candidate.startswith(("{", "[")):
@@ -2936,6 +3007,12 @@ class Backend:
         status["model_provider"] = (
             "opencode" if user.get("model_provider_override") == "opencode" else "deepseek"
         )
+        memory_limit = runtime_memory_limit_mb()
+        status["browser_resource_ready"] = bool(
+            memory_limit is None
+            or self.cfg.pi_browser_min_memory_mb == 0
+            or memory_limit >= self.cfg.pi_browser_min_memory_mb
+        )
         json_response(handler, 200, status)
 
     def handle_agent_run_status(
@@ -3375,6 +3452,24 @@ class Backend:
         if not isinstance(browser, bool):
             error_response(handler, 400, "browser debe ser true o false", "bad_browser")
             return
+        if browser and self.cfg.pi_browser_min_memory_mb > 0:
+            memory_limit = runtime_memory_limit_mb()
+            if (
+                memory_limit is not None
+                and memory_limit < self.cfg.pi_browser_min_memory_mb
+            ):
+                logging.warning(
+                    "Browser run rejected: container memory %sMB is below %sMB",
+                    memory_limit,
+                    self.cfg.pi_browser_min_memory_mb,
+                )
+                error_response(
+                    handler,
+                    503,
+                    "La navegación web está temporalmente fuera de servicio; el resto de Agentgenia sigue disponible",
+                    "pi_browser_insufficient_memory",
+                )
+                return
         if not isinstance(computer_requested, bool):
             error_response(handler, 400, "computer debe ser true o false", "bad_computer")
             return

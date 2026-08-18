@@ -2388,6 +2388,26 @@ class TestBackend(unittest.TestCase):
         self.assertIsNone(decoded["widget"])
         self.assertTrue(decoded["text"].endswith("[Respuesta truncada por límite de sincronización]"))
 
+    def test_agent_envelope_removes_explicit_deliberation_and_duplicate_sections(self):
+        original = json.dumps({
+            "text": (
+                "The email search returned no actual results.\n\n"
+                "For calendar, every event is in the past.\n\n"
+                "Let me report accordingly.\n\n"
+                "Calendario: no hay próximos eventos.\n\n"
+                "Correo: sin_resultados."
+                "Calendario: sin_resultados.\n\nCorreo: sin_resultados."
+            ),
+            "widget": None,
+        })
+
+        bounded = _bounded_agent_envelope(original)
+
+        self.assertEqual(
+            json.loads(bounded)["text"],
+            "Calendario: sin_resultados.\n\nCorreo: sin_resultados.",
+        )
+
     def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
@@ -3126,7 +3146,7 @@ class TestBackend(unittest.TestCase):
                 self.assertEqual(len(adapter.calls), call_count + 1, case_id)
                 write_count += 1
 
-        self.assertEqual(read_count + write_count, 221)
+        self.assertEqual(read_count + write_count, 222)
         self.assertGreater(read_count, write_count)
         self.assertEqual(len(adapter.validations), write_count * 2)
 
@@ -3802,6 +3822,25 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(client.executions, [(
             "GOOGLESUPER_VALUES_GET",
             {"spreadsheet_id": "sheet_123", "range": "Sheet1!A1:C3"},
+        )])
+
+    def test_google_sheet_names_use_exact_id_without_tool_search(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("google-sheet-names-routing")["user_id"],
+            "google-workspace",
+            "list_sheet_names",
+            {"file_id": "sheet_123"},
+        )
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_GET_SHEET_NAMES",
+            {"spreadsheet_id": "sheet_123"},
         )])
 
     def test_google_sheet_update_normalizes_friendly_arguments_for_provider_schema(self):
@@ -4667,6 +4706,26 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["type"], "bad_connector")
+
+    def test_browser_run_fails_closed_before_chromium_can_oom_small_container(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi(browser=True)
+
+        with patch("go_backend.server.runtime_memory_limit_mb", return_value=512):
+            status, body = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": "navega una tienda pública",
+                    "browser": True,
+                    "idempotency_key": "browser-memory-admission",
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "pi_browser_insufficient_memory")
 
     def test_pi_chrome_uses_a_fresh_profile_and_bridge_for_each_run(self):
         signup = self.new_user()
