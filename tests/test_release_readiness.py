@@ -21,7 +21,9 @@ REQUIRED_CHECKS = {
     "computers": True,
     "pi": True,
     "pi_chrome": True,
+    "desktop_relay": True,
     "model_provider": True,
+    "whatsapp": True,
 }
 
 
