@@ -90,6 +90,7 @@ COMPOSIO_TOOLKITS: dict[str, str] = {
 # operation.
 COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
+    ("google-workspace", "delete_calendar_event"): "GOOGLESUPER_DELETE_EVENT",
 }
 
 _ISO_DATETIME_RE = re.compile(
@@ -795,7 +796,34 @@ def _normalize_operation_arguments(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     """Translate friendly aliases into the exact schema of pinned actions."""
-    if (connector_id, operation) != ("google-workspace", "create_calendar_event"):
+    if connector_id != "google-workspace":
+        return arguments
+
+    if operation == "delete_calendar_event":
+        normalized = dict(arguments)
+        event_id = normalized.get("event_id", normalized.get("eventId", normalized.get("id")))
+        if not isinstance(event_id, str) or not event_id.strip() or len(event_id.strip()) > 2048:
+            raise ConnectorBrokerError(
+                400,
+                "delete_calendar_event requiere el event_id exacto; usa list_calendar_events primero",
+                "bad_connector_arguments",
+            )
+        calendar_id = normalized.get("calendar_id", normalized.get("calendarId", "primary"))
+        if not isinstance(calendar_id, str) or not calendar_id.strip() or len(calendar_id.strip()) > 1024:
+            raise ConnectorBrokerError(
+                400,
+                "calendar_id no es válido",
+                "bad_connector_arguments",
+            )
+        result: dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "calendar_id": calendar_id.strip(),
+        }
+        if isinstance(normalized.get("send_updates"), str):
+            result["send_updates"] = normalized["send_updates"]
+        return result
+
+    if operation != "create_calendar_event":
         return arguments
 
     normalized = dict(arguments)

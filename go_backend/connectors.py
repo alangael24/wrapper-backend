@@ -50,7 +50,7 @@ CONNECTOR_CATALOG: dict[str, dict[str, Any]] = {
             ),
             (
                 "search_email", "read_email", "draft_email", "list_calendar_events",
-                "create_calendar_event", "search_drive", "read_drive_file",
+                "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file",
                 "list_contacts", "read_sheet", "update_sheet",
             ),
         ),

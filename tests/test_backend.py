@@ -96,7 +96,11 @@ class MockUpstream(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
         if self.path == "/v1/chat/completions":
             if payload.get("stream"):
-                content = str(payload.get("messages", [{}])[0].get("content", ""))
+                content = "\n".join(
+                    str(message.get("content", ""))
+                    for message in payload.get("messages", [])
+                    if isinstance(message, dict)
+                )
                 if "__empty_stream_retry__" in content:
                     self._send(
                         200,
@@ -137,7 +141,11 @@ class MockUpstream(BaseHTTPRequestHandler):
                     ctype="text/event-stream",
                 )
             else:
-                content = str(payload.get("messages", [{}])[0].get("content", ""))
+                content = "\n".join(
+                    str(message.get("content", ""))
+                    for message in payload.get("messages", [])
+                    if isinstance(message, dict)
+                )
                 expects_agent_envelope = (
                     "Devuelve exclusivamente JSON válido" in content
                     and '"text":"respuesta visible"' in content
@@ -2320,7 +2328,8 @@ class TestBackend(unittest.TestCase):
         upstream = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream), 1)
         sent = json.loads(upstream[0][3])
-        self.assertEqual(sent["messages"][0]["content"], "Reply briefly to the user: hola")
+        self.assertEqual(sent["messages"][-1]["content"], "Reply briefly to the user: hola")
+        self.assertIn("una a tres frases", sent["messages"][0]["content"])
         self.assertEqual(sent["thinking"], {"type": "disabled"})
         self.assertEqual(sent["max_tokens"], 4096)
 
@@ -2693,6 +2702,16 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(body["operation"], "create_calendar_event")
         self.assertEqual(adapter.calls[0][2]["summary"], "Inicio de trabajo")
 
+    def test_explicit_calendar_delete_grants_only_delete_for_one_run(self):
+        approvals = _explicit_write_approvals(
+            ("google-workspace",),
+            "Elimina el evento Comienzo a trabajar de mi calendario",
+        )
+        self.assertEqual(
+            approvals,
+            frozenset({("google-workspace", "delete_calendar_event")}),
+        )
+
     def test_connector_grant_expires_without_server_restart(self):
         clock = [time.time()]
         broker = ConnectorBroker(default_ttl_seconds=5, now=lambda: clock[0])
@@ -2944,6 +2963,51 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(error.exception.code, "bad_connector_arguments")
         self.assertIn("ISO 8601", str(error.exception))
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [])
+
+    def test_google_calendar_delete_uses_pinned_tool_and_exact_event_id(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("google-calendar-delete")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        gateway.execute(
+            user_id,
+            "google-workspace",
+            "delete_calendar_event",
+            {"eventId": "evt_abc123", "calendarId": "primary"},
+        )
+
+        self.assertEqual(client.searches, [(
+            "googlesuper",
+            "Use Google Workspace to perform the operation 'delete_calendar_event'.",
+        )])
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_DELETE_EVENT",
+            {"event_id": "evt_abc123", "calendar_id": "primary"},
+        )])
+
+    def test_google_calendar_delete_requires_exact_event_id(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        with self.assertRaises(ConnectorBrokerError) as error:
+            gateway.execute(
+                self.new_user("google-calendar-delete-invalid")["user_id"],
+                "google-workspace",
+                "delete_calendar_event",
+                {"event_title": "Comienzo a trabajar"},
+            )
+
+        self.assertEqual(error.exception.code, "bad_connector_arguments")
         self.assertEqual(client.searches, [])
         self.assertEqual(client.executions, [])
 

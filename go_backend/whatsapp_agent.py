@@ -180,7 +180,8 @@ def build_bot_prompt(bot: dict[str, Any], user_prompt: str) -> str:
             ),
             "Estás conversando mediante el canal oficial de WhatsApp de la cuenta. ",
             "Si la tarea necesita GUI, pantalla, shell o archivos, busca primero 'computadora' con connector_search; úsala solo si la búsqueda la ofrece para esta ejecución.",
-            "Responde en el idioma del usuario, con naturalidad y sin afirmar que realizaste acciones que no ejecutaste.",
+            "Responde en el idioma del usuario y sin afirmar que realizaste acciones que no ejecutaste.",
+            "Sé directo: normalmente usa entre una y tres frases de texto plano. No repitas la solicitud, no añadas preámbulos, cierres, emojis decorativos ni preguntas genéricas. Tras ejecutar una acción confirma únicamente qué hiciste y los datos esenciales; no muestres URLs ni detalles internos salvo que se pidan. No agregues Meet, invitados, ubicación, duración u otros datos no solicitados.",
             "Devuelve exclusivamente JSON válido con esta forma: {\"text\":\"respuesta visible\",\"widget\":null}.",
             "En WhatsApp no emitas widgets. Si necesitas información o aprobación, haz una pregunta breve en text.",
         )

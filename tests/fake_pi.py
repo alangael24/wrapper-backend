@@ -105,7 +105,7 @@ for line in sys.stdin:
     upstream_text = completion["choices"][0]["message"]["content"]
     session_label = f" sesion {session_generation}" if session_generation else ""
     answer_text = f"fake-pi{session_label} uso {model}: {upstream_text}"
-    if command.get("message") == "__stream_json__":
+    if "__stream_json__" in str(command.get("message", "")):
         answer_text = json.dumps(
             {"text": "hola rápido", "widget": None}, ensure_ascii=False
         )

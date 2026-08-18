@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
 
 const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  "google-workspace": ["search_email", "read_email", "draft_email", "list_calendar_events", "create_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
+  "google-workspace": ["search_email", "read_email", "draft_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
   slack: ["list_channels", "search_messages", "read_thread", "post_message"],
   notion: ["search", "read_page", "create_page", "query_database", "update_page"],
   salesforce: ["search_records", "get_record", "create_record", "update_record"],
@@ -146,6 +146,13 @@ const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
     },
     rule: "No afirmes que el evento fue creado hasta que esta herramienta responda sin error. Si el usuario no quiere indicar una hora final, omite end_datetime y la duración para usar el valor seguro predeterminado de una hora; nunca inventes una jornada de 8 horas. Si falla por argumentos, corrige y reintenta.",
   },
+  delete_calendar_event: {
+    arguments: {
+      event_id: "ID exacto del evento; si no lo tienes, usa list_calendar_events primero",
+      calendar_id: "Usa primary salvo que el evento pertenezca a otro calendario",
+    },
+    rule: "Borra únicamente el evento que el usuario pidió eliminar en su turno actual. No confundas event_id con el enlace, título o calendar_id. Confirma solo después de una respuesta exitosa.",
+  },
 });
 
 function providerArgumentDescription(id: string): string {
@@ -154,6 +161,7 @@ function providerArgumentDescription(id: string): string {
     "Argumentos JSON de la operacion.",
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",
+    "Para delete_calendar_event usa event_id exacto y calendar_id; lista eventos primero si falta el ID.",
     "Nunca pases fechas naturales como 'tomorrow' o 'manana'.",
   ].join(" ");
 }

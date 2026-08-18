@@ -162,6 +162,14 @@ JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "run_query"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
 READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
+AGENT_RESPONSE_STYLE_INSTRUCTION = (
+    "Responde directamente en el idioma del usuario, normalmente en una a tres "
+    "frases. Usa texto plano: no Markdown ni emojis decorativos. No repitas la "
+    "solicitud, no añadas preámbulos, cierres o preguntas genéricas. Tras una "
+    "acción confirma solo qué hiciste y los datos esenciales. No muestres URLs "
+    "crudas ni detalles internos salvo que se pidan. No agregues Meet, invitados, "
+    "ubicación, duración u otros datos que el usuario no haya solicitado."
+)
 
 
 def _plain_intent_text(value: str) -> str:
@@ -182,15 +190,20 @@ def _explicit_write_approvals(
     """
     intent = _plain_intent_text(user_message)
     approved: set[tuple[str, str]] = set()
-    mutation = re.search(
-        r"\b(?:crea|crear|creame|agrega|agregar|anade|anadir|agenda|agendar|"
-        r"programa|programar|envia|enviar|manda|mandar|publica|publicar|"
-        r"actualiza|actualizar|modifica|modificar|edita|editar|elimina|eliminar|"
-        r"sube|subir|responde|responder|cancela|cancelar|create|add|schedule|"
-        r"send|post|update|edit|delete|remove|upload|reply|cancel)\b",
-        intent,
-    )
-    if not mutation:
+    action_patterns = {
+        "create": r"\b(?:crea|crear|creame|agrega|agregar|anade|anadir|agenda|agendar|programa|programar|create|add|schedule)\b",
+        "send": r"\b(?:envia|enviar|manda|mandar|publica|publicar|send|post)\b",
+        "reply": r"\b(?:responde|responder|reply)\b",
+        "update": r"\b(?:actualiza|actualizar|modifica|modificar|edita|editar|update|edit)\b",
+        "delete": r"\b(?:elimina|eliminar|borra|borrar|quita|quitar|cancela|cancelar|delete|remove|cancel)\b",
+        "upload": r"\b(?:sube|subir|upload)\b",
+        "draft": r"\b(?:redacta|redactar|borrador|draft)\b",
+    }
+    requested_actions = {
+        family for family, pattern in action_patterns.items()
+        if re.search(pattern, intent)
+    }
+    if not requested_actions:
         return frozenset()
     aliases = {
         "calendar": {"evento", "calendario", "cita", "reunion", "calendar", "event", "meeting"},
@@ -207,6 +220,16 @@ def _explicit_write_approvals(
     for connector_id in connector_ids:
         for operation in CONNECTOR_CATALOG[connector_id]["operations"]:
             if operation in READ_ONLY_CONNECTOR_OPERATIONS or operation.startswith(READ_ONLY_CONNECTOR_PREFIXES):
+                continue
+            verb = operation.split("_", 1)[0]
+            family = {
+                "create": "create", "add": "create", "schedule": "create",
+                "send": "send", "post": "send", "reply": "reply",
+                "update": "update", "edit": "update", "patch": "update",
+                "delete": "delete", "remove": "delete", "cancel": "delete",
+                "upload": "upload", "draft": "draft",
+            }.get(verb)
+            if family not in requested_actions:
                 continue
             operation_words = set(operation.split("_")) - {
                 "create", "add", "send", "post", "update", "edit", "delete",
@@ -2871,7 +2894,10 @@ class Backend:
         ).hexdigest()
         request_payload: dict[str, object] = {
             "model": self.cfg.pi_model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": AGENT_RESPONSE_STYLE_INSTRUCTION},
+                {"role": "user", "content": prompt},
+            ],
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": 4096,
@@ -3292,6 +3318,10 @@ class Backend:
             effective_prompt = prompt
 
         if not direct_chat:
+            if AGENT_RESPONSE_STYLE_INSTRUCTION not in effective_prompt:
+                effective_prompt = (
+                    f"{effective_prompt}\n\n{AGENT_RESPONSE_STYLE_INSTRUCTION}"
+                )
             if connector_ids:
                 connector_names = ", ".join(
                     f"{CONNECTOR_CATALOG[item]['name']} ({item})"
