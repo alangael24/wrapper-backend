@@ -82,6 +82,7 @@ from .billing import BillingConfig, BillingError, BillingService
 from .connector_adapters import (
     ComposioConnectorAdapter,
     ComposioConnectorGateway,
+    normalize_operation_arguments,
     parse_config_mapping,
 )
 from .native_connectors import NativeConnectorGateway
@@ -4030,6 +4031,21 @@ class Backend:
         if not isinstance(arguments, dict):
             error_response(handler, 400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
             return
+        if (
+            isinstance(connector_id, str)
+            and connector_id in CONNECTOR_CATALOG
+            and isinstance(operation, str)
+            and operation in CONNECTOR_CATALOG[connector_id]["operations"]
+        ):
+            try:
+                # Reject incomplete model tool calls before creating or
+                # matching an approval for their placeholder arguments.
+                arguments = normalize_operation_arguments(
+                    connector_id, operation, arguments
+                )
+            except ConnectorBrokerError as e:
+                error_response(handler, e.status, str(e), e.code)
+                return
         try:
             action = self.connectors.approved_action(token)
             context = self.connectors.grant_context(token)

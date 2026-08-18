@@ -2755,8 +2755,23 @@ class TestBackend(unittest.TestCase):
         user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
         adapter = FakeGitHubAdapter(user["id"])
         self.ws.backend.connectors.register_adapter("github", adapter)
+        prepared = self.ws.backend.store.create_unmetered_agent_run(
+            user_id=user["id"],
+            idempotency_key="connector-scope-run",
+            model="deepseek-chat",
+            browser=False,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash="connector-scope-token",
+            token_expires_at=time.time() + 600,
+        )
+        run_id = prepared["run"]["id"]
+        bot_id = str(uuid.uuid4())
         token = self.ws.backend.connectors.issue(
-            user_id=user["id"], connector_ids=("github", "google-workspace")
+            user_id=user["id"],
+            run_id=run_id,
+            bot_id=bot_id,
+            connector_ids=("github", "google-workspace"),
         )
         internal_headers = {"X-Connector-Run-Token": token}
 
@@ -2801,6 +2816,27 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["type"], "operation_approval_required")
+
+        approvals_before = self.ws.backend.store.pending_approvals_for_run(
+            user["id"], run_id
+        )
+        status, body = self.ws.req(
+            "POST",
+            "/v1/internal/connectors/execute",
+            {
+                "connector_id": "google-workspace",
+                "operation": "send_email",
+                "arguments": {},
+            },
+            headers=internal_headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "bad_connector_arguments")
+        self.assertIn("recipient_email", body["error"]["message"])
+        self.assertEqual(
+            self.ws.backend.store.pending_approvals_for_run(user["id"], run_id),
+            approvals_before,
+        )
 
         status, body = self.ws.req(
             "POST",

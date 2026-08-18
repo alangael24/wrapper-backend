@@ -1117,6 +1117,20 @@ def _normalize_operation_arguments(
     return normalized
 
 
+def normalize_operation_arguments(
+    connector_id: str,
+    operation: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and canonicalize arguments before side-effect approval.
+
+    Approval capabilities must bind the exact payload sent to the provider.
+    Exposing this boundary lets the broker reject incomplete writes before it
+    creates a card for a placeholder action such as an empty email.
+    """
+    return _normalize_operation_arguments(connector_id, operation, arguments)
+
+
 def _validated_select_statement(value: str) -> str:
     """Accept one conservative SELECT statement and reject mutating SQL.
 
