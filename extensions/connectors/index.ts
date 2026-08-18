@@ -133,6 +133,19 @@ interface SearchMatch {
 }
 
 const GOOGLE_WORKSPACE_GUIDANCE = Object.freeze({
+  search_email: {
+    arguments: {
+      query: "Consulta Gmail real; combina términos con OR y usa comillas para frases exactas",
+      max_results: "Cantidad máxima de resultados, normalmente entre 10 y 25",
+    },
+    rule: "Ejecuta la búsqueda y basa la respuesta únicamente en sus resultados. Si no hay coincidencias, dilo; nunca inventes asuntos o remitentes.",
+  },
+  read_email: {
+    arguments: {
+      message_id: "ID exacto obtenido con search_email",
+    },
+    rule: "Usa el ID exacto de search_email. No afirmes haber leído un correo si la herramienta falla.",
+  },
   draft_email: {
     arguments: {
       recipient_email: "Correo exacto del destinatario",
@@ -177,6 +190,7 @@ function providerArgumentDescription(id: string): string {
   if (id !== "google-workspace") return "Argumentos JSON de la operacion";
   return [
     "Argumentos JSON de la operacion.",
+    "Para search_email usa query con sintaxis de Gmail y max_results; para read_email usa message_id obtenido de la búsqueda.",
     "Para draft_email y send_email usa recipient_email, subject y body; send_email envía realmente y draft_email solo guarda.",
     "Para create_calendar_event usa start_datetime ISO 8601 exacto, timezone IANA, summary y",
     "end_datetime o event_duration_hour/event_duration_minutes; calendar_id normalmente es primary.",

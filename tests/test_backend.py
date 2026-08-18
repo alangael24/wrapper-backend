@@ -3380,6 +3380,42 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(client.executions, [])
 
+    def test_google_workspace_catalog_keeps_every_verified_pinned_operation(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        operations = tuple(CONNECTOR_CATALOG["google-workspace"]["operations"])
+        self.assertEqual(
+            gateway.resolvable_operations(
+                self.new_user("google-pinned-catalog")["user_id"],
+                "google-workspace",
+                operations,
+            ),
+            operations,
+        )
+        self.assertEqual(client.searches, [])
+
+    def test_google_email_search_uses_verified_fetch_tool(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        gateway.execute(
+            self.new_user("google-live-search-routing")["user_id"],
+            "google-workspace",
+            "search_email",
+            {"query": "CDL OR \"commercial driver's license\"", "max_results": 10},
+        )
+        self.assertEqual(client.executions, [(
+            "GOOGLESUPER_FETCH_EMAILS",
+            {"query": "CDL OR \"commercial driver's license\"", "max_results": 10},
+        )])
+
     def test_plugin_write_fails_closed_when_provider_schema_is_missing(self):
         client = FakeComposioClient()
         gateway = ComposioConnectorGateway(

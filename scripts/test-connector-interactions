@@ -12,4 +12,6 @@ exec "$python_bin" -m unittest \
   tests.test_backend.TestBackend.test_provider_schema_rejects_any_plugin_write_before_approval \
   tests.test_backend.TestBackend.test_plugin_write_fails_closed_when_provider_schema_is_missing \
   tests.test_backend.TestBackend.test_native_plugin_preflight_rejects_missing_resource_identifiers \
+  tests.test_backend.TestBackend.test_google_workspace_catalog_keeps_every_verified_pinned_operation \
+  tests.test_backend.TestBackend.test_google_email_search_uses_verified_fetch_tool \
   -v

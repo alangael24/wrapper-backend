@@ -92,10 +92,18 @@ COMPOSIO_TOOLKITS: dict[str, str] = {
 # to the public Composio action documented for the corresponding Agent Genia
 # operation.
 COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
+    ("google-workspace", "search_email"): "GOOGLESUPER_FETCH_EMAILS",
+    ("google-workspace", "read_email"): "GOOGLESUPER_FETCH_MESSAGE_BY_MESSAGE_ID",
     ("google-workspace", "draft_email"): "GOOGLESUPER_CREATE_EMAIL_DRAFT",
     ("google-workspace", "send_email"): "GOOGLESUPER_SEND_EMAIL",
+    ("google-workspace", "list_calendar_events"): "GOOGLESUPER_EVENTS_LIST",
     ("google-workspace", "create_calendar_event"): "GOOGLESUPER_CREATE_EVENT",
     ("google-workspace", "delete_calendar_event"): "GOOGLESUPER_DELETE_EVENT",
+    ("google-workspace", "search_drive"): "GOOGLESUPER_FIND_FILE",
+    ("google-workspace", "read_drive_file"): "GOOGLESUPER_PARSE_FILE",
+    ("google-workspace", "list_contacts"): "GOOGLESUPER_GET_CONTACTS",
+    ("google-workspace", "read_sheet"): "GOOGLESUPER_VALUES_GET",
+    ("google-workspace", "update_sheet"): "GOOGLESUPER_VALUES_UPDATE",
     ("github", "read_file"): "GITHUB_GET_REPOSITORY_CONTENT",
     ("snowflake", "select_query"): "SNOWFLAKE_EXECUTE_SQL",
     ("snowflake", "execute_sql"): "SNOWFLAKE_EXECUTE_SQL",
@@ -551,10 +559,27 @@ class ComposioConnectorGateway:
             return ()
         if description.get("driver") == "native":
             return operations
+        pinned_operations = {
+            operation: COMPOSIO_OPERATION_TO_TOOL[(connector_id, operation)]
+            for operation in operations
+            if (connector_id, operation) in COMPOSIO_OPERATION_TO_TOOL
+        }
+        dynamic_operations = tuple(
+            operation for operation in operations if operation not in pinned_operations
+        )
+        if pinned_operations:
+            with self._lock:
+                for operation, slug in pinned_operations.items():
+                    self._operation_cache[(connector_id, operation)] = (
+                        self._now() + 900,
+                        slug,
+                    )
+        if not dynamic_operations:
+            return operations
         with self._lock:
             cached = {
                 operation: self._operation_cache.get((connector_id, operation))
-                for operation in operations
+                for operation in dynamic_operations
             }
         if cached and all(
             value is not None and value[0] > self._now()
@@ -563,35 +588,26 @@ class ComposioConnectorGateway:
             return tuple(
                 operation
                 for operation in operations
-                if cached[operation] is not None and bool(cached[operation][1])
+                if operation in pinned_operations
+                or (
+                    operation in cached
+                    and cached[operation] is not None
+                    and bool(cached[operation][1])
+                )
             )
         session = self._session(user_id, connector_id)
         try:
             search = session.search(
                 query=(
                     f"Resolve these exact {CONNECTOR_CATALOG[connector_id]['name']} "
-                    f"operations: {', '.join(operations)}."
+                    f"operations: {', '.join(dynamic_operations)}."
                 )
             )
             results = list(getattr(search, "results", []) or [])
-            schemas = getattr(search, "tool_schemas", None)
-            available_slugs = {
-                str(raw).upper()
-                for result in results
-                for raw in list(getattr(result, "primary_tool_slugs", []) or [])
-                if isinstance(raw, str) and raw
-            }
-            if isinstance(schemas, dict):
-                available_slugs.update(str(key).upper() for key in schemas)
-            resolved: list[str] = []
-            for operation in operations:
-                pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
-                slug = pinned or _select_composio_tool_slug(
-                    connector_id, operation, results
-                )
-                if not slug or (
-                    pinned and available_slugs and pinned.upper() not in available_slugs
-                ):
+            resolved: list[str] = list(pinned_operations)
+            for operation in dynamic_operations:
+                slug = _select_composio_tool_slug(connector_id, operation, results)
+                if not slug:
                     logging.warning(
                         "Hiding unresolved connector operation connector=%s operation=%s",
                         connector_id,
@@ -609,7 +625,7 @@ class ComposioConnectorGateway:
                         self._now() + 900,
                         slug,
                     )
-            return tuple(resolved)
+            return tuple(operation for operation in operations if operation in resolved)
         finally:
             _delete_session(session)
 
