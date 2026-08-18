@@ -3492,6 +3492,66 @@ class TestBackend(unittest.TestCase):
             },
         )])
 
+    def test_connected_plugin_reads_use_verified_tools_without_dynamic_search(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        user_id = self.new_user("verified-connected-plugin-reads")["user_id"]
+
+        gateway.execute(user_id, "notion", "search", {"query": "ads"})
+        gateway.execute(
+            user_id,
+            "microsoft-365",
+            "list_calendar_events",
+            {"limit": 100, "timezone": "America/Denver"},
+        )
+        gateway.execute(
+            user_id,
+            "canva",
+            "search_designs",
+            {"search": "Agent Genia", "max_results": 50},
+        )
+
+        self.assertEqual(client.searches, [])
+        self.assertEqual(client.executions, [
+            ("NOTION_SEARCH_NOTION_PAGE", {"query": "ads"}),
+            ("OUTLOOK_LIST_EVENTS", {"top": 10, "timezone": "America/Denver"}),
+            ("CANVA_LIST_USER_DESIGNS", {"query": "Agent Genia"}),
+        ])
+
+    def test_connected_plugin_collections_are_compact_but_keep_ids_and_titles(self):
+        private_body = "contenido privado " * 4_000
+        cases = (
+            (
+                "notion", "search",
+                {"results": [{"id": "page_1", "title": "Plan", "properties": private_body}]},
+                ("page_1", "Plan"),
+            ),
+            (
+                "microsoft-365", "list_calendar_events",
+                {"items": [{"id": "event_1", "subject": "Reunión", "body": private_body}]},
+                ("event_1", "Reunión"),
+            ),
+            (
+                "canva", "search_designs",
+                {"items": [{"id": "design_1", "title": "Campaña", "content": private_body}]},
+                ("design_1", "Campaña"),
+            ),
+        )
+        for connector_id, operation, payload, expected in cases:
+            with self.subTest(connector_id=connector_id):
+                compacted = json.dumps(
+                    _compact_connector_result(connector_id, operation, payload),
+                    ensure_ascii=False,
+                )
+                for value in expected:
+                    self.assertIn(value, compacted)
+                self.assertNotIn("contenido privado", compacted)
+                self.assertLess(len(compacted), 1_000)
+
     def test_google_collection_results_drop_wire_noise_but_keep_actionable_ids(self):
         huge_body = "contenido privado " * 4_000
         email = _compact_connector_result(

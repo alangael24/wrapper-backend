@@ -105,6 +105,17 @@ COMPOSIO_OPERATION_TO_TOOL: dict[tuple[str, str], str] = {
     ("google-workspace", "list_contacts"): "GOOGLESUPER_GET_CONTACTS",
     ("google-workspace", "read_sheet"): "GOOGLESUPER_VALUES_GET",
     ("google-workspace", "update_sheet"): "GOOGLESUPER_VALUES_UPDATE",
+    ("notion", "search"): "NOTION_SEARCH_NOTION_PAGE",
+    ("notion", "read_page"): "NOTION_GET_PAGE_MARKDOWN",
+    ("notion", "query_database"): "NOTION_QUERY_DATABASE",
+    ("microsoft-365", "search_email"): "OUTLOOK_SEARCH_MESSAGES",
+    ("microsoft-365", "read_email"): "OUTLOOK_GET_MESSAGE",
+    ("microsoft-365", "draft_email"): "OUTLOOK_CREATE_DRAFT",
+    ("microsoft-365", "list_calendar_events"): "OUTLOOK_LIST_EVENTS",
+    ("microsoft-365", "create_calendar_event"): "OUTLOOK_CALENDAR_CREATE_EVENT",
+    ("canva", "search_designs"): "CANVA_LIST_USER_DESIGNS",
+    ("canva", "get_design"): "CANVA_FETCH_DESIGN_METADATA_AND_ACCESS_INFORMATION",
+    ("canva", "create_design"): "CANVA_POST_DESIGNS",
     ("github", "read_file"): "GITHUB_GET_REPOSITORY_CONTENT",
     ("snowflake", "select_query"): "SNOWFLAKE_EXECUTE_SQL",
     ("snowflake", "execute_sql"): "SNOWFLAKE_EXECUTE_SQL",
@@ -125,6 +136,14 @@ PINNED_DIRECT_READ_OPERATIONS = frozenset({
     ("google-workspace", "read_drive_file"),
     ("google-workspace", "list_contacts"),
     ("google-workspace", "read_sheet"),
+    ("notion", "search"),
+    ("notion", "read_page"),
+    ("notion", "query_database"),
+    ("microsoft-365", "search_email"),
+    ("microsoft-365", "read_email"),
+    ("microsoft-365", "list_calendar_events"),
+    ("canva", "search_designs"),
+    ("canva", "get_design"),
     ("github", "read_file"),
     ("snowflake", "select_query"),
     ("databricks", "select_query"),
@@ -1089,6 +1108,7 @@ _LEAN_COLLECTION_FIELDS: dict[str, set[str]] = {
     },
     "list_calendar_events": {
         "id", "eventid", "calendarid", "status", "summary", "title",
+        "subject",
         "description", "location", "htmllink", "hangoutlink", "start", "end",
         "organizer", "creator", "attendees", "recurrence", "eventtype",
         "items", "events", "results", "data", "nextpagetoken", "count",
@@ -1108,6 +1128,23 @@ _LEAN_COLLECTION_FIELDS: dict[str, set[str]] = {
     },
 }
 
+_LEAN_PROVIDER_COLLECTION_FIELDS: dict[tuple[str, str], set[str]] = {
+    ("notion", "search"): {
+        "id", "pageid", "databaseid", "object", "title", "name", "url",
+        "createdtime", "lasteditedtime", "parent", "icon", "archived",
+        "results", "items", "data", "nextcursor", "hasmore", "count",
+        "total", "success",
+    },
+    ("microsoft-365", "search_email"): _LEAN_COLLECTION_FIELDS["search_email"],
+    ("microsoft-365", "list_calendar_events"): _LEAN_COLLECTION_FIELDS["list_calendar_events"],
+    ("canva", "search_designs"): {
+        "id", "designid", "title", "name", "url", "thumbnail", "thumbnailurl",
+        "editurl", "viewurl", "createdat", "updatedat", "ownership", "type",
+        "results", "items", "designs", "data", "continuation", "count",
+        "total", "success",
+    },
+}
+
 
 def _compact_connector_result(
     connector_id: str, operation: str, value: Any
@@ -1119,9 +1156,14 @@ def _compact_connector_result(
     fields into the model slows the summarization round and can expose content
     the user did not ask to read. Point reads intentionally remain untouched.
     """
-    if connector_id != "google-workspace" or operation not in _LEAN_COLLECTION_FIELDS:
+    collection_fields = (
+        _LEAN_COLLECTION_FIELDS.get(operation)
+        if connector_id == "google-workspace"
+        else _LEAN_PROVIDER_COLLECTION_FIELDS.get((connector_id, operation))
+    )
+    if collection_fields is None:
         return value
-    allowed = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in _LEAN_COLLECTION_FIELDS[operation]}
+    allowed = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in collection_fields}
     heavy = {
         "raw", "rawdata", "rawpayload", "payload", "parts", "body", "bodies",
         "content", "html", "htmlbody", "textbody", "decodedbody", "attachments",
@@ -1174,7 +1216,7 @@ def _compact_connector_result(
             return str(candidate)[:512]
 
         compacted: dict[str, Any] = {}
-        if operation == "search_email":
+        if connector_id == "google-workspace" and operation == "search_email":
             compacted.update(selected_headers(candidate.get("headers")))
             payload = candidate.get("payload")
             if isinstance(payload, dict):
@@ -1250,6 +1292,54 @@ def _normalize_operation_arguments(
                     400, f"read_file requiere {field}", "bad_connector_arguments"
                 )
             normalized[field] = normalized[field].strip()
+        return normalized
+
+    if connector_id == "canva" and operation == "search_designs":
+        normalized = dict(arguments)
+        if "query" not in normalized:
+            for alias in ("search", "search_query", "name", "title"):
+                if isinstance(normalized.get(alias), str):
+                    normalized["query"] = normalized[alias]
+                    break
+        for alias in ("search", "search_query", "name", "title", "limit", "max_results"):
+            normalized.pop(alias, None)
+        query = normalized.get("query")
+        if query is not None:
+            if not isinstance(query, str) or len(query.strip()) > 500:
+                raise ConnectorBrokerError(
+                    400, "query no es válido", "bad_connector_arguments"
+                )
+            normalized["query"] = query.strip()
+        for field in ("continuation", "ownership", "sort_by"):
+            value = normalized.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > 500):
+                raise ConnectorBrokerError(
+                    400, f"{field} no es válido", "bad_connector_arguments"
+                )
+        return normalized
+
+    if connector_id == "microsoft-365" and operation == "list_calendar_events":
+        normalized = dict(arguments)
+        if "top" not in normalized:
+            for alias in ("limit", "max_results", "page_size"):
+                if alias in normalized:
+                    normalized["top"] = normalized[alias]
+                    break
+        for alias in ("limit", "max_results", "page_size"):
+            normalized.pop(alias, None)
+        top = normalized.get("top", 10)
+        if isinstance(top, bool) or not isinstance(top, (int, float)):
+            raise ConnectorBrokerError(
+                400, "top debe ser numérico", "bad_connector_arguments"
+            )
+        normalized["top"] = max(1, min(int(top), 10))
+        timezone = normalized.get("timezone")
+        if timezone is not None and (
+            not isinstance(timezone, str) or not timezone.strip() or len(timezone) > 100
+        ):
+            raise ConnectorBrokerError(
+                400, "timezone no es válido", "bad_connector_arguments"
+            )
         return normalized
 
     if connector_id != "google-workspace":
