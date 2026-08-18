@@ -179,6 +179,32 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(Set(identifiers).count, identifiers.count)
     }
 
+    func testRoutingContextIsCompactAndContainsOnlyRecentConversation() {
+        let messages = (0..<7).map { index in
+            BotMessage(
+                id: UUID(),
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                text: String(repeating: "x", count: 1_500) + "-\(index)",
+                widget: nil,
+                createdAt: Date(timeIntervalSince1970: TimeInterval(index))
+            )
+        }
+        let bot = BotProfile(
+            id: UUID(), name: "Agente", title: "Calendario", description: "Privado",
+            color: "#2f91f5", shape: .circle, notificationsEnabled: true,
+            connectorIDs: ["google-workspace"], messages: messages, createdAt: Date()
+        )
+
+        let context = buildRoutingContext(bot: bot)
+
+        XCTAssertLessThanOrEqual(context.count, 4_100)
+        XCTAssertFalse(context.contains("Calendario"))
+        XCTAssertFalse(context.contains("google-workspace"))
+        XCTAssertFalse(context.contains("-2"))
+        XCTAssertTrue(context.contains("Usuario:"))
+        XCTAssertTrue(context.contains("Agente:"))
+    }
+
     func testServerSentEventParserFlushesDoneFrameAtEOF() throws {
         var parser = ServerSentEventParser()
         XCTAssertNil(parser.consume(line: "event: done"))

@@ -2958,7 +2958,10 @@ class Backend:
             ],
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": 4096,
+            # Product chat is intentionally concise. A smaller ceiling avoids
+            # runaway mobile replies while leaving ample room for a question
+            # widget or a useful draft.
+            "max_tokens": 1024,
             "user_id": provider_user_id,
         }
         if self.cfg.pi_model.startswith("deepseek-"):
@@ -3242,6 +3245,7 @@ class Backend:
         stream_requested = body.get("stream", False)
         execution_mode = body.get("execution_mode", "agent")
         chat_prompt = body.get("chat_prompt", "")
+        routing_context = body.get("routing_context")
         user_message = body.get("user_message", "")
         client_timezone = body.get("client_timezone")
         bot_id = body.get("bot_id")
@@ -3267,6 +3271,11 @@ class Backend:
             return
         if not isinstance(chat_prompt, str) or len(chat_prompt) > self.cfg.pi_max_prompt_chars:
             error_response(handler, 400, "chat_prompt no es válido", "bad_chat_prompt")
+            return
+        if routing_context is not None and (
+            not isinstance(routing_context, str) or len(routing_context) > 10_000
+        ):
+            error_response(handler, 400, "routing_context no es válido", "bad_routing_context")
             return
         if not isinstance(user_message, str) or len(user_message) > 20_000:
             error_response(handler, 400, "user_message no es válido", "bad_user_message")
@@ -3373,17 +3382,42 @@ class Backend:
         except ConnectorBrokerError as e:
             error_response(handler, e.status, str(e), e.code)
             return
-        assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
+
+        # Current clients send only recent user-visible conversation as a
+        # routing hint. Decide the no-tools path before reading account state
+        # or calling Composio: ordinary conversation must go directly to the
+        # model even when the bot owns connected tools.
+        has_fast_routing_context = routing_context is not None
+        direct_chat = bool(
+            has_fast_routing_context
+            and not approved_action
+            and self._direct_chat_allowed(
+                execution_mode,
+                user_message,
+                browser=browser,
+                computer=computer_requested,
+                conversation_context=routing_context or "",
+            )
+            and chat_prompt.strip()
+        )
+        assigned_connector_ids: tuple[str, ...] = ()
+        connected_connector_ids: tuple[str, ...] = ()
+        connector_ids: tuple[str, ...] = ()
+        if not direct_chat:
+            assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
         # ``connector_ids`` from a client is a hint for backwards
         # compatibility, never an authorization source. A connector must be
         # assigned to this bot in server state and currently connected.
-        if requested_connector_ids and set(requested_connector_ids) != set(assigned_connector_ids):
+        if (
+            not direct_chat
+            and requested_connector_ids
+            and set(requested_connector_ids) != set(assigned_connector_ids)
+        ):
             logging.info(
                 "Ignoring stale connector scope user_id=%s bot_id=%s requested=%s assigned=%s",
                 user["id"], bot_id, requested_connector_ids, assigned_connector_ids,
             )
-        connected_connector_ids: tuple[str, ...] = ()
-        if assigned_connector_ids:
+        if not direct_chat and assigned_connector_ids:
             try:
                 connected_connector_ids = self.connector_gateway.connected_connector_ids(
                     user["id"]
@@ -3398,9 +3432,11 @@ class Backend:
                 logging.warning("Connector reconciliation failed: %s", exc)
                 return
             self._replace_connected_connectors_in_state(user["id"], connected_connector_ids)
-        connector_ids = tuple(
-            item for item in assigned_connector_ids if item in set(connected_connector_ids)
-        )
+        if not direct_chat:
+            connected_set = set(connected_connector_ids)
+            connector_ids = tuple(
+                item for item in assigned_connector_ids if item in connected_set
+            )
         if approved_action and approved_action["target_type"] == "connector":
             if approved_action["connector_id"] not in connector_ids:
                 error_response(
@@ -3411,13 +3447,17 @@ class Backend:
                 )
                 return
 
-        direct_chat = self._direct_chat_allowed(
-            execution_mode,
-            user_message,
-            browser=browser,
-            computer=computer_requested,
-            conversation_context=chat_prompt if connector_ids else "",
-        )
+        if not has_fast_routing_context and not approved_action:
+            # Backwards-compatible routing for clients that predate the
+            # compact context field. It intentionally retains the older
+            # connector verification order until those clients update.
+            direct_chat = self._direct_chat_allowed(
+                execution_mode,
+                user_message,
+                browser=browser,
+                computer=computer_requested,
+                conversation_context=chat_prompt if connector_ids else "",
+            )
         if direct_chat and chat_prompt.strip():
             effective_prompt = chat_prompt.strip()
         else:

@@ -260,6 +260,7 @@ export class DesktopOAuthController {
       idempotencyKey?: string;
       executionMode?: "auto" | "agent" | "chat";
       chatPrompt?: string;
+      routingContext?: string;
       userMessage?: string;
       approval?: { approval_id: string; decision: "approve" | "reject" };
       signal?: AbortSignal;
@@ -498,6 +499,7 @@ class WrapperServiceClient {
       idempotencyKey?: string;
       executionMode?: "auto" | "agent" | "chat";
       chatPrompt?: string;
+      routingContext?: string;
       userMessage?: string;
       approval?: { approval_id: string; decision: "approve" | "reject" };
       signal?: AbortSignal;
@@ -512,6 +514,7 @@ class WrapperServiceClient {
       connector_ids: connectorIds,
       execution_mode: options.executionMode ?? "agent",
       chat_prompt: options.chatPrompt ?? "",
+      routing_context: options.routingContext ?? "",
       user_message: options.userMessage ?? "",
       ...(options.approval ? { approval: options.approval } : {}),
       client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",

@@ -665,6 +665,7 @@ function registerDesktopIpc(): void {
           chatPrompt: initial
             ? buildBotPrompt({ ...bot, connectorIds }, prompt, true)
             : buildDirectChatPrompt({ ...bot, connectorIds }, prompt),
+          routingContext: buildRoutingContext(bot),
           userMessage: prompt,
           approval: action ? { approval_id: action.approvalId, decision: action.decision } : undefined,
           onDelta: (text) => {
@@ -1028,7 +1029,7 @@ function buildBotPrompt(
   initial: boolean
 ): string {
   const history = bot.messages.slice(-4).map((message) => (
-    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 8_000)}`
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 2_000)}`
   )).join("\n");
   const profile = [
     `Eres ${bot.name}, un agente de Agent Genia.`,
@@ -1051,8 +1052,8 @@ function buildDirectChatPrompt(
   bot: AppState["bots"][number],
   userPrompt: string
 ): string {
-  const history = bot.messages.slice(-6).map((message) => (
-    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 8_000)}`
+  const history = bot.messages.slice(-4).map((message) => (
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 1_000)}`
   )).join("\n");
   return [
     `Eres ${bot.name}, un agente de Agent Genia.`,
@@ -1065,6 +1066,12 @@ function buildDirectChatPrompt(
     history ? `Conversación reciente:\n${history}` : "",
     `Usuario: ${userPrompt}`,
   ].filter(Boolean).join("\n\n");
+}
+
+function buildRoutingContext(bot: AppState["bots"][number]): string {
+  return bot.messages.slice(-4).map((message) => (
+    `${message.role === "user" ? "Usuario" : bot.name}: ${message.text.slice(0, 1_000)}`
+  )).join("\n");
 }
 
 function parseAgentAnswer(value: unknown): {

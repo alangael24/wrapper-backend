@@ -198,13 +198,15 @@ class AgentGeniaApi(
 
     suspend fun runAgent(
         prompt: String, botId: String, connectorIds: List<String>, idempotencyKey: String,
-        executionMode: String = "agent", chatPrompt: String = "", userMessage: String = "",
+        executionMode: String = "agent", chatPrompt: String = "", routingContext: String = "",
+        userMessage: String = "",
         approval: BotWidgetAction? = null,
     ): String {
         val body = JSONObject()
                 .put("prompt", prompt)
                 .put("execution_mode", executionMode)
                 .put("chat_prompt", chatPrompt)
+                .put("routing_context", routingContext)
                 .put("user_message", userMessage)
                 .put("client_timezone", java.time.ZoneId.systemDefault().id)
                 .put("browser", false)

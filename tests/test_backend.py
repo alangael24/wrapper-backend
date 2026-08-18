@@ -2400,7 +2400,36 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(sent["messages"][-1]["content"], "Reply briefly to the user: hola")
         self.assertIn("una a tres frases", sent["messages"][0]["content"])
         self.assertEqual(sent["thinking"], {"type": "disabled"})
-        self.assertEqual(sent["max_tokens"], 4096)
+        self.assertEqual(sent["max_tokens"], 1024)
+
+    def test_compact_routing_context_skips_connector_provider_for_chat(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        bot_id = self.assign_bot_connectors(signup, ["google-workspace"])
+
+        def unexpected_connector_lookup(_user_id):
+            raise AssertionError("ordinary chat must not query Composio")
+
+        self.ws.backend.connector_gateway.connected_connector_ids = unexpected_connector_lookup
+        status, result = self.ws.req(
+            "POST",
+            "/v1/agent/run",
+            {
+                "prompt": "legacy full agent prompt",
+                "chat_prompt": "Responde brevemente: de nada",
+                "routing_context": "Usuario: gracias\nAgente: de nada",
+                "user_message": "perfecto",
+                "execution_mode": "auto",
+                "bot_id": bot_id,
+                "connector_ids": ["google-workspace"],
+                "idempotency_key": "direct-chat-no-composio",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["execution_path"], "direct_chat")
+        self.assertEqual(result["connector_ids"], [])
 
     def test_direct_chat_streams_first_visible_model_delta(self):
         signup = self.new_user()
@@ -2543,6 +2572,10 @@ class TestBackend(unittest.TestCase):
                 "prompt": "Continúa la acción pendiente con Google Calendar.",
                 "chat_prompt": (
                     "Conversación reciente:\nAgente: ¿Hasta qué hora será el evento del calendario?\n"
+                    "Usuario: No necesitas ponerle hasta qué hora será"
+                ),
+                "routing_context": (
+                    "Agente: ¿Hasta qué hora será el evento del calendario?\n"
                     "Usuario: No necesitas ponerle hasta qué hora será"
                 ),
                 "user_message": "No necesitas ponerle hasta qué hora será",

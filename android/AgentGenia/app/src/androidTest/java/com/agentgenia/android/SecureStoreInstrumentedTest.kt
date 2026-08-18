@@ -26,7 +26,11 @@ class SecureStoreInstrumentedTest {
         assertEquals(session, store.readSession())
 
         val bot = BotProfile(id = UUID.randomUUID().toString(), name = "Prueba")
-        val state = PersistedAccountState(listOf(bot), emptyList(), bot.id)
+        val state = PersistedAccountState(
+            bots = listOf(bot),
+            selectedConnectorIds = emptyList(),
+            activeBotId = bot.id,
+        )
         store.writeAccountState(account.id, state)
         assertEquals(state, store.readAccountState(account.id))
         store.deleteAccountState(account.id)

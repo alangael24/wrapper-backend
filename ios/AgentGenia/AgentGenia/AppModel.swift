@@ -249,17 +249,17 @@ final class AppModel {
     }
 
     func prepareBot(botID: UUID) async {
-        await recoverPendingRuns()
-        // Generate the visible first turn before starting Pi. Most messages use
-        // the direct chat path, so speculative process startup must not compete
-        // with the response the user is waiting to see.
+        // Recovery is durable and independent from opening this screen. Do not
+        // hold the first visible turn behind status polling for another bot.
+        Task { await recoverPendingRuns() }
+        // Generate the visible first turn before starting Pi. The first turn
+        // uses direct chat, so it never needs to wait for the harness process.
         await sendInitialMessageIfNeeded(botID: botID)
         Task {
-            // Starting Pi is CPU-heavy on the small production host. Most
-            // first turns use direct chat, so warm only after the user has had
-            // time to read the onboarding response instead of slowing or
-            // interrupting the next message.
-            try? await Task.sleep(for: .seconds(30))
+            // Warm immediately after the first response finishes. The old
+            // 30-second delay made the user's first tool request pay the full
+            // process cold start.
+            try? await Task.sleep(for: .seconds(1))
             await warmAgent(botID: botID)
         }
     }
@@ -741,9 +741,9 @@ final class AppModel {
             updated.conversationRevision = updated.updatedAt
             bots[index] = updated
         }
-        // Make the outgoing turn crash-safe locally without blocking dispatch
-        // on the cross-region account-state API.
-        await persistLocalState(dirty: true)
+        // Start the local crash-safe write and the network dispatch together.
+        // Disk serialization is not part of time-to-first-token anymore.
+        let outboundPersistence = Task { await persistLocalState(dirty: true) }
         do {
             let connectorIDs = initial ? [] : availableConnectorIDs
             let agentTask = Task {
@@ -756,6 +756,7 @@ final class AppModel {
                     chatPrompt: initial
                         ? prompt
                         : buildDirectChatPrompt(bot: executionBot, userText: userText),
+                    routingContext: buildRoutingContext(bot: executionBot),
                     userMessage: userText,
                     approval: action,
                     computer: false,
@@ -773,6 +774,7 @@ final class AppModel {
                     UIApplication.shared.endBackgroundTask(backgroundTask)
                 }
             }
+            await outboundPersistence.value
             let response = try await agentTask.value
             let generated = parseAgentAnswer(response.answer)
             guard !deletedBotIDs.contains(botID), installAgentReply(
@@ -785,11 +787,13 @@ final class AppModel {
             ) else {
                 throw ServiceError(message: "El agente no devolvió una respuesta.", code: "empty_agent_response", status: 502)
             }
-            await persistLocalState(dirty: true)
             pendingRuns.removeAll { $0.idempotencyKey == turnID }
+            // The completed reply and removal of its recovery marker form one
+            // atomic local snapshot instead of two full JSON file rewrites.
             await persistLocalState(dirty: true)
             schedulePersist()
         } catch {
+            await outboundPersistence.value
             if let index = bots.firstIndex(where: { $0.id == botID }) {
                 var updated = bots[index]
                 // Partial output is render-only. Without a terminal success it
@@ -1173,7 +1177,7 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
     // enough to recover context after a restart without resending a growing
     // transcript on every turn.
     let history = bot.messages.suffix(4).map { message in
-        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(8_000))"
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(2_000))"
     }.joined(separator: "\n")
     let profile = [
         "Eres \(bot.name), un agente de Agent Genia.",
@@ -1193,8 +1197,8 @@ private func buildBotPrompt(bot: BotProfile, userText: String, initial: Bool) ->
 }
 
 private func buildDirectChatPrompt(bot: BotProfile, userText: String) -> String {
-    let history = bot.messages.suffix(6).map { message in
-        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(8_000))"
+    let history = bot.messages.suffix(4).map { message in
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(1_000))"
     }.joined(separator: "\n")
     return [
         "Eres \(bot.name), un agente de Agent Genia.",
@@ -1209,6 +1213,15 @@ private func buildDirectChatPrompt(bot: BotProfile, userText: String) -> String 
     ].filter { !$0.isEmpty }.joined(separator: "\n\n")
 }
 
+/// Recent user-visible conversation only, without profile or system text.
+/// The backend can route ordinary conversation before querying connector
+/// providers, while short follow-ups to a tool task still stay on Pi.
+func buildRoutingContext(bot: BotProfile) -> String {
+    bot.messages.suffix(4).map { message in
+        "\(message.role == .user ? "Usuario" : bot.name): \(message.text.prefix(1_000))"
+    }.joined(separator: "\n")
+}
+
 func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionWidget?) {
     let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
     let candidate = trimmed
@@ -1216,6 +1229,9 @@ func parseAgentAnswer(_ rawValue: String) -> (text: String, widget: BotQuestionW
         .replacingOccurrences(of: #"\s*```$"#, with: "", options: .regularExpression)
     guard let object = firstAgentEnvelope(in: candidate)
     else {
+        if let visibleText = visibleTextFromPartialAgentEnvelope(candidate) {
+            return (String(visibleText.prefix(20_000)), nil)
+        }
         return candidate.hasPrefix("{") || candidate.hasPrefix("[")
             ? ("", nil)
             : (String(trimmed.prefix(20_000)), nil)

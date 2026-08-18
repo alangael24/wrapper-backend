@@ -123,6 +123,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     let prompt: String
     let executionMode: String
     let chatPrompt: String
+    let routingContext: String
     let userMessage: String
     let approval: AgentApprovalRequest?
     let clientTimezone: String
@@ -136,6 +137,7 @@ private struct AgentRunRequest: Encodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case prompt, browser, computer
         case executionMode = "execution_mode"; case chatPrompt = "chat_prompt"; case userMessage = "user_message"
+        case routingContext = "routing_context"
         case approval
         case clientTimezone = "client_timezone"
         case botID = "bot_id"; case connectorIDs = "connector_ids"
@@ -454,6 +456,7 @@ actor APIClient {
         idempotencyKey: String,
         executionMode: String = "agent",
         chatPrompt: String = "",
+        routingContext: String = "",
         userMessage: String = "",
         approval: BotWidgetAction? = nil,
         computer: Bool = true,
@@ -463,6 +466,7 @@ actor APIClient {
             prompt: prompt,
             executionMode: executionMode,
             chatPrompt: chatPrompt,
+            routingContext: routingContext,
             userMessage: userMessage,
             approval: approval.map { AgentApprovalRequest(approvalID: $0.approvalID, decision: $0.decision) },
             clientTimezone: TimeZone.current.identifier,
@@ -472,32 +476,30 @@ actor APIClient {
             connectorIDs: connectorIDs,
             maxCredits: 15,
             idempotencyKey: idempotencyKey,
-            // Foundation has repeatedly lost otherwise valid SSE terminal
-            // frames on physical iPhones behind Render. Mobile uses a normal
-            // JSON response; the backend still persists the run before
-            // replying, and the same idempotency key makes a retry recover it.
-            stream: false
+            // The backend now emits ASCII-only, chunked SSE frames and stores
+            // the result before the terminal frame. Streaming makes the first
+            // useful text visible immediately; run recovery below covers a
+            // cellular transition or app backgrounding after dispatch.
+            stream: true
         )
-        _ = onDelta
+        let bodyData = try encoder.encode(request)
         do {
-            return try await self.request(
-                "/v1/agent/run", method: "POST", body: request
+            return try await streamAgent(
+                bodyData: bodyData,
+                authorization: try await accessToken(),
+                canRefresh: true,
+                onDelta: onDelta
             )
-        } catch let error as ServiceError where error.status == 0 {
-            // A response can be lost after the durable run has completed.
-            // Replaying the same idempotency key never starts a second run;
-            // production returns the saved answer (or waits for the original).
-            try await Task.sleep(for: .milliseconds(250))
-            do {
-                return try await self.request(
-                    "/v1/agent/run", method: "POST", body: request
-                )
-            } catch {
-                if let recovered = try await recoverAgentRun(idempotencyKey: idempotencyKey) {
-                    return recovered
-                }
-                throw error
+        } catch let error as ServiceError where
+            error.status == 0
+                || error.code == "incomplete_stream"
+                || error.code == "run_still_running" {
+            // Never replay an uncertain write. Resolve the original durable
+            // execution by its stable key, preserving external side effects.
+            if let recovered = try await recoverAgentRun(idempotencyKey: idempotencyKey) {
+                return recovered
             }
+            throw error
         }
     }
 

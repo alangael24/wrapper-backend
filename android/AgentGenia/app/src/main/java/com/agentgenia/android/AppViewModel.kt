@@ -467,6 +467,7 @@ class AppViewModel(
                 idempotencyKey = turnId,
                 executionMode = if (initial) "chat" else "auto",
                 chatPrompt = if (initial) prompt else buildDirectChatPrompt(original, userText),
+                routingContext = buildRoutingContext(original),
                 userMessage = userText,
                 approval = action,
             ))
@@ -640,7 +641,7 @@ internal fun shouldSendInitialBotMessage(tier: String?, bot: BotProfile?): Boole
 
 internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean): String {
     val history = bot.messages.takeLast(4).joinToString("\n") { message ->
-        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(8_000)}"
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(2_000)}"
     }
     val profile = listOfNotNull(
         "Eres ${bot.name}, un agente de Agent Genia.",
@@ -662,8 +663,8 @@ internal fun buildBotPrompt(bot: BotProfile, userText: String, initial: Boolean)
 }
 
 internal fun buildDirectChatPrompt(bot: BotProfile, userText: String): String {
-    val history = bot.messages.takeLast(6).joinToString("\n") { message ->
-        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(8_000)}"
+    val history = bot.messages.takeLast(4).joinToString("\n") { message ->
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(1_000)}"
     }
     return listOfNotNull(
         "Eres ${bot.name}, un agente de Agent Genia.",
@@ -677,6 +678,11 @@ internal fun buildDirectChatPrompt(bot: BotProfile, userText: String): String {
         "Usuario: $userText",
     ).joinToString("\n\n")
 }
+
+internal fun buildRoutingContext(bot: BotProfile): String =
+    bot.messages.takeLast(4).joinToString("\n") { message ->
+        "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(1_000)}"
+    }
 
 private fun clean(value: String, maximum: Int, fallback: String = ""): String {
     val normalized = value.replace(Regex("\\s+"), " ").trim().take(maximum)

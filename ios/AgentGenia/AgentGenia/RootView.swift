@@ -281,6 +281,10 @@ private struct ChatTimeline: View {
     let bot: BotProfile
 
     var body: some View {
+        let lastUserIndex = bot.messages.lastIndex { $0.role == .user }
+        let streamingLength = model.runningBotIDs.contains(bot.id)
+            ? (bot.messages.last?.text.count ?? 0)
+            : 0
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -293,17 +297,21 @@ private struct ChatTimeline: View {
                         MessageBubble(
                             message: item,
                             botID: bot.id,
-                            hasLaterUserMessage: bot.messages.dropFirst(index + 1).contains {
-                                $0.role == .user
-                            }
+                            hasLaterUserMessage: lastUserIndex.map { index < $0 } ?? false
                         )
                             .id(item.id)
                     }
+                    Color.clear.frame(height: 1).id("chat-bottom-\(bot.id)")
                 }
                 .padding()
             }
             .onChange(of: bot.messages.count) {
-                if let last = bot.messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                proxy.scrollTo("chat-bottom-\(bot.id)", anchor: .bottom)
+            }
+            .onChange(of: streamingLength) {
+                // Keep the newest streamed text visible without animating and
+                // laying out the complete timeline for every fragment.
+                proxy.scrollTo("chat-bottom-\(bot.id)", anchor: .bottom)
             }
         }
         .background(Color(uiColor: .systemBackground))
