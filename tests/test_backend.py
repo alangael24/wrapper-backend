@@ -3514,13 +3514,58 @@ class TestBackend(unittest.TestCase):
             "search_designs",
             {"search": "Agent Genia", "max_results": 50},
         )
+        gateway.execute(
+            user_id,
+            "microsoft-365",
+            "search_email",
+            {"search_query": "Microsoft", "max_results": 50},
+        )
+        gateway.execute(user_id, "microsoft-365", "read_email", {"id": "message_1"})
+        gateway.execute(user_id, "canva", "get_design", {"design_id": "design_1"})
 
         self.assertEqual(client.searches, [])
         self.assertEqual(client.executions, [
             ("NOTION_SEARCH_NOTION_PAGE", {"query": "ads"}),
             ("OUTLOOK_LIST_EVENTS", {"top": 10, "timezone": "America/Denver"}),
             ("CANVA_LIST_USER_DESIGNS", {"query": "Agent Genia"}),
+            ("OUTLOOK_SEARCH_MESSAGES", {"query": "Microsoft", "size": 10}),
+            ("OUTLOOK_GET_MESSAGE", {"message_id": "message_1"}),
+            ("CANVA_FETCH_DESIGN_METADATA_AND_ACCESS_INFORMATION", {"designId": "design_1"}),
         ])
+
+    def test_outlook_search_falls_back_when_tenant_rejects_search_endpoint(self):
+        client = FakeComposioClient()
+        session = FakeComposioSession(client, "outlook-fallback", "outlook")
+
+        def execute(slug, *, arguments):
+            client.executions.append((slug, arguments))
+            if slug == "OUTLOOK_SEARCH_MESSAGES":
+                return SimpleNamespace(data=None, error="Search endpoint unavailable")
+            return SimpleNamespace(
+                data={"items": [{"id": "message_1", "subject": "Microsoft"}]},
+                error=None,
+            )
+
+        session.execute = execute
+        client.sessions.create = lambda **_options: session
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        result = gateway.execute(
+            self.new_user("outlook-search-fallback")["user_id"],
+            "microsoft-365",
+            "search_email",
+            {"query": "Microsoft", "size": 100},
+        )
+
+        self.assertEqual(client.executions, [
+            ("OUTLOOK_SEARCH_MESSAGES", {"query": "Microsoft", "size": 10}),
+            ("OUTLOOK_LIST_MESSAGES", {"subject_contains": "Microsoft", "top": 10}),
+        ])
+        self.assertIn("message_1", json.dumps(result))
 
     def test_connected_plugin_collections_are_compact_but_keep_ids_and_titles(self):
         private_body = "contenido privado " * 4_000

@@ -527,6 +527,28 @@ class ComposioConnectorGateway:
             )
             result = session.execute(slug, arguments=normalized_arguments)
             error = getattr(result, "error", None)
+            if (
+                error
+                and connector_id == "microsoft-365"
+                and operation == "search_email"
+                and slug == "OUTLOOK_SEARCH_MESSAGES"
+            ):
+                # Microsoft's search endpoint is unavailable for some valid
+                # consumer/tenant mailboxes even though Mail.Read and normal
+                # message listing work. Preserve the richer search first, but
+                # fall back to a bounded subject query instead of presenting a
+                # connected Outlook account as unusable.
+                fallback_arguments = {
+                    "subject_contains": normalized_arguments["query"],
+                    "top": normalized_arguments.get("size", 10),
+                }
+                logging.info(
+                    "Outlook search rejected; falling back to bounded message list"
+                )
+                result = session.execute(
+                    "OUTLOOK_LIST_MESSAGES", arguments=fallback_arguments
+                )
+                error = getattr(result, "error", None)
             if error:
                 logging.warning(
                     "Connector provider rejected operation connector=%s operation=%s tool=%s: %s",
@@ -1317,6 +1339,51 @@ def _normalize_operation_arguments(
                     400, f"{field} no es válido", "bad_connector_arguments"
                 )
         return normalized
+
+    if connector_id == "canva" and operation == "get_design":
+        raw_id = arguments.get(
+            "designId", arguments.get("design_id", arguments.get("id"))
+        )
+        if not isinstance(raw_id, str) or not raw_id.strip() or len(raw_id) > 500:
+            raise ConnectorBrokerError(
+                400, "get_design requiere designId", "bad_connector_arguments"
+            )
+        return {"designId": raw_id.strip()}
+
+    if connector_id == "microsoft-365" and operation == "search_email":
+        normalized = dict(arguments)
+        query = normalized.get(
+            "query", normalized.get("search", normalized.get("search_query"))
+        )
+        if not isinstance(query, str) or not query.strip() or len(query) > 500:
+            raise ConnectorBrokerError(
+                400, "search_email requiere query", "bad_connector_arguments"
+            )
+        raw_size = normalized.get(
+            "size", normalized.get("max_results", normalized.get("limit", 10))
+        )
+        if isinstance(raw_size, bool) or not isinstance(raw_size, (int, float)):
+            raise ConnectorBrokerError(
+                400, "size debe ser numérico", "bad_connector_arguments"
+            )
+        result: dict[str, Any] = {
+            "query": query.strip(),
+            "size": max(1, min(int(raw_size), 10)),
+        }
+        for field in ("fromEmail", "subject", "hasAttachments", "enable_top_results"):
+            if field in normalized:
+                result[field] = normalized[field]
+        return result
+
+    if connector_id == "microsoft-365" and operation == "read_email":
+        message_id = arguments.get(
+            "message_id", arguments.get("messageId", arguments.get("id"))
+        )
+        if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 2_048:
+            raise ConnectorBrokerError(
+                400, "read_email requiere message_id", "bad_connector_arguments"
+            )
+        return {"message_id": message_id.strip()}
 
     if connector_id == "microsoft-365" and operation == "list_calendar_events":
         normalized = dict(arguments)
