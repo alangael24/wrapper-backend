@@ -16,6 +16,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict, deque
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -190,6 +191,9 @@ class ComposioConnectorGateway:
         self._start_rate: dict[str, deque[float]] = defaultdict(deque)
         self._snapshot_cache: dict[str, tuple[float, tuple[dict[str, Any], ...]]] = {}
         self._operation_cache: dict[tuple[str, str], tuple[float, str]] = {}
+        self._operation_schema_cache: dict[
+            tuple[str, str], tuple[float, dict[str, Any]]
+        ] = {}
         self._lock = threading.RLock()
         self.client = client
         self.native_gateway = native_gateway
@@ -545,7 +549,9 @@ class ComposioConnectorGateway:
         )
         session = self._session(user_id, connector_id)
         try:
-            slug, search = self._resolve_operation(session, connector_id, operation)
+            slug, search = self._resolve_operation(
+                session, connector_id, operation, require_schema=True
+            )
             return _validated_operation_arguments(
                 connector_id,
                 operation,
@@ -643,23 +649,56 @@ class ComposioConnectorGateway:
                         self._now() + 900,
                         slug,
                     )
+                    schema = _composio_input_schema(search, slug)
+                    if schema is not None:
+                        self._operation_schema_cache[(connector_id, operation)] = (
+                            self._now() + 900,
+                            schema,
+                        )
             return tuple(operation for operation in operations if operation in resolved)
         finally:
             _delete_session(session)
 
     def _resolve_operation(
-        self, session: Any, connector_id: str, operation: str
+        self,
+        session: Any,
+        connector_id: str,
+        operation: str,
+        *,
+        require_schema: bool = False,
     ) -> tuple[str, Any]:
         with self._lock:
             cached = self._operation_cache.get((connector_id, operation))
+            cached_schema = self._operation_schema_cache.get(
+                (connector_id, operation)
+            )
         if cached is not None and cached[0] > self._now() and not cached[1]:
             raise ConnectorBrokerError(
                 404,
                 "No encontramos una acción inequívoca para esta operación",
                 "connector_operation_not_found",
             )
+        if (
+            not require_schema
+            and cached is not None
+            and cached[0] > self._now()
+            and cached[1]
+            and cached_schema is not None
+            and cached_schema[0] > self._now()
+        ):
+            # The action identity was already resolved against Composio's
+            # versioned catalog. Reuse it for execution instead of paying for
+            # another Tool Router search. Write arguments still fetch and pass
+            # the live schema before the approval is created.
+            return cached[1], SimpleNamespace(
+                tool_schemas={cached[1]: {"input_schema": cached_schema[1]}}
+            )
         pinned = COMPOSIO_OPERATION_TO_TOOL.get((connector_id, operation))
-        if pinned and (connector_id, operation) in PINNED_DIRECT_READ_OPERATIONS:
+        if (
+            not require_schema
+            and pinned
+            and (connector_id, operation) in PINNED_DIRECT_READ_OPERATIONS
+        ):
             with self._lock:
                 self._operation_cache[(connector_id, operation)] = (
                     self._now() + 900,
@@ -694,6 +733,12 @@ class ComposioConnectorGateway:
                 self._now() + 900,
                 slug,
             )
+            schema = _composio_input_schema(search, slug)
+            if schema is not None:
+                self._operation_schema_cache[(connector_id, operation)] = (
+                    self._now() + 900,
+                    schema,
+                )
         return slug, search
 
     def _session(self, user_id: str, connector_id: str) -> Any:

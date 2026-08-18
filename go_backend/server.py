@@ -167,6 +167,7 @@ JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "select_query"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
 READ_ONLY_COMPUTER_OPERATIONS = frozenset({"status", "screenshot", "list_files", "read_file"})
+MAX_EAGER_CONNECTORS = 8
 AGENT_RESPONSE_STYLE_INSTRUCTION = (
     "Responde directamente en el idioma del usuario, normalmente en una a tres "
     "frases. Usa texto plano: no Markdown ni emojis decorativos. No repitas la "
@@ -229,6 +230,37 @@ def _action_summary(
         arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     return f"{label}: {operation} con {encoded[:700]}"
+
+
+def _approved_connector_confirmation(action: dict[str, Any]) -> str:
+    """Return a concise deterministic confirmation after an exact write."""
+    connector_id = str(action.get("connector_id") or "")
+    operation = str(action.get("operation") or "")
+    arguments = action.get("arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    if connector_id == "google-workspace":
+        if operation == "send_email":
+            recipient = str(arguments.get("recipient_email") or "el destinatario")[:320]
+            subject = str(arguments.get("subject") or "sin asunto")[:200]
+            return f"Listo. Envié el correo a {recipient} con asunto «{subject}»."
+        if operation == "draft_email":
+            recipient = str(arguments.get("recipient_email") or "el destinatario")[:320]
+            subject = str(arguments.get("subject") or "sin asunto")[:200]
+            return f"Listo. Guardé el borrador para {recipient} con asunto «{subject}»."
+        if operation == "create_calendar_event":
+            title = str(arguments.get("summary") or "evento")[:200]
+            start = str(arguments.get("start_datetime") or "")[:100]
+            return f"Listo. Creé «{title}»{f' para {start}' if start else ''}."
+        if operation == "delete_calendar_event":
+            return "Listo. Eliminé el evento solicitado."
+        if operation == "update_sheet":
+            cell_range = str(arguments.get("range") or "el rango solicitado")[:500]
+            return f"Listo. Actualicé {cell_range} en la hoja indicada."
+    connector_name = str(
+        CONNECTOR_CATALOG.get(connector_id, {"name": connector_id or "el conector"})["name"]
+    )
+    summary = str(action.get("human_summary") or operation or "la acción solicitada")
+    return f"Listo. Completé la acción en {connector_name}: {summary}."
 
 
 def _approval_envelope(approval: dict[str, Any]) -> str:
@@ -3446,6 +3478,10 @@ class Backend:
                     "approval_connector_unavailable",
                 )
                 return
+        approved_connector_execution = bool(
+            approved_action is not None
+            and approved_action["target_type"] == "connector"
+        )
 
         if not has_fast_routing_context and not approved_action:
             # Backwards-compatible routing for clients that predate the
@@ -3486,10 +3522,25 @@ class Backend:
                     f"{CONNECTOR_CATALOG[item]['name']} ({item})"
                     for item in connector_ids
                 )
+                eager_tools = len(connector_ids) <= MAX_EAGER_CONNECTORS
+                connector_tool_context = (
+                    "Las herramientas exactas de esos conectores ya están activadas "
+                    "para esta ejecución. Invoca directamente la herramienta del "
+                    "proveedor y su operación; no llames connector_search primero. "
+                    + " ".join(
+                        f"connector_{item.replace('-', '_')} admite: "
+                        f"{', '.join(CONNECTOR_CATALOG[item]['operations'])}."
+                        for item in connector_ids
+                    )
+                    if eager_tools
+                    else (
+                        "Hay muchos conectores asignados; usa connector_search una "
+                        "sola vez para activar únicamente el proveedor necesario."
+                    )
+                )
                 connector_context = (
                     "Conectores autenticados disponibles para esta ejecución: "
-                    f"{connector_names}. Cuando la tarea los necesite, usa "
-                    "connector_search y después la herramienta activada. Para "
+                    f"{connector_names}. {connector_tool_context} Para "
                     "consultar o modificar datos externos debes basar la respuesta "
                     "en el resultado exitoso de esa herramienta. Si no ejecutaste "
                     "la herramienta o falló, dilo claramente: nunca inventes correos, "
@@ -3533,7 +3584,7 @@ class Backend:
             return
 
         pi_status = self.pi.status()
-        if not direct_chat:
+        if not direct_chat and not approved_connector_execution:
             if not pi_status["enabled"]:
                 error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
                 return
@@ -3554,7 +3605,12 @@ class Backend:
             )
             return
         computer_enabled = bool(computer_requested)
-        if not direct_chat and (connector_ids or computer_enabled) and not pi_status["connectors_available"]:
+        if (
+            not direct_chat
+            and not approved_connector_execution
+            and (connector_ids or computer_enabled)
+            and not pi_status["connectors_available"]
+        ):
             error_response(
                 handler,
                 409,
@@ -3743,7 +3799,7 @@ class Backend:
                 )
                 self._mark_run_timing(run_id, "direct_complete_ms")
             else:
-                if bot_id is not None:
+                if bot_id is not None and not approved_connector_execution:
                     conversation_key = f"{user['id']}\0{bot_id}"
                     with self._pi_warm_lock:
                         warm_event = self._pi_warm_events.pop(conversation_key, None)
@@ -3762,30 +3818,68 @@ class Backend:
                     )
                 self._mark_run_timing(run_id, "pi_dispatch_ms")
 
-                def on_text_delta(delta: str) -> None:
-                    self._mark_run_timing(run_id, "pi_first_text_ms")
-                    if event_stream:
-                        before = len(event_stream.visible_sent)
-                        event_stream.model_delta(delta)
-                        if len(event_stream.visible_sent) > before:
-                            self._mark_run_timing(run_id, "first_visible_delta_ms")
+                if approved_connector_execution:
+                    # The model already selected the operation and the user
+                    # approved its canonical argument hash. Sending the exact
+                    # capability back through another model round adds latency
+                    # and can only introduce drift. Execute it directly through
+                    # the same one-shot broker boundary used by Pi.
+                    action_started = time.monotonic()
+                    self.connectors.execute(
+                        token=connector_run_token or "",
+                        connector_id=approved_action["connector_id"],
+                        operation=approved_action["operation"],
+                        arguments=approved_action["arguments"],
+                        operation_id=approved_action["action_id"],
+                        approval_id=approved_action["id"],
+                        action_id=approved_action["action_id"],
+                    )
+                    result = PiRunResult(
+                        run_id=run_id,
+                        answer=_approved_connector_confirmation(approved_action),
+                        model=self.cfg.pi_model,
+                        duration_seconds=round(
+                            time.monotonic() - action_started, 3
+                        ),
+                        usage={
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cached_read_tokens": 0,
+                            "cached_write_tokens": 0,
+                        },
+                        browser=False,
+                        event_log="",
+                        stderr_log="",
+                    )
+                    self._mark_run_timing(run_id, "connector_action_complete_ms")
+                else:
 
-                result = self.pi.run(
-                    run_id=run_id,
-                    run_api_key=run_api_key,
-                    prompt=effective_prompt,
-                    browser=browser,
-                    connector_run_token=connector_run_token,
-                    conversation_key=(
-                        f"{user['id']}\0{bot_id}" if bot_id is not None else None
-                    ),
-                    on_text_delta=on_text_delta,
-                    # Transport loss is not cancellation. The run remains
-                    # durable and recoverable by run_id, avoiding duplicate
-                    # external side effects when a mobile/desktop stream drops.
-                    is_cancelled=None,
-                )
-                self._mark_run_timing(run_id, "pi_complete_ms")
+                    def on_text_delta(delta: str) -> None:
+                        self._mark_run_timing(run_id, "pi_first_text_ms")
+                        if event_stream:
+                            before = len(event_stream.visible_sent)
+                            event_stream.model_delta(delta)
+                            if len(event_stream.visible_sent) > before:
+                                self._mark_run_timing(run_id, "first_visible_delta_ms")
+
+                    result = self.pi.run(
+                        run_id=run_id,
+                        run_api_key=run_api_key,
+                        prompt=effective_prompt,
+                        browser=browser,
+                        connector_run_token=connector_run_token,
+                        connector_ids=connector_ids,
+                        computer_enabled=computer_enabled,
+                        conversation_key=(
+                            f"{user['id']}\0{bot_id}" if bot_id is not None else None
+                        ),
+                        on_text_delta=on_text_delta,
+                        # Transport loss is not cancellation. The run remains
+                        # durable and recoverable by run_id, avoiding duplicate
+                        # external side effects when a mobile/desktop stream drops.
+                        is_cancelled=None,
+                    )
+                    self._mark_run_timing(run_id, "pi_complete_ms")
         except DirectChatError as e:
             _settled, _credits = settle("failed", e.code)
             agent_error(e.status, str(e), e.code)

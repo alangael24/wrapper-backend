@@ -260,6 +260,8 @@ class PiHarness:
         prompt: str,
         browser: bool = False,
         connector_run_token: str | None = None,
+        connector_ids: tuple[str, ...] = (),
+        computer_enabled: bool = False,
         conversation_key: str | None = None,
         on_text_delta: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
@@ -290,6 +292,8 @@ class PiHarness:
                     run_api_key=run_api_key,
                     prompt=prompt,
                     connector_run_token=connector_run_token,
+                    connector_ids=connector_ids,
+                    computer_enabled=computer_enabled,
                     conversation_key=conversation_key,
                     on_text_delta=on_text_delta,
                     is_cancelled=is_cancelled,
@@ -300,6 +304,8 @@ class PiHarness:
                 prompt=prompt,
                 browser=browser,
                 connector_run_token=connector_run_token,
+                connector_ids=connector_ids,
+                computer_enabled=computer_enabled,
                 on_text_delta=on_text_delta,
                 is_cancelled=is_cancelled,
             )
@@ -455,6 +461,8 @@ class PiHarness:
         run_api_key: str,
         chrome_bridge_port: int | None = None,
         connector_run_token: str | None = None,
+        connector_ids: tuple[str, ...] = (),
+        computer_enabled: bool = False,
         runtime_auth_file: Path | None = None,
     ) -> dict[str, str]:
         # No heredar ADMIN_TOKEN, WRAPPER_SECRET ni otras API keys del servidor.
@@ -479,6 +487,10 @@ class PiHarness:
         if connector_run_token is not None:
             env["PI_CONNECTOR_BROKER_URL"] = self.connector_broker_url
             env["PI_CONNECTOR_RUN_TOKEN"] = connector_run_token
+            env["PI_CONNECTOR_IDS"] = json.dumps(
+                list(dict.fromkeys(connector_ids)), separators=(",", ":")
+            )
+            env["PI_COMPUTER_ENABLED"] = "1" if computer_enabled else "0"
         if runtime_auth_file is not None:
             env["PI_RUNTIME_AUTH_FILE"] = str(runtime_auth_file)
         return env
@@ -624,11 +636,15 @@ class PiHarness:
         *,
         run_api_key: str = "",
         connector_run_token: str = "",
+        connector_ids: tuple[str, ...] = (),
+        computer_enabled: bool = False,
     ) -> None:
         payload = json.dumps(
             {
                 "run_api_key": run_api_key,
                 "connector_run_token": connector_run_token,
+                "connector_ids": list(dict.fromkeys(connector_ids)),
+                "computer_enabled": bool(computer_enabled),
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -758,6 +774,8 @@ class PiHarness:
         *,
         run_api_key: str,
         connector_run_token: str | None,
+        connector_ids: tuple[str, ...] = (),
+        computer_enabled: bool = False,
     ) -> None:
         resolved_binary = self._resolved_binary()
         if not resolved_binary or Path(resolved_binary).name not in {
@@ -787,6 +805,8 @@ class PiHarness:
             session.auth_file,
             run_api_key=run_api_key,
             connector_run_token=connector_run_token or "",
+            connector_ids=connector_ids,
+            computer_enabled=computer_enabled,
         )
         stderr_path = session.root / "session-stderr.log"
         session.stderr_stream = stderr_path.open("a", encoding="utf-8")
@@ -845,6 +865,8 @@ class PiHarness:
         run_api_key: str,
         prompt: str,
         connector_run_token: str | None,
+        connector_ids: tuple[str, ...],
+        computer_enabled: bool,
         conversation_key: str,
         on_text_delta: Callable[[str], None] | None,
         is_cancelled: Callable[[], bool] | None,
@@ -874,12 +896,16 @@ class PiHarness:
                     session,
                     run_api_key=run_api_key,
                     connector_run_token=connector_run_token,
+                    connector_ids=connector_ids,
+                    computer_enabled=computer_enabled,
                 )
             else:
                 self._atomic_runtime_auth(
                     session.auth_file,
                     run_api_key=run_api_key,
                     connector_run_token=connector_run_token or "",
+                    connector_ids=connector_ids,
+                    computer_enabled=computer_enabled,
                 )
             process = session.process
             events = session.events
@@ -1119,6 +1145,8 @@ class PiHarness:
         prompt: str,
         browser: bool,
         connector_run_token: str | None,
+        connector_ids: tuple[str, ...],
+        computer_enabled: bool,
         on_text_delta: Callable[[str], None] | None,
         is_cancelled: Callable[[], bool] | None,
     ) -> PiRunResult:
@@ -1176,6 +1204,8 @@ class PiHarness:
                         run_api_key,
                         chrome_bridge_port=bridge_port,
                         connector_run_token=connector_run_token,
+                        connector_ids=connector_ids,
+                        computer_enabled=computer_enabled,
                     ),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,

@@ -2414,7 +2414,12 @@ class TestBackend(unittest.TestCase):
         self.assertIn("--no-session", command)
         self.assertIn(str(RUNTIME_AUTH_EXTENSION.resolve()), command)
         credentials = json.loads(session.auth_file.read_text(encoding="utf-8"))
-        self.assertEqual(credentials, {"run_api_key": "", "connector_run_token": ""})
+        self.assertEqual(credentials, {
+            "run_api_key": "",
+            "connector_run_token": "",
+            "connector_ids": [],
+            "computer_enabled": False,
+        })
         upstream_calls = [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"]
         self.assertEqual(len(upstream_calls), 2)
 
@@ -2445,7 +2450,12 @@ class TestBackend(unittest.TestCase):
         process_id = session.process.pid
         self.assertEqual(
             json.loads(session.auth_file.read_text(encoding="utf-8")),
-            {"run_api_key": "", "connector_run_token": ""},
+            {
+                "run_api_key": "",
+                "connector_run_token": "",
+                "connector_ids": [],
+                "computer_enabled": False,
+            },
         )
         self.assertEqual(
             [r for r in MockUpstream.requests if r[1] == "/v1/chat/completions"],
@@ -3529,6 +3539,48 @@ class TestBackend(unittest.TestCase):
             },
         )
 
+    def test_approved_write_reuses_the_schema_resolved_tool_for_execution(self):
+        client = FakeComposioClient()
+        client.tool_schemas = {
+            "GOOGLESUPER_SEND_EMAIL": {
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "recipient_email": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["recipient_email", "subject", "body"],
+                    "additionalProperties": False,
+                }
+            }
+        }
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        user_id = self.new_user("google-write-cache")['user_id']
+        arguments = {
+            "recipient_email": "self@example.com",
+            "subject": "Prueba",
+            "body": "Mensaje",
+        }
+
+        self.assertEqual(
+            gateway.validate_arguments(
+                user_id, "google-workspace", "send_email", arguments
+            ),
+            arguments,
+        )
+        gateway.execute(user_id, "google-workspace", "send_email", arguments)
+
+        self.assertEqual(len(client.searches), 1)
+        self.assertEqual(
+            client.executions,
+            [("GOOGLESUPER_SEND_EMAIL", arguments)],
+        )
+
     def test_plugin_write_fails_closed_when_provider_schema_is_missing(self):
         client = FakeComposioClient()
         gateway = ComposioConnectorGateway(
@@ -4072,6 +4124,74 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 200, result)
         self.assertEqual(len(issued), 1)
         self.assertIsNone(issued[0]["approved_action"])
+
+    def test_approved_connector_action_executes_without_a_second_model_round(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        bot_id = self.assign_bot_connectors(signup, ["google-workspace"])
+        user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
+        adapter = FakeGitHubAdapter(user["id"])
+        self.ws.backend.connectors.register_adapter("google-workspace", adapter)
+        self.ws.backend.connector_gateway.connected_connector_ids = (
+            lambda _user_id: ("google-workspace",)
+        )
+        prior = self.ws.backend.store.create_unmetered_agent_run(
+            user_id=user["id"],
+            idempotency_key="approved-direct-prior",
+            model="deepseek-v4-flash",
+            browser=False,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash="approved-direct-prior-token",
+            token_expires_at=time.time() + 600,
+        )
+        arguments = {
+            "recipient_email": "self@example.com",
+            "subject": "Prueba directa",
+            "body": "Contenido",
+        }
+        approval = self.ws.backend.store.create_pending_approval(
+            user_id=user["id"],
+            bot_id=bot_id,
+            run_id=prior["run"]["id"],
+            target_type="connector",
+            connector_id="google-workspace",
+            operation="send_email",
+            arguments=arguments,
+            arguments_hash=canonical_arguments_hash(arguments),
+            human_summary="Enviar correo de prueba",
+        )
+
+        with patch.object(
+            self.ws.backend.pi,
+            "run",
+            side_effect=AssertionError("Pi must not run after exact approval"),
+        ) as pi_run:
+            status, result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": "Autorizar esta acción",
+                    "bot_id": bot_id,
+                    "connector_ids": ["google-workspace"],
+                    "execution_mode": "agent",
+                    "idempotency_key": "approved-direct-execution",
+                    "approval": {
+                        "approval_id": approval["id"],
+                        "decision": "approve",
+                    },
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(status, 200, result)
+        self.assertIn("Envié el correo", result["answer"])
+        self.assertEqual(result["usage"]["input_tokens"], 0)
+        self.assertEqual(adapter.calls, [
+            (user["id"], "send_email", arguments),
+        ])
+        pi_run.assert_not_called()
 
     def test_agent_rejects_unknown_connector_before_starting_pi(self):
         signup = self.new_user()

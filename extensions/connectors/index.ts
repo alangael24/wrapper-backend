@@ -4,11 +4,14 @@ import { readFileSync } from "node:fs";
 
 const BROKER_URL_ENV = "PI_CONNECTOR_BROKER_URL";
 const RUN_TOKEN_ENV = "PI_CONNECTOR_RUN_TOKEN";
+const CONNECTOR_IDS_ENV = "PI_CONNECTOR_IDS";
+const COMPUTER_ENABLED_ENV = "PI_COMPUTER_ENABLED";
 const AUTH_FILE_ENV = "PI_RUNTIME_AUTH_FILE";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_COMPUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 45_000;
 const COMPUTER_REQUEST_TIMEOUT_MS = 180_000;
+const MAX_EAGER_CONNECTORS = 8;
 
 const PROVIDER_OPERATIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "google-workspace": ["search_email", "read_email", "draft_email", "send_email", "list_calendar_events", "create_calendar_event", "delete_calendar_event", "search_drive", "read_drive_file", "list_contacts", "read_sheet", "update_sheet"],
@@ -251,16 +254,49 @@ function brokerConfig(): { baseUrl: string; token: string } {
 }
 
 function currentConnectorToken(): string {
+  return currentRuntimeGrant().token;
+}
+
+interface RuntimeGrant {
+  token: string;
+  connectorIds: string[];
+  computerEnabled: boolean;
+}
+
+function currentRuntimeGrant(): RuntimeGrant {
   const authFile = process.env[AUTH_FILE_ENV] ?? "";
   if (authFile) {
     try {
-      const parsed = JSON.parse(readFileSync(authFile, "utf8")) as { connector_run_token?: unknown };
-      return typeof parsed.connector_run_token === "string" ? parsed.connector_run_token : "";
+      const parsed = JSON.parse(readFileSync(authFile, "utf8")) as {
+        connector_run_token?: unknown;
+        connector_ids?: unknown;
+        computer_enabled?: unknown;
+      };
+      return {
+        token: typeof parsed.connector_run_token === "string" ? parsed.connector_run_token : "",
+        connectorIds: Array.isArray(parsed.connector_ids)
+          ? [...new Set(parsed.connector_ids.filter((item): item is string => typeof item === "string"))]
+          : [],
+        computerEnabled: parsed.computer_enabled === true,
+      };
     } catch {
-      return "";
+      return { token: "", connectorIds: [], computerEnabled: false };
     }
   }
-  return process.env[RUN_TOKEN_ENV] ?? "";
+  let connectorIds: string[] = [];
+  try {
+    const parsed = JSON.parse(process.env[CONNECTOR_IDS_ENV] ?? "[]") as unknown;
+    if (Array.isArray(parsed)) {
+      connectorIds = [...new Set(parsed.filter((item): item is string => typeof item === "string"))];
+    }
+  } catch {
+    connectorIds = [];
+  }
+  return {
+    token: process.env[RUN_TOKEN_ENV] ?? "",
+    connectorIds,
+    computerEnabled: process.env[COMPUTER_ENABLED_ENV] === "1",
+  };
 }
 
 async function readLimited(response: Response, maxBytes = MAX_RESPONSE_BYTES): Promise<string> {
@@ -350,6 +386,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export default function connectorExtension(pi: ExtensionAPI): void {
   const providerToolNames = new Set(PROVIDERS.map((item) => item.toolName));
+
+  const applyGrantedTools = (): void => {
+    const grant = currentRuntimeGrant();
+    const base = pi.getActiveTools().filter((name) => (
+      !providerToolNames.has(name)
+      && name !== "computer"
+      && name !== "connector_search"
+    ));
+    if (!grant.token) {
+      pi.setActiveTools(base);
+      return;
+    }
+    const allowed = grant.connectorIds.filter((id) => PROVIDER_OPERATIONS[id]);
+    if (allowed.length > 0 && allowed.length <= MAX_EAGER_CONNECTORS) {
+      for (const id of allowed) {
+        const tool = PROVIDERS.find((item) => item.id === id)?.toolName;
+        if (tool && !base.includes(tool)) base.push(tool);
+      }
+    } else if (
+      (allowed.length > MAX_EAGER_CONNECTORS || !grant.computerEnabled)
+      && !base.includes("connector_search")
+    ) {
+      // Large connector sets stay lazy so the provider does not receive an
+      // unnecessarily large tool schema on every model round.
+      base.push("connector_search");
+    }
+    if (grant.computerEnabled && !base.includes("computer")) base.push("computer");
+    pi.setActiveTools(base);
+  };
 
   for (const item of PROVIDERS) {
     const operations = PROVIDER_OPERATIONS[item.id] ?? [];
@@ -558,20 +623,11 @@ export default function connectorExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on("session_start", () => {
-    const hasGrant = Boolean(currentConnectorToken() || process.env[AUTH_FILE_ENV]);
-    const active = pi.getActiveTools().filter((name) => (
-      !providerToolNames.has(name)
-      && name !== "computer"
-      && (hasGrant || name !== "connector_search")
-    ));
-    if (!hasGrant) {
-      pi.setActiveTools(active);
-      return;
-    }
-    if (!active.includes("connector_search")) active.push("connector_search");
-    pi.setActiveTools(active);
-  });
+  pi.on("session_start", applyGrantedTools);
+  // Warm Pi processes rotate grants between turns. Re-read the atomic runtime
+  // file immediately before each agent loop so the first provider request can
+  // call the exact authorized connector directly, without a discovery round.
+  pi.on("before_agent_start", applyGrantedTools);
 }
 
 function isBrokerConnector(value: unknown): value is BrokerConnector {

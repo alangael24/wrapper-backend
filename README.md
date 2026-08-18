@@ -482,11 +482,13 @@ credenciales reales dentro de su namespace.
 ## Conectores nativos de Pi
 
 Pi carga `extensions/connectors/index.ts` como una extensión first-party. Para
-conservar el prompt cache y no mandar 18 esquemas de herramientas en cada turno,
-al inicio solo está activa `connector_search`. Cuando el modelo busca una
-capacidad, la extensión consulta el catálogo permitido para esa ejecución y
-activa aditivamente únicamente la herramienta correspondiente, por ejemplo
-`connector_github`.
+evitar una ronda de modelo innecesaria, el backend coloca en el grant la lista
+cerrada de conectores del bot y la extensión activa sus herramientas exactas
+antes de la primera petición al proveedor. Con hasta ocho conectores se llama
+directamente, por ejemplo, a `connector_google_workspace`; con conjuntos mayores
+se conserva `connector_search` como cargador diferido para no inflar el prompt.
+Las sesiones cálidas vuelven a leer el grant atómico en cada turno, por lo que
+una herramienta nunca queda activa por pertenecer a una ejecución anterior.
 
 El aislamiento es por ejecución:
 
@@ -498,6 +500,13 @@ El aislamiento es por ejecución:
 4. Los endpoints internos aceptan únicamente tráfico loopback y limitan cada
    operación al grant. El token se revoca al terminar o fallar la tarea y además
    tiene una expiración máxima de una hora.
+
+Las escrituras usan una aprobación estructurada vinculada al hash canónico de
+los argumentos. La app nunca interpreta un “sí” escrito como una capability:
+solo reenvía el `approval_id` de la tarjeta. Tras autorizar, el backend consume
+la capability una vez y ejecuta exactamente el mismo conector, operación y
+argumentos directamente en el broker. No se paga una segunda ronda de modelo
+para repetir una decisión ya tomada; la confirmación final es determinística.
 5. Composio conserva y refresca las credenciales; el adaptador se ejecuta dentro
    del backend. Si no existe o el usuario no inició sesión, la llamada falla cerrada
    con `connector_not_configured` o `connector_not_connected`.
@@ -767,7 +776,7 @@ runtime se agrupan aquí por función.
 | `PI_TIMEOUT_SECONDS` | `1800` | Timeout; `0` significa sin límite |
 | `PI_MAX_CONCURRENT` | `4` | Procesos Pi simultáneos; permite cumplir la concurrencia máxima de Business |
 | `PI_MAX_PROMPT_CHARS` | `100000` | Tamaño máximo del prompt |
-| `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con `connector_search` y herramientas diferidas |
+| `PI_CONNECTOR_EXTENSION` | `./extensions/connectors/index.ts` | Extensión first-party con activación exacta por grant y fallback diferido para conjuntos grandes |
 | `PI_CONNECTOR_TOKEN_TTL_SECONDS` | timeout + 60, máx. 3600 | Vida máxima del grant interno por ejecución |
 | `PI_CHROME_EXTENSION` | `./node_modules/pi-chrome/.../index.ts` | Extensión Pi de pi-chrome |
 | `PI_CHROME_BIN` | autodetectado | Ejecutable de Chrome for Testing/Chromium; no es una ruta de perfil |

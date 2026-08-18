@@ -161,6 +161,14 @@ test("connector_search activa solo la herramienta necesaria y el broker recibe e
     assert.equal(requests[1].url, "/v1/internal/connectors/catalog");
     assert.equal(requests[3].url, "/v1/internal/connectors/catalog");
     assert.deepEqual(requests[4].body, { operation: "screenshot", arguments: {} });
+
+    await writeFile(authFile, JSON.stringify({
+      connector_run_token: "rotated-run-token",
+      connector_ids: ["github"],
+      computer_enabled: false,
+    }), { mode: 0o600 });
+    handlers.get("before_agent_start")();
+    assert.deepEqual(activeTools, ["read", "connector_github"]);
   } finally {
     delete process.env.PI_CONNECTOR_BROKER_URL;
     delete process.env.PI_CONNECTOR_RUN_TOKEN;
