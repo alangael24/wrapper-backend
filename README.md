@@ -878,6 +878,9 @@ Las credenciales y el procedimiento exacto están en
 pnpm test:desktop
 pnpm test:connectors
 
+# Matriz sintética: 49 conectores y sus 221 operaciones públicas
+pnpm test:interactions
+
 # iOS: compila unit/UI tests sin firma y después ejecútalos en un simulador
 xcodebuild \
   -project ios/AgentGenia/AgentGenia.xcodeproj \
@@ -894,6 +897,12 @@ xcodebuild \
 cd android/AgentGenia
 ./gradlew testDebugUnitTest lintDebug assembleDebug connectedDebugAndroidTest
 ```
+
+La matriz de interacciones verifica lecturas, validación previa de escrituras,
+autorizaciones exactas de un solo uso, ejecución e idempotencia sin modificar
+cuentas externas. Las escrituras administradas por Composio se validan contra
+el esquema actual del proveedor antes de mostrar `Autorizar`; si el esquema no
+está disponible o es inválido, Agent Genia falla de forma segura.
 
 Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del
 proveedor ni realizan cobros. Cubren signup siempre-free, activación, proxy y

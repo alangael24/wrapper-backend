@@ -33,6 +33,7 @@ from go_backend.server import (  # noqa: E402
     Handler,
     UnsafeConfigurationError,
     _bounded_agent_envelope,
+    _connector_operation_is_read_only,
     _partial_json_text,
     serve,
     validate_runtime_security,
@@ -326,6 +327,39 @@ class FakeGitHubAdapter:
     def execute(self, user_id: str, operation: str, arguments: dict):
         self.calls.append((user_id, operation, arguments))
         return {"items": [{"name": "wrapper-backend", "private": True}]}
+
+
+class FakeContractAdapter:
+    """Provider double used to exercise every public connector operation."""
+
+    def __init__(self, connected_user_id: str):
+        self.connected_user_id = connected_user_id
+        self.validations: list[tuple[str, str, dict]] = []
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def is_connected(self, user_id: str) -> bool:
+        return user_id == self.connected_user_id
+
+    def normalize_arguments(self, operation: str, arguments: dict) -> dict:
+        prepared = dict(arguments)
+        provider_alias = prepared.pop("provider_alias", None)
+        if provider_alias is not None:
+            prepared["contract_case"] = provider_alias
+        return prepared
+
+    def validate_arguments(
+        self, user_id: str, operation: str, arguments: dict
+    ) -> dict:
+        self.validations.append((user_id, operation, arguments))
+        if arguments.get("__invalid__"):
+            raise ConnectorBrokerError(
+                400, f"Argumentos inválidos para {operation}", "bad_connector_arguments"
+            )
+        return self.normalize_arguments(operation, arguments)
+
+    def execute(self, user_id: str, operation: str, arguments: dict):
+        self.calls.append((user_id, operation, arguments))
+        return {"ok": True, "operation": operation, "arguments": arguments}
 
 
 class FakeComposioAccounts:
@@ -2820,19 +2854,22 @@ class TestBackend(unittest.TestCase):
         approvals_before = self.ws.backend.store.pending_approvals_for_run(
             user["id"], run_id
         )
+        self.ws.backend.connectors.register_adapter(
+            "google-workspace", FakeContractAdapter(user["id"])
+        )
         status, body = self.ws.req(
             "POST",
             "/v1/internal/connectors/execute",
             {
                 "connector_id": "google-workspace",
                 "operation": "send_email",
-                "arguments": {},
+                "arguments": {"__invalid__": True},
             },
             headers=internal_headers,
         )
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["type"], "bad_connector_arguments")
-        self.assertIn("recipient_email", body["error"]["message"])
+        self.assertIn("send_email", body["error"]["message"])
         self.assertEqual(
             self.ws.backend.store.pending_approvals_for_run(user["id"], run_id),
             approvals_before,
@@ -2912,6 +2949,133 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(replay, result)
         self.assertEqual(len(adapter.calls), 1)
+
+    def test_every_catalog_operation_obeys_read_or_exact_write_contract(self):
+        """Synthetic end-to-end matrix for the whole connector marketplace."""
+        signup = self.new_user()
+        user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
+        prepared = self.ws.backend.store.create_unmetered_agent_run(
+            user_id=user["id"],
+            idempotency_key="all-connector-interactions",
+            model="deepseek-chat",
+            browser=False,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash="all-connector-interactions-token",
+            token_expires_at=time.time() + 600,
+        )
+        run_id = prepared["run"]["id"]
+        bot_id = str(uuid.uuid4())
+        adapter = FakeContractAdapter(user["id"])
+        connector_ids = tuple(CONNECTOR_CATALOG)
+        for connector_id in connector_ids:
+            self.ws.backend.connectors.register_adapter(connector_id, adapter)
+        token = self.ws.backend.connectors.issue(
+            user_id=user["id"],
+            run_id=run_id,
+            bot_id=bot_id,
+            connector_ids=connector_ids,
+        )
+        headers = {"X-Connector-Run-Token": token}
+        read_count = 0
+        write_count = 0
+
+        for connector_id, item in CONNECTOR_CATALOG.items():
+            for operation in item["operations"]:
+                case_id = f"{connector_id}:{operation}"
+                arguments = {"contract_case": case_id}
+                if _connector_operation_is_read_only(operation):
+                    status, body = self.ws.req(
+                        "POST",
+                        "/v1/internal/connectors/execute",
+                        {
+                            "connector_id": connector_id,
+                            "operation": operation,
+                            "arguments": arguments,
+                            "operation_id": f"read:{case_id}",
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual((status, body.get("operation")), (200, operation), case_id)
+                    read_count += 1
+                    continue
+
+                # Model/provider aliases may be canonicalized by an adapter.
+                # The approved retry deliberately reuses the original shape.
+                arguments = {"provider_alias": case_id}
+
+                approvals_before = len(
+                    self.ws.backend.store.pending_approvals_for_run(user["id"], run_id)
+                )
+                status, body = self.ws.req(
+                    "POST",
+                    "/v1/internal/connectors/execute",
+                    {
+                        "connector_id": connector_id,
+                        "operation": operation,
+                        "arguments": {"__invalid__": True, "contract_case": case_id},
+                    },
+                    headers=headers,
+                )
+                self.assertEqual(status, 400, case_id)
+                self.assertEqual(body["error"]["type"], "bad_connector_arguments", case_id)
+                self.assertEqual(
+                    len(self.ws.backend.store.pending_approvals_for_run(user["id"], run_id)),
+                    approvals_before,
+                    case_id,
+                )
+
+                status, body = self.ws.req(
+                    "POST",
+                    "/v1/internal/connectors/execute",
+                    {
+                        "connector_id": connector_id,
+                        "operation": operation,
+                        "arguments": arguments,
+                    },
+                    headers=headers,
+                )
+                self.assertEqual(status, 409, case_id)
+                self.assertEqual(
+                    body["error"]["type"], "operation_approval_required", case_id
+                )
+                approval = self.ws.backend.store.approve_pending_approval(
+                    user_id=user["id"],
+                    bot_id=bot_id,
+                    approval_id=body["approval"]["approval_id"],
+                )
+                self.assertIsNotNone(approval, case_id)
+                approved_token = self.ws.backend.connectors.issue(
+                    user_id=user["id"],
+                    run_id=run_id,
+                    bot_id=bot_id,
+                    connector_ids=(connector_id,),
+                    approved_action=approval,
+                )
+                approved_headers = {"X-Connector-Run-Token": approved_token}
+                call_count = len(adapter.calls)
+                payload = {
+                    "connector_id": connector_id,
+                    "operation": operation,
+                    "arguments": arguments,
+                    "operation_id": body["approval"]["action_id"],
+                }
+                status, executed = self.ws.req(
+                    "POST", "/v1/internal/connectors/execute", payload,
+                    headers=approved_headers,
+                )
+                self.assertEqual((status, executed.get("operation")), (200, operation), case_id)
+                status, replayed = self.ws.req(
+                    "POST", "/v1/internal/connectors/execute", payload,
+                    headers=approved_headers,
+                )
+                self.assertEqual((status, replayed), (200, executed), case_id)
+                self.assertEqual(len(adapter.calls), call_count + 1, case_id)
+                write_count += 1
+
+        self.assertEqual(read_count + write_count, 221)
+        self.assertGreater(read_count, write_count)
+        self.assertEqual(len(adapter.validations), write_count * 2)
 
     def test_connector_grant_expires_without_server_restart(self):
         clock = [time.time()]
@@ -3177,6 +3341,63 @@ class TestBackend(unittest.TestCase):
             },
         )])
 
+    def test_provider_schema_rejects_any_plugin_write_before_approval(self):
+        client = FakeComposioClient()
+        user_id = self.new_user("provider-schema-preflight")["user_id"]
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        client.tool_schemas = {
+            "SLACK_POST_MESSAGE": {
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string", "minLength": 1},
+                        "text": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["channel_id", "text"],
+                    "additionalProperties": False,
+                }
+            }
+        }
+
+        with self.assertRaises(ConnectorBrokerError) as incomplete:
+            gateway.validate_arguments(
+                user_id, "slack", "post_message", {"channel_id": "C123"}
+            )
+        self.assertEqual(incomplete.exception.code, "bad_connector_arguments")
+        self.assertEqual(client.executions, [])
+        self.assertEqual(
+            gateway.validate_arguments(
+                user_id,
+                "slack",
+                "post_message",
+                {"channel_id": "C123", "text": "Hola"},
+            ),
+            {"channel_id": "C123", "text": "Hola"},
+        )
+        self.assertEqual(client.executions, [])
+
+    def test_plugin_write_fails_closed_when_provider_schema_is_missing(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+        with self.assertRaises(ConnectorBrokerError) as missing:
+            gateway.validate_arguments(
+                self.new_user("missing-provider-schema")["user_id"],
+                "notion",
+                "create_page",
+                {"title": "Página"},
+            )
+        self.assertEqual(missing.exception.code, "connector_schema_unavailable")
+        self.assertEqual(missing.exception.status, 503)
+        self.assertEqual(client.executions, [])
+
     def test_google_calendar_create_rejects_natural_language_before_upstream(self):
         client = FakeComposioClient()
         user_id = self.new_user("google-calendar-invalid")["user_id"]
@@ -3388,6 +3609,19 @@ class TestBackend(unittest.TestCase):
             gateway.start(user_id, "github")
         self.assertEqual(error.exception.status, 429)
         self.assertEqual(error.exception.code, "connector_rate_limit")
+
+    def test_native_plugin_preflight_rejects_missing_resource_identifiers(self):
+        gateway = self.ws.backend.native_connector_gateway
+        with self.assertRaises(ConnectorBrokerError) as missing:
+            gateway.validate_arguments("salesloft", "update_person", {"name": "Ana"})
+        self.assertEqual(missing.exception.code, "bad_connector_arguments")
+        self.assertIn("id", str(missing.exception))
+        self.assertEqual(
+            gateway.validate_arguments(
+                "salesloft", "update_person", {"id": "person_123", "name": "Ana"}
+            ),
+            {"id": "person_123", "name": "Ana"},
+        )
 
     def test_native_connector_fallback_is_encrypted_isolated_and_executable(self):
         with tempfile.TemporaryDirectory() as tmp:

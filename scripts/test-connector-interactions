@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+if [ -x .venv/bin/python ]; then
+  python_bin=.venv/bin/python
+else
+  python_bin=${PYTHON:-python}
+fi
+
+exec "$python_bin" -m unittest \
+  tests.test_backend.TestBackend.test_every_catalog_operation_obeys_read_or_exact_write_contract \
+  tests.test_backend.TestBackend.test_provider_schema_rejects_any_plugin_write_before_approval \
+  tests.test_backend.TestBackend.test_plugin_write_fails_closed_when_provider_schema_is_missing \
+  tests.test_backend.TestBackend.test_native_plugin_preflight_rejects_missing_resource_identifiers \
+  -v

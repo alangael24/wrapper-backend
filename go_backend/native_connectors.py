@@ -382,6 +382,26 @@ class NativeConnectorGateway:
         credentials = self._credentials(user_id, connector_id)
         return self._execute_with_credentials(definition, spec, credentials, arguments)
 
+    def validate_arguments(
+        self, connector_id: str, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        definition = NATIVE_CONNECTORS.get(connector_id)
+        spec = definition.operations.get(operation) if definition else None
+        if definition is None or spec is None:
+            raise ConnectorBrokerError(404, "Operacion first-party no encontrada", "connector_operation_not_found")
+        prepared = dict(arguments)
+        for marker in _path_markers(spec.path):
+            value = prepared.get(marker)
+            if not isinstance(value, (str, int)) or not str(value):
+                raise ConnectorBrokerError(400, f"Falta {marker}", "bad_connector_arguments")
+            if not all(char.isalnum() or char in "-_." for char in str(value)):
+                raise ConnectorBrokerError(400, f"{marker} invalido", "bad_connector_arguments")
+        try:
+            json.dumps(prepared, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ConnectorBrokerError(400, "Argumentos JSON invalidos", "bad_connector_arguments") from exc
+        return prepared
+
     def _validate_credentials(
         self, definition: NativeDefinition, credentials: dict[str, str]
     ) -> None:

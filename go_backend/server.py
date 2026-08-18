@@ -82,7 +82,6 @@ from .billing import BillingConfig, BillingError, BillingService
 from .connector_adapters import (
     ComposioConnectorAdapter,
     ComposioConnectorGateway,
-    normalize_operation_arguments,
     parse_config_mapping,
 )
 from .native_connectors import NativeConnectorGateway
@@ -4031,21 +4030,6 @@ class Backend:
         if not isinstance(arguments, dict):
             error_response(handler, 400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
             return
-        if (
-            isinstance(connector_id, str)
-            and connector_id in CONNECTOR_CATALOG
-            and isinstance(operation, str)
-            and operation in CONNECTOR_CATALOG[connector_id]["operations"]
-        ):
-            try:
-                # Reject incomplete model tool calls before creating or
-                # matching an approval for their placeholder arguments.
-                arguments = normalize_operation_arguments(
-                    connector_id, operation, arguments
-                )
-            except ConnectorBrokerError as e:
-                error_response(handler, e.status, str(e), e.code)
-                return
         try:
             action = self.connectors.approved_action(token)
             context = self.connectors.grant_context(token)
@@ -4053,12 +4037,27 @@ class Backend:
             error_response(handler, e.status, str(e), e.code)
             return
         write_is_approved = False
+        arguments_prepared = False
         if (
-            isinstance(connector_id, str)
+            not _connector_operation_is_read_only(operation)
+            and isinstance(connector_id, str)
             and isinstance(operation, str)
             and action is not None
         ):
             try:
+                # The adapter may canonicalize aliases before approval (for
+                # example ``eventId`` -> ``event_id``). Reapply that same
+                # contract before comparing the one-shot capability so an
+                # approved retry cannot miss solely because it used the
+                # original provider alias.
+                arguments = self.connectors.prepare_arguments(
+                    token,
+                    connector_id,
+                    operation,
+                    arguments,
+                    validate_provider=False,
+                )
+                arguments_prepared = True
                 write_is_approved = self.connectors.write_is_approved(
                     token,
                     connector_id,
@@ -4084,6 +4083,14 @@ class Backend:
                     handler, 400, "Operación de conector inválida", "bad_connector_operation"
                 )
                 return
+            if not arguments_prepared:
+                try:
+                    arguments = self.connectors.prepare_arguments(
+                        token, connector_id, operation, arguments
+                    )
+                except ConnectorBrokerError as e:
+                    error_response(handler, e.status, str(e), e.code)
+                    return
             if not context.get("run_id") or not context.get("bot_id"):
                 error_response(
                     handler, 409,

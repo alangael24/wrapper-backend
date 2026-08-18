@@ -313,7 +313,15 @@ class ConnectorAdapter(Protocol):
 
     def is_connected(self, user_id: str) -> bool: ...
 
+    def normalize_arguments(
+        self, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
     def execute(self, user_id: str, operation: str, arguments: dict[str, Any]) -> Any: ...
+
+    def validate_arguments(
+        self, user_id: str, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
 
 class ConnectorOperationStore(Protocol):
@@ -582,6 +590,56 @@ class ConnectorBroker:
             and action.operation == operation
             and action.arguments_hash == canonical_arguments_hash(arguments)
         )
+
+    def prepare_arguments(
+        self,
+        token: str,
+        connector_id: Any,
+        operation: Any,
+        arguments: Any,
+        *,
+        validate_provider: bool = True,
+    ) -> dict[str, Any]:
+        """Validate a write before an approval capability is created.
+
+        Provider schemas are part of the security boundary: a user must never
+        be asked to approve placeholder or malformed arguments that the
+        provider would reject only after consent.
+        """
+        grant = self._require_grant(token)
+        if not isinstance(connector_id, str) or connector_id not in CONNECTOR_CATALOG:
+            raise ConnectorBrokerError(404, "Conector desconocido", "connector_not_found")
+        if connector_id not in grant.connector_ids:
+            raise ConnectorBrokerError(403, "Conector fuera del grant de esta ejecucion", "connector_forbidden")
+        if (
+            not isinstance(operation, str)
+            or operation not in CONNECTOR_CATALOG[connector_id]["operations"]
+        ):
+            raise ConnectorBrokerError(400, "Operacion no permitida para el conector", "bad_connector_operation")
+        if not isinstance(arguments, dict):
+            raise ConnectorBrokerError(400, "arguments debe ser un objeto JSON", "bad_connector_arguments")
+        adapter = self._adapter_for(connector_id)
+        normalizer = getattr(adapter, "normalize_arguments", None)
+        prepared = normalizer(operation, arguments) if callable(normalizer) else dict(arguments)
+        if validate_provider:
+            try:
+                connected = bool(adapter.is_connected(grant.user_id))
+            except Exception as exc:
+                raise ConnectorBrokerError(502, "No se pudo consultar la conexion", "connector_adapter_error") from exc
+            if not connected:
+                raise ConnectorBrokerError(
+                    409,
+                    f"{CONNECTOR_CATALOG[connector_id]['name']} todavia no esta autenticado para este usuario",
+                    "connector_not_connected",
+                )
+            validator = getattr(adapter, "validate_arguments", None)
+            if callable(validator):
+                prepared = validator(grant.user_id, operation, prepared)
+        if not isinstance(prepared, dict):
+            raise ConnectorBrokerError(502, "El adaptador devolvio argumentos invalidos", "connector_adapter_error")
+        if len(canonical_arguments_json(prepared)) > MAX_CONNECTOR_ARGUMENTS_BYTES:
+            raise ConnectorBrokerError(413, "arguments excede 64 KiB", "connector_arguments_too_large")
+        return prepared
 
     def execute(
         self,

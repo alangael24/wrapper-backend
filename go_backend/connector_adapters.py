@@ -461,32 +461,15 @@ class ComposioConnectorGateway:
             raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
         if description.get("driver") == "native":
             return self.native_gateway.execute(user_id, connector_id, operation, arguments)  # type: ignore[union-attr]
+        normalized_arguments = _normalize_operation_arguments(
+            connector_id, operation, arguments
+        )
         session = self._session(user_id, connector_id)
         try:
-            normalized_arguments = _normalize_operation_arguments(
-                connector_id, operation, arguments
-            )
             slug, search = self._resolve_operation(session, connector_id, operation)
-            input_schema = _composio_input_schema(search, slug)
-            if input_schema:
-                try:
-                    jsonschema.validate(normalized_arguments, input_schema)
-                except jsonschema.ValidationError as exc:
-                    field = ".".join(str(item) for item in exc.absolute_path)
-                    suffix = f" en {field}" if field else ""
-                    raise ConnectorBrokerError(
-                        400,
-                        f"Argumentos inválidos para {operation}{suffix}",
-                        "bad_connector_arguments",
-                    ) from exc
-                except jsonschema.SchemaError:
-                    # A malformed provider schema is an upstream metadata
-                    # issue. Keep deterministic slug selection and let the
-                    # provider validate instead of rejecting valid calls.
-                    logging.warning(
-                        "Ignoring invalid provider schema connector=%s operation=%s tool=%s",
-                        connector_id, operation, slug,
-                    )
+            normalized_arguments = _validated_operation_arguments(
+                connector_id, operation, normalized_arguments, search, slug
+            )
             logging.info(
                 "Executing connector operation connector=%s operation=%s tool=%s",
                 connector_id,
@@ -515,6 +498,49 @@ class ComposioConnectorGateway:
             raise _upstream_error(exc, "El proveedor rechazo la operacion") from exc
         finally:
             _delete_session(session)
+
+    def validate_arguments(
+        self,
+        user_id: str,
+        connector_id: str,
+        operation: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve the current provider schema without executing the action."""
+        description = self.describe(connector_id)
+        if not description["available"]:
+            raise ConnectorBrokerError(409, description["reason"], "connector_not_configured")
+        if description.get("driver") == "native":
+            if self.native_gateway is None:
+                raise ConnectorBrokerError(409, "Conector first-party no disponible", "connector_not_configured")
+            return self.native_gateway.validate_arguments(connector_id, operation, arguments)
+        normalized_arguments = _normalize_operation_arguments(
+            connector_id, operation, arguments
+        )
+        session = self._session(user_id, connector_id)
+        try:
+            slug, search = self._resolve_operation(session, connector_id, operation)
+            return _validated_operation_arguments(
+                connector_id,
+                operation,
+                normalized_arguments,
+                search,
+                slug,
+                require_schema=True,
+            )
+        finally:
+            _delete_session(session)
+
+    def normalize_arguments(
+        self, connector_id: str, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Canonicalize aliases locally without contacting the provider."""
+        description = self.describe(connector_id)
+        if description.get("driver") == "native":
+            if self.native_gateway is None:
+                raise ConnectorBrokerError(409, "Conector first-party no disponible", "connector_not_configured")
+            return self.native_gateway.validate_arguments(connector_id, operation, arguments)
+        return _normalize_operation_arguments(connector_id, operation, arguments)
 
     def resolvable_operations(
         self, user_id: str, connector_id: str, operations: tuple[str, ...]
@@ -730,6 +756,20 @@ class ComposioConnectorAdapter:
     def execute(self, user_id: str, operation: str, arguments: dict[str, Any]) -> Any:
         return self.gateway.execute(user_id, self.connector_id, operation, arguments)
 
+    def normalize_arguments(
+        self, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.gateway.normalize_arguments(
+            self.connector_id, operation, arguments
+        )
+
+    def validate_arguments(
+        self, user_id: str, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.gateway.validate_arguments(
+            user_id, self.connector_id, operation, arguments
+        )
+
     def available_operations(
         self, user_id: str, operations: tuple[str, ...]
     ) -> tuple[str, ...]:
@@ -891,6 +931,49 @@ def _composio_input_schema(search: Any, slug: str) -> dict[str, Any] | None:
         else getattr(selected, "input_schema", None)
     )
     return schema if isinstance(schema, dict) else None
+
+
+def _validated_operation_arguments(
+    connector_id: str,
+    operation: str,
+    arguments: dict[str, Any],
+    search: Any,
+    slug: str,
+    *,
+    require_schema: bool = False,
+) -> dict[str, Any]:
+    normalized = _normalize_operation_arguments(connector_id, operation, arguments)
+    input_schema = _composio_input_schema(search, slug)
+    if input_schema is None:
+        if require_schema:
+            raise ConnectorBrokerError(
+                503,
+                "El proveedor no publicó el esquema de esta acción; no se puede autorizar con seguridad",
+                "connector_schema_unavailable",
+            )
+        return normalized
+    try:
+        jsonschema.validate(normalized, input_schema)
+    except jsonschema.ValidationError as exc:
+        field = ".".join(str(item) for item in exc.absolute_path)
+        suffix = f" en {field}" if field else ""
+        raise ConnectorBrokerError(
+            400,
+            f"Argumentos inválidos para {operation}{suffix}",
+            "bad_connector_arguments",
+        ) from exc
+    except jsonschema.SchemaError as exc:
+        if require_schema:
+            raise ConnectorBrokerError(
+                503,
+                "El proveedor publicó un esquema inválido; no se puede autorizar con seguridad",
+                "connector_schema_unavailable",
+            ) from exc
+        logging.warning(
+            "Ignoring invalid provider schema connector=%s operation=%s tool=%s",
+            connector_id, operation, slug,
+        )
+    return normalized
 
 
 def _delete_session(session: Any) -> None:
@@ -1115,20 +1198,6 @@ def _normalize_operation_arguments(
         normalized["event_duration_minutes"] = 0
     normalized.setdefault("calendar_id", "primary")
     return normalized
-
-
-def normalize_operation_arguments(
-    connector_id: str,
-    operation: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    """Validate and canonicalize arguments before side-effect approval.
-
-    Approval capabilities must bind the exact payload sent to the provider.
-    Exposing this boundary lets the broker reject incomplete writes before it
-    creates a card for a placeholder action such as an empty email.
-    """
-    return _normalize_operation_arguments(connector_id, operation, arguments)
 
 
 def _validated_select_statement(value: str) -> str:
