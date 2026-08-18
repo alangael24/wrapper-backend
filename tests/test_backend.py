@@ -23,7 +23,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -2408,6 +2408,24 @@ class TestBackend(unittest.TestCase):
             "Calendario: sin_resultados.\n\nCorreo: sin_resultados.",
         )
 
+    def test_agent_envelope_removes_honest_report_deliberation_boundary(self):
+        original = json.dumps({
+            "text": (
+                "The connector omitted its result list.\n\n"
+                "Let me be honest about what I can determine.\n\n"
+                "Let me report honestly what I found.\n\n"
+                "Correos revisados: sin_resultados\n\nEventos próximos: 0"
+            ),
+            "widget": None,
+        })
+
+        bounded = _bounded_agent_envelope(original)
+
+        self.assertEqual(
+            json.loads(bounded)["text"],
+            "Correos revisados: sin_resultados\n\nEventos próximos: 0",
+        )
+
     def test_pi_reuses_one_isolated_rpc_session_per_user_bot(self):
         signup = self.new_user()
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
@@ -4688,6 +4706,77 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(adapter.calls, [
             (user["id"], "send_email", arguments),
         ])
+        pi_run.assert_not_called()
+
+    def test_rejected_connector_action_finishes_without_reprompting_or_model_round(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        self.ws.enable_fake_pi()
+        bot_id = self.assign_bot_connectors(signup, ["google-workspace"])
+        user = self.ws.backend.store.get_user_by_api_key(signup["api_key"])
+        adapter = FakeGitHubAdapter(user["id"])
+        self.ws.backend.connectors.register_adapter("google-workspace", adapter)
+        self.ws.backend.connector_gateway.connected_connector_ids = Mock(
+            side_effect=AssertionError(
+                "connector provider must not be checked after rejection"
+            )
+        )
+        prior = self.ws.backend.store.create_unmetered_agent_run(
+            user_id=user["id"],
+            idempotency_key="rejected-direct-prior",
+            model="deepseek-v4-flash",
+            browser=False,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash="rejected-direct-prior-token",
+            token_expires_at=time.time() + 600,
+        )
+        arguments = {
+            "recipient_email": "self@example.com",
+            "subject": "No enviar",
+            "body": "Contenido",
+        }
+        approval = self.ws.backend.store.create_pending_approval(
+            user_id=user["id"],
+            bot_id=bot_id,
+            run_id=prior["run"]["id"],
+            target_type="connector",
+            connector_id="google-workspace",
+            operation="send_email",
+            arguments=arguments,
+            arguments_hash=canonical_arguments_hash(arguments),
+            human_summary="Enviar correo que será cancelado",
+        )
+
+        with patch.object(
+            self.ws.backend.pi,
+            "run",
+            side_effect=AssertionError("Pi must not run after rejection"),
+        ) as pi_run:
+            status, result = self.ws.req(
+                "POST",
+                "/v1/agent/run",
+                {
+                    "prompt": "Cancelar esta acción",
+                    "bot_id": bot_id,
+                    "connector_ids": ["google-workspace"],
+                    "execution_mode": "agent",
+                    "idempotency_key": "rejected-direct-execution",
+                    "approval": {
+                        "approval_id": approval["id"],
+                        "decision": "reject",
+                    },
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(
+            json.loads(result["answer"])["text"],
+            "Acción cancelada. No se realizó ningún cambio.",
+        )
+        self.assertEqual(result["usage"]["input_tokens"], 0)
+        self.assertEqual(adapter.calls, [])
         pi_run.assert_not_called()
 
     def test_agent_rejects_unknown_connector_before_starting_pi(self):

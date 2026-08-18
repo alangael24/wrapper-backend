@@ -792,7 +792,8 @@ def _agent_envelope_text(value: str) -> str:
 
 _VISIBLE_DELIBERATION_BOUNDARY_RE = re.compile(
     r"(?:^|\n\s*\n)\s*(?:"
-    r"let me report (?:that |this )?accordingly[.!]?|"
+    r"let me report(?: honestly)?(?: what I found| (?:the )?results?)?"
+    r"(?: (?:that |this )?accordingly)?[.!]?|"
     r"here (?:is|are) (?:the )?final (?:answer|result)s?[.:]?|"
     r"the final answer is[.:]?|"
     r"final answer[.:]?"
@@ -3521,6 +3522,7 @@ class Backend:
             return
         bot_id = bot_id.strip() if isinstance(bot_id, str) else None
         approved_action: dict[str, Any] | None = None
+        approval_rejected = False
         approval_value = body.get("approval")
         if approval_value is not None:
             if (
@@ -3560,6 +3562,7 @@ class Backend:
                         "approval_unavailable",
                     )
                     return
+                approval_rejected = True
         if (
             not isinstance(idempotency_key, str)
             or not 8 <= len(idempotency_key.strip()) <= 200
@@ -3613,7 +3616,7 @@ class Backend:
         assigned_connector_ids: tuple[str, ...] = ()
         connected_connector_ids: tuple[str, ...] = ()
         connector_ids: tuple[str, ...] = ()
-        if not direct_chat:
+        if not direct_chat and not approval_rejected:
             assigned_connector_ids = self._assigned_connector_ids(user["id"], bot_id)
             mark_pre_run("connector_assignment_complete_ms")
         # ``connector_ids`` from a client is a hint for backwards
@@ -3621,6 +3624,7 @@ class Backend:
         # assigned to this bot in server state and currently connected.
         if (
             not direct_chat
+            and not approval_rejected
             and requested_connector_ids
             and set(requested_connector_ids) != set(assigned_connector_ids)
         ):
@@ -3628,7 +3632,7 @@ class Backend:
                 "Ignoring stale connector scope user_id=%s bot_id=%s requested=%s assigned=%s",
                 user["id"], bot_id, requested_connector_ids, assigned_connector_ids,
             )
-        if not direct_chat and assigned_connector_ids:
+        if not direct_chat and not approval_rejected and assigned_connector_ids:
             try:
                 connected_connector_ids = self.connector_gateway.connected_connector_ids(
                     user["id"]
@@ -3647,7 +3651,7 @@ class Backend:
             # snapshot. Connector list/auth/disconnect endpoints already
             # reconcile UI state; doing it again on every agent turn performed
             # a second cross-region account-state read before Pi could start.
-        if not direct_chat:
+        if not direct_chat and not approval_rejected:
             connected_set = set(connected_connector_ids)
             connector_ids = tuple(
                 item for item in assigned_connector_ids if item in connected_set
@@ -3666,7 +3670,7 @@ class Backend:
             and approved_action["target_type"] == "connector"
         )
 
-        if not has_fast_routing_context and not approved_action:
+        if not has_fast_routing_context and not approved_action and not approval_rejected:
             # Backwards-compatible routing for clients that predate the
             # compact context field. It intentionally retains the older
             # connector verification order until those clients update.
@@ -3767,7 +3771,7 @@ class Backend:
             return
 
         pi_status = self.pi.status()
-        if not direct_chat and not approved_connector_execution:
+        if not direct_chat and not approved_connector_execution and not approval_rejected:
             if not pi_status["enabled"]:
                 error_response(handler, 503, "El harness de Pi esta desactivado", "pi_disabled")
                 return
@@ -3791,6 +3795,7 @@ class Backend:
         if (
             not direct_chat
             and not approved_connector_execution
+            and not approval_rejected
             and (connector_ids or computer_enabled)
             and not pi_status["connectors_available"]
         ):
@@ -3973,7 +3978,31 @@ class Backend:
             # retain the explicit transition used by the credit ledger.
             if not unlimited:
                 self.store.mark_agent_run_running(run_id)
-            if direct_chat:
+            if approval_rejected:
+                result = PiRunResult(
+                    run_id=run_id,
+                    answer=json.dumps(
+                        {
+                            "text": "Acción cancelada. No se realizó ningún cambio.",
+                            "widget": None,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    model=self.cfg.pi_model,
+                    duration_seconds=round(time.monotonic() - started_at, 3),
+                    usage={
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_read_tokens": 0,
+                        "cached_write_tokens": 0,
+                    },
+                    browser=False,
+                    event_log="",
+                    stderr_log="",
+                )
+                self._mark_run_timing(run_id, "approval_rejected_ms")
+            elif direct_chat:
                 result = self._run_direct_chat(
                     run_id=run_id,
                     user=user,
