@@ -679,10 +679,11 @@ function registerDesktopIpc(): void {
       return stateStore.update((current) => {
         const index = current.bots.findIndex((item) => item.id === botId);
         if (index < 0) throw new Error("El bot se eliminó mientras trabajaba.");
+        const replyId = initial ? botId : assistantMessageId(turnId);
         const messages = [
-          ...current.bots[index].messages,
+          ...current.bots[index].messages.filter((message) => message.id !== replyId),
           {
-            id: initial ? botId : randomUUID(),
+            id: replyId,
             role: "assistant" as const,
             text: generated.text,
             ...(generated.widget ? { widget: generated.widget } : {}),
@@ -1275,13 +1276,14 @@ async function performPendingDesktopRecovery(): Promise<void> {
       const generated = parseAgentAnswer(result.answer);
       if (!generated.text && !generated.widget) continue;
       const now = new Date().toISOString();
+      const replyId = assistantMessageId(pending.idempotencyKey);
       await stateStore.update((current) => ({
         ...current,
         bots: current.bots.map((bot) => bot.id === pending.botId
           ? {
             ...bot,
-            messages: [...bot.messages, {
-              id: randomUUID(),
+            messages: [...bot.messages.filter((message) => message.id !== replyId), {
+              id: replyId,
               role: "assistant" as const,
               text: generated.text,
               ...(generated.widget ? { widget: generated.widget } : {}),
@@ -1297,6 +1299,18 @@ async function performPendingDesktopRecovery(): Promise<void> {
       console.error(`[agent-recovery] ${errorMessage(error)}`);
     }
   }
+}
+
+function assistantMessageId(idempotencyKey: string): string {
+  const bytes = createHash("sha256")
+    .update(`agentgenia:assistant:${idempotencyKey}`)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const compact = bytes.toString("hex");
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-` +
+    `${compact.slice(16, 20)}-${compact.slice(20, 32)}`;
 }
 
 function configureAutoUpdates(): void {

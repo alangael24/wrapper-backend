@@ -79,4 +79,26 @@ class AgentResponseTest {
         assertTrue(prompt.contains("Conectores autorizables: github, slack"))
         assertTrue(prompt.endsWith("Usuario: Revisa mi trabajo"))
     }
+
+    @Test
+    fun durableRunUsesTheSameAssistantMessageIdOnEveryReplay() {
+        assertEquals("6a5b1dc6-534d-50b9-a858-dc91a382de41", assistantMessageId("turn-123"))
+        assertTrue(assistantMessageId("turn-123") != assistantMessageId("turn-124"))
+    }
+
+    @Test
+    fun duplicateAssistantReplyIsCollapsedOnlyWithinItsUserTurn() {
+        val messages = listOf(
+            BotMessage(id = "user-1", role = MessageRole.User, text = "Hola"),
+            BotMessage(id = "assistant-1", role = MessageRole.Assistant, text = "Listo"),
+            BotMessage(id = "assistant-2", role = MessageRole.Assistant, text = "Listo"),
+            BotMessage(id = "user-2", role = MessageRole.User, text = "Otra vez"),
+            BotMessage(id = "assistant-3", role = MessageRole.Assistant, text = "Listo"),
+        )
+
+        assertEquals(
+            listOf("user-1", "assistant-1", "user-2", "assistant-3"),
+            deduplicatedConversationMessages(messages).map { it.id },
+        )
+    }
 }

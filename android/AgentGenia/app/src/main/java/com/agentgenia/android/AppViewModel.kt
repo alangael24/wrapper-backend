@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.security.MessageDigest
 import java.util.UUID
 
 enum class AppPhase { Loading, SignedOut, Ready }
@@ -318,7 +319,9 @@ class AppViewModel(
             phase = AppPhase.Ready,
             account = account,
             profile = profile,
-            bots = persisted.bots,
+            bots = persisted.bots.map { bot ->
+                bot.copy(messages = deduplicatedConversationMessages(bot.messages).takeLast(200))
+            },
             selectedConnectorIds = persisted.selectedConnectorIds,
             selectedBotId = persisted.activeBotId?.takeIf { id -> persisted.bots.any { it.id == id } }
                 ?: persisted.bots.firstOrNull()?.id,
@@ -476,8 +479,9 @@ class AppViewModel(
             }
             mutateBot(botId, persistAfter = false) { bot ->
                 val now = System.currentTimeMillis()
-                bot.copy(messages = (bot.messages + BotMessage(
-                    id = if (initial) botId else UUID.randomUUID().toString(),
+                val replyId = if (initial) botId else assistantMessageId(turnId)
+                bot.copy(messages = (bot.messages.filterNot { it.id == replyId } + BotMessage(
+                    id = replyId,
                     role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
                 )).takeLast(200), updatedAt = now, conversationRevision = now)
             }
@@ -519,7 +523,8 @@ class AppViewModel(
         if (pendingRecoveryJob?.isActive == true) return
         pendingRecoveryJob = viewModelScope.launch {
             pendingRuns.toList().forEach { pending ->
-                if (_state.value.bots.none { it.id == pending.botId }) return@forEach
+                if (pending.botId in _state.value.runningBotIds ||
+                    _state.value.bots.none { it.id == pending.botId }) return@forEach
                 pendingRuns = pendingRuns.map { if (it.idempotencyKey == pending.idempotencyKey)
                     it.copy(status = "recovering", lastRecoveryAt = System.currentTimeMillis()) else it }
                 persist()
@@ -530,8 +535,10 @@ class AppViewModel(
                     if (generated.text.isBlank() && generated.widget == null) return@forEach
                     mutateBot(pending.botId, persistAfter = false) { bot ->
                         val now = System.currentTimeMillis()
+                        val replyId = assistantMessageId(pending.idempotencyKey)
                         bot.copy(
-                            messages = (bot.messages + BotMessage(
+                            messages = (bot.messages.filterNot { it.id == replyId } + BotMessage(
+                                id = replyId,
                                 role = MessageRole.Assistant, text = generated.text, widget = generated.widget,
                             )).takeLast(200),
                             updatedAt = now, conversationRevision = now,
@@ -557,7 +564,9 @@ class AppViewModel(
         deletedBotIds = snapshot.deletedBotIds.takeLast(1_000)
         pendingRuns = snapshot.pendingRuns.takeLast(100)
         val deleted = deletedBotIds.toSet()
-        val bots = snapshot.bots.filterNot { it.id in deleted }
+        val bots = snapshot.bots.filterNot { it.id in deleted }.map { bot ->
+            bot.copy(messages = deduplicatedConversationMessages(bot.messages).takeLast(200))
+        }
         _state.update { current ->
             val active = snapshot.activeBotId?.takeIf { id -> bots.any { it.id == id } }
                 ?: current.selectedBotId?.takeIf { id -> bots.any { it.id == id } }
@@ -684,6 +693,38 @@ internal fun buildRoutingContext(bot: BotProfile): String =
         "${if (message.role == MessageRole.User) "Usuario" else bot.name}: ${message.text.take(1_000)}"
     }
 
+internal fun assistantMessageId(idempotencyKey: String): String {
+    val bytes = MessageDigest.getInstance("SHA-256")
+        .digest("agentgenia:assistant:$idempotencyKey".encodeToByteArray())
+        .copyOfRange(0, 16)
+    bytes[6] = ((bytes[6].toInt() and 0x0f) or 0x50).toByte()
+    bytes[8] = ((bytes[8].toInt() and 0x3f) or 0x80).toByte()
+    val compact = bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    return "${compact.substring(0, 8)}-${compact.substring(8, 12)}-" +
+        "${compact.substring(12, 16)}-${compact.substring(16, 20)}-${compact.substring(20, 32)}"
+}
+
+internal fun deduplicatedConversationMessages(messages: List<BotMessage>): List<BotMessage> {
+    val signatures = mutableSetOf<String>()
+    return messages.filter { message ->
+        if (message.role == MessageRole.User) {
+            signatures.clear()
+            true
+        } else {
+            val widget = message.widget?.let { value ->
+                value.options.joinToString("\u001e") { option ->
+                    "${option.label}\u001f${option.value}\u001f${option.description}\u001f" +
+                        "${option.action?.approvalId.orEmpty()}\u001f${option.action?.decision.orEmpty()}"
+                }.let { options ->
+                    "${value.type}\u001f${value.approvalId.orEmpty()}\u001f${value.prompt}\u001f" +
+                        "${value.helpText}\u001f${value.allowCustom}\u001f${value.dismissOnMoveOn}\u001f$options"
+                }
+            }.orEmpty()
+            signatures.add("${message.text.trim()}\u001d$widget")
+        }
+    }
+}
+
 private fun clean(value: String, maximum: Int, fallback: String = ""): String {
     val normalized = value.replace(Regex("\\s+"), " ").trim().take(maximum)
     return normalized.ifBlank { fallback }
@@ -717,7 +758,9 @@ internal fun mergeAccountStates(
         bots[localBot.id] = profile.copy(
             connectorIds = connectors.connectorIds.distinct().sorted(),
             notificationsEnabled = notifications.notificationsEnabled,
-            messages = messages.values.sortedBy { it.createdAt }.takeLast(200),
+            messages = deduplicatedConversationMessages(
+                messages.values.sortedBy { it.createdAt }
+            ).takeLast(200),
             workflows = workflows.values.sortedBy { it.updatedAt }.takeLast(50),
             updatedAt = maxOf(localBot.updatedAt, remoteBot.updatedAt),
             profileRevision = maxOf(localBot.profileRevision, remoteBot.profileRevision),

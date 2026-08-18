@@ -55,7 +55,9 @@ final class AppModel {
     func bootstrap() async {
         guard phase == .loading else { return }
         if ProcessInfo.processInfo.arguments.contains("-ui-testing") {
-            await api.clearLocalSessionForUITesting()
+            // UI tests render a deterministic signed-out shell without
+            // deleting the real device's Keychain session. This matters when
+            // developers run the suite against a physical phone.
             phase = .signedOut
             return
         }
@@ -730,7 +732,7 @@ final class AppModel {
         }
         // All devices use the bot UUID for its single generated first reply,
         // so replaying `initial-<bot>` cannot create duplicate messages.
-        let replyID = initial ? botID : UUID()
+        let replyID = initial ? botID : assistantMessageID(idempotencyKey: turnID)
         let replyCreatedAt = Date()
         if let index = bots.firstIndex(where: { $0.id == botID }) {
             var updated = bots[index]
@@ -832,7 +834,10 @@ final class AppModel {
         isRecoveringPendingRuns = true
         defer { isRecoveringPendingRuns = false }
         for pending in pendingRuns {
-            guard phase == .ready, bots.contains(where: { $0.id == pending.botID }) else { continue }
+            guard phase == .ready,
+                  !runningBotIDs.contains(pending.botID),
+                  bots.contains(where: { $0.id == pending.botID })
+            else { continue }
             if let index = pendingRuns.firstIndex(where: { $0.idempotencyKey == pending.idempotencyKey }) {
                 pendingRuns[index].status = "recovering"
                 pendingRuns[index].lastRecoveryAt = Date()
@@ -844,17 +849,14 @@ final class AppModel {
                 guard let response = try await api.recoverAgentRun(idempotencyKey: pending.idempotencyKey) else { continue }
                 let generated = parseAgentAnswer(response.answer)
                 guard !generated.text.isEmpty || generated.widget != nil else { continue }
-                let now = Date()
-                guard let index = bots.firstIndex(where: { $0.id == pending.botID }) else { continue }
-                var bot = bots[index]
-                bot.messages.append(BotMessage(
-                    id: UUID(), role: .assistant, text: generated.text,
-                    widget: generated.widget, createdAt: now
-                ))
-                bot.messages = Array(bot.messages.suffix(200))
-                bot.updatedAt = now
-                bot.conversationRevision = now
-                bots[index] = bot
+                guard installAgentReply(
+                    in: &bots,
+                    botID: pending.botID,
+                    messageID: assistantMessageID(idempotencyKey: pending.idempotencyKey),
+                    text: generated.text,
+                    widget: generated.widget,
+                    createdAt: pending.submittedAt
+                ) else { continue }
                 pendingRuns.removeAll { $0.idempotencyKey == pending.idempotencyKey }
                 await persistLocalState(dirty: true)
                 schedulePersist()
@@ -958,7 +960,11 @@ final class AppModel {
         deletedBotIDs = Array(state.deletedBotIDs.suffix(1_000))
         pendingRuns = Array(state.pendingRuns.suffix(100))
         let deleted = Set(deletedBotIDs)
-        bots = state.bots.filter { !deleted.contains($0.id) }
+        bots = state.bots.filter { !deleted.contains($0.id) }.map { bot in
+            var normalized = bot
+            normalized.messages = Array(deduplicatedConversationMessages(bot.messages).suffix(200))
+            return normalized
+        }
         selectedConnectorIDs = state.selectedConnectorIDs
         if let active = state.activeBotID, bots.contains(where: { $0.id == active }) {
             destination = .bot(active)
@@ -1015,8 +1021,10 @@ private actor AccountStateStore {
             )
         }
         var state = cache.state
-        for index in state.bots.indices where state.bots[index].messages.count > 200 {
-            state.bots[index].messages = Array(state.bots[index].messages.suffix(200))
+        for index in state.bots.indices {
+            state.bots[index].messages = Array(
+                deduplicatedConversationMessages(state.bots[index].messages).suffix(200)
+            )
         }
         return CachedAccountState(
             state: state,
@@ -1064,6 +1072,54 @@ private actor AccountStateStore {
 /// label; `/v1/agent/run` remains the sole access-control authority.
 func shouldSendInitialBotMessage(tier _: String?, bot: BotProfile?) -> Bool {
     bot?.messages.isEmpty == true
+}
+
+/// The same durable run must map to the same assistant message on every
+/// device. Otherwise normal completion and crash recovery can both be merged
+/// as different messages even though the backend executed the turn once.
+func assistantMessageID(idempotencyKey: String) -> UUID {
+    var bytes = Array(SHA256.hash(
+        data: Data("agentgenia:assistant:\(idempotencyKey)".utf8)
+    ).prefix(16))
+    bytes[6] = (bytes[6] & 0x0f) | 0x50
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+    let compact = bytes.map { String(format: "%02x", $0) }.joined()
+    let first = String(compact.prefix(8))
+    let second = String(compact.dropFirst(8).prefix(4))
+    let third = String(compact.dropFirst(12).prefix(4))
+    let fourth = String(compact.dropFirst(16).prefix(4))
+    let fifth = String(compact.dropFirst(20).prefix(12))
+    let value = "\(first)-\(second)-\(third)-\(fourth)-\(fifth)"
+    return UUID(uuidString: value)!
+}
+
+/// Remove only byte-for-byte-equivalent assistant replies produced for the
+/// same preceding user turn. Repeated answers in separate user turns remain.
+func deduplicatedConversationMessages(_ messages: [BotMessage]) -> [BotMessage] {
+    var signatures = Set<String>()
+    var output: [BotMessage] = []
+    for message in messages {
+        if message.role == .user {
+            signatures.removeAll(keepingCapacity: true)
+            output.append(message)
+            continue
+        }
+        let widgetSignature = message.widget.map { widget in
+            let options = widget.options.map { option in
+                "\(option.label)\u{1f}\(option.value)\u{1f}\(option.description)\u{1f}" +
+                    "\(option.action?.approvalID ?? "")\u{1f}\(option.action?.decision ?? "")"
+            }.joined(separator: "\u{1e}")
+            return "\(widget.type ?? "")\u{1f}\(widget.approvalID ?? "")\u{1f}" +
+                "\(widget.prompt)\u{1f}\(widget.helpText)\u{1f}\(widget.allowCustom)\u{1f}" +
+                "\(widget.dismissOnMoveOn)\u{1f}\(options)"
+        } ?? ""
+        let signature = message.text.trimmingCharacters(in: .whitespacesAndNewlines) +
+            "\u{1d}" + widgetSignature
+        if signatures.insert(signature).inserted {
+            output.append(message)
+        }
+    }
+    return output
 }
 
 /// Installs a completed answer even if account-state reconciliation replaced
@@ -1137,7 +1193,9 @@ private func mergeAccountStates(
         var merged = profile
         merged.connectorIDs = Array(Set(connectors.connectorIDs)).sorted()
         merged.notificationsEnabled = notifications.notificationsEnabled
-        merged.messages = Array(messages.values.sorted { $0.createdAt < $1.createdAt }.suffix(200))
+        merged.messages = Array(deduplicatedConversationMessages(
+            messages.values.sorted { $0.createdAt < $1.createdAt }
+        ).suffix(200))
         merged.workflows = Array(workflows.values.sorted { $0.updatedAt < $1.updatedAt }.suffix(50))
         merged.updatedAt = max(localBot.updatedAt, serverBot.updatedAt)
         merged.profileRevision = max(localBot.profileRevision, serverBot.profileRevision)

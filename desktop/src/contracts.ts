@@ -587,7 +587,7 @@ function cleanProfileText(value: unknown, limit: number): string {
 
 function normalizeBotMessages(value: unknown): BotMessage[] {
   if (!Array.isArray(value)) return [];
-  return value.slice(-200).flatMap((item): BotMessage[] => {
+  const messages = value.slice(-200).flatMap((item): BotMessage[] => {
     if (!isRecord(item) || (item.role !== "user" && item.role !== "assistant")) return [];
     const text = cleanProfileText(item.text, 20_000);
     const widget = item.role === "assistant" ? normalizeQuestionWidget(item.widget) : undefined;
@@ -602,6 +602,17 @@ function normalizeBotMessages(value: unknown): BotMessage[] {
       ...(widget ? { widget } : {}),
       createdAt
     }];
+  });
+  const signatures = new Set<string>();
+  return messages.filter((message) => {
+    if (message.role === "user") {
+      signatures.clear();
+      return true;
+    }
+    const signature = `${message.text.trim()}\u001d${JSON.stringify(message.widget ?? null)}`;
+    if (signatures.has(signature)) return false;
+    signatures.add(signature);
+    return true;
   });
 }
 

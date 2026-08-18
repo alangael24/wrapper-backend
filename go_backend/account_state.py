@@ -175,6 +175,7 @@ def _messages(value: Any, *, bot_id: str) -> list[dict[str, Any]]:
     if len(value) > 200:
         raise AccountStateError("bot.messages admite como máximo 200 elementos")
     result = []
+    assistant_signatures: set[str] = set()
     for item in value:
         if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
             continue
@@ -199,6 +200,22 @@ def _messages(value: Any, *, bot_id: str) -> list[dict[str, Any]]:
         }
         if widget:
             message["widget"] = widget
+        if item["role"] == "user":
+            assistant_signatures.clear()
+        else:
+            # A durable run can be observed through normal completion and
+            # recovery at nearly the same time. Older clients assigned a new
+            # message UUID in each path, so ID-only synchronization retained
+            # the same answer twice. Collapse only exact assistant duplicates
+            # for the same preceding user turn; repeated answers after a new
+            # user message remain legitimate conversation.
+            signature = json.dumps(
+                [text, widget], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            if signature in assistant_signatures:
+                continue
+            assistant_signatures.add(signature)
         result.append(message)
     return result
 

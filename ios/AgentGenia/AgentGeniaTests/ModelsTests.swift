@@ -118,6 +118,33 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(bots[0].messages[0].createdAt, createdAt)
     }
 
+    func testDurableRunUsesTheSameAssistantMessageIDOnEveryReplay() {
+        XCTAssertEqual(
+            assistantMessageID(idempotencyKey: "turn-123").uuidString.lowercased(),
+            "6a5b1dc6-534d-50b9-a858-dc91a382de41"
+        )
+        XCTAssertNotEqual(
+            assistantMessageID(idempotencyKey: "turn-123"),
+            assistantMessageID(idempotencyKey: "turn-124")
+        )
+    }
+
+    func testDuplicateAssistantReplyIsCollapsedOnlyWithinItsUserTurn() {
+        let firstUser = BotMessage(id: UUID(), role: .user, text: "Hola", widget: nil, createdAt: Date())
+        let firstReply = BotMessage(id: UUID(), role: .assistant, text: "Listo", widget: nil, createdAt: Date())
+        let duplicateReply = BotMessage(id: UUID(), role: .assistant, text: "Listo", widget: nil, createdAt: Date())
+        let secondUser = BotMessage(id: UUID(), role: .user, text: "Otra vez", widget: nil, createdAt: Date())
+        let legitimateRepeat = BotMessage(id: UUID(), role: .assistant, text: "Listo", widget: nil, createdAt: Date())
+
+        let messages = deduplicatedConversationMessages([
+            firstUser, firstReply, duplicateReply, secondUser, legitimateRepeat
+        ])
+
+        XCTAssertEqual(messages.map(\.id), [
+            firstUser.id, firstReply.id, secondUser.id, legitimateRepeat.id
+        ])
+    }
+
     func testAgentEnvelopeIsRecoveredFromSurroundingModelText() throws {
         let generated = parseAgentAnswer("""
         Aquí está la pregunta:

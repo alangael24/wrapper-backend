@@ -89,6 +89,30 @@ test("normalizes connector selection and persisted bot state", () => {
   assert.equal(state.activeBotId, "bot-1");
 });
 
+test("collapses a duplicate assistant completion only within the same user turn", () => {
+  const normalized = contracts.normalizeAppState({
+    bots: [{
+      id: "bot-duplicates",
+      name: "Asistente",
+      color: "#2f91f5",
+      shape: "circle",
+      createdAt: "2026-08-17T00:00:00.000Z",
+      messages: [
+        { id: "user-1", role: "user", text: "Hola", createdAt: "2026-08-17T00:00:01.000Z" },
+        { id: "assistant-1", role: "assistant", text: "Listo", createdAt: "2026-08-17T00:00:02.000Z" },
+        { id: "assistant-2", role: "assistant", text: "Listo", createdAt: "2026-08-17T00:00:03.000Z" },
+        { id: "user-2", role: "user", text: "Otra vez", createdAt: "2026-08-17T00:00:04.000Z" },
+        { id: "assistant-3", role: "assistant", text: "Listo", createdAt: "2026-08-17T00:00:05.000Z" }
+      ]
+    }]
+  });
+
+  assert.deepEqual(
+    normalized.bots[0].messages.map((message) => message.id),
+    ["user-1", "assistant-1", "user-2", "assistant-3"]
+  );
+});
+
 test("normalizes learned workflows inside the account-scoped bot state", () => {
   const workflow = contracts.createBotWorkflow({
     title: "  Publicar   reporte  ",

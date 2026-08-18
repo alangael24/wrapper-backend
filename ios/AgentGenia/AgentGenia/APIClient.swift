@@ -398,13 +398,6 @@ actor APIClient {
         UserDefaults.standard.removeObject(forKey: Self.deviceIDKey)
     }
 
-    func clearLocalSessionForUITesting() {
-        refreshTask?.cancel()
-        refreshTask = nil
-        session = nil
-        try? keychain.clear()
-    }
-
     func me() async throws -> AccountProfile {
         try await request("/v1/me", body: Optional<EmptyBody>.none)
     }

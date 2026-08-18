@@ -1039,6 +1039,68 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(invalid["error"]["type"], "invalid_account_state")
 
+    def test_account_state_collapses_duplicate_completion_only_within_one_turn(self):
+        signup = self.new_user(tier="free")
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        bot_id = str(uuid.uuid4())
+        messages = [
+            {
+                "id": str(uuid.uuid4()), "role": "user", "text": "Hola",
+                "createdAt": "2026-08-17T12:00:00Z",
+            },
+            {
+                "id": str(uuid.uuid4()), "role": "assistant", "text": "Listo",
+                "createdAt": "2026-08-17T12:00:01Z",
+            },
+            {
+                "id": str(uuid.uuid4()), "role": "assistant", "text": "Listo",
+                "createdAt": "2026-08-17T12:00:02Z",
+            },
+            {
+                "id": str(uuid.uuid4()), "role": "user", "text": "Otra vez",
+                "createdAt": "2026-08-17T12:00:03Z",
+            },
+            {
+                "id": str(uuid.uuid4()), "role": "assistant", "text": "Listo",
+                "createdAt": "2026-08-17T12:00:04Z",
+            },
+        ]
+        state = {
+            "version": 2,
+            "onboardingCompleted": True,
+            "selectedConnectorIds": [],
+            "activeBotId": bot_id,
+            "bots": [{
+                "id": bot_id,
+                "name": "Asistente",
+                "color": "#2f91f5",
+                "shape": "circle",
+                "connectorIds": [],
+                "messages": messages,
+                "workflows": [],
+                "createdAt": "2026-08-17T12:00:00Z",
+                "updatedAt": "2026-08-17T12:00:04Z",
+            }],
+        }
+
+        status, saved = self.ws.req(
+            "POST", "/v1/account-state",
+            {
+                "base_revision": 0,
+                "device_id": str(uuid.uuid4()),
+                "state": state,
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(status, 200)
+        saved_messages = saved["state"]["bots"][0]["messages"]
+        self.assertEqual(
+            [(message["role"], message["text"]) for message in saved_messages],
+            [("user", "Hola"), ("assistant", "Listo"),
+             ("user", "Otra vez"), ("assistant", "Listo")],
+        )
+
     def test_server_tombstone_rejects_a_bot_resurrected_by_stale_device(self):
         signup = self.new_user(tier="free")
         headers = {"Authorization": f"Bearer {signup['api_key']}"}
