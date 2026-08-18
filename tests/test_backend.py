@@ -47,6 +47,7 @@ from go_backend.connectors import (  # noqa: E402
 from go_backend.connector_adapters import (  # noqa: E402
     ComposioConnectorAdapter,
     ComposioConnectorGateway,
+    _compact_connector_result,
 )
 from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
@@ -3490,6 +3491,56 @@ class TestBackend(unittest.TestCase):
                 "verbose": False,
             },
         )])
+
+    def test_google_collection_results_drop_wire_noise_but_keep_actionable_ids(self):
+        huge_body = "contenido privado " * 4_000
+        email = _compact_connector_result(
+            "google-workspace",
+            "search_email",
+            {
+                "messages": [{
+                    "id": "msg_123",
+                    "threadId": "thread_456",
+                    "snippet": "Oferta de entrenamiento CDL",
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": "Entrenamiento CDL pagado"},
+                            {"name": "From", "value": "Recruiting <jobs@example.com>"},
+                        ],
+                        "body": {"data": huge_body},
+                        "parts": [{"body": {"data": huge_body}}],
+                    },
+                    "raw": huge_body,
+                }],
+                "nextPageToken": "page_2",
+            },
+        )
+        serialized_email = json.dumps(email, ensure_ascii=False)
+        self.assertIn("msg_123", serialized_email)
+        self.assertIn("thread_456", serialized_email)
+        self.assertIn("Entrenamiento CDL pagado", serialized_email)
+        self.assertIn("jobs@example.com", serialized_email)
+        self.assertIn("page_2", serialized_email)
+        self.assertNotIn("contenido privado", serialized_email)
+        self.assertLess(len(serialized_email), 2_000)
+
+        calendar = _compact_connector_result(
+            "google-workspace",
+            "list_calendar_events",
+            {"items": [{
+                "id": "evt_123",
+                "summary": "Reunión de ventas",
+                "start": {"dateTime": "2026-08-25T14:00:00-06:00"},
+                "end": {"dateTime": "2026-08-25T15:00:00-06:00"},
+                "description": "d" * 5_000,
+                "conferenceData": {"entryPoints": [{"uri": "https://meet.example"}]},
+            }]},
+        )
+        serialized_calendar = json.dumps(calendar, ensure_ascii=False)
+        self.assertIn("evt_123", serialized_calendar)
+        self.assertIn("Reunión de ventas", serialized_calendar)
+        self.assertIn("2026-08-25T14:00:00-06:00", serialized_calendar)
+        self.assertLess(len(serialized_calendar), 2_000)
 
     def test_google_sheet_read_uses_exact_id_range_without_tool_search(self):
         client = FakeComposioClient()

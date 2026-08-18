@@ -521,7 +521,11 @@ class ComposioConnectorGateway:
                     "El proveedor rechazo la operacion",
                     "connector_upstream_error",
                 )
-            return _json_value(getattr(result, "data", result))
+            return _compact_connector_result(
+                connector_id,
+                operation,
+                _json_value(getattr(result, "data", result)),
+            )
         except ConnectorBrokerError:
             raise
         except Exception as exc:
@@ -1074,6 +1078,130 @@ def _requires_connect_link(exc: Exception) -> bool:
         return True
     message = str(exc).lower()
     return "no longer supported" in message and "connected_accounts/link" in message
+
+
+_LEAN_COLLECTION_FIELDS: dict[str, set[str]] = {
+    "search_email": {
+        "id", "messageid", "threadid", "subject", "from", "sender", "to",
+        "date", "timestamp", "internaldate", "snippet", "labelids", "labels",
+        "historyid", "messages", "threads", "items", "results", "data",
+        "nextpagetoken", "resultsizeestimate", "count", "total", "success",
+    },
+    "list_calendar_events": {
+        "id", "eventid", "calendarid", "status", "summary", "title",
+        "description", "location", "htmllink", "hangoutlink", "start", "end",
+        "organizer", "creator", "attendees", "recurrence", "eventtype",
+        "items", "events", "results", "data", "nextpagetoken", "count",
+        "total", "success",
+    },
+    "search_drive": {
+        "id", "fileid", "name", "title", "mimetype", "modifiedtime",
+        "createdtime", "webviewlink", "webcontentlink", "owners", "parents",
+        "size", "items", "files", "results", "data", "nextpagetoken",
+        "count", "total", "success",
+    },
+    "list_contacts": {
+        "id", "resourceName", "name", "names", "displayname", "email",
+        "emails", "emailaddresses", "phone", "phones", "phonenumbers",
+        "organization", "organizations", "items", "contacts", "people",
+        "results", "data", "nextpagetoken", "count", "total", "success",
+    },
+}
+
+
+def _compact_connector_result(
+    connector_id: str, operation: str, value: Any
+) -> Any:
+    """Keep actionable collection metadata while dropping provider wire noise.
+
+    Search/list tools frequently return MIME bodies, repeated HTTP headers and
+    raw SDK envelopes even when the caller requested metadata. Feeding those
+    fields into the model slows the summarization round and can expose content
+    the user did not ask to read. Point reads intentionally remain untouched.
+    """
+    if connector_id != "google-workspace" or operation not in _LEAN_COLLECTION_FIELDS:
+        return value
+    allowed = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in _LEAN_COLLECTION_FIELDS[operation]}
+    heavy = {
+        "raw", "rawdata", "rawpayload", "payload", "parts", "body", "bodies",
+        "content", "html", "htmlbody", "textbody", "decodedbody", "attachments",
+        "attachmentdata", "mime", "mimeraw", "responseheaders", "requestheaders",
+    }
+
+    def normalized_key(key: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+    def selected_headers(candidate: Any) -> dict[str, str]:
+        if not isinstance(candidate, list):
+            return {}
+        selected: dict[str, str] = {}
+        header_names = {
+            "subject": "subject",
+            "from": "from",
+            "to": "to",
+            "date": "date",
+            "messageid": "message_id_header",
+        }
+        for item in candidate:
+            if not isinstance(item, dict):
+                continue
+            name = normalized_key(item.get("name"))
+            output_name = header_names.get(name)
+            raw_value = item.get("value")
+            if output_name and isinstance(raw_value, str) and raw_value:
+                selected[output_name] = raw_value[:512]
+        return selected
+
+    collection_wrappers = {
+        "items", "events", "messages", "threads", "files", "contacts", "people",
+        "results", "data",
+    }
+
+    def walk(candidate: Any, depth: int = 0, preserve_scalars: bool = False) -> Any:
+        if depth > 8:
+            return None
+        if isinstance(candidate, str):
+            return candidate if len(candidate) <= 512 else candidate[:509] + "..."
+        if candidate is None or isinstance(candidate, (bool, int, float)):
+            return candidate
+        if isinstance(candidate, list):
+            return [
+                compacted
+                for item in candidate[:10]
+                if (compacted := walk(item, depth + 1, preserve_scalars)) is not None
+            ]
+        if not isinstance(candidate, dict):
+            return str(candidate)[:512]
+
+        compacted: dict[str, Any] = {}
+        if operation == "search_email":
+            compacted.update(selected_headers(candidate.get("headers")))
+            payload = candidate.get("payload")
+            if isinstance(payload, dict):
+                compacted.update(selected_headers(payload.get("headers")))
+        for key, item in candidate.items():
+            normalized = normalized_key(key)
+            if normalized == "headers" or normalized in heavy:
+                continue
+            if (
+                not preserve_scalars
+                and normalized not in allowed
+                and not isinstance(item, (dict, list))
+            ):
+                continue
+            child = walk(
+                item,
+                depth + 1,
+                preserve_scalars=(
+                    preserve_scalars
+                    or (normalized in allowed and normalized not in collection_wrappers)
+                ),
+            )
+            if child not in (None, {}, []):
+                compacted[str(key)] = child
+        return compacted
+
+    return walk(value)
 
 
 def _normalize_operation_arguments(
