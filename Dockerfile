@@ -40,6 +40,7 @@ RUN /usr/sbin/update-ca-certificates
 
 WORKDIR /app
 COPY requirements.txt package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
     && pnpm install --prod --frozen-lockfile
 
