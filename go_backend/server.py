@@ -2673,6 +2673,25 @@ class Backend:
 
         if account_state_snapshot is not None:
             snapshot = self._account_state_payload(account_state_snapshot)
+            fast_append = getattr(
+                self.store, "append_account_state_messages", None
+            )
+            if callable(fast_append):
+                try:
+                    fast_append(
+                        user_id=user_id,
+                        bot_id=bot_id,
+                        messages=messages,
+                        base_revision=snapshot["revision"],
+                        device_hash=hashlib.sha256(
+                            b"account-state-device|whatsapp-channel"
+                        ).hexdigest(),
+                    )
+                    return
+                except AccountStateConflict:
+                    # Preserve changes made by desktop/mobile while the model
+                    # was running by falling through to the existing merge.
+                    pass
             next_state = normalize_account_state(
                 append(json.loads(json.dumps(snapshot["state"])))
             )

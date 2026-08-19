@@ -164,6 +164,40 @@ class PostgresStoreConfigurationTests(unittest.TestCase):
         self.assertIn("LEFT JOIN account_states", captured["sql"])
         self.assertEqual(captured["params"], ("15557654321", "123456789012345"))
 
+    def test_whatsapp_history_append_is_one_atomic_database_call(self):
+        store = PostgresStore.__new__(PostgresStore)
+        captured = {}
+
+        def one(sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return {
+                "user_id": "usr_test",
+                "revision": 8,
+                "state_json": '{"bots":[]}',
+                "created_at": 10.0,
+                "updated_at": 20.0,
+            }
+
+        store._one = one
+        saved = store.append_account_state_messages(
+            user_id="usr_test",
+            bot_id="bot_test",
+            messages=[
+                {"id": "message_user", "role": "user", "text": "hola"},
+                {"id": "message_agent", "role": "assistant", "text": "listo"},
+            ],
+            base_revision=7,
+            device_hash="device-hash",
+        )
+
+        self.assertEqual(saved["revision"], 8)
+        self.assertIn("UPDATE account_states", captured["sql"])
+        self.assertIn("WITH ORDINALITY", captured["sql"])
+        self.assertIn("LIMIT 200", captured["sql"])
+        self.assertIn("existing.value->>'id'=incoming.value->>'id'", captured["sql"])
+        self.assertEqual(captured["sql"].count("?"), len(captured["params"]))
+
     def test_unmetered_run_is_settled_in_one_statement(self):
         store = PostgresStore.__new__(PostgresStore)
         captured = {}

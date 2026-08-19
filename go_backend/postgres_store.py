@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .store import (
+    AccountStateConflict,
     SCHEMA_VERSION,
     Store,
     _hash_account_token,
@@ -394,6 +395,78 @@ class PostgresStore(Store):
             "user": decoded(row.get("user_json")),
             "account_state": account_state,
         }
+
+    def append_account_state_messages(
+        self,
+        *,
+        user_id: str,
+        bot_id: str,
+        messages: list[dict],
+        base_revision: int,
+        device_hash: str,
+    ) -> dict:
+        """Append one turn to a bot with one cross-region Postgres call.
+
+        The generic account-state writer intentionally validates tombstones and
+        arbitrary client edits. WhatsApp only appends two already-normalized
+        messages to an existing bot, so rewriting the complete 100+ KB account
+        snapshot through several SQL round trips is unnecessary. This update
+        retains optimistic concurrency, message-id deduplication, ordering and
+        the product's 200-message cap.
+        """
+        now = time.time()
+        messages_json = json.dumps(
+            messages, separators=(",", ":"), ensure_ascii=False
+        )
+        row = self._one(
+            "UPDATE account_states ast SET state_json=("
+            " jsonb_set(jsonb_set(ast.state_json::jsonb,'{bots}',("
+            "  SELECT COALESCE(jsonb_agg(CASE WHEN bot->>'id'=? THEN "
+            "   jsonb_set(bot,'{messages}',("
+            "    SELECT COALESCE(jsonb_agg(recent.value ORDER BY recent.ord),'[]'::jsonb) FROM ("
+            "     SELECT combined.value,combined.ord FROM jsonb_array_elements("
+            "      COALESCE(bot->'messages','[]'::jsonb)||COALESCE(("
+            "       SELECT jsonb_agg(incoming.value) FROM jsonb_array_elements(?::jsonb) incoming(value)"
+            "       WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements("
+            "        COALESCE(bot->'messages','[]'::jsonb)) existing(value)"
+            "        WHERE existing.value->>'id'=incoming.value->>'id')"
+            "      ),'[]'::jsonb)"
+            "     ) WITH ORDINALITY combined(value,ord)"
+            "     ORDER BY combined.ord DESC LIMIT 200"
+            "    ) recent"
+            "   ),true) ELSE bot END ORDER BY ordinal),'[]'::jsonb)"
+            "  FROM jsonb_array_elements(COALESCE(ast.state_json::jsonb->'bots','[]'::jsonb))"
+            "  WITH ORDINALITY listed(bot,ordinal)"
+            " ),false),'{activeBotId}',to_jsonb(?::text),true)"
+            ")::text,revision=ast.revision+1,updated_by_device_hash=?,updated_at=? "
+            "WHERE ast.user_id=? AND ast.revision=? AND EXISTS ("
+            " SELECT 1 FROM jsonb_array_elements(COALESCE(ast.state_json::jsonb->'bots','[]'::jsonb)) item"
+            " WHERE item->>'id'=?) "
+            "RETURNING user_id,revision,state_json,created_at,updated_at",
+            (
+                bot_id,
+                messages_json,
+                bot_id,
+                device_hash,
+                now,
+                user_id,
+                base_revision,
+                bot_id,
+            ),
+        )
+        if row is not None:
+            return dict(row)
+
+        current = self.get_account_state(user_id)
+        if current is None or int(current.get("revision") or 0) != base_revision:
+            raise AccountStateConflict(current or {
+                "user_id": user_id,
+                "revision": 0,
+                "state_json": "",
+                "created_at": now,
+                "updated_at": now,
+            })
+        raise RuntimeError("El agente de WhatsApp ya no existe")
 
     def create_agent_run(
         self,
