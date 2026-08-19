@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import http.client
+import httpx
 import os
 import re
 import sqlite3
@@ -53,6 +54,7 @@ from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
 from go_backend.pi_harness import RUNTIME_AUTH_EXTENSION  # noqa: E402
 from go_backend.store import Store, new_id  # noqa: E402
+from go_backend.upstream import Usage  # noqa: E402
 from go_backend.whatsapp import (  # noqa: E402
     WhatsAppCloudAPI,
     WhatsAppConfig,
@@ -2897,6 +2899,49 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(len(upstream), 2)
         self.assertTrue(json.loads(upstream[0][3])["stream"])
         self.assertFalse(json.loads(upstream[1][3])["stream"])
+
+    def test_nonstreaming_opencode_direct_chat_retries_silent_tail(self):
+        backend = self.ws.backend
+        run_id = "run_tail_retry"
+        backend._start_run_timing(run_id, time.monotonic())
+        calls = []
+
+        def slow_then_fast(*_args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("silent upstream")
+            kwargs["on_headers"](200, {"content-type": "text/event-stream"})
+            kwargs["on_chunk"](
+                b'data: {"choices":[{"delta":{"content":"hola"},"finish_reason":"stop"}]}\n\n'
+            )
+            return 200, {"content-type": "text/event-stream"}, None, Usage(
+                model="deepseek-v4-flash", input_tokens=10, output_tokens=2
+            )
+
+        with (
+            patch("go_backend.server.proxy_request", side_effect=slow_then_fast),
+            patch.object(backend, "record"),
+        ):
+            result = backend._run_direct_chat(
+                run_id=run_id,
+                user={"id": "usr_tail"},
+                provider={
+                    "name": "opencode",
+                    "base_url": "https://example.invalid",
+                    "api_key": "secret",
+                    "subscription_id": "sub_tail",
+                },
+                prompt="responde hola",
+                event_stream=None,
+            )
+
+        self.assertEqual(result.answer, "hola")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["raise_on_timeout"])
+        self.assertEqual(calls[0]["timeout"].read, 4.0)
+        self.assertFalse(calls[1]["raise_on_timeout"])
+        timing = backend._run_timing_snapshot(run_id, pop=True)
+        self.assertIn("upstream_tail_retry_ms", timing)
 
     def test_direct_chat_repairs_partial_structured_envelope(self):
         signup = self.new_user()

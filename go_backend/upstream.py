@@ -153,6 +153,7 @@ def proxy_request(
     on_chunk=None,
     on_headers=None,
     timeout: httpx.Timeout | float | None = None,
+    raise_on_timeout: bool = False,
 ) -> tuple[int, dict, bytes | None, Usage]:
     """Hace la request al upstream.
 
@@ -174,6 +175,13 @@ def proxy_request(
             timeout=timeout,
         )
         resp = response_context.__enter__()
+    except httpx.TimeoutException:
+        if raise_on_timeout:
+            raise
+        logging.warning("Upstream timeout", exc_info=True)
+        return 502, {"content-type": "application/json"}, json.dumps(
+            {"error": {"message": "Upstream timeout", "type": "upstream_error"}}
+        ).encode(), Usage()
     except httpx.HTTPError:
         logging.warning("Upstream no disponible", exc_info=True)
         return 502, {"content-type": "application/json"}, json.dumps(

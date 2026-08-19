@@ -3790,25 +3790,54 @@ class Backend:
 
         self._mark_run_timing(run_id, "direct_dispatch_ms")
         self._mark_run_timing(run_id, "upstream_request_ms")
-        status, _headers, response_body, usage = proxy_request(
-            "POST",
-            provider["base_url"],
-            "/chat/completions",
-            {
-                "content-type": "application/json",
-                "accept": "text/event-stream",
-                "stream": "true",
-                "user-agent": DEFAULT_UA,
-            },
-            request_body,
-            provider["api_key"],
-            on_chunk=on_chunk,
-            on_headers=on_headers,
-            # Conversation should fail recoverably instead of leaving a
-            # durable run in `running` for the global 15-minute tool timeout.
-            # Full Pi/computer work retains its longer execution budget.
-            timeout=httpx.Timeout(60.0, connect=20.0),
-        )
+        request_headers = {
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "stream": "true",
+            "user-agent": DEFAULT_UA,
+        }
+
+        def request_stream(*, tail_guard: bool):
+            return proxy_request(
+                "POST",
+                provider["base_url"],
+                "/chat/completions",
+                request_headers,
+                request_body,
+                provider["api_key"],
+                on_chunk=on_chunk,
+                on_headers=on_headers,
+                # OpenCode occasionally accepts a request and then leaves a
+                # short direct chat waiting 10-16 seconds for its first SSE
+                # frame. WhatsApp has not exposed partial output at this point,
+                # so retrying once after four silent seconds is safe and much
+                # cheaper than making every request speculative. Streaming app
+                # clients keep the normal timeout because they may already have
+                # rendered a partial answer.
+                timeout=(
+                    httpx.Timeout(60.0, connect=20.0, read=4.0)
+                    if tail_guard
+                    else httpx.Timeout(60.0, connect=20.0)
+                ),
+                raise_on_timeout=tail_guard,
+            )
+
+        tail_guard = event_stream is None and provider.get("name") == "opencode"
+        try:
+            status, _headers, response_body, usage = request_stream(
+                tail_guard=tail_guard
+            )
+        except httpx.TimeoutException:
+            # No output was exposed to this non-streaming client. Discard any
+            # internal partial frame and retry once on a fresh pooled request.
+            answer_parts.clear()
+            pending = ""
+            finish_reason = ""
+            self._mark_run_timing(run_id, "upstream_tail_retry_ms")
+            logging.info("Retrying slow OpenCode direct chat run_id=%s", run_id)
+            status, _headers, response_body, usage = request_stream(
+                tail_guard=False
+            )
         if pending.strip():
             process_line(pending)
         self._mark_run_timing(run_id, "upstream_complete_ms")
