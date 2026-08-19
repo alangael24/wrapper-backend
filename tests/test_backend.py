@@ -52,6 +52,7 @@ from go_backend.connector_adapters import (  # noqa: E402
     _compact_connector_result,
 )
 from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
+from go_backend.postgres_store import PostgresStore  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
 from go_backend.pi_harness import RUNTIME_AUTH_EXTENSION  # noqa: E402
 from go_backend.store import Store, new_id  # noqa: E402
@@ -1049,6 +1050,99 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(len(outcomes), 12)
         self.assertTrue(all(status == 200 for status, _ in outcomes))
         self.assertEqual(sum(body["accepted"] for _, body in outcomes), 1)
+
+    def test_whatsapp_webhook_hands_a_preclaimed_lease_to_the_worker(self):
+        config, _sent = self.configure_fake_whatsapp()
+        claimed = {
+            "message_id": "wamid.preclaimed",
+            "phone_number_id": config.phone_number_id,
+            "wa_user_id": "15557654321",
+            "message_type": "text",
+            "text": "hola",
+            "payload_json": "{}",
+            "status": "processing",
+            "attempts": 1,
+        }
+        calls: list[list[dict]] = []
+
+        def enqueue_and_claim(messages):
+            calls.append(messages)
+            return 1, claimed
+
+        self.ws.backend.store.enqueue_and_claim_whatsapp_messages = enqueue_and_claim
+        self.ws.backend.store.claim_whatsapp_message = Mock(
+            side_effect=AssertionError("preclaimed lease must skip a second DB claim")
+        )
+        status, result = self.send_whatsapp_webhook(
+            self.whatsapp_payload("wamid.preclaimed", "hola"), config.app_secret
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["accepted"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.ws.backend._next_whatsapp_message(), claimed)
+        self.ws.backend.store.claim_whatsapp_message.assert_not_called()
+
+    def test_postgres_whatsapp_pipeline_returns_insert_and_claim_results(self):
+        inserted_cursor = Mock()
+        inserted_cursor.fetchall.return_value = [{"message_id": "wamid.pipeline"}]
+        claimed_cursor = Mock()
+        claimed_cursor.fetchone.return_value = {
+            "message_id": "wamid.pipeline",
+            "status": "processing",
+            "context_link_json": {"user_id": "usr_pipeline"},
+            "context_user_json": {"id": "usr_pipeline", "tier": "pro"},
+            "context_state_user_id": None,
+        }
+        commit_cursor = Mock()
+
+        class FakePipeline:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class FakeConnection:
+            def __init__(self):
+                self.commands = []
+
+            def pipeline(self):
+                return FakePipeline()
+
+            def execute(self, sql, params=()):
+                self.commands.append((sql, params))
+                return [inserted_cursor, claimed_cursor, commit_cursor][
+                    len(self.commands) - 1
+                ]
+
+            def rollback(self):
+                raise AssertionError("successful pipeline must not roll back")
+
+        connection = FakeConnection()
+        pool = Mock()
+        pool.getconn.return_value = connection
+        store = object.__new__(PostgresStore)
+        store._pool = pool
+        store._operational_error = OSError
+
+        accepted, claimed = store.enqueue_and_claim_whatsapp_messages([{
+            "message_id": "wamid.pipeline",
+            "phone_number_id": "phone-id",
+            "wa_user_id": "15557654321",
+            "message_type": "text",
+            "text": "hola",
+            "payload": {},
+        }])
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual(claimed["message_id"], "wamid.pipeline")
+        self.assertEqual(
+            claimed["_processing_context"]["user"]["id"], "usr_pipeline"
+        )
+        self.assertEqual(len(connection.commands), 3)
+        self.assertEqual(connection.commands[-1], ("COMMIT", ()))
+        pool.putconn.assert_called_once_with(connection)
 
     def test_whatsapp_text_authorization_carries_the_exact_pending_approval(self):
         config, sent = self.configure_fake_whatsapp()

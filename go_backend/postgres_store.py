@@ -381,6 +381,125 @@ class PostgresStore(Store):
         )
         return len(rows)
 
+    def enqueue_and_claim_whatsapp_messages(
+        self, messages: list[dict]
+    ) -> tuple[int, dict | None]:
+        """Pipeline durable insertion and the first ordered lease.
+
+        Both commands execute sequentially in one PostgreSQL transaction and
+        one client/server synchronization. The claim therefore sees the rows
+        inserted by the first command while retaining the existing SKIP LOCKED
+        ordering and multi-replica safety guarantees.
+        """
+        if not messages:
+            return 0, None
+        now = time.time()
+        encoded = json.dumps(
+            [
+                {
+                    "message_id": str(item["message_id"])[:300],
+                    "phone_number_id": str(item["phone_number_id"])[:100],
+                    "wa_user_id": str(item["wa_user_id"])[:100],
+                    "message_type": str(item["message_type"])[:40],
+                    "text": str(item.get("text") or "")[:20_000],
+                    "payload_json": json.dumps(
+                        item.get("payload") or {},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                }
+                for item in messages
+            ],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        insert_sql = _postgres_sql(
+            "WITH incoming AS ("
+            " SELECT * FROM jsonb_to_recordset(?::jsonb) AS x("
+            " message_id text,phone_number_id text,wa_user_id text,"
+            " message_type text,text text,payload_json text)"
+            ") INSERT INTO whatsapp_messages("
+            " message_id,user_id,phone_number_id,wa_user_id,message_type,text,payload_json,"
+            " status,next_attempt_at,created_at,updated_at) "
+            "SELECT i.message_id,CASE WHEN u.id IS NOT NULL THEN l.user_id END,"
+            "i.phone_number_id,i.wa_user_id,"
+            "i.message_type,i.text,i.payload_json,'pending',?,?,? FROM incoming i "
+            "LEFT JOIN whatsapp_links l ON l.wa_user_id=i.wa_user_id "
+            " AND l.phone_number_id=i.phone_number_id "
+            "LEFT JOIN users u ON u.id=l.user_id AND u.account_status='active' "
+            "ON CONFLICT(message_id) DO NOTHING RETURNING message_id"
+        )
+        claim_sql = _postgres_sql(
+            "WITH candidate AS ("
+            " SELECT m.message_id FROM whatsapp_messages m "
+            " WHERE m.status='pending' AND m.next_attempt_at<=? AND NOT EXISTS ("
+            " SELECT 1 FROM whatsapp_messages earlier "
+            " WHERE earlier.phone_number_id=m.phone_number_id "
+            " AND earlier.wa_user_id=m.wa_user_id "
+            " AND earlier.status IN ('pending','processing','sending') AND ("
+            " earlier.created_at<m.created_at OR "
+            " (earlier.created_at=m.created_at AND earlier.message_id<m.message_id))) "
+            " ORDER BY m.created_at,m.message_id FOR UPDATE SKIP LOCKED LIMIT 1"
+            "), claimed AS ("
+            " UPDATE whatsapp_messages m SET status='processing',"
+            " attempts=m.attempts+1,updated_at=? FROM candidate "
+            " WHERE m.message_id=candidate.message_id RETURNING m.*"
+            ") SELECT claimed.*,to_jsonb(l) AS context_link_json,"
+            "to_jsonb(u) AS context_user_json,"
+            "gs.id AS context_provider_subscription_id,"
+            "gs.api_key_enc AS context_provider_api_key_enc,"
+            "gs.key_id AS context_provider_key_id,"
+            "gs.key_version AS context_provider_key_version,"
+            "gs.status AS context_provider_subscription_status,"
+            "gs.assigned_user_id AS context_provider_assigned_user_id,"
+            "ast.user_id AS context_state_user_id,"
+            "ast.revision AS context_state_revision,"
+            "ast.state_json AS context_state_json,"
+            "ast.created_at AS context_state_created_at,"
+            "ast.updated_at AS context_state_updated_at "
+            "FROM claimed "
+            "LEFT JOIN whatsapp_links l ON l.wa_user_id=claimed.wa_user_id "
+            " AND l.phone_number_id=claimed.phone_number_id "
+            "LEFT JOIN users u ON u.id=l.user_id AND u.account_status='active' "
+            "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+            "LEFT JOIN account_states ast ON ast.user_id=u.id"
+        )
+
+        for attempt in range(2):
+            connection = self._pool.getconn(timeout=10)
+            try:
+                with connection.pipeline():
+                    inserted_cursor = connection.execute(
+                        insert_sql, (encoded, now, now, now)
+                    )
+                    claimed_cursor = connection.execute(claim_sql, (now, now))
+                    connection.execute("COMMIT")
+                inserted = inserted_cursor.fetchall()
+                row = claimed_cursor.fetchone()
+                if row is None:
+                    return len(inserted), None
+                message = dict(row)
+                message["_processing_context"] = self._whatsapp_context_from_row(
+                    row, prefix="context_"
+                )
+                return len(inserted), message
+            except self._operational_error:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                if attempt:
+                    raise
+            except Exception:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                self._pool.putconn(connection)
+        raise AssertionError("unreachable")
+
     def get_whatsapp_processing_context(
         self, *, wa_user_id: str, phone_number_id: str
     ) -> dict:

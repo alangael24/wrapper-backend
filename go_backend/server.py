@@ -64,6 +64,7 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import sys
@@ -1276,6 +1277,7 @@ class Backend:
         self._desktop_result_condition = threading.Condition()
         self._desktop_result_generation = 0
         self._whatsapp_wake = threading.Event()
+        self._whatsapp_claimed_queue: queue.SimpleQueue[dict] = queue.SimpleQueue()
         validate_runtime_security(cfg)
         validate_pi_chrome_security(cfg.pi_chrome_isolation)
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2102,8 +2104,12 @@ class Backend:
                 "text": message["text"],
                 "payload": durable_payload,
             })
-        accepted = self.store.enqueue_whatsapp_messages(queued_messages)
-        if accepted:
+        accepted, claimed = self.store.enqueue_and_claim_whatsapp_messages(
+            queued_messages
+        )
+        if claimed is not None:
+            self._whatsapp_claimed_queue.put(claimed)
+        if accepted or claimed is not None:
             self._whatsapp_wake.set()
         # Meta needs an immediate 2xx. Durable processing happens after this.
         json_response(handler, 200, {"received": True, "accepted": accepted})
@@ -2111,7 +2117,7 @@ class Backend:
     def _whatsapp_worker_loop(self) -> None:
         while True:
             try:
-                message = self.store.claim_whatsapp_message()
+                message = self._next_whatsapp_message()
                 if message is None:
                     self._whatsapp_wake.wait(2)
                     self._whatsapp_wake.clear()
@@ -2146,6 +2152,13 @@ class Backend:
                 logging.exception("WhatsApp queue polling failed")
                 self._whatsapp_wake.wait(5)
                 self._whatsapp_wake.clear()
+
+    def _next_whatsapp_message(self) -> dict | None:
+        """Prefer a lease returned by the webhook's pipelined DB call."""
+        try:
+            return self._whatsapp_claimed_queue.get_nowait()
+        except queue.Empty:
+            return self.store.claim_whatsapp_message()
 
     def _deliver_whatsapp_answer(
         self,

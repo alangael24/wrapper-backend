@@ -1482,6 +1482,17 @@ class Store:
                 self._conn.rollback()
                 raise
 
+    def enqueue_and_claim_whatsapp_messages(
+        self, messages: list[dict]
+    ) -> tuple[int, dict | None]:
+        """Persist a webhook batch and optionally return a pre-claimed item.
+
+        SQLite is used for local development and tests, where an extra local
+        query is effectively free. PostgreSQL overrides this method with a
+        pipelined insert+claim that avoids a second cross-region round trip.
+        """
+        return self.enqueue_whatsapp_messages(messages), None
+
     def claim_whatsapp_message(self) -> dict | None:
         now = _now()
         with self._lock:
