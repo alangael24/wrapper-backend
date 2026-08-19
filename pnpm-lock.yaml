@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  pi-chrome@0.15.46: fa872d16e1fdc584e4801aced527736885d40c224a245651ba7af583f144b03d
+
 importers:
 
   .:
@@ -19,7 +22,7 @@ importers:
         version: 6.8.9(supports-color@7.2.0)
       pi-chrome:
         specifier: 0.15.46
-        version: 0.15.46(@earendil-works/pi-coding-agent@0.84.1(supports-color@7.2.0)(ws@8.21.3)(zod@4.4.3))(typebox@1.3.7)
+        version: 0.15.46(patch_hash=fa872d16e1fdc584e4801aced527736885d40c224a245651ba7af583f144b03d)(@earendil-works/pi-coding-agent@0.84.1(supports-color@7.2.0)(ws@8.21.3)(zod@4.4.3))(typebox@1.3.7)
       simple-icons:
         specifier: ^15.15.0
         version: 15.22.0
@@ -3343,7 +3346,7 @@ snapshots:
 
   pe-library@0.4.1: {}
 
-  pi-chrome@0.15.46(@earendil-works/pi-coding-agent@0.84.1(supports-color@7.2.0)(ws@8.21.3)(zod@4.4.3))(typebox@1.3.7):
+  pi-chrome@0.15.46(patch_hash=fa872d16e1fdc584e4801aced527736885d40c224a245651ba7af583f144b03d)(@earendil-works/pi-coding-agent@0.84.1(supports-color@7.2.0)(ws@8.21.3)(zod@4.4.3))(typebox@1.3.7):
     optionalDependencies:
       '@earendil-works/pi-coding-agent': 0.84.1(supports-color@7.2.0)(ws@8.21.3)(zod@4.4.3)
       typebox: 1.3.7

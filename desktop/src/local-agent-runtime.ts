@@ -21,6 +21,8 @@ const POLL_MS = 50;
 const RETRY_AFTER_ERROR_MS = 5_000;
 const HEARTBEAT_MS = 15_000;
 const LOCAL_RUN_TIMEOUT_MS = 31 * 60 * 1_000;
+const LOCAL_TOOL_IDLE_TIMEOUT_MS = 3 * 60 * 1_000;
+const COMPLETION_TIMEOUT_MS = 15_000;
 const LOCAL_RUN_KEY_ENV = "AGENTGENIA_LOCAL_RUN_KEY";
 
 type LocalModel = NonNullable<ReturnType<ModelRuntime["getModel"]>>;
@@ -49,7 +51,11 @@ export interface DesktopRuntimeJob {
 }
 
 export interface DesktopRuntimeTransport {
-  heartbeat(capabilities: DesktopRuntimeCapabilities, signal?: AbortSignal): Promise<void>;
+  heartbeat(
+    capabilities: DesktopRuntimeCapabilities,
+    signal?: AbortSignal,
+    activeJobId?: string
+  ): Promise<void>;
   claim(capabilities: DesktopRuntimeCapabilities, signal?: AbortSignal): Promise<DesktopRuntimeJob | null>;
   complete(
     jobId: string,
@@ -74,7 +80,6 @@ interface AssistantUsage {
 export class LocalAgentRuntime {
   private abortController: AbortController | null = null;
   private loop: Promise<void> | null = null;
-  private chromeAuthorizedUntil = 0;
   private readonly modelRuntimes = new Map<string, Promise<CachedModelRuntime>>();
   private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
 
@@ -86,7 +91,9 @@ export class LocalAgentRuntime {
   start(): void {
     if (this.loop) return;
     this.abortController = new AbortController();
+    console.info("[local-runtime] polling enabled");
     this.loop = this.runLoop(this.abortController.signal).finally(() => {
+      console.info("[local-runtime] polling stopped");
       this.loop = null;
       this.abortController = null;
     });
@@ -112,7 +119,7 @@ export class LocalAgentRuntime {
         }
         const job = await this.transport.claim(capabilities, signal);
         if (job) {
-          await this.executeAndComplete(job, signal);
+          await this.executeAndComplete(job, capabilities, signal);
           nextHeartbeat = 0;
           continue;
         }
@@ -128,20 +135,48 @@ export class LocalAgentRuntime {
     }
   }
 
-  private async executeAndComplete(job: DesktopRuntimeJob, parentSignal: AbortSignal): Promise<void> {
+  private async executeAndComplete(
+    job: DesktopRuntimeJob,
+    capabilities: DesktopRuntimeCapabilities,
+    parentSignal: AbortSignal
+  ): Promise<void> {
     const timeout = AbortSignal.timeout(LOCAL_RUN_TIMEOUT_MS);
     const signal = AbortSignal.any([parentSignal, timeout]);
+    const heartbeatController = new AbortController();
+    const heartbeatSignal = AbortSignal.any([parentSignal, heartbeatController.signal]);
+    const heartbeatLoop = this.keepAliveDuringJob(job.id, capabilities, heartbeatSignal);
     try {
       const result = await this.execute(job, signal);
-      await this.transport.complete(job.id, { status: "succeeded", result }, signal);
+      await this.transport.complete(
+        job.id,
+        { status: "succeeded", result },
+        AbortSignal.timeout(COMPLETION_TIMEOUT_MS)
+      );
     } catch (error) {
       const cancelled = parentSignal.aborted;
       await this.transport.complete(job.id, {
         status: cancelled ? "cancelled" : "failed",
         error_code: cancelled ? "desktop_runtime_stopped" : "desktop_runtime_error",
         error_message: errorMessage(error).slice(0, 2000)
-      }).catch((completionError) => {
+      }, AbortSignal.timeout(COMPLETION_TIMEOUT_MS)).catch((completionError) => {
         console.error(`[local-runtime] No fue posible reportar ${job.id}: ${errorMessage(completionError)}`);
+      });
+    } finally {
+      heartbeatController.abort();
+      await heartbeatLoop;
+    }
+  }
+
+  private async keepAliveDuringJob(
+    jobId: string,
+    capabilities: DesktopRuntimeCapabilities,
+    signal: AbortSignal
+  ): Promise<void> {
+    while (!signal.aborted) {
+      await delay(HEARTBEAT_MS, signal).catch(() => undefined);
+      if (signal.aborted) return;
+      await this.transport.heartbeat(capabilities, signal, jobId).catch((error) => {
+        if (!signal.aborted) console.error(`[local-runtime] heartbeat: ${errorMessage(error)}`);
       });
     }
   }
@@ -212,24 +247,30 @@ export class LocalAgentRuntime {
         sessionManager: SessionManager.inMemory(this.workspaceDirectory)
       }));
       mark("session_ready_ms");
-      let chromeAuthorizationGranted = false;
       await session.bindExtensions({
         mode: "rpc",
-        uiContext: electronExtensionUi((granted) => {
-          chromeAuthorizationGranted = granted;
-        })
+        uiContext: electronExtensionUi()
       });
       mark("extensions_ready_ms");
-      if (payload.browser && this.chromeAuthorizedUntil <= Date.now()) {
-        // Native pi-chrome keeps authorization scoped to this Pi process and
-        // asks the user before touching their authenticated Chrome profile.
-        await session.prompt("/chrome authorize 30m", { source: "rpc" });
-        if (chromeAuthorizationGranted) {
-          this.chromeAuthorizedUntil = Date.now() + 29 * 60 * 1_000;
-        }
+      if (payload.browser) {
+        // Native authorization is process-scoped, but every new AgentSession
+        // must still run the extension command so its tools bind to the
+        // already-authorized bridge. The native layer suppresses repeat OS
+        // prompts during the active 30-minute grant.
+        await promptWithWatchdog(
+          session,
+          "/chrome authorize 30m",
+          signal,
+          LOCAL_RUN_TIMEOUT_MS
+        );
         mark("chrome_authorized_ms");
       }
-      await session.prompt(payload.prompt, { source: "rpc" });
+      await promptWithWatchdog(
+        session,
+        payload.prompt,
+        signal,
+        LOCAL_TOOL_IDLE_TIMEOUT_MS
+      );
       mark("prompt_complete_ms");
       const assistant = [...session.state.messages].reverse().find((message) => message.role === "assistant");
       if (!assistant) throw new Error("Pi terminó sin una respuesta final.");
@@ -381,9 +422,68 @@ function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-function electronExtensionUi(
-  onChromeAuthorization: (granted: boolean) => void
-): ExtensionUIContext {
+async function promptWithWatchdog(
+  session: Awaited<ReturnType<typeof createAgentSession>>["session"],
+  prompt: string,
+  signal: AbortSignal,
+  idleTimeoutMs: number
+): Promise<void> {
+  signal.throwIfAborted();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectIdle: (reason: Error) => void = () => undefined;
+  let rejectAbort: (reason: unknown) => void = () => undefined;
+  const idle = new Promise<never>((_resolve, reject) => { rejectIdle = reject; });
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+  const resetIdle = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      rejectIdle(new Error(`Pi local no tuvo actividad durante ${Math.round(idleTimeoutMs / 1_000)} segundos.`));
+    }, idleTimeoutMs);
+  };
+  const abort = (): void => {
+    rejectAbort(signal.reason ?? new DOMException("La operación fue cancelada.", "AbortError"));
+  };
+  const progressEvents = new Set([
+    "agent_start",
+    "agent_end",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_update",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_end",
+    "agent_settled",
+    "auto_retry_start",
+    "auto_retry_end"
+  ]);
+  const unsubscribe = session.subscribe((event) => {
+    if (progressEvents.has(event.type)) resetIdle();
+    if (event.type === "tool_execution_start") {
+      console.info(`[local-runtime] tool start ${event.toolName}`);
+    } else if (event.type === "tool_execution_end") {
+      console.info(`[local-runtime] tool end ${event.toolName} error=${event.isError ? 1 : 0}`);
+    }
+  });
+  signal.addEventListener("abort", abort, { once: true });
+  resetIdle();
+  try {
+    await Promise.race([
+      session.prompt(prompt, { source: "rpc" }),
+      idle,
+      aborted
+    ]);
+  } catch (error) {
+    await session.abort().catch(() => undefined);
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+    unsubscribe();
+  }
+}
+
+function electronExtensionUi(): ExtensionUIContext {
   const ui = {
     async select(title: string, options: string[]): Promise<string | undefined> {
       const response = await dialog.showMessageBox({
@@ -409,7 +509,6 @@ function electronExtensionUi(
         noLink: true
       });
       const granted = response.response === 0;
-      if (title.toLowerCase().includes("pi-chrome")) onChromeAuthorization(granted);
       return granted;
     },
     async input(): Promise<string | undefined> { return undefined; },

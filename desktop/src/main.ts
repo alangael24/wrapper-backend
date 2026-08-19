@@ -1364,16 +1364,22 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     // Pi Chrome and Computer Use pull in platform-native runtimes. Load them
     // only for a real signed-in desktop session so startup/smoke checks do not
     // initialize an unused native bridge (notably on Windows CI).
+    console.info("[local-runtime] loading");
     const { LocalAgentRuntime } = await import("./local-agent-runtime");
     localAgentRuntime = new LocalAgentRuntime(
       {
-        heartbeat: (capabilities, signal) => oauthController.desktopRuntimeHeartbeat(capabilities, signal),
+        heartbeat: (capabilities, signal, activeJobId) => oauthController.desktopRuntimeHeartbeat(
+          capabilities,
+          signal,
+          activeJobId
+        ),
         claim: (capabilities, signal) => oauthController.desktopRuntimeClaim(capabilities, signal),
         complete: (jobId, result, signal) => oauthController.desktopRuntimeComplete(jobId, result, signal)
       },
       path.join(userDataPath, "local-agent-runtime")
     );
     localAgentRuntime.start();
+    console.info("[local-runtime] started");
   }
   configureAutoUpdates();
   const startupWindow = mainWindow;

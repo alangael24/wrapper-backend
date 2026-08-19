@@ -1,0 +1,22 @@
+diff --git a/extensions/chrome-profile-bridge/index.ts b/extensions/chrome-profile-bridge/index.ts
+index e3fe9aa..ebf5adc 100644
+--- a/extensions/chrome-profile-bridge/index.ts
++++ b/extensions/chrome-profile-bridge/index.ts
+@@ -849,7 +849,16 @@ export default function chromeProfileBridge(pi: ExtensionAPI) {
+ 				clearCountdownInterval();
+ 				return;
+ 			}
+-			updateChromeStatus(ctx);
++			try {
++				updateChromeStatus(ctx);
++			} catch (error) {
++				// Agent Genia creates short-lived RPC sessions for isolated jobs.
++				// A disposed session invalidates its ExtensionContext; the status
++				// ticker must not turn that expected lifecycle into an uncaught
++				// Electron main-process exception.
++				clearCountdownInterval();
++				console.warn(`Stopped stale pi-chrome status ticker: ${(error as Error).message}`);
++			}
+ 		}, 60_000);
+ 	};
+ 

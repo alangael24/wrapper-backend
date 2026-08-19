@@ -80,6 +80,15 @@ test("ships and starts the account-scoped native Pi Chrome runtime", async () =>
   assert.match(runtime, /resourceLoaders = new Map/);
   assert.match(runtime, /model_runtime_ready_ms/);
   assert.match(runtime, /prompt_complete_ms/);
+  assert.match(runtime, /LOCAL_TOOL_IDLE_TIMEOUT_MS = 3 \* 60 \* 1_000/);
+  assert.match(runtime, /promptWithWatchdog/);
+  assert.doesNotMatch(runtime, /chromeAuthorizedUntil/);
+  assert.match(runtime, /session\.abort\(\)/);
+  assert.doesNotMatch(runtime, /session\.subscribe\(\(\) => resetIdle\(\)\)/);
+  assert.match(runtime, /tool start \$\{event\.toolName\}/);
+  assert.match(runtime, /keepAliveDuringJob/);
+  assert.match(runtime, /heartbeat\(capabilities, signal, jobId\)/);
+  assert.match(runtime, /AbortSignal\.timeout\(COMPLETION_TIMEOUT_MS\)/);
   assert.match(runtime, /apiKey: `\$\$\{LOCAL_RUN_KEY_ENV\}`/);
   assert.doesNotMatch(runtime, /setRuntimeApiKey/);
   assert.match(loader, /pi-chrome\/extensions\/chrome-profile-bridge/);

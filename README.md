@@ -902,6 +902,23 @@ node_modules/.bin/electron scripts/e2e-production.mjs
 AGENTGENIA_E2E_BROWSER=1 AGENTGENIA_E2E_MUTATIONS=1 \
   node_modules/.bin/electron scripts/e2e-production.mjs
 
+# Evaluación intensiva reproducible contra producción (300 casos)
+AGENTGENIA_E2E_DRY_RUN=1 pnpm e2e:reliability:300
+pnpm e2e:reliability:300
+
+# Reanudar el mismo checkpoint sin repetir casos terminados
+AGENTGENIA_E2E_RUN_PREFIX=e2e300-... \
+AGENTGENIA_E2E_REPORT=/tmp/e2e300-....json \
+AGENTGENIA_E2E_RESUME=1 pnpm e2e:reliability:300
+
+# Conservar los aprobados y repetir fallos causados por una interrupción global
+AGENTGENIA_E2E_RESUME=1 AGENTGENIA_E2E_RETRY_FAILED=1 \
+  pnpm e2e:reliability:300
+
+# Diagnóstico de una familia sin alterar la matriz completa
+AGENTGENIA_E2E_FILTER='^(chrome|computer)-' AGENTGENIA_E2E_LIMIT=3 \
+  pnpm e2e:reliability:300
+
 # iOS: compila unit/UI tests sin firma y después ejecútalos en un simulador
 xcodebuild \
   -project ios/AgentGenia/AgentGenia.xcodeproj \
@@ -931,6 +948,13 @@ terminar y, con `AGENTGENIA_E2E_MUTATIONS=1`, borra el evento de prueba después
 de validar todo el ciclo de aprobación. La corrida debe complementarse con la
 telemetría de `connector_operations`: una respuesta del modelo no cuenta como
 éxito si la operación real del proveedor falló.
+
+La evaluación intensiva escribe un checkpoint JSON privado en `/tmp` después de
+cada caso. Incluye 50 conversaciones, 20 pruebas de transporte/estado, 100 de
+Pi Chrome, 40 de Computer Use, 70 de conectores reales y 20 combinaciones entre
+web y conectores. Sus páginas deterministas se sirven únicamente en loopback;
+las pruebas de proveedores son de lectura y el bot temporal se elimina incluso
+si el runner termina con fallos funcionales.
 
 Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del
 proveedor ni realizan cobros. Cubren signup siempre-free, activación, proxy y

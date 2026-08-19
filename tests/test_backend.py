@@ -55,7 +55,7 @@ from go_backend.native_connectors import NativeConnectorGateway  # noqa: E402
 from go_backend.postgres_store import PostgresStore  # noqa: E402
 from go_backend.google_auth import GoogleAccountAuth  # noqa: E402
 from go_backend.pi_harness import RUNTIME_AUTH_EXTENSION  # noqa: E402
-from go_backend.store import Store, new_id  # noqa: E402
+from go_backend.store import Store, hash_desktop_device_id, new_id  # noqa: E402
 from go_backend.upstream import Usage  # noqa: E402
 from go_backend.whatsapp import (  # noqa: E402
     WhatsAppCloudAPI,
@@ -5325,6 +5325,65 @@ class TestBackend(unittest.TestCase):
 
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["type"], "desktop_runtime_offline")
+
+    def test_desktop_heartbeat_renews_only_the_active_claim(self):
+        signup = self.new_user()
+        headers = {"Authorization": f"Bearer {signup['api_key']}"}
+        device_id = str(uuid.uuid4())
+        heartbeat_body = {
+            "device_id": device_id,
+            "platform": "darwin",
+            "app_version": "1.1.3-test",
+            "capabilities": {"browser": True, "computer": True},
+        }
+        status, heartbeat = self.ws.req(
+            "POST", "/v1/desktop-runtime/heartbeat", heartbeat_body, headers=headers
+        )
+        self.assertEqual(status, 200, heartbeat)
+        reserved = self.ws.backend.store.create_agent_run(
+            user_id=signup["user_id"],
+            idempotency_key=f"desktop-lease-{uuid.uuid4()}",
+            model="deepseek-v4-flash",
+            browser=True,
+            max_credit_milli=1_000,
+            max_concurrent_runs=4,
+            token_hash=uuid.uuid4().hex,
+            token_expires_at=time.time() + 300,
+            enforce=False,
+        )
+        job = self.ws.backend.store.create_desktop_runtime_job(
+            user_id=signup["user_id"],
+            run_id=reserved["run"]["id"],
+            bot_id=None,
+            job_kind="browser",
+            payload_enc=b"encrypted-test-payload",
+            key_id="test-key",
+            key_version=1,
+            expires_at=time.time() + 300,
+        )
+        claimed = self.ws.backend.store.claim_desktop_runtime_job(
+            user_id=signup["user_id"],
+            device_id_hash=hash_desktop_device_id(device_id),
+            capabilities={"browser": True, "computer": True},
+        )
+        self.assertEqual(claimed["id"], job["id"])
+        self.ws.backend.store._exec(
+            "UPDATE desktop_runtime_jobs SET claim_expires_at=? WHERE id=?",
+            (time.time() + 1, job["id"]),
+        )
+
+        status, renewed = self.ws.req(
+            "POST",
+            "/v1/desktop-runtime/heartbeat",
+            {**heartbeat_body, "active_job_id": job["id"]},
+            headers=headers,
+        )
+        self.assertEqual(status, 200, renewed)
+        self.assertTrue(renewed["job_lease_renewed"])
+        refreshed = self.ws.backend.store.get_desktop_runtime_job(
+            job["id"], signup["user_id"]
+        )
+        self.assertGreater(refreshed["claim_expires_at"], time.time() + 60)
 
     def test_local_runtime_intent_keeps_connector_only_work_remote_and_routes_explicit_desktop_work(self):
         self.assertFalse(self.ws.backend._local_browser_intent("revisa mis correos de Gmail"))

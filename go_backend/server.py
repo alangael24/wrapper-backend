@@ -3329,6 +3329,7 @@ class Backend:
         platform = body.get("platform")
         app_version = body.get("app_version", "")
         capabilities = body.get("capabilities")
+        active_job_id = body.get("active_job_id")
         if not device_id:
             error_response(handler, 400, "device_id no es válido", "bad_device_id")
             return
@@ -3344,6 +3345,13 @@ class Backend:
         ):
             error_response(handler, 400, "capabilities no es válido", "bad_capabilities")
             return
+        if active_job_id is not None and (
+            not isinstance(active_job_id, str)
+            or not active_job_id.startswith("djob_")
+            or len(active_job_id) > 80
+        ):
+            error_response(handler, 400, "active_job_id no es válido", "bad_desktop_job")
+            return
         normalized = {
             "browser": capabilities.get("browser") is True,
             "computer": capabilities.get("computer") is True,
@@ -3355,6 +3363,12 @@ class Backend:
             app_version=app_version,
             capabilities=normalized,
         )
+        if active_job_id:
+            status["job_lease_renewed"] = self.store.renew_desktop_runtime_job_claim(
+                job_id=active_job_id,
+                user_id=user["id"],
+                device_id_hash=hash_desktop_device_id(device_id),
+            )
         json_response(handler, 200, status)
 
     def handle_desktop_runtime_status(self, handler: BaseHTTPRequestHandler) -> None:

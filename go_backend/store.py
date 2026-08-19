@@ -2763,7 +2763,7 @@ class Store:
         user_id: str,
         device_id_hash: str,
         capabilities: dict,
-        lease_seconds: int = 1_900,
+        lease_seconds: int = 75,
     ) -> dict | None:
         now = _now()
         with self._lock:
@@ -2834,6 +2834,35 @@ class Store:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def renew_desktop_runtime_job_claim(
+        self,
+        *,
+        job_id: str,
+        user_id: str,
+        device_id_hash: str,
+        lease_seconds: int = 75,
+    ) -> bool:
+        now = _now()
+        renewed_until = now + max(30, min(int(lease_seconds), 120))
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE desktop_runtime_jobs SET claim_expires_at="
+                "CASE WHEN expires_at<? THEN expires_at ELSE ? END,updated_at=? "
+                "WHERE id=? AND user_id=? AND status='claimed' "
+                "AND claimed_device_hash=? AND expires_at>?",
+                (
+                    renewed_until,
+                    renewed_until,
+                    now,
+                    job_id,
+                    user_id,
+                    device_id_hash,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def get_desktop_runtime_job(self, job_id: str, user_id: str) -> dict | None:
         row = self._one(

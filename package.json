@@ -26,6 +26,7 @@
     "release:desktop": "pnpm build:desktop && electron-builder --publish always",
     "release:verify": "node scripts/verify-release-config.mjs",
     "smoke:desktop": "pnpm build:desktop && electron . --smoke-test",
+    "e2e:reliability:300": "electron scripts/e2e-reliability-300.mjs",
     "test:connectors": "pnpm typecheck:connectors && node --test tests/test_connector_extension.mjs",
     "test:interactions": "scripts/test-connector-interactions",
     "typecheck:connectors": "tsc -p extensions/connectors/tsconfig.json && tsc -p extensions/runtime-auth/tsconfig.json",

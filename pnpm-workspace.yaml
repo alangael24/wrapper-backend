@@ -5,3 +5,5 @@ allowBuilds:
   electron-winstaller: true
   esbuild: true
   protobufjs: true
+patchedDependencies:
+  pi-chrome@0.15.46: patches/pi-chrome@0.15.46.patch

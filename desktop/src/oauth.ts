@@ -284,9 +284,10 @@ export class DesktopOAuthController {
 
   desktopRuntimeHeartbeat(
     capabilities: DesktopRuntimeCapabilities,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    activeJobId?: string
   ): Promise<void> {
-    return this.client.desktopRuntimeHeartbeat(capabilities, signal);
+    return this.client.desktopRuntimeHeartbeat(capabilities, signal, activeJobId);
   }
 
   desktopRuntimeClaim(
@@ -518,7 +519,8 @@ class WrapperServiceClient {
 
   async desktopRuntimeHeartbeat(
     capabilities: DesktopRuntimeCapabilities,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    activeJobId?: string
   ): Promise<void> {
     const deviceId = await this.options.deviceStore.getOrCreate();
     await this.authorizedJson("/v1/desktop-runtime/heartbeat", {
@@ -527,7 +529,8 @@ class WrapperServiceClient {
         device_id: deviceId,
         platform: process.platform,
         app_version: this.options.appVersion,
-        capabilities
+        capabilities,
+        ...(activeJobId ? { active_job_id: activeJobId } : {})
       },
       signal
     });
