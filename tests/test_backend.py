@@ -4225,6 +4225,26 @@ class TestBackend(unittest.TestCase):
         ])
         self.assertIn("message_1", json.dumps(result))
 
+    def test_outlook_recent_mail_uses_bounded_list_without_inventing_query(self):
+        client = FakeComposioClient()
+        gateway = ComposioConnectorGateway(
+            client=client,
+            public_base_url="https://agentgenia-api.onrender.com",
+            store=self.ws.backend.store,
+        )
+
+        result = gateway.execute(
+            self.new_user("outlook-recent-list")["user_id"],
+            "microsoft-365",
+            "search_email",
+            {"limit": 50},
+        )
+
+        self.assertEqual(client.executions, [
+            ("OUTLOOK_LIST_MESSAGES", {"top": 10}),
+        ])
+        self.assertIsNotNone(result)
+
     def test_connected_plugin_collections_are_compact_but_keep_ids_and_titles(self):
         private_body = "contenido privado " * 4_000
         cases = (

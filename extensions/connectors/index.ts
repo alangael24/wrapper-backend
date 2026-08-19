@@ -270,8 +270,8 @@ const CONNECTOR_GUIDANCE: Readonly<Record<string, Readonly<Record<string, unknow
   }),
   "microsoft-365": Object.freeze({
     search_email: {
-      arguments: { query: "Consulta de Outlook", size: "1 a 10" },
-      rule: "No afirmes haber leído correo si la búsqueda no devuelve mensajes.",
+      arguments: { query: "Consulta de Outlook; omítela para listar correo reciente", size: "1 a 10" },
+      rule: "Para correo reciente sin un término concreto omite query y el backend usa una lista acotada. No afirmes haber leído correo si la herramienta falla o no devuelve mensajes.",
     },
     create_calendar_event: {
       arguments: {

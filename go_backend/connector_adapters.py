@@ -693,9 +693,23 @@ class ComposioConnectorGateway:
                         "connector_upstream_error",
                     )
             slug, search = self._resolve_operation(session, connector_id, operation)
-            normalized_arguments = _validated_operation_arguments(
-                connector_id, operation, normalized_arguments, search, slug
-            )
+            if (
+                connector_id == "microsoft-365"
+                and operation == "search_email"
+                and not normalized_arguments.get("query")
+            ):
+                # OUTLOOK_SEARCH_MESSAGES requires a non-empty query. The
+                # explicit list action is the exact contract for "recent/all
+                # messages" and remains capped at ten results.
+                slug = "OUTLOOK_LIST_MESSAGES"
+                search = None
+                normalized_arguments = {
+                    "top": normalized_arguments.get("size", 10),
+                }
+            else:
+                normalized_arguments = _validated_operation_arguments(
+                    connector_id, operation, normalized_arguments, search, slug
+                )
             logging.info(
                 "Executing connector operation connector=%s operation=%s tool=%s",
                 connector_id,
@@ -1778,9 +1792,15 @@ def _normalize_operation_arguments(
         query = normalized.get(
             "query", normalized.get("search", normalized.get("search_query"))
         )
-        if not isinstance(query, str) or not query.strip() or len(query) > 500:
+        # A user asking for "recent Outlook mail" has no semantic search
+        # term. Preserve that distinction: the gateway will use the bounded
+        # list endpoint instead of making Pi invent a query or rejecting an
+        # otherwise valid read before it reaches Microsoft.
+        if query is None:
+            query = ""
+        if not isinstance(query, str) or len(query) > 500:
             raise ConnectorBrokerError(
-                400, "search_email requiere query", "bad_connector_arguments"
+                400, "query no es válido", "bad_connector_arguments"
             )
         raw_size = normalized.get(
             "size", normalized.get("max_results", normalized.get("limit", 10))

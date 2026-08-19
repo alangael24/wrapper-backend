@@ -895,6 +895,13 @@ pnpm test:connectors
 # Matriz sintética: 49 conectores y sus 221 operaciones públicas
 pnpm test:interactions
 
+# E2E contra producción con la sesión cifrada de Agent Genia Desktop
+node_modules/.bin/electron scripts/e2e-production.mjs
+
+# Añade Chrome local y un ciclo real crear-aprobar-eliminar en Calendar
+AGENTGENIA_E2E_BROWSER=1 AGENTGENIA_E2E_MUTATIONS=1 \
+  node_modules/.bin/electron scripts/e2e-production.mjs
+
 # iOS: compila unit/UI tests sin firma y después ejecútalos en un simulador
 xcodebuild \
   -project ios/AgentGenia/AgentGenia.xcodeproj \
@@ -917,6 +924,13 @@ autorizaciones exactas de un solo uso, ejecución e idempotencia sin modificar
 cuentas externas. Las escrituras administradas por Composio se validan contra
 el esquema actual del proveedor antes de mostrar `Autorizar`; si el esquema no
 está disponible o es inválido, Agent Genia falla de forma segura.
+
+El E2E de producción requiere una sesión iniciada y desbloqueada en Desktop.
+Nunca imprime tokens ni contenido privado, crea un bot temporal que elimina al
+terminar y, con `AGENTGENIA_E2E_MUTATIONS=1`, borra el evento de prueba después
+de validar todo el ciclo de aprobación. La corrida debe complementarse con la
+telemetría de `connector_operations`: una respuesta del modelo no cuenta como
+éxito si la operación real del proveedor falló.
 
 Las pruebas automáticas usan upstreams y servicios falsos: no consumen saldo del
 proveedor ni realizan cobros. Cubren signup siempre-free, activación, proxy y
