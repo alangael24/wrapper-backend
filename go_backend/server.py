@@ -3780,6 +3780,9 @@ class Backend:
             # runaway mobile replies while leaving ample room for a question
             # widget or a useful draft.
             "max_tokens": 1024,
+            # The provider default is 1.0. Product chat favors instruction
+            # adherence and stable UI envelopes over creative variation.
+            "temperature": 0.2,
             "user_id": provider_user_id,
         }
         if self.cfg.pi_model.startswith("deepseek-"):

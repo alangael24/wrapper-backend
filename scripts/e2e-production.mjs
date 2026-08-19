@@ -192,6 +192,19 @@ async function saveAccountState(token, deviceId, state, baseRevision) {
   });
 }
 
+async function mutateAccountState(token, deviceId, mutate, attempts = 6) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await request("/v1/account-state", token);
+    const next = mutate(structuredClone(current.state));
+    try {
+      return await saveAccountState(token, deviceId, next, current.revision);
+    } catch (error) {
+      if (error.status !== 409 || attempt === attempts - 1) throw error;
+    }
+  }
+  throw new Error("account state changed too many times during E2E mutation");
+}
+
 async function execute() {
   const window = new BrowserWindow({ show: false, webPreferences: { sandbox: true } });
   await window.loadURL("data:text/html,<title>Agentgenia E2E</title>");
@@ -363,12 +376,12 @@ async function execute() {
       conversationRevision: now,
       workflowRevision: now
     };
-    accountState = await saveAccountState(
-      token,
-      deviceId,
-      { ...accountState.state, bots: [...accountState.state.bots, temporaryBot] },
-      accountState.revision
-    );
+    accountState = await mutateAccountState(token, deviceId, (state) => ({
+      ...state,
+      bots: state.bots.some((item) => item.id === temporaryBot.id)
+        ? state.bots
+        : [...state.bots, temporaryBot]
+    }));
     bot = temporaryBot;
     scoped = connected;
   }
@@ -484,14 +497,12 @@ async function execute() {
   if (temporaryBotId) {
     started = performance.now();
     try {
-      const latest = await request("/v1/account-state", token);
-      const nextState = {
-        ...latest.state,
-        bots: latest.state.bots.filter((item) => item.id !== temporaryBotId),
-        deletedBotIds: [...new Set([...(latest.state.deletedBotIds || []), temporaryBotId])],
-        activeBotId: latest.state.activeBotId === temporaryBotId ? (existingBot?.id || null) : latest.state.activeBotId
-      };
-      await saveAccountState(token, deviceId, nextState, latest.revision);
+      await mutateAccountState(token, deviceId, (state) => ({
+        ...state,
+        bots: state.bots.filter((item) => item.id !== temporaryBotId),
+        deletedBotIds: [...new Set([...(state.deletedBotIds || []), temporaryBotId])],
+        activeBotId: state.activeBotId === temporaryBotId ? (existingBot?.id || null) : state.activeBotId
+      }));
       record("temporary E2E bot cleanup", "simple", started, true);
     } catch (error) { record("temporary E2E bot cleanup", "simple", started, false, error.message); }
   }
@@ -503,7 +514,9 @@ async function execute() {
   if (failed) process.exitCode = 1;
 }
 
-app.whenReady().then(execute).catch((error) => {
+app.whenReady().then(execute).then(() => {
+  app.exit(process.exitCode || 0);
+}).catch((error) => {
   console.error(JSON.stringify({ fatal: error.message }));
-  process.exitCode = 1;
-}).finally(() => app.quit());
+  app.exit(1);
+});

@@ -2992,6 +2992,7 @@ class TestBackend(unittest.TestCase):
         self.assertIn("una a tres frases", sent["messages"][0]["content"])
         self.assertEqual(sent["thinking"], {"type": "disabled"})
         self.assertEqual(sent["max_tokens"], 1024)
+        self.assertEqual(sent["temperature"], 0.2)
 
     def test_compact_routing_context_skips_connector_provider_for_chat(self):
         signup = self.new_user()
