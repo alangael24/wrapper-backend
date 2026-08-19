@@ -1824,6 +1824,33 @@ class TestBackend(unittest.TestCase):
             {"type": "disabled"},
         )
 
+    def test_private_provider_key_cache_invalidates_when_ciphertext_changes(self):
+        ws = self.ws
+        subscription = {
+            "id": "gos_private_cache",
+            "api_key_enc": ws.backend.encrypt_secret("sk-first", "cache-key"),
+            "key_id": "cache-key",
+            "key_version": ws.cfg.wrapper_secret_version,
+        }
+        original = ws.backend.decrypt_secret
+        decryptions = 0
+
+        def counted_decrypt(blob, key_id, key_version):
+            nonlocal decryptions
+            decryptions += 1
+            return original(blob, key_id, key_version)
+
+        ws.backend.decrypt_secret = counted_decrypt
+        self.assertEqual(ws.backend.subscription_key(subscription), "sk-first")
+        self.assertEqual(ws.backend.subscription_key(subscription), "sk-first")
+        self.assertEqual(decryptions, 1)
+
+        subscription["api_key_enc"] = ws.backend.encrypt_secret(
+            "sk-second", "cache-key"
+        )
+        self.assertEqual(ws.backend.subscription_key(subscription), "sk-second")
+        self.assertEqual(decryptions, 2)
+
     def test_unlimited_opencode_account_runs_pi_without_consuming_credits(self):
         ws = self.ws
         signup = self.new_user(tier="free")

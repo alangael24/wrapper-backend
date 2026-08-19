@@ -72,6 +72,7 @@ import time
 import unicodedata
 import uuid
 import httpx
+from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1255,6 +1256,10 @@ class Backend:
         self._run_timings: dict[str, dict[str, float]] = {}
         self._run_provider_lock = threading.Lock()
         self._run_providers: dict[str, dict[str, Any]] = {}
+        self._provider_key_cache_lock = threading.Lock()
+        self._provider_key_cache: OrderedDict[
+            tuple[str, str, int, bytes], tuple[float, str]
+        ] = OrderedDict()
         self._run_principal_lock = threading.Lock()
         self._run_principals: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
         self._pi_warm_lock = threading.Lock()
@@ -1587,15 +1592,35 @@ class Backend:
     def subscription_key(self, subscription: dict) -> str:
         """Decrypt and opportunistically rotate a server-owned provider key."""
         version = int(subscription.get("key_version") or 1)
-        plaintext = self.decrypt_secret(
-            bytes(subscription["api_key_enc"]), subscription["key_id"], version
+        encrypted = bytes(subscription["api_key_enc"])
+        cache_key = (
+            str(subscription["id"]),
+            str(subscription["key_id"]),
+            version,
+            hashlib.sha256(encrypted).digest(),
         )
+        now = time.monotonic()
+        with self._provider_key_cache_lock:
+            cached = self._provider_key_cache.pop(cache_key, None)
+            if cached is not None and now - cached[0] <= 600:
+                self._provider_key_cache[cache_key] = cached
+                return cached[1]
+        plaintext = self.decrypt_secret(encrypted, subscription["key_id"], version)
         if version != self.cfg.wrapper_secret_version:
             self.store.update_subscription_encryption(
                 subscription["id"],
                 self.encrypt_secret(plaintext, subscription["key_id"]),
                 self.cfg.wrapper_secret_version,
             )
+        else:
+            # PBKDF2 intentionally makes credential theft expensive, but the
+            # same server-owned key is reused across many requests. Keep a
+            # small process-local cache keyed by the encrypted blob itself so
+            # a rotation or replacement invalidates it automatically.
+            with self._provider_key_cache_lock:
+                self._provider_key_cache[cache_key] = (now, plaintext)
+                while len(self._provider_key_cache) > 32:
+                    self._provider_key_cache.popitem(last=False)
         return plaintext
 
     def model_provider(self, user: dict) -> dict:
