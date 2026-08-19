@@ -33,6 +33,7 @@ from go_backend.server import (  # noqa: E402
     Config,
     Handler,
     UnsafeConfigurationError,
+    _InternalAgentHandler,
     _bounded_agent_envelope,
     _connector_operation_is_read_only,
     _partial_json_text,
@@ -1850,6 +1851,68 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(ws.backend.subscription_key(subscription), "sk-second")
         self.assertEqual(decryptions, 2)
+
+    def test_internal_unlimited_run_defers_only_optional_metadata_refresh(self):
+        ws = self.ws
+        signup = self.new_user(tier="free")
+        user = ws.backend.store.get_user_by_api_key(signup["api_key"])
+        encrypted = ws.backend.encrypt_secret("sk-opencode-private", "opencode-whatsapp")
+        credential = ws.backend.store.add_subscription(
+            encrypted,
+            "opencode-whatsapp",
+            "Private OpenCode WhatsApp",
+            key_version=ws.cfg.wrapper_secret_version,
+        )
+        ws.backend.store.configure_user_model_provider(
+            user["id"],
+            provider="opencode",
+            subscription_id=credential["id"],
+            unlimited_usage=True,
+        )
+        user = ws.backend.store.get_user_by_api_key(signup["api_key"])
+        refreshed: list[callable] = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+
+            def start(self):
+                self.assertions()
+                refreshed.append(self.function)
+
+            def assertions(self):
+                self_case.assertEqual(self.interval, 2.0)
+                self_case.assertTrue(self.daemon)
+
+        self_case = self
+        internal = _InternalAgentHandler(user, {
+            "prompt": "legacy prompt",
+            "chat_prompt": "Reply briefly: hola",
+            "routing_context": "",
+            "user_message": "hola",
+            "execution_mode": "auto",
+            "bot_id": "bot-whatsapp-fast-metadata",
+            "idempotency_key": "whatsapp-fast-metadata",
+        })
+        with patch("go_backend.server.threading.Timer", FakeTimer):
+            ws.backend.handle_agent_run(internal)
+
+        self.assertEqual(internal.status, 200)
+        response = internal.json()
+        self.assertEqual(response["status"], "succeeded")
+        self.assertEqual(len(refreshed), 1)
+        durable = ws.backend.store.get_agent_run(response["run_id"])
+        provisional = json.loads(durable["result_json"])
+        self.assertEqual(provisional["answer"], response["answer"])
+        self.assertNotIn("timings", provisional)
+
+        refreshed[0]()
+        final = json.loads(
+            ws.backend.store.get_agent_run(response["run_id"])["result_json"]
+        )
+        self.assertIn("response_ready_ms", final["timings"])
 
     def test_unlimited_opencode_account_runs_pi_without_consuming_credits(self):
         ws = self.ws

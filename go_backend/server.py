@@ -4951,12 +4951,27 @@ class Backend:
             # the UI terminal event before refreshing optional accounting
             # metadata so the user does not wait for one more database RTT.
             event_stream.done_text(result.answer)
-        try:
-            self.store.save_agent_run_result(run_id, payload)
-        except Exception:
-            # The provisional answer was durably stored before settlement, so
-            # recovery remains possible even if the metadata refresh fails.
-            logging.exception("Could not refresh final agent metadata run_id=%s", run_id)
+
+        def refresh_final_metadata() -> None:
+            try:
+                self.store.save_agent_run_result(run_id, payload)
+            except Exception:
+                # The provisional answer was durably stored before settlement,
+                # so recovery remains possible even if this optional refresh
+                # fails or the process stops before it runs.
+                logging.exception("Could not refresh final agent metadata run_id=%s", run_id)
+
+        if unlimited and isinstance(handler, _InternalAgentHandler):
+            # WhatsApp already has a durable answer and terminal run before it
+            # reaches this point. The final metadata refresh is useful for
+            # diagnostics, but waiting for another cross-region PostgreSQL RTT
+            # delays every visible reply. Defer it briefly so it also does not
+            # contend with the account-state/delivery transaction that follows.
+            metadata_timer = threading.Timer(2.0, refresh_final_metadata)
+            metadata_timer.daemon = True
+            metadata_timer.start()
+        else:
+            refresh_final_metadata()
         logging.info(
             "agent timing run_id=%s timings=%s",
             run_id,
