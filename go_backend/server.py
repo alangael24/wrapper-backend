@@ -2129,14 +2129,16 @@ class Backend:
         sender: str,
         answer: str,
         user_id: str | None,
+        delivery_prepared: bool = False,
     ) -> None:
         # Claim delivery durably before talking to Meta. Cloud API does not
         # accept a caller idempotency key, so a timeout after submission is an
         # uncertain one-shot delivery and must never be sent a second time.
         delivery_started = time.perf_counter()
-        self.store.prepare_whatsapp_outbound(
-            message_id=message_id, result_text=answer, user_id=user_id
-        )
+        if not delivery_prepared:
+            self.store.prepare_whatsapp_outbound(
+                message_id=message_id, result_text=answer, user_id=user_id
+            )
         prepared = time.perf_counter()
         outbound = self.whatsapp.send_text(
             to=sender, text=answer, reply_to_message_id=message_id
@@ -2175,9 +2177,11 @@ class Backend:
             else ""
         )
         display_name = display_name if isinstance(display_name, str) else ""
-        processing_context = self.store.get_whatsapp_processing_context(
-            wa_user_id=sender, phone_number_id=phone_number_id
-        )
+        processing_context = message.get("_processing_context")
+        if not isinstance(processing_context, dict):
+            processing_context = self.store.get_whatsapp_processing_context(
+                wa_user_id=sender, phone_number_id=phone_number_id
+            )
         link = processing_context.get("link")
         code = extract_link_code(text)
         if code:
@@ -2496,7 +2500,7 @@ class Backend:
             )
         else:
             answer = parse_whatsapp_agent_answer(str(response.get("answer") or ""))
-        self._append_whatsapp_state_messages(
+        delivery_prepared = self._append_whatsapp_state_messages(
             user_id=user_id,
             bot_id=bot["id"],
             messages=[
@@ -2509,9 +2513,15 @@ class Backend:
                 },
             ],
             account_state_snapshot=processing_context.get("account_state"),
+            delivery_message_id=message_id,
+            delivery_result_text=answer,
         )
         self._deliver_whatsapp_answer(
-            message_id=message_id, sender=sender, answer=answer, user_id=user_id,
+            message_id=message_id,
+            sender=sender,
+            answer=answer,
+            user_id=user_id,
+            delivery_prepared=delivery_prepared,
         )
 
     @staticmethod
@@ -2646,7 +2656,9 @@ class Backend:
         bot_id: str,
         messages: list[dict],
         account_state_snapshot: dict | None = None,
-    ) -> None:
+        delivery_message_id: str | None = None,
+        delivery_result_text: str = "",
+    ) -> bool:
         """Persist a complete turn with the fewest safe database round trips."""
         def append(current: dict) -> dict:
             for bot in current["bots"]:
@@ -2678,7 +2690,7 @@ class Backend:
             )
             if callable(fast_append):
                 try:
-                    fast_append(
+                    saved = fast_append(
                         user_id=user_id,
                         bot_id=bot_id,
                         messages=messages,
@@ -2686,8 +2698,13 @@ class Backend:
                         device_hash=hashlib.sha256(
                             b"account-state-device|whatsapp-channel"
                         ).hexdigest(),
+                        delivery_message_id=delivery_message_id,
+                        delivery_result_text=delivery_result_text,
                     )
-                    return
+                    return bool(
+                        delivery_message_id
+                        and saved.get("delivery_prepared") is True
+                    )
                 except AccountStateConflict:
                     # Preserve changes made by desktop/mobile while the model
                     # was running by falling through to the existing merge.
@@ -2706,13 +2723,14 @@ class Backend:
                         b"account-state-device|whatsapp-channel"
                     ).hexdigest(),
                 )
-                return
+                return False
             except AccountStateConflict:
                 # A desktop or mobile client changed the account while the
                 # agent was running. Re-read and merge rather than dropping
                 # either side of the concurrent edit.
                 pass
         self._mutate_whatsapp_state(user_id, append)
+        return False
 
     def _add_whatsapp_connector_state(
         self, *, user_id: str, connector_id: str, active_bot_id: str | None

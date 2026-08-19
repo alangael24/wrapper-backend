@@ -301,13 +301,39 @@ class PostgresStore(Store):
                 " earlier.created_at<m.created_at OR "
                 " (earlier.created_at=m.created_at AND earlier.message_id<m.message_id))) "
                 " ORDER BY m.created_at,m.message_id FOR UPDATE SKIP LOCKED LIMIT 1"
-                ") UPDATE whatsapp_messages m SET status='processing',"
-                "attempts=m.attempts+1,updated_at=? FROM candidate "
-                "WHERE m.message_id=candidate.message_id RETURNING m.*",
+                "), claimed AS ("
+                " UPDATE whatsapp_messages m SET status='processing',"
+                " attempts=m.attempts+1,updated_at=? FROM candidate "
+                " WHERE m.message_id=candidate.message_id RETURNING m.*"
+                ") SELECT claimed.*,to_jsonb(l) AS context_link_json,"
+                "to_jsonb(u) AS context_user_json,"
+                "gs.id AS context_provider_subscription_id,"
+                "gs.api_key_enc AS context_provider_api_key_enc,"
+                "gs.key_id AS context_provider_key_id,"
+                "gs.key_version AS context_provider_key_version,"
+                "gs.status AS context_provider_subscription_status,"
+                "gs.assigned_user_id AS context_provider_assigned_user_id,"
+                "ast.user_id AS context_state_user_id,"
+                "ast.revision AS context_state_revision,"
+                "ast.state_json AS context_state_json,"
+                "ast.created_at AS context_state_created_at,"
+                "ast.updated_at AS context_state_updated_at "
+                "FROM claimed "
+                "LEFT JOIN whatsapp_links l ON l.wa_user_id=claimed.wa_user_id "
+                " AND l.phone_number_id=claimed.phone_number_id "
+                "LEFT JOIN users u ON u.id=l.user_id AND u.account_status='active' "
+                "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
+                "LEFT JOIN account_states ast ON ast.user_id=u.id",
                 (now, now),
             ).fetchone()
             self._conn.commit()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            message = dict(row)
+            message["_processing_context"] = self._whatsapp_context_from_row(
+                row, prefix="context_"
+            )
+            return message
         except Exception:
             self._conn.rollback()
             raise
@@ -361,10 +387,17 @@ class PostgresStore(Store):
         """Load link, user and synchronized product state in one DB call."""
         row = self._one(
             "SELECT to_jsonb(l) AS link_json,to_jsonb(u) AS user_json,"
+            "gs.id AS provider_subscription_id,"
+            "gs.api_key_enc AS provider_api_key_enc,"
+            "gs.key_id AS provider_key_id,"
+            "gs.key_version AS provider_key_version,"
+            "gs.status AS provider_subscription_status,"
+            "gs.assigned_user_id AS provider_assigned_user_id,"
             "ast.user_id AS state_user_id,ast.revision AS state_revision,"
             "ast.state_json,ast.created_at AS state_created_at,"
             "ast.updated_at AS state_updated_at "
             "FROM whatsapp_links l JOIN users u ON u.id=l.user_id "
+            "LEFT JOIN go_subscriptions gs ON gs.id=u.subscription_id "
             "LEFT JOIN account_states ast ON ast.user_id=u.id "
             "WHERE l.wa_user_id=? AND l.phone_number_id=? "
             "AND u.account_status='active'",
@@ -372,7 +405,12 @@ class PostgresStore(Store):
         )
         if row is None:
             return {"link": None, "user": None, "account_state": None}
+        return self._whatsapp_context_from_row(row)
 
+    @staticmethod
+    def _whatsapp_context_from_row(
+        row: Any, *, prefix: str = ""
+    ) -> dict:
         def decoded(value: Any) -> dict:
             if isinstance(value, dict):
                 return dict(value)
@@ -381,18 +419,34 @@ class PostgresStore(Store):
                 return dict(parsed) if isinstance(parsed, dict) else {}
             return {}
 
+        link = decoded(row.get(f"{prefix}link_json"))
+        user = decoded(row.get(f"{prefix}user_json"))
+        if not user:
+            return {"link": None, "user": None, "account_state": None}
+        for field in (
+            "provider_subscription_id",
+            "provider_api_key_enc",
+            "provider_key_id",
+            "provider_key_version",
+            "provider_subscription_status",
+            "provider_assigned_user_id",
+        ):
+            value = row.get(f"{prefix}{field}")
+            if value is not None:
+                user[field] = value
+
         account_state = None
-        if row.get("state_user_id") is not None:
+        if row.get(f"{prefix}state_user_id") is not None:
             account_state = {
-                "user_id": row["state_user_id"],
-                "revision": row["state_revision"],
-                "state_json": row["state_json"],
-                "created_at": row["state_created_at"],
-                "updated_at": row["state_updated_at"],
+                "user_id": row[f"{prefix}state_user_id"],
+                "revision": row[f"{prefix}state_revision"],
+                "state_json": row[f"{prefix}state_json"],
+                "created_at": row[f"{prefix}state_created_at"],
+                "updated_at": row[f"{prefix}state_updated_at"],
             }
         return {
-            "link": decoded(row.get("link_json")),
-            "user": decoded(row.get("user_json")),
+            "link": link,
+            "user": user,
             "account_state": account_state,
         }
 
@@ -404,6 +458,8 @@ class PostgresStore(Store):
         messages: list[dict],
         base_revision: int,
         device_hash: str,
+        delivery_message_id: str | None = None,
+        delivery_result_text: str = "",
     ) -> dict:
         """Append one turn to a bot with one cross-region Postgres call.
 
@@ -418,7 +474,7 @@ class PostgresStore(Store):
         messages_json = json.dumps(
             messages, separators=(",", ":"), ensure_ascii=False
         )
-        row = self._one(
+        state_update = (
             "UPDATE account_states ast SET state_json=("
             " jsonb_set(jsonb_set(ast.state_json::jsonb,'{bots}',("
             "  SELECT COALESCE(jsonb_agg(CASE WHEN bot->>'id'=? THEN "
@@ -442,19 +498,40 @@ class PostgresStore(Store):
             "WHERE ast.user_id=? AND ast.revision=? AND EXISTS ("
             " SELECT 1 FROM jsonb_array_elements(COALESCE(ast.state_json::jsonb->'bots','[]'::jsonb)) item"
             " WHERE item->>'id'=?) "
-            "RETURNING user_id,revision,state_json,created_at,updated_at",
-            (
-                bot_id,
-                messages_json,
-                bot_id,
-                device_hash,
-                now,
-                user_id,
-                base_revision,
-                bot_id,
-            ),
+            "RETURNING user_id,revision,state_json,created_at,updated_at"
         )
+        params: tuple[Any, ...] = (
+            bot_id,
+            messages_json,
+            bot_id,
+            device_hash,
+            now,
+            user_id,
+            base_revision,
+            bot_id,
+        )
+        if delivery_message_id:
+            row = self._one(
+                "WITH updated_state AS (" + state_update + "),claimed_delivery AS ("
+                " UPDATE whatsapp_messages SET status='sending',result_text=?,"
+                " user_id=COALESCE(?,user_id),updated_at=? "
+                " WHERE message_id=? AND status='processing' "
+                " AND EXISTS(SELECT 1 FROM updated_state) RETURNING message_id"
+                ") SELECT updated_state.*,"
+                "EXISTS(SELECT 1 FROM claimed_delivery) AS delivery_prepared "
+                "FROM updated_state",
+                params + (
+                    delivery_result_text[:20_000],
+                    user_id,
+                    now,
+                    delivery_message_id,
+                ),
+            )
+        else:
+            row = self._one(state_update, params)
         if row is not None:
+            if delivery_message_id and row.get("delivery_prepared") is not True:
+                raise RuntimeError("whatsapp_delivery_already_claimed")
             return dict(row)
 
         current = self.get_account_state(user_id)
