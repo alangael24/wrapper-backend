@@ -141,6 +141,7 @@ from .whatsapp_agent import (
     connector_command as whatsapp_connector_command,
     create_bot_from_request,
     extract_link_code,
+    format_bot_list,
     likely_connector_action as whatsapp_likely_connector_action,
     parse_agent_answer as parse_whatsapp_agent_answer,
     requested_bot,
@@ -169,6 +170,7 @@ MAX_JSON_BODY = 1024 * 1024
 MAX_STRIPE_WEBHOOK_BODY = 1024 * 1024  # Los eventos Stripe normales son mucho menores.
 MAX_WHATSAPP_WEBHOOK_BODY = 1024 * 1024
 UNSAFE_ADMIN_TOKENS = frozenset({"cambia-este-token"})
+LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
 READ_ONLY_CONNECTOR_OPERATIONS = frozenset({"search", "query_database", "select_query"})
 READ_ONLY_CONNECTOR_PREFIXES = ("search_", "read_", "list_", "get_", "query_", "describe_", "enrich_")
@@ -425,6 +427,11 @@ class Config:
         if self.environment not in {"development", "production"}:
             raise UnsafeConfigurationError(
                 "ENVIRONMENT debe ser 'development' o 'production'"
+            )
+        self.log_level = (os.environ.get("LOG_LEVEL") or "INFO").strip().upper()
+        if self.log_level not in LOG_LEVELS:
+            raise UnsafeConfigurationError(
+                "LOG_LEVEL debe ser CRITICAL, ERROR, WARNING, INFO o DEBUG"
             )
         self.db_path = Path(os.environ.get("DB_PATH", str(DEFAULT_DB)))
         self.database_url = (os.environ.get("DATABASE_URL") or "").strip() or None
@@ -2323,12 +2330,7 @@ class Backend:
             )
             return
         if wants_bot_list(text):
-            names = [bot["name"] for bot in state.get("bots", [])]
-            answer = (
-                "Tus agentes son:\n• " + "\n• ".join(names)
-                if names
-                else "Todavía no tienes agentes. Puedes decir: “Crea un agente para cotizaciones”."
-            )
+            answer = format_bot_list(state.get("bots", []), text)
             self._deliver_whatsapp_answer(
                 message_id=message_id, sender=sender, answer=answer, user_id=user_id,
             )
@@ -5723,7 +5725,24 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._worker_slots.release()
 
 
+def configure_runtime_logging(level_name: str) -> None:
+    """Enable operational logs while keeping transport URLs out of INFO."""
+    level = getattr(logging, level_name, logging.INFO)
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        root_logger.setLevel(level)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    # httpx's INFO records contain full request URLs. Agentgenia emits its own
+    # sanitized timing events, so transport internals remain at WARNING.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 def serve(cfg: Config) -> None:
+    configure_runtime_logging(cfg.log_level)
     validate_runtime_security(cfg)
     if not cfg.admin_token:
         cfg.admin_token = secrets.token_hex(32)

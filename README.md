@@ -692,6 +692,7 @@ runtime se agrupan aquí por función.
 | `HOST` | `127.0.0.1` | Interfaz de escucha; usa `0.0.0.0` detrás de un proxy |
 | `PORT` | `8787` | Puerto HTTP |
 | `ENVIRONMENT` | `development` | Solo admite `development` o `production` |
+| `LOG_LEVEL` | `INFO` | Nivel de logs; `INFO` incluye telemetría de latencia sin secretos |
 | `WRAPPER_SECRET` | archivo local en desarrollo | Obligatoria en producción; clave maestra para cifrar credenciales |
 | `WRAPPER_SECRET_VERSION` | `1` | Versión activa; los nuevos secretos se cifran con ella |
 | `WRAPPER_SECRET_PREVIOUS_JSON` | `{}` | Versiones anteriores para rotación dual-read/new-write |

@@ -63,6 +63,7 @@ from go_backend.whatsapp_agent import (  # noqa: E402
     connector_command,
     create_bot_from_request,
     extract_link_code,
+    format_bot_list,
     requested_bot,
     wants_bot_list,
 )
@@ -705,6 +706,21 @@ class TestBackend(unittest.TestCase):
             "bsuid_test_contact",
         )
         self.assertTrue(wants_bot_list("¿Cuáles son mis bots?"))
+        self.assertEqual(
+            format_bot_list(
+                [
+                    {"id": "one", "name": "Nuevo bot"},
+                    {"id": "two", "name": "Nuevo bot"},
+                    {"id": "sales", "name": "Ventas"},
+                ],
+                "Enumera mis agentes en una sola línea",
+            ),
+            "Tus agentes: Nuevo bot (2), Ventas.",
+        )
+        self.assertEqual(
+            format_bot_list([], "Mis agentes"),
+            "Todavía no tienes agentes. Puedes decir: “Crea un agente para cotizaciones”.",
+        )
         self.assertEqual(extract_link_code("Vincular Agentgenia ag-abcd-2345"), "AG-ABCD-2345")
         created = create_bot_from_request("Crea un agente para preparar cotizaciones")
         self.assertIsNotNone(created)
@@ -1669,6 +1685,11 @@ class TestBackend(unittest.TestCase):
         cfg.admin_token = "  CAMBIA-ESTE-TOKEN  "
         with self.assertRaisesRegex(UnsafeConfigurationError, "valor inseguro de ejemplo"):
             serve(cfg)
+
+    def test_config_rejects_invalid_log_level(self):
+        with patch.dict(os.environ, {"LOG_LEVEL": "verbose"}):
+            with self.assertRaisesRegex(UnsafeConfigurationError, "LOG_LEVEL"):
+                Config()
 
     def test_server_rejects_shared_chrome_profiles(self):
         cfg = Config()

@@ -85,6 +85,43 @@ def wants_bot_list(text: str) -> bool:
     )
 
 
+def format_bot_list(bots: list[dict[str, Any]], request_text: str) -> str:
+    """Render a compact bot inventory without spending an LLM call.
+
+    Repeated display names are valid (and common after creating several test
+    agents), but repeating the same line hundreds of times is neither useful
+    nor cheap to deliver through WhatsApp. Preserve the real count while
+    grouping equal names and honor explicit one-line requests.
+    """
+    if not bots:
+        return "Todavía no tienes agentes. Puedes decir: “Crea un agente para cotizaciones”."
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for bot in bots:
+        raw_name = bot.get("name") if isinstance(bot, dict) else None
+        name = str(raw_name or "Sin nombre").strip()[:80] or "Sin nombre"
+        key = name.casefold()
+        if key not in grouped:
+            grouped[key] = {"name": name, "count": 0}
+        grouped[key]["count"] += 1
+
+    groups = list(grouped.values())
+    visible = groups[:20]
+    labels = [
+        f"{item['name']} ({item['count']})" if item["count"] > 1 else item["name"]
+        for item in visible
+    ]
+    hidden_count = sum(int(item["count"]) for item in groups[20:])
+    if hidden_count:
+        labels.append(f"+{hidden_count} agentes más")
+
+    normalized = _normalized(request_text)
+    one_line = bool(re.search(r"\b(?:en|una)\s+(?:sola\s+)?linea\b|\bone line\b", normalized))
+    if one_line:
+        return "Tus agentes: " + ", ".join(labels) + "."
+    return "Tus agentes son:\n• " + "\n• ".join(labels)
+
+
 def connector_command(text: str) -> tuple[str, str | None] | None:
     """Parsea comandos de conectores sin enviar la intención al LLM.
 

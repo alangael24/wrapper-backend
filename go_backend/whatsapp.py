@@ -207,7 +207,15 @@ class WhatsAppCloudAPI:
         self._client = client or httpx.Client(
             http2=True,
             timeout=httpx.Timeout(float(timeout_seconds), connect=min(5.0, float(timeout_seconds))),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            # httpx expires idle connections after five seconds by default.
+            # WhatsApp conversations commonly pause longer than that between
+            # turns, so keep the already-established TLS/HTTP2 connection long
+            # enough to reuse it throughout an active conversation.
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=60.0,
+            ),
             headers={"User-Agent": "AgentGenia-WhatsApp/1.0"},
         )
 
